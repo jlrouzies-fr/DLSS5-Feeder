@@ -25,6 +25,8 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 - [Install for a 32-bit game](#install-for-a-32-bit-game-beta)
 - [Install for a DirectX 9 game](#install-for-a-directx-9-game-beta)
 - [Install for a Vulkan game](#install-for-a-vulkan-game)
+- [Motion vector providers](#motion-vector-providers)
+  - [iMMERSE Launchpad, through a bridge](#immerse-launchpad-through-a-bridge)
 - [How it works](#how-it-works)
   - [The 32-bit path](#the-32-bit-path)
   - [The DirectX 9 path](#the-directx-9-path)
@@ -163,7 +165,24 @@ game already wraps to D3D11 — skip this section, it is just a normal 32-bit in
    [Install for a 32-bit game](#install-for-a-32-bit-game-beta) (or the 64-bit steps for a 64-bit
    D3D9 game). ReShade must be installed as **`dxgi.dll`**, never as `d3d9.dll` — dgVoodoo owns that
    filename now and the two would fight.
-6. Turn the watermark off once everything works.
+6. **Fix the depth buffer.** A translated D3D9 game will usually hand ReShade an *empty* depth
+   buffer even though Generic Depth lists a candidate, and DLSS then runs with no depth at all. Two
+   settings, neither of which the other install paths need:
+
+   * **`RESHADE_DEPTH_INPUT_IS_REVERSED=0`** in ReShade's global preprocessor definitions (Home tab
+     ▸ *Edit global preprocessor definitions*). ReShade defaults it to `1`, which is correct for
+     modern reversed-Z engines and wrong for everything of the D3D9 era. The feeder's
+     `depth_inverted` follows this definition by default; `depth_inverted=0` in `dlss5-feed.cfg`
+     forces it independently of the shaders.
+   * **`DepthCopyBeforeClears=1`** in the `[DEPTH]` section of `reshade.ini` (Add-ons ▸ *Generic
+     Depth* in the overlay). Engines of that age clear depth several times per frame — scene,
+     cutscene layers, UI — and by default ReShade takes the buffer at the end of the frame, when it
+     has already been wiped. Then step **`DepthCopyAtClearIndex`** through `0, 1, 2, …` until depth
+     appears.
+
+   Verify with **DLSS 5 Feed – debug view ▸ Raw depth**: a flat white or black screen means no depth
+   is arriving; you want visible near/far shading and object silhouettes.
+7. Turn the watermark off once everything works.
 
 ## Install for a Vulkan game
 
@@ -195,6 +214,52 @@ layer\run-with-feed-layer.bat "E:\path\to\game.exe"
 ```
 
 See [`layer/README.md`](layer/README.md). It does the same job from outside the process.
+
+## Motion vector providers
+
+DLSS5-Feeder consumes exactly one interface: the shared `texMotionVectors` texture (RG16F, full
+resolution, delta UV with `prev_uv = uv + mv`). Enable **one** provider that writes it, above
+`DLSS 5 Feed` in the effect list:
+
+* **[ReshadeMotionEstimation](https://github.com/JakobPCoder/ReshadeMotionEstimation)** (technique
+  `DRME`, CC BY-NC 4.0) — the straightforward choice, writes `texMotionVectors` directly.
+* **`qUINT_motionvectors`** — same convention, also direct.
+* **iMMERSE Launchpad** — better optical flow, but needs a bridge; see below.
+
+> The feed log line `MV provider <name>` reports that `texMotionVectors` **exists**, not that
+> anything is writing to it. Zero-filled vectors look exactly the same in the log. To check the
+> actual contents, enable the **DLSS 5 Feed – debug view** technique: a static scene must be flat
+> grey and moving the camera must flood the frame with colour that tracks the direction.
+
+### iMMERSE Launchpad, through a bridge
+
+Launchpad has the most accurate free optical flow for ReShade, but it is **not** a drop-in provider.
+Two independent reasons, both of which fail silently:
+
+1. **It publishes its vectors as `Deferred::MotionVectorsTex`**, not `texMotionVectors`. That
+   texture lives inside a namespace, and ReShade mangles names in namespaces — so a plain top-level
+   declaration of `MotionVectorsTex` creates a *different* resource and binds to nothing.
+2. **It computes optical flow only on request.** Its flow vertex shader culls the geometry when the
+   feature was not requested, and it clears the request buffer at the end of its own technique,
+   explicitly so that effects running after it can ask for what they need. Nothing in a stock setup
+   asks, so the flow passes never run and the texture stays zero.
+
+**`shaders/DLSS5_MV_Bridge.fx`** handles both: it declares the provider-side resources so ReShade
+binds Launchpad's actual textures, raises the optical-flow request, and copies the vectors into
+`texMotionVectors` unchanged — the conventions already agree, so there is no rescaling. Like the
+rest of this project it includes no third-party files and contains no third-party code; interop is
+by declaration only.
+
+1. Install **iMMERSE** (`MartysMods_LAUNCHPAD.fx` plus its `MartysMods\` headers) and its textures
+   from **https://github.com/martymcmodding/iMMERSE** into `reshade-shaders\`.
+2. Put **`DLSS5_MV_Bridge.fx`** in `reshade-shaders\Shaders\`.
+3. Enable, in this order: **Launchpad** → **DLSS 5 MV Bridge** → **DLSS 5 Feed**. Disable DRME and
+   any other provider — they write the same texture.
+
+The request reaches Launchpad on the next frame, so the very first frame after enabling has no
+vectors yet. A useful side check: with the bridge working, the flow passes actually execute, so the
+frame cost visibly rises — if enabling it changes nothing at all, the request is not getting
+through.
 
 ## How it works
 
@@ -284,8 +349,8 @@ down. The hook is removed on DLL unload, since ReShade reloads add-ons per Vulka
 | D3D11, D3D12 or Vulkan game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan works out of the box (the add-on adds the interop extensions itself; [a small bundled layer](#install-for-a-vulkan-game) is the fallback). D3D10 is not supported. |
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
 | DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | from its own author; this project does not include it. |
-| `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
-| A motion vector provider | any shader writing the community-standard `texMotionVectors`, e.g. **ReshadeMotionEstimation** (CC BY-NC 4.0) or **qUINT_motionvectors**. Install it yourself — nothing third-party is bundled, and our shader includes no third-party files. |
+| `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). **It must carry NVIDIA's own signature.** Some games ship a copy re-signed by their publisher; NGX rejects those and the host log then says `SuperSampling.Available=0` with no further explanation. Check with `Get-AuthenticodeSignature` — the signer has to be `CN=NVIDIA Corporation`. |
+| A motion vector provider | any shader writing the community-standard `texMotionVectors`, e.g. **ReshadeMotionEstimation** (CC BY-NC 4.0) or **qUINT_motionvectors**. Install it yourself — nothing third-party is bundled, and our shaders include no third-party files. **iMMERSE Launchpad does not write `texMotionVectors`** and is not a drop-in provider; see [Motion vector providers](#motion-vector-providers). |
 | `dlss5-feed.addon64` (or `.addon32` + `host64\`) + `DLSS5_Feed.fx` | this project. |
 
 ## Configuration
@@ -344,6 +409,16 @@ Common cases:
 * **Image is static-sharp but smears when moving** — no provider is writing `texMotionVectors`
   (the feed log then says "no known texMotionVectors provider found"): enable DRME (or another
   provider) above DLSS 5 Feed.
+* **`Raw depth` in the debug view is a flat white or black screen** — no depth is reaching the
+  shaders, even if Generic Depth lists a candidate buffer. Most common on games translated from
+  D3D9; see the depth step in [the D3D9 section](#install-for-a-directx-9-game-beta)
+  (`DepthCopyBeforeClears`, `DepthCopyAtClearIndex`, `RESHADE_DEPTH_INPUT_IS_REVERSED`).
+* **The host logs `SuperSampling.Available=0` and `NGX unavailable`, then exits** — `nvngx_dlss.dll`
+  is there but NGX refused it. Usually a copy re-signed by a game's publisher rather than NVIDIA;
+  check the signer and swap in an NVIDIA-signed runtime.
+* **The feed log says `MV provider <name>` but motion still smears** — that line only reports that
+  `texMotionVectors` exists, not that anything writes to it. Confirm the contents with the debug
+  view; for iMMERSE Launchpad see [Motion vector providers](#motion-vector-providers).
 * **Nothing happens, no `dlss5-feed.log`** — ReShade's architecture does not match the game's
   (a 64-bit `dxgi.dll` cannot load into a 32-bit game, and vice versa).
 * **"ran out of video memory" with dgVoodoo** — raise `VRAM` in `dgVoodoo.conf`; the default 256 MB
