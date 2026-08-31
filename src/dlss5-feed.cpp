@@ -56,7 +56,7 @@
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
 
-#define FEED_VERSION "0.8.0-beta.1"
+#define FEED_VERSION "0.8.0-beta.2"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
