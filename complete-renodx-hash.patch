@@ -1,0 +1,6 @@
+diff --git a/Build-CK3-Complete-Test.ps1 b/Build-CK3-Complete-Test.ps1
+--- a/Build-CK3-Complete-Test.ps1
++++ b/Build-CK3-Complete-Test.ps1
+@@ -27 +27 @@
+-    RenoDx = 'e1c28fde0922b12fc10734e58c3d24a36808e575247f4fd4f36226540d7ee023'
++    RenoDx = '9150097cdee2953cdc9894d2e5606ea5100e6c8f95fc7bb1b407328b4391a07a'

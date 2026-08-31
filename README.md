@@ -1,5 +1,26 @@
 ## ⚠️ Not compatible with Nvidia Smooth Motion / Optiscaler. Disable them to avoid issues.
 
+> ## Fork notice — Crusader Kings III
+>
+> **This repository is a fork of [DLSS5-Feeder](https://github.com/jlrouzies-fr/DLSS5-Feeder) by
+> Jean-Laurent ROUZIES, tailored for Crusader Kings III.** The engine remains based on upstream;
+> this fork additionally exposes DLSS 4.5 L/M presets and cleanly bypasses RenoDX-only startup
+> delays when the Neural Rendering add-on is absent. Everything under **`ck3-package/`** plus the
+> `Build-CK3-Package*.ps1` scripts is CK3-specific packaging: a drag-and-drop installer, isolated
+> per-game Vulkan layers, runtime profiles, and a builder that creates
+> `release\CK3-DLSS-Portable.zip`.
+>
+> **If you are here for Crusader Kings III, you do not need to read this README — start with
+> [`ck3-package/README.md`](ck3-package/README.md).** It is the user-facing install guide for the
+> CK3 portable package, its RTX 3060-compatible DLSS 4.5/DLAA profile, optional RHI-backed DLSS 5
+> preview profiles, install/launch commands, release layout, and build instructions. Come back here
+> for the underlying engine details, motion-vector provider reference, or source builds.
+>
+> For everything not game-specific, please use the upstream issue tracker and discussions at
+> **https://github.com/jlrouzies-fr/DLSS5-Feeder** — the Feeder itself is maintained there.
+> Issues in this fork should be limited to the CK3 packaging (`ck3-package/`, the `Build-CK3-*`
+> scripts, or CK3-specific behaviour such as the `Graphics.renderer` flip from DX11 to Vulkan).
+
 # DLSS5-Feeder
 
 **DLSS 5 neural rendering in games that ship without any DLSS — D3D11, D3D12, Vulkan, 32-bit, even DirectX 9.**
@@ -20,6 +41,8 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 
 ## Contents
 
+- [Crusader Kings III (this fork)](#crusader-kings-iii-this-fork)
+- [Scripts (`.cmd` / `.ps1`)](#scripts-cmd--ps1)
 - [Status](#status)
 - [Install for a 64-bit game](#install-for-a-64-bit-game)
 - [Install for a 32-bit game](#install-for-a-32-bit-game-beta)
@@ -38,7 +61,68 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 - [Credits](#credits)
 - [License](#license)
 
+## Crusader Kings III (this fork)
+
+CK3 ships with DX11 and no DLSS integration; `ck3-package/` turns the feeder into a
+**portable, drag-and-drop install** over the `Crusader Kings III\` folder:
+
+- `Install CK3 DLSS.cmd` — selects/acquires a runtime profile, validates it, backs up settings, and
+  flips `Graphics.renderer` to `Vulkan` only after setup succeeds.
+- `DLSS 4.5 / DLAA` — the default RTX 3060-safe profile: official NVIDIA `nvngx_dlss.dll`, Model M,
+  and no active RenoDX/Neural Rendering runtime.
+- `DLSS 5 Neural Rendering` and `DLSS 5 Extended` — explicit opt-in preview profiles using RHI's
+  maintained component sources; Extended is an unsigned modified compatibility runtime.
+- `Launch CK3 with DLSS.cmd` — starts CK3 with package-local ReShade and feeder Vulkan layers.
+  **No global ReShade install and no registry changes.**
+- `Configure CK3 DLSS Runtime.cmd` — switches profiles while preserving per-profile feeder settings.
+- `Build-CK3-Package.ps1` — creates a thin `release\CK3-DLSS-Portable.zip` by default. Proprietary
+  NVIDIA/RenoDX inputs are optional build arguments; otherwise the end-user installer downloads
+  them only after consent and records source URLs, signatures, versions, and SHA-256 hashes.
+
+**Full CK3 install guide, expected release layout, and build instructions:
+[`ck3-package/README.md`](ck3-package/README.md).**
+
+## Scripts (`.cmd` / `.ps1`)
+
+Every CK3 user-facing command is a tiny `.cmd` shim that calls a single PowerShell driver
+([`ck3-package/DLSS5-CK3.ps1`](ck3-package/DLSS5-CK3.ps1)). That driver delegates the actual
+runtime work to [`ck3-package/DLSS-Runtime-Setup.ps1`](ck3-package/DLSS-Runtime-Setup.ps1).
+The engine itself (add-on, host, fallback layer, spike) is built by the `.bat` scripts listed in
+[Building](#building); only the CK3 packaging uses PowerShell.
+
+### CK3 user-facing — `ck3-package/`
+
+| File | What it does |
+| --- | --- |
+| **`Install CK3 DLSS.cmd`** | Thin shim: runs `DLSS5-CK3.ps1 -Action Install`. Validates every required file in `binaries\`, calls the runtime setup to acquire/select a profile, then flips `Graphics.renderer` to `Vulkan` in `%USERPROFILE%\Documents\Paradox Interactive\Crusader Kings III\pdx_settings.txt` (creating a `.ck3-dlss-backup` of the original on first run). Pauses on failure so the error is readable. |
+| `Install CK3 DLSS5.cmd` | Back-compat shim — just forwards to `Install CK3 DLSS.cmd`. Kept so existing shortcuts and tutorials keep working. |
+| **`Launch CK3 with DLSS.cmd`** | Checks that `binaries\ck3.exe` and `binaries\dlss-active\dlss5-feed.addon64` exist, then sets **`VK_LAYER_PATH=binaries\dlss5-vulkan`**, **`VK_INSTANCE_LAYERS=VK_LAYER_feed_vk;VK_LAYER_reshade`**, and **`RESHADE_BASE_PATH_OVERRIDE=binaries\`** in the launched process's environment, and starts `ck3.exe` with `-gdpr-compliant` from `binaries\`. **No Vulkan registry keys, no global ReShade install** — other games are unaffected. |
+| `Launch CK3 with DLSS5.cmd` | Back-compat shim → `Launch CK3 with DLSS.cmd`. |
+| **`Disable CK3 DLSS.cmd`** | Runs `DLSS5-CK3.ps1 -Action Disable` — flips the saved `Graphics.renderer` value back to `DX11`. Does **not** delete or move any of the package files, so the next `Install CK3 DLSS.cmd` is a no-op. |
+| `Disable CK3 DLSS5.cmd` | Back-compat shim → `Disable CK3 DLSS.cmd`. |
+| `Configure CK3 DLSS Runtime.cmd` | Runs `DLSS5-CK3.ps1 -Action ConfigureRuntime`. Same profile setup as `Install`, but **does not touch** the `Graphics.renderer` setting — use this to switch between `DLSS 4.5 / DLAA`, `DLSS 5 Neural Rendering`, and `DLSS 5 Extended` after the first install without re-validating the base package. |
+| `Open RHI Runtime Manager.cmd` | Runs `DLSS5-CK3.ps1 -Action OpenRHI`. Confirms by typing `OPEN RHI` (no silent download), pulls the latest `RHI-Setup-*.exe` from `RankFTW/RHI` releases, validates its PE header, and launches it. Used to obtain a RenoDX/NVIDIA runtime pair when you'd rather use RHI than let the package fetch the components itself. |
+
+### CK3 drivers — `ck3-package/`
+
+| File | What it does |
+| --- | --- |
+| [`DLSS5-CK3.ps1`](ck3-package/DLSS5-CK3.ps1) | The single entry point that all eight `.cmd` shims call. Switches on `-Action` (`Install` / `ConfigureRuntime` / `Disable` / `Validate` / `OpenRHI`). `Install` does: `Test-BasePackage` → `DLSS-Runtime-Setup.ps1 -Action Configure` → `-Action Status` → `Set-CK3Renderer … 'Vulkan'`. `Disable` only flips the saved renderer back to `DX11`. `Validate` re-runs the package and runtime checks without changing anything. Accepts `-Profile Auto|DLSS45|DLSS5|DLSS5Extended` and forwards `-DlssRuntime` / `-DlssNrRuntime` / `-RenoDxAddon` / `-AcceptRuntimeLicenses` / `-AllowUnsignedNvidiaRuntime` / `-ForceDownload` to the runtime setup. Exits non-zero on any failure so the `.cmd` shims can surface the error. |
+| [`DLSS-Runtime-Setup.ps1`](ck3-package/DLSS-Runtime-Setup.ps1) | Does the actual runtime work. Three runtime profiles — **`DLSS 4.5 / DLAA`** (default, RTX 20/30/40 friendly, no Neural Rendering runtime), **`DLSS 5 Neural Rendering`** (official supported-hardware DLSS 5), **`DLSS 5 Extended`** (RHI/ShortFuse modified compatibility runtime for RTX 20/30/40, unsigned). `Configure` action enumerates `Win32_VideoController`, asks the user to pick a profile (or accepts `-Mode Auto|DLSS45|DLSS5|DLSS5Extended`), and stages the components in `binaries\dlss-active\`, recording a `CK3-DLSS-RUNTIME.json` next to them. `Status` re-validates the active profile. `OpenRHI` downloads and launches the latest `RHI-Setup.exe` after explicit `OPEN RHI` consent. **Validation is strict on purpose:** every binary is read as a PE file (`Get-PeMachine`), SHA-256-hashed, and `nvngx_*.dll` files must carry a valid NVIDIA Authenticode signature unless `-AllowUnsignedNvidiaRuntime` is passed. Downloads come from `api.github.com/repos/NVIDIA/DLSS/releases/latest` and `RankFTW/RHI`'s official manifest only — no third-party mirrors. |
+
+### Portable-package builders — repo root
+
+| File | What it does |
+| --- | --- |
+| [`Build-CK3-Package.ps1`](Build-CK3-Package.ps1) | Thin user-facing wrapper. Its only job is to keep scripts written against the v0 prototype working: it forwards `-ReShadeSetup`, `-RenoDxAddon`, `-DlssRuntime`, `-DlssNrRuntime`, the four optional asset paths, and `-OutputDirectory` to `Build-CK3-Package.Portable.Core.ps1`. No work is done here. |
+| [`Build-CK3-Package.Core.ps1`](Build-CK3-Package.Core.ps1) | Second back-compat shim — same forwarding pattern, also kept for older tutorials. New packaging work belongs in `Build-CK3-Package.Portable.Core.ps1`. |
+| [`Build-CK3-Package.Portable.Core.ps1`](Build-CK3-Package.Portable.Core.ps1) | The actual builder. Required: `-ReShadeSetup` (the official full/add-on `ReShade_Setup_Addon.exe`, used only to extract the 64-bit `ReShade64.dll`). Optional: `-RenoDxAddon`, `-DlssRuntime`, `-DlssNrRuntime`, and the four upstream-asset overrides (`-FeederAddon`, `-FeedLayerZip`, `-LumeniteZip`, `-ReShadeShadersZip`) — when not supplied, it downloads them from `jlrouzies-fr/DLSS5-Feeder` latest release, `umar-afzaal/LumeniteFX` mainline, and `crosire/reshade-shaders` slim. All four user-supplied binaries are PE-validated as x64 before the build continues. Output: `release\CK3-DLSS-Portable\` (or whatever `-OutputDirectory` points at), optionally zipped and kept via `-KeepStagingDirectory`. Proprietary NVIDIA and RenoDX inputs are **never** downloaded from third-party mirrors — pass them in, or have users supply them at install time. |
+
 ## Status
+
+> **This fork's primary target is [Crusader Kings III](#crusader-kings-iii-this-fork)** (64-bit
+> Vulkan, CXB-style portable install under `ck3-package/`). The proven-working table below is
+> the upstream Feeder's — same engine paths the CK3 package relies on.
 
 Proven working in six games covering every supported path:
 
@@ -358,8 +442,8 @@ down. The hook is removed on DLL unload, since ReShade reloads add-ons per Vulka
 | --- | --- |
 | D3D11, D3D12 or Vulkan game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan works out of the box (the add-on adds the interop extensions itself; [a small bundled layer](#install-for-a-vulkan-game) is the fallback). D3D10 is not supported. |
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
-| DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | from its own author; this project does not include it. |
-| `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
+| DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | Optional. Required only for Neural Rendering; plain DLAA works without them. |
+| `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the add-on. Required for the full DLSS/DLAA path. |
 | A motion vector provider | one of five, selected with the `DLSS5_MV_PROVIDER` definition — **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) Kernel is recommended** (`=3`); also iMMERSE Launchpad, VORT, LumeniteFX QuantMotion, or anything writing `texMotionVectors` (qUINT, `dh_uber_motion`). **Not DRME — it does not compile on ReShade 6.8.** See [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider). Install it yourself — nothing third-party is bundled, and our shader includes no third-party files. |
 | `dlss5-feed.addon64` (or `.addon32` + `host64\`) + `DLSS5_Feed.fx` | this project. |
 
@@ -384,11 +468,11 @@ if you prefer editing the file directly:
 | `depth_inverted` | -1 | -1 follow `RESHADE_DEPTH_INPUT_IS_REVERSED`, 0/1 force. |
 | `flags` | -1 | raw `DLSS.Feature.Create.Flags` override. |
 | `reset_every` | 0 | 1 = NGX Reset every frame (no temporal history; diagnostic). |
-| `warmup_rebuild` | 180 | re-create the feature once after N delivered frames (works around the DLSS 5 add-on latching STANDBY on its first create; skipped automatically on newer "v45+" add-on builds). |
+| `warmup_rebuild` | 180 | re-create the feature once after N delivered frames (works around classic RenoDX startup; skipped when RenoDX is absent or uses the newer "v45+" engine). |
 | `rebuild` | 0 | change the number to re-create the feature once, by hand. |
 | `log_frames` | 3 | first N frames logged in detail. |
-| `create_delay` | 60 | frames to hold a feature (re)build after a runtime (re)init — the DLSS 5 add-on arms its NGX hooks asynchronously, and calling in too early can crash. 0 disables. |
-| `preset` | 0 | DLSS render-preset hint: `0` default, `5`/`6` = legacy CNN presets E/F (clamp history harder — try these if motion warps around transparents like dust or flames), `10`/`11` = transformer presets J/K. |
+| `create_delay` | 60 | frames to hold a feature (re)build while RenoDX arms NGX hooks. Automatically skipped when RenoDX is absent; 0 disables. |
+| `preset` | 0 | DLSS render-preset hint: `0` default; `5`/`6` E/F; `10` J; `11` K (DLSS 4); `12` L and `13` M (DLSS 4.5). |
 | `mv_scale_x/y` | 1.0 | extra motion-vector multiplier. |
 | `host_window` | 1 | **32-bit games only.** 1 shows the helper's window; 0 hides it (its own settings are now on the overlay page above, so you rarely need it). |
 

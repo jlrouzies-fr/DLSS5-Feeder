@@ -1,0 +1,24 @@
+diff --git a/ck3-package/DLSS-Runtime-Setup.ps1 b/ck3-package/DLSS-Runtime-Setup.ps1
+--- a/ck3-package/DLSS-Runtime-Setup.ps1
++++ b/ck3-package/DLSS-Runtime-Setup.ps1
+@@ -194 +194 @@
+-    Write-Host '  2. DLSS 5 Neural Rendering       (official supported-hardware runtime)'
++    Write-Host '  2. DLSS 5 Neural Rendering       (NVIDIA-signed preview runtime selected through RHI)'
+@@ -296 +296,3 @@
+-    $releases = @(Get-RemoteJson $script:RhiRepoReleases 'RHI''s RenoDX component releases')
++    # Windows PowerShell 5.1 exposes a top-level JSON array as one Object[] pipeline item.
++    # Wrapping this call in @() would therefore create a nested array.
++    $releases = Get-RemoteJson $script:RhiRepoReleases 'RHI''s RenoDX component releases'
+@@ -297,3 +299,4 @@
+     $release = $releases |
+         Where-Object { -not $_.draft -and [string]$_.tag_name -like 'renodx-dlss5-*' } |
++        Sort-Object { [DateTime]$_.published_at } -Descending |
+         Select-Object -First 1
+@@ -301 +304 @@
+-    $asset = @($release.assets) |
++    $asset = $release.assets |
+@@ -497 +500,3 @@
+-        Write-Host 'RHI is optional; this CK3 package can acquire its three runtime components itself.'
++        Write-Host 'RHI is optional; this CK3 package already acquires its runtime components itself.'
++        Write-Host 'Do not enable RHI''s global Vulkan ReShade for CK3 while using this portable launcher;' -ForegroundColor Yellow
++        Write-Host 'both expose VK_LAYER_reshade and would conflict.' -ForegroundColor Yellow

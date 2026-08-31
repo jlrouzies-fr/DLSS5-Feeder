@@ -143,7 +143,8 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 // The 'EnableHooks' string in the binary is the v45+ marker.
 // ---------------------------------------------------------------------------
 
-static char g_renodx_ver[48] = "not found";
+static char g_renodx_ver[48] = "unknown";
+static bool g_renodx_present = false;
 static bool g_renodx_lazy    = false;
 
 // Set when the game's device (or the process) is being destroyed: from that moment,
@@ -163,9 +164,11 @@ static void DetectRenodxAddon()
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE)
     {
-        Log("[feed] DLSS 5 add-on: renodx-dlss5.addon64 not found next to this add-on");
+        Log("[feed] DLSS 5 add-on: not installed; using standard DLAA without Neural Rendering");
         return;
     }
+    g_renodx_present = true;
+
     const DWORD size = GetFileSize(f, nullptr);
     DWORD got = 0;
     char *buf = (size > 0 && size < 8u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
@@ -224,7 +227,7 @@ struct Cfg
     int   rebuild;         // any change of this number re-creates the feature once (manual trigger)
     int   log_frames;      // how many first frames get a full parameter dump in the log
     int   create_delay;    // frames to hold the FIRST feature create (the DLSS 5 add-on arms its NGX hooks asynchronously)
-    int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer)
+    int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F, 10=J, 11=K, 12=L, 13=M
     float mv_scale_x;      // multiplier applied to the motion vectors (the FX already outputs pixels)
     float mv_scale_y;
 };
@@ -1095,7 +1098,9 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
     {
         g.params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, static_cast<unsigned int>(g_cfg.preset));
         Log("[feed] DLSS render preset hint: %d (%s)", g_cfg.preset,
-            g_cfg.preset == 5 ? "E" : g_cfg.preset == 6 ? "F" : g_cfg.preset == 10 ? "J" : g_cfg.preset == 11 ? "K" : "?");
+            g_cfg.preset == 5 ? "E" : g_cfg.preset == 6 ? "F" : g_cfg.preset == 10 ? "J" :
+            g_cfg.preset == 11 ? "K" : g_cfg.preset == 12 ? "L (DLSS 4.5)" :
+            g_cfg.preset == 13 ? "M (DLSS 4.5)" : "?");
     }
 
     if (!BeginCommands()) { Log("[feed] could not start a command list"); return false; }
@@ -1910,7 +1915,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
     // add-on may still be patching its vtable (that has crashed the process at EXEC 0x0),
     // and it re-patches after every runtime recreation.
     const bool needs_build12 = !g.frame_ready || w != g.width || h != g.height || cd.Format != g.bb_fmt;
-    if (ok && needs_build12 && g.create_grace < g_cfg.create_delay)
+    if (ok && g_renodx_present && needs_build12 && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
             Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously)",
@@ -2050,7 +2055,8 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                     // in LOTR: hooks +215 ms), which latches it in STANDBY. One warm-up re-create
                     // fixes that -- and it is safe now: it goes through RecreateFeatureOnly, which
                     // keeps the old feature if the new create fails or crashes.
-                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                    if (g_renodx_present && g_cfg.warmup_rebuild > 0 && !g.warmup_done &&
+                        !g_renodx_lazy && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
                     {
                         g.warmup_done = true;
                         g.frame_ready = false;
@@ -2157,7 +2163,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
     const DXGI_FORMAT bbf = static_cast<DXGI_FORMAT>(cd.texture.format);
     const bool needs_build_vk = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt;
-    if (ok && needs_build_vk && g.create_grace < g_cfg.create_delay)
+    if (ok && g_renodx_present && needs_build_vk && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
             Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously)",
@@ -2341,7 +2347,8 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
                     Log("[feed] frame %llu delivered (%ux%u, reset=%d, Vulkan transport)", fn, g.width, g.height, reset);
 
-                if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                if (g_renodx_present && g_cfg.warmup_rebuild > 0 && !g.warmup_done &&
+                    !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
                 {
                     g.warmup_done = true;
                     g.frame_ready = false;
@@ -2450,7 +2457,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     // process (EXEC at 0x0, sometimes fatally on a foreign thread). Hold EVERY build that
     // follows a runtime (re-)init until that settled.
     const bool needs_build11 = !g.frame_ready || cd.Width != g.width || cd.Height != g.height || cd.Format != g.bb_fmt;
-    if (ok && needs_build11 && g.create_grace < g_cfg.create_delay)
+    if (ok && g_renodx_present && needs_build11 && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
             Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously)",
@@ -2559,7 +2566,8 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
 
                     // The DLSS 5 add-on sometimes latches STANDBY/FAILED on the very first create and only
                     // recovers on a fresh one; re-create once after the pipeline has settled.
-                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                    if (g_renodx_present && g_cfg.warmup_rebuild > 0 && !g.warmup_done &&
+                        !g_renodx_lazy && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
                     {
                         g.warmup_done = true;
                         g.frame_ready = false;
@@ -2777,7 +2785,10 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Text("Session: %s", g.disabled ? "disabled (see dlss5-feed.log)" : g.session_ready ? "open" : "not started");
     ImGui::Text("Feature: %s", g.frame_ready ? "ready" : "not built");
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
-    ImGui::Text("DLSS 5 add-on: v%s (%s)", g_renodx_ver, g_renodx_lazy ? "v45+ engine" : "classic engine");
+    if (g_renodx_present)
+        ImGui::Text("DLSS 5 add-on: v%s (%s)", g_renodx_ver, g_renodx_lazy ? "v45+ engine" : "classic engine");
+    else
+        ImGui::TextUnformatted("DLSS 5 add-on: not installed (standard DLAA only)");
     if (g.disabled && ImGui::Button("Re-enable"))
     {
         g.disabled = false;
@@ -2798,13 +2809,14 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
     ImGui::Separator();
     ImGui::TextUnformatted("DLSS render preset");
-    static const char *kPresetNames[] = { "Default", "E (legacy CNN)", "F (legacy CNN)", "J (transformer)", "K (transformer)" };
-    static const int   kPresetValues[] = { 0, 5, 6, 10, 11 };
+    static const char *kPresetNames[] = { "Default", "E (legacy CNN)", "F (legacy CNN)", "J (transformer)", "K (recommended DLAA)", "L (DLSS 4.5 Ultra Performance model)", "M (DLSS 4.5 Performance model)" };
+    static const int   kPresetValues[] = { 0, 5, 6, 10, 11, 12, 13 };
     int preset_idx = 0;
-    for (int i = 0; i < 5; ++i) if (kPresetValues[i] == g_cfg.preset) preset_idx = i;
-    if (ImGui::Combo("Preset", &preset_idx, kPresetNames, 5)) { g_cfg.preset = kPresetValues[preset_idx]; dirty = true; }
-    ImGui::TextWrapped("Presets differ in how hard DLSS clamps history against the current frame. "
-                       "If motion warps around transparents (dust, smoke, flames), try E or F.");
+    for (int i = 0; i < 7; ++i) if (kPresetValues[i] == g_cfg.preset) preset_idx = i;
+    if (ImGui::Combo("Preset", &preset_idx, kPresetNames, 7)) { g_cfg.preset = kPresetValues[preset_idx]; dirty = true; }
+    ImGui::TextWrapped("K is NVIDIA's recommended DLAA model. L and M enable DLSS 4.5 for comparison, "
+                       "but cost more on RTX 20/30 GPUs without native FP8. If motion warps around "
+                       "transparents (dust, smoke, flames), try E or F.");
 
     ImGui::Separator();
     ImGui::TextUnformatted("Motion vectors");

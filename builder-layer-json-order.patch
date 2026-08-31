@@ -1,0 +1,12 @@
+diff --git a/Build-CK3-Package.Portable.Core.ps1 b/Build-CK3-Package.Portable.Core.ps1
+--- a/Build-CK3-Package.Portable.Core.ps1
++++ b/Build-CK3-Package.Portable.Core.ps1
+@@ -203,6 +203,6 @@
+-    try { $layerJson = Get-Content -LiteralPath (Join-Path $layerRoot 'VkLayer_feed_vk.json') -Raw | ConvertFrom-Json }
+     $layerManifestPath = Join-Path $layerRoot 'VkLayer_feed_vk.json'
+     $layerManifestText = Get-Content -LiteralPath $layerManifestPath -Raw
+     $layerManifestText = $layerManifestText.Replace('".\VkLayer_feed_vk.dll"', '".\\VkLayer_feed_vk.dll"')
+     [IO.File]::WriteAllText($layerManifestPath, $layerManifestText, [Text.UTF8Encoding]::new($false))
+-    catch { throw "The feeder Vulkan manifest is invalid: $($_.Exception.Message)" }
++    try { $layerJson = Get-Content -LiteralPath $layerManifestPath -Raw | ConvertFrom-Json }
++    catch { throw "The normalized feeder Vulkan manifest is invalid: $($_.Exception.Message)" }

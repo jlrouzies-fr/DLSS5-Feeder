@@ -1,0 +1,45 @@
+diff --git a/ck3-package/DLSS-Runtime-Setup.ps1 b/ck3-package/DLSS-Runtime-Setup.ps1
+--- a/ck3-package/DLSS-Runtime-Setup.ps1
++++ b/ck3-package/DLSS-Runtime-Setup.ps1
+@@ -191,7 +191,7 @@ function Select-RuntimeMode([string[]]$GpuNames) {
+     Write-Host ''
+     Write-Host '  1. DLSS 4.5 / DLAA compatibility  (recommended for RTX 20/30/40, including RTX 3060)'
+-    Write-Host '  2. DLSS 5 Neural Rendering       (official supported-hardware runtime)'
++    Write-Host '  2. DLSS 5 Neural Rendering       (NVIDIA-signed preview runtime selected through RHI)'
+     Write-Host '  3. DLSS 5 Extended               (experimental RHI/ShortFuse runtime for RTX 20/30/40)'
+     Write-Host '  Q. Cancel'
+     Write-Host ''
+@@ -293,12 +293,13 @@ function Get-RenoDxAddon([string]$CacheRoot, [string]$LocalPath) {
+         return [pscustomobject]@{ Info = $info; Version = $info.FileVersion; Source = 'Pre-bundled or supplied local file' }
+     }
+ 
+-    $releases = @(Get-RemoteJson $script:RhiRepoReleases 'RHI''s RenoDX component releases')
++    # Windows PowerShell 5.1 returns a top-level JSON array from Invoke-RestMethod as one
++    # Object[] pipeline item. Do not wrap this call in @(), or it becomes a nested array.
++    $releases = Get-RemoteJson $script:RhiRepoReleases 'RHI''s RenoDX component releases'
+     $release = $releases |
+         Where-Object { -not $_.draft -and [string]$_.tag_name -like 'renodx-dlss5-*' } |
++        Sort-Object { [DateTime]$_.published_at } -Descending |
+         Select-Object -First 1
+     if (-not $release) { throw 'No RenoDX DLSS 5 component release was found in the RHI repository.' }
+-    $asset = @($release.assets) |
++    $asset = $release.assets |
+         Where-Object { $_.name -ieq 'renodx-dlss5.addon64' -or $_.name -match '(?i)^renodx-dlss5.*\.zip$' } |
+         Select-Object -First 1
+     if (-not $asset) { throw "RHI release '$($release.tag_name)' has no RenoDX DLSS 5 add-on asset." }
+@@ -493,8 +494,10 @@ function Open-RhiManager([string]$CacheRoot) {
+     if (-not $AcceptRuntimeLicenses) {
+         Write-Host ''
+         Write-Host 'This downloads and opens the latest official RHI installer from RankFTW/RHI.' -ForegroundColor Yellow
+-        Write-Host 'RHI is optional; this CK3 package can acquire its three runtime components itself.'
++        Write-Host 'RHI is optional; this CK3 package already acquires its runtime components itself.'
++        Write-Host 'Do not enable RHI''s global Vulkan ReShade for CK3 while using this portable launcher;' -ForegroundColor Yellow
++        Write-Host 'both expose VK_LAYER_reshade and would conflict.' -ForegroundColor Yellow
+         $answer = (Read-Host 'Type OPEN RHI to continue').Trim()
+         if ($answer -cne 'OPEN RHI') { throw 'RHI Manager was not downloaded.' }
+     }
+@@ -499,7 +502,7 @@ function Open-RhiManager([string]$CacheRoot) {
+         Where-Object { $_.name -match '(?i)^RHI.*Setup.*\.exe$' -or $_.name -ieq 'RHI-Setup.exe' } |
+         Select-Object -First 1
+     if (-not $asset) { throw "RHI release '$($release.tag_name)' has no setup executable asset." }
+

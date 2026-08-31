@@ -1,0 +1,12 @@
+diff --git a/src/dlss5-feed.cpp b/src/dlss5-feed.cpp
+--- a/src/dlss5-feed.cpp
++++ b/src/dlss5-feed.cpp
+@@ -2812 +2812 @@
+-    static const char *kPresetNames[] = { "Default", "E (legacy CNN)", "F (legacy CNN)", "J (transformer)", "K (DLSS 4)", "L (DLSS 4.5 quality)", "M (DLSS 4.5 balanced)" };
++    static const char *kPresetNames[] = { "Default", "E (legacy CNN)", "F (legacy CNN)", "J (transformer)", "K (recommended DLAA)", "L (DLSS 4.5 Ultra Performance model)", "M (DLSS 4.5 Performance model)" };
+@@ -2817,2 +2817,3 @@
+-    ImGui::TextWrapped("Presets differ in how hard DLSS clamps history against the current frame. "
+-                       "If motion warps around transparents (dust, smoke, flames), try E or F.");
++    ImGui::TextWrapped("K is NVIDIA's recommended DLAA model. L and M enable DLSS 4.5 for comparison, "
++                       "but cost more on RTX 20/30 GPUs without native FP8. If motion warps around "
++                       "transparents (dust, smoke, flames), try E or F.");
