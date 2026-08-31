@@ -281,8 +281,11 @@ the pixel is flagged in a `DLSS5_Mask` texture the add-on passes to DLSS as its
   mode (render size = output size, no jitter). The DLSS 5 neural-rendering add-on
   (`renodx-dlss5.addon64`) detours that D3D12 evaluate and inserts its neural pass — it cannot tell
   the contract is synthetic.
-* On a **D3D11 game** the frame is copied into textures **shared** with a private D3D12 device
-  (shared NT handles + a shared fence), and the D3D12 output is blitted back onto the backbuffer.
+* On a **64-bit D3D11 game** the optional **Work resolution** slider can run the private
+  DLAA + Neural Rendering contract at 50–100% of each backbuffer axis. Color is resampled
+  linearly; depth, motion vectors and the trust mask use point sampling; motion-vector
+  magnitudes are corrected for the selected work extent. The result is linearly expanded
+  back over the native-size backbuffer. At 100% this reduces to the original copy path.
 * On a **D3D12 game** there is no transport at all: NGX runs on the game's own device and queue,
   motion vectors and depth are consumed zero-copy straight from the effect textures, and the feature
   survives alt-tabs and effect reloads untouched (only a real resolution change rebuilds).
@@ -380,6 +383,7 @@ if you prefer editing the file directly:
 | --- | --- | --- |
 | `enabled` | 1 | 0 disables everything. |
 | `mode` | 2 | 0 inert · 1 transport test (no NGX; on 32-bit it copies only the left half, so a split screen proves the round trip) · 2 full DLSS path. |
+| `work_resolution` | 100 | **64-bit D3D11 only.** 50–100% of each backbuffer axis for the private DLAA + Neural Rendering work textures. The Add-ons overlay slider applies once 400 ms after dragging stops. Other paths remain at 100%. |
 | `hdr` | -1 | -1 auto (FP16 / R11G11B10 backbuffer = HDR), 0 force SDR, 1 force HDR. |
 | `depth_inverted` | -1 | -1 follow `RESHADE_DEPTH_INPUT_IS_REVERSED`, 0/1 force. |
 | `flags` | -1 | raw `DLSS.Feature.Create.Flags` override. |
@@ -468,8 +472,10 @@ NGX links against the Release CRT, so the builds use `/MD`.
 
 ## Limitations and roadmap
 
-* **DLAA only** — render resolution = output resolution = the game's backbuffer. No upscaling perf
-  gain yet; a jittered render-at-lower / output-at-higher upscaling mode is future work.
+* **DLAA contract, optional reduced work extent on 64-bit D3D11** — render resolution still
+  equals DLAA output resolution, but the private work extent can be 50–100% of the native
+  backbuffer and is spatially expanded afterward. D3D12, Vulkan and 32-bit paths remain at
+  100%. This is not jittered DLSS Super Resolution.
 * Estimated motion vectors → temporal artifacts in fast motion; the UI is processed with the scene
   (a UI mask / pre-UI colour capture is future work).
 * **Geometry vectors are experimental and off.** The camera-model fit is derived from the provider's
