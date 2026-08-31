@@ -73,6 +73,35 @@ static void LayerLog(const char *fmt, ...)
 static PFN_vkGetInstanceProcAddr g_next_gipa;
 static PFN_vkGetDeviceProcAddr   g_next_gdpa;
 
+// Reproduce the DXGI initialization path that RHI gets from an app-local
+// ReShade proxy before the feeder creates its private D3D12 device.
+static void BootstrapPrivateDxgi()
+{
+    static LONG attempted = 0;
+    if (InterlockedCompareExchange(&attempted, 1, 0) != 0) return;
+    wchar_t path[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) return;
+    wchar_t *slash = wcsrchr(path, L'\\');
+    if (slash == nullptr) return;
+    wcscpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - path), L"dxgi.dll");
+    const HMODULE bridge = LoadLibraryExW(path, nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (bridge == nullptr)
+    {
+        LayerLog("[layer] private DXGI bridge failed to load from %ls (Win32 %lu)", path, GetLastError());
+        return;
+    }
+    using BootstrapFn = HRESULT (WINAPI *)();
+    const auto bootstrap = reinterpret_cast<BootstrapFn>(GetProcAddress(bridge, "DLSS5Bootstrap"));
+    if (bootstrap == nullptr)
+    {
+        LayerLog("[layer] %ls is not the DLSS5 DXGI bridge; DLSS5Bootstrap export missing", path);
+        return;
+    }
+    const HRESULT result = bootstrap();
+    LayerLog("[layer] private DXGI/ReShade bootstrap -> 0x%08lX", static_cast<unsigned long>(result));
+}
+
 // The extensions the DLSS5-Feeder transport needs on the device.
 static const char *kWanted[] = {
     VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
@@ -106,6 +135,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedCreateInstance(const VkInstanceCreateI
                                                          const VkAllocationCallbacks *pAllocator,
                                                          VkInstance *pInstance)
 {
+    BootstrapPrivateDxgi();
+
     const auto *chain = FindLayerChainInfo<VkLayerInstanceCreateInfo>(
         pCreateInfo->pNext, VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO);
     if (chain == nullptr || chain->u.pLayerInfo == nullptr) return VK_ERROR_INITIALIZATION_FAILED;

@@ -1,8 +1,8 @@
 # CK3 DLSS Vulkan — All Profiles
 
 This is a drag-and-drop Vulkan/ReShade/DLSS package for the Windows version of **Crusader Kings III**.
-It includes the locally built DLSS feeder, portable Vulkan layers, ReShade, VORT motion-vector shaders,
-RHI, and the files for all three runtime profiles.
+It includes the locally built DLSS feeder, an app-local DXGI/D3D12 bootstrap, portable Vulkan layers,
+ReShade, VORT motion-vector shaders, the complete Lilium HDR Shaders 2026.02.28 suite, RHI, and the files for all three runtime profiles.
 
 ## Install
 
@@ -25,9 +25,11 @@ RHI, and the files for all three runtime profiles.
 
 6. Start the game with **`Launch CK3 with DLSS.cmd`**. This launcher supplies the package-local
    Vulkan-layer environment. Launching CK3 normally through Steam does not activate these layers.
+   RHI may remain installed; the launcher disables its global ReShade Vulkan layer only for CK3.
 
 The installer validates the package, creates `binaries\dlss-active`, backs up CK3's renderer setting,
-and changes `Graphics.renderer` to `Vulkan`. It does not replace `binaries\ck3.exe`.
+and changes `Graphics.renderer` to `Vulkan`. It installs the package-owned `binaries\dxgi.dll`
+bootstrap but does not replace `binaries\ck3.exe`.
 
 ## ReShade controls
 
@@ -37,8 +39,9 @@ Press **Home** in game to open ReShade. The focused DLSS preset intentionally co
 2. `DLSS5_Feed`
 3. `vort_StaticEffects`
 
-Keep the motion effect above `DLSS5_Feed`. Generic color, bloom, CRT, and sharpening shader packs are
-not required for DLSS and are not included. Open **Add-ons -> DLSS 5 Feed -> Neural reconstruction
+Keep the motion effect above `DLSS5_Feed`. Lilium HDR Shaders 2026.02.28 are bundled for HDR analysis,
+tone mapping, inverse tone mapping, black-floor correction, and HDR-aware sharpening.
+Open **Add-ons -> DLSS 5 Feed -> Neural reconstruction
 model** to switch live among Runtime Default, E, F, J, K, L, and M. Changing the model immediately
 rebuilds the NGX feature and saves the selection to `dlss5-feed.cfg`. DLSS 5 profiles also expose
 controls for the separate RenoDX/Neural Rendering extension.
@@ -62,8 +65,8 @@ remain available, but its portable Vulkan layers are inactive when CK3 is launch
   profile installer.
 - **No ReShade overlay** — use `Launch CK3 with DLSS.cmd`; Steam's normal Play button does not set the
   portable Vulkan-layer variables.
-- **Few ReShade effects** — expected. This package installs the effects used by the DLSS path, not the
-  optional general-purpose ReShade shader collection.
+- **Shader selection** — the package includes its DLSS/VORT effects and the complete Lilium HDR
+  suite, not every general-purpose ReShade collection.
 - **Artifacts or ghosting** — CK3 has no native DLSS motion-vector integration. VORT estimates motion,
   so fast map movement, UI, smoke, and transparency can ghost.
 

@@ -73,6 +73,7 @@ try {
     foreach ($path in @($dlss45, $dlss5, $dlss5Nr, $extended, $extendedNr, $reno)) { New-FakeX64Pe $path }
 
     $layerSource = Join-Path $tempRoot 'layer-source'
+    New-FakeX64Pe (Join-Path $layerSource 'dxgi.dll')
     New-FakeX64Pe (Join-Path $layerSource 'VkLayer_feed_vk.dll')
     Write-Utf8 (Join-Path $layerSource 'VkLayer_feed_vk.json') '{"layer":{"name":"VK_LAYER_feed_vk"}}'
     $layerZip = Join-Path $inputs 'feed-vk-layer.zip'
@@ -94,6 +95,11 @@ try {
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\dlss5-vulkan\ReShade64.dll') -PathType Leaf)) 'Bootstrap unexpectedly redistributes ReShade64.dll.'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\reshade-shaders\Shaders\ReShade.fxh') -PathType Leaf)) 'Bootstrap unexpectedly redistributes ReShade.fxh.'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\third-party\vort_Shaders') -PathType Container)) 'Bootstrap unexpectedly redistributes VORT.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\reshade-shaders\Shaders\Lilium\lilium__tone_mapping.fx') -PathType Leaf) 'Bootstrap is missing Lilium tone mapping.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\reshade-shaders\Shaders\Lilium\lilium__inverse_tone_mapping.fx') -PathType Leaf) 'Bootstrap is missing Lilium inverse tone mapping.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\reshade-shaders\Textures\Lilium\lilium__blue_noise_64x64.png') -PathType Leaf) 'Bootstrap is missing Lilium textures.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $thinOutput 'THIRD-PARTY-LICENSES\Lilium-GPL-3.0.txt') -PathType Leaf) 'Bootstrap is missing the Lilium GPL license.'
+
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $thinOutput 'binaries\dlss-payload\runtimes\DLSS45\nvngx_dlss.dll') -PathType Leaf)) 'Bootstrap unexpectedly contains DLSS.'
     foreach ($license in @('DLSS5-Feeder-LICENSE.txt', 'MinHook-LICENSE.txt', 'Dear-ImGui-LICENSE.txt', 'ReShade-LICENSE.txt', 'NIGos-bridge-LICENSE.txt')) {
         Assert-True (Test-Path -LiteralPath (Join-Path $thinOutput "THIRD-PARTY-LICENSES\$license") -PathType Leaf) "License bundle is missing $license."
@@ -101,6 +107,7 @@ try {
     $provenance = Get-Content -LiteralPath (Join-Path $thinOutput 'BUILD-PROVENANCE.txt') -Raw
     Assert-True ($provenance -match 'maintainer-supplied CK3 fork build') 'Provenance does not identify the fork build.'
     Assert-True ($provenance -match 'ReShade=not bundled') 'Provenance does not record first-run acquisition.'
+    Assert-True ($provenance -match 'Lilium.Version=2026.02.28') 'Provenance does not record the bundled Lilium release.'
 
     Write-Host 'TEST: private offline inputs are staged in unambiguous profile directories'
     $offlineArguments = $common.Clone()

@@ -153,6 +153,24 @@ function Add-RuntimePair(
 
 $template = Join-Path $PSScriptRoot 'ck3-package'
 if (-not (Test-Path -LiteralPath $template -PathType Container)) { throw "CK3 package template not found: '$template'" }
+$liliumShaderRoot = Join-Path $template 'binaries\reshade-shaders\Shaders\Lilium'
+$liliumTextureRoot = Join-Path $template 'binaries\reshade-shaders\Textures\Lilium'
+$liliumLicense = Join-Path $template 'THIRD-PARTY-LICENSES\Lilium-GPL-3.0.txt'
+foreach ($required in @(
+    (Join-Path $liliumShaderRoot 'lilium__tone_mapping.fx'),
+    (Join-Path $liliumShaderRoot 'lilium__inverse_tone_mapping.fx'),
+    (Join-Path $liliumShaderRoot 'lilium__include\include_main.fxh'),
+    (Join-Path $liliumTextureRoot 'lilium__blue_noise_64x64.png'),
+    $liliumLicense
+)) {
+    Assert-File $required 'Bundled Lilium dependency' | Out-Null
+}
+$liliumShaderCount = @(Get-ChildItem -LiteralPath $liliumShaderRoot -Recurse -File).Count
+$liliumTextureCount = @(Get-ChildItem -LiteralPath $liliumTextureRoot -Recurse -File).Count
+if ($liliumShaderCount -ne 44 -or $liliumTextureCount -ne 3) {
+    throw "The bundled Lilium 2026.02.28 payload is incomplete: $liliumShaderCount shader files, $liliumTextureCount textures."
+}
+
 $feeder = Assert-ForkFeeder $FeederAddon
 
 $output = [IO.Path]::GetFullPath($OutputDirectory)
@@ -194,12 +212,14 @@ try {
     Copy-Item -LiteralPath $feeder -Destination (Join-Path $payloadRoot 'dlss5-feed.addon64') -Force
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'shaders\\DLSS5_Feed.fx') -Destination $shaderRoot -Force
 
-    foreach ($name in @('VkLayer_feed_vk.dll', 'VkLayer_feed_vk.json')) {
+    foreach ($name in @('VkLayer_feed_vk.dll', 'VkLayer_feed_vk.json', 'dxgi.dll')) {
         $matches = @(Get-ChildItem -LiteralPath $layerExtract -Recurse -File -Filter $name)
         if ($matches.Count -ne 1) { throw "Expected one $name in the feeder Vulkan layer archive; found $($matches.Count)." }
-        Copy-Item -LiteralPath $matches[0].FullName -Destination $layerRoot -Force
+        $destination = if ($name -eq 'dxgi.dll') { $binaryRoot } else { $layerRoot }
+        Copy-Item -LiteralPath $matches[0].FullName -Destination $destination -Force
     }
     Assert-X64Pe (Join-Path $layerRoot 'VkLayer_feed_vk.dll') 'Feeder Vulkan layer' | Out-Null
+    Assert-X64Pe (Join-Path $binaryRoot 'dxgi.dll') 'App-local DXGI bootstrap' | Out-Null
     $layerManifestPath = Join-Path $layerRoot 'VkLayer_feed_vk.json'
     $layerManifestText = Get-Content -LiteralPath $layerManifestPath -Raw
     $layerManifestText = $layerManifestText.Replace('".\VkLayer_feed_vk.dll"', '".\\VkLayer_feed_vk.dll"')
@@ -224,6 +244,11 @@ try {
     $provenance.Add('ReShade=not bundled; pinned official setup is downloaded by the end-user bootstrap')
     $provenance.Add('ReShade.fxh=not bundled; pinned official source is downloaded by the end-user bootstrap')
     $provenance.Add('VORT=not bundled; pinned official source is downloaded by the end-user bootstrap')
+    $provenance.Add('Lilium.Version=2026.02.28')
+    $provenance.Add('Lilium.Source=https://github.com/EndlesslyFlowering/ReShade_HDR_shaders/releases/tag/2026.02.28')
+    $provenance.Add('Lilium.ArchiveSha256=3dc9f9dd70c9ae7dfbb3d770032afbc1998d46aece4ee247460462ed53815488')
+    $provenance.Add('Lilium.License=GPL-3.0; complete shader source and license are bundled')
+
 
     if ($Dlss45Runtime) {
         Add-RuntimeFile $Dlss45Runtime (Join-Path $runtimeRoot 'DLSS45\\nvngx_dlss.dll') 'DLSS45.DLSS' $true $false $provenance | Out-Null

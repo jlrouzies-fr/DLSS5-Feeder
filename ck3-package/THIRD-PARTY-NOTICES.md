@@ -5,6 +5,8 @@ their respective authors and retain their own licenses and distribution terms.
 
 - **ReShade** and **reshade-shaders** — <https://github.com/crosire/reshade> and
   <https://github.com/crosire/reshade-shaders>
+- **Lilium HDR Shaders 2026.02.28** — <https://github.com/EndlesslyFlowering/ReShade_HDR_shaders>
+  (GPL-3.0; the complete shader source, textures, and license are bundled unchanged)
 - **LumeniteFX** — <https://github.com/umar-afzaal/LumeniteFX>
 - **DLSS5-Feeder** — <https://github.com/jlrouzies-fr/DLSS5-Feeder>
 - **RHI** — <https://github.com/RankFTW/RHI> (GPL-3.0; optional companion and runtime metadata source)

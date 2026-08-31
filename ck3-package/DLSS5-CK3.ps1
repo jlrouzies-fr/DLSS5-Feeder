@@ -158,6 +158,7 @@ function Test-BootstrapPackage([string]$Root) {
     $binaryRoot = Join-Path $Root 'binaries'
     $rootRequired = @('Graphics-Dependency-Setup.ps1', 'DLSS-Runtime-Setup.ps1')
     $binaryRequired = @(
+        'dxgi.dll',
         'dlss-payload\\dlss5-feed.addon64',
         'ReShade.ini',
         'DLSS5-CK3.ini',
@@ -192,10 +193,6 @@ function Test-BasePackage([string]$Root) {
     }
     if ($reshadeText -notmatch '(?im)vort_Shaders\\Shaders') {
         throw 'ReShade.ini does not include the installed VORT shader path.'
-    }
-    $wrongPlace = Join-Path $binaryRoot 'dxgi.dll'
-    if (Test-Path -LiteralPath $wrongPlace -PathType Leaf) {
-        Write-Warning "'$wrongPlace' exists. CK3 Vulkan does not use a DXGI proxy, and it can create a second ReShade instance."
     }
     Write-Status 'Base package validation passed.'
 }

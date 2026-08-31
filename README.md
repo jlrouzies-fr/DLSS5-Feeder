@@ -3,8 +3,8 @@
 Drag-and-drop Vulkan/ReShade/DLSS integration for the Windows version of **Crusader Kings III**.
 
 The package changes CK3 to Vulkan, loads ReShade and the DLSS feeder through package-local Vulkan
-layers, and provides three selectable runtime profiles. It does not replace `ck3.exe`, install a
-global Vulkan layer, or affect other games.
+layers, bootstraps RenoDX through its own app-local `binaries\dxgi.dll`, and provides three selectable
+runtime profiles. It does not replace `ck3.exe`, register a global Vulkan layer, or affect other games.
 
 ## Download
 
@@ -53,11 +53,45 @@ Press **Home** in game to open ReShade. The focused preset contains:
 2. `DLSS5_Feed`
 3. `vort_StaticEffects`
 
-Keep `vort_MotionEffects` above `DLSS5_Feed`. Generic color-grading, bloom, CRT, and sharpening
-shader packs are unrelated to DLSS and are not included.
+Keep `vort_MotionEffects` above `DLSS5_Feed`. Lilium HDR Shaders 2026.02.28 are bundled for HDR
+analysis, tone mapping, inverse tone mapping, black-floor correction, and HDR-aware sharpening.
+Other general-purpose shader collections are not included.
 
 Feeder controls, including DLSS preset selection, appear in ReShade's **Add-ons** tab. DLSS 5
 profiles also expose RenoDX/Neural Rendering controls.
+
+## Why the app-local DXGI bridge is required
+
+CK3's Vulkan renderer does not naturally load a DXGI proxy or create a D3D12 presentation runtime.
+That matters because the RenoDX DLSS 5 add-on hooks the D3D12 NGX entry points. When RHI installs
+ReShade as `dxgi.dll` for a D3D12 game, ReShade starts early and RenoDX observes the D3D12 device,
+runtime, and presentation lifecycle before the game creates or evaluates its DLSS feature. Loading
+ReShade only as a Vulkan layer discovers the add-ons, but by itself does not guarantee that those
+D3D12 hooks are armed.
+
+This package therefore includes its own x64 `binaries\dxgi.dll`. It is not a replacement Vulkan
+driver and it does not translate all CK3 rendering to D3D12. The package's Vulkan layer explicitly
+calls its `DLSS5Bootstrap` export before Vulkan device creation. The bridge then:
+
+1. Loads the package's private full-add-on `ReShade64.dll` through its DXGI exports.
+2. Creates a hidden D3D12 device, command queue, and DXGI swapchain.
+3. Performs an initial `Present` so ReShade and RenoDX receive the initialization events they expect.
+4. Keeps that hidden runtime alive while the feeder creates its private D3D12 device and DLSS feature.
+5. Leaves the existing Vulkan/D3D12 shared-texture and shared-fence transport responsible for moving
+   CK3's frame to DLSS and returning the processed result to Vulkan.
+
+```text
+CK3 Vulkan -> package Vulkan layers -> shared textures/fences
+                                      -> private D3D12 feeder -> DLSS
+                         dxgi.dll -> hidden DXGI/D3D12 runtime
+                                  -> ReShade/RenoDX hook initialization
+```
+
+The bridge is package-local and affects no other game. RHI may remain installed: the launcher sets
+`DISABLE_VK_LAYER_reshade_1=1` only for the CK3 process to suppress a separately registered global
+ReShade Vulkan layer, while the package manifest uses its own disable key and remains active. Do not
+let RHI or another injector replace this package's `binaries\dxgi.dll`; it contains the custom
+`DLSS5Bootstrap` entry point that the Vulkan layer requires.
 
 ## What the installer changes
 
@@ -66,6 +100,7 @@ profiles also expose RenoDX/Neural Rendering controls.
 - Backs up CK3's current renderer setting.
 - Changes `Graphics.renderer` to `Vulkan`.
 - Keeps ReShade and both Vulkan layers local to CK3.
+- Installs its own `binaries\dxgi.dll` bootstrap so RenoDX sees the feeder's private D3D12 device.
 
 Run **`Disable CK3 DLSS.cmd`** to restore the renderer recorded before installation. The package's
 Vulkan layers are inactive when CK3 is launched normally.
@@ -88,6 +123,7 @@ Crusader Kings III\
     RHI-Setup.exe
   binaries\
     ck3.exe                              (provided by CK3)
+    dxgi.dll                             (this package's DXGI/D3D12 bootstrap)
     ReShade.ini
     DLSS5-CK3.ini
     dlss5-vulkan\
@@ -129,6 +165,7 @@ Outputs:
 ```text
 build\dlss5-feed.addon64
 layer\VkLayer_feed_vk.dll
+layer\dxgi.dll
 ```
 
 CK3 packaging scripts and the drag-and-drop template are under [`ck3-package`](ck3-package).
@@ -139,8 +176,10 @@ CK3 packaging scripts and the drag-and-drop template are under [`ck3-package`](c
 - CK3 has no native DLSS motion-vector integration. VORT estimates motion vectors, so fast map
   movement, UI elements, smoke, and transparency can ghost.
 - The CK3 interface is part of the processed frame.
-- Do not combine this package with another ReShade installation, OptiScaler, Smooth Motion, or a
-  second DLSS/Streamline injector.
+- RHI may remain installed. The launcher disables RHI/global ReShade Vulkan registration only inside
+  the CK3 process and explicitly loads this package's private layers.
+- Do not replace `binaries\dxgi.dll` with another ReShade proxy or combine the active package with
+  OptiScaler, Smooth Motion, or a second DLSS/Streamline injector.
 
 ## Troubleshooting
 
@@ -148,7 +187,13 @@ CK3 packaging scripts and the drag-and-drop template are under [`ck3-package`](c
 - **Validation failed** — close CK3, extract the ZIP again with overwrite enabled, and rerun the
   selected profile installer.
 - **No ReShade overlay** — launch with `Launch CK3 with DLSS.cmd`, not Steam's normal Play button.
-- **Few ReShade effects** — expected; only the effects used by the DLSS path are included.
+- **DXGI bootstrap failed** — inspect `binaries\dlss5-dxgi.log` and
+  `binaries\dlss5-vulkan\feed-vk-layer.log`. A successful start records the hidden D3D12 `Present`
+  and a `private DXGI/ReShade bootstrap -> 0x00000000` result.
+- **RHI or ReShade asks to replace `dxgi.dll`** — decline that replacement for CK3. The file in
+  `binaries` is this package's Vulkan-to-D3D12 bootstrap, not a stock ReShade proxy.
+- **Shader selection** — the package includes its DLSS/VORT effects and the complete Lilium HDR
+  suite, not every general-purpose ReShade collection.
 - **Need to recover** — run `Disable CK3 DLSS.cmd`, then launch CK3 normally.
 
 ## Included projects

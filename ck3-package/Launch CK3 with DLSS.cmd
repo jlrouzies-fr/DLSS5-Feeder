@@ -35,6 +35,7 @@ if errorlevel 1 (
 
 set "VK_LAYER_PATH=%CK3_DLSS_LAYER_PATH%"
 set "VK_INSTANCE_LAYERS=VK_LAYER_feed_vk;VK_LAYER_reshade"
+set "DISABLE_VK_LAYER_reshade_1=1"
 set "RESHADE_BASE_PATH_OVERRIDE=%CK3_BIN%"
 
 pushd "%CK3_BIN%"

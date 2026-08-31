@@ -1015,6 +1015,9 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
                               reshade::api::resource_view /*rtv_srgb*/)
 {
     if (rt != g.runtime || g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    // Do not let an explicit render request from another add-on bypass ReShade's Home-tab
+    // technique checkbox or the global effects toggle.
+    if (!rt->get_effects_state() || !rt->get_technique_state(g.technique)) return;
     FeedFrame(rt, cl, rtv);
 }
 

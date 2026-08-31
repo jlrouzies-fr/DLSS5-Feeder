@@ -70,6 +70,16 @@ if (-not $resolvedFixture.StartsWith($tempBase + [IO.Path]::DirectorySeparatorCh
 
 try {
     Expand-Archive -LiteralPath $resolvedZip -DestinationPath $resolvedFixture
+    foreach ($relative in @(
+        'binaries\reshade-shaders\Shaders\Lilium\lilium__tone_mapping.fx',
+        'binaries\reshade-shaders\Shaders\Lilium\lilium__inverse_tone_mapping.fx',
+        'binaries\reshade-shaders\Shaders\Lilium\lilium__include\include_main.fxh',
+        'binaries\reshade-shaders\Textures\Lilium\lilium__blue_noise_64x64.png',
+        'THIRD-PARTY-LICENSES\Lilium-GPL-3.0.txt'
+    )) {
+        if (-not (Test-Path -LiteralPath (Join-Path $resolvedFixture $relative) -PathType Leaf)) { throw "Complete ZIP is missing $relative." }
+    }
+
     $installer = Join-Path $resolvedFixture 'DLSS5-CK3.ps1'
     $settings = Join-Path $resolvedFixture 'pdx_settings.txt'
     Copy-Item -LiteralPath (Join-Path $resolvedFixture 'binaries\dlss-payload\dlss5-feed.addon64') `

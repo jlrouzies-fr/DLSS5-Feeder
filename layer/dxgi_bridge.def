@@ -1,0 +1,7 @@
+LIBRARY dxgi
+EXPORTS
+    CreateDXGIFactory=BridgeCreateDXGIFactory
+    CreateDXGIFactory1=BridgeCreateDXGIFactory1
+    CreateDXGIFactory2=BridgeCreateDXGIFactory2
+    DXGIGetDebugInterface1=BridgeDXGIGetDebugInterface1
+    DLSS5Bootstrap

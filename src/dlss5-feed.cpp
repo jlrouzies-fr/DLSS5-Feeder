@@ -2729,6 +2729,10 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
                               reshade::api::resource_view /*rtv_srgb*/)
 {
     if (rt != g.runtime || g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    // ReShade may still notify add-ons when a technique is rendered explicitly by another
+    // add-on. Honour both user-facing disable controls here instead of assuming that receipt
+    // of reshade_render_technique means the Home-tab technique and global effects are enabled.
+    if (!rt->get_effects_state() || !rt->get_technique_state(g.technique)) return;
     FeedFrame(rt, cl, rtv);
 }
 

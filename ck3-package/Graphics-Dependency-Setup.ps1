@@ -28,6 +28,10 @@ $script:ReShadeFfxSha256 = '6dabfbbaf968c3871905d2ea17f96572ff7b1cec01310b5d0e52
 $script:VortCommit = 'b410b9f0c0fbb83c8cb42164aaf1655fab386f4a'
 $script:VortUrl = "https://codeload.github.com/vortigern11/vort_Shaders/zip/$($script:VortCommit)"
 $script:VortArchiveSha256 = '231ba34a75556f9943e359559a89b0d0cc2caa322d9dcdee5630061bf9fe13b6'
+$script:LiliumVersion = '2026.02.28'
+$script:LiliumSource = 'https://github.com/EndlesslyFlowering/ReShade_HDR_shaders/releases/tag/2026.02.28'
+$script:LiliumArchiveSha256 = '3dc9f9dd70c9ae7dfbb3d770032afbc1998d46aece4ee247460462ed53815488'
+
 
 function Write-GraphicsStatus([string]$Message) {
     Write-Host "[CK3 DLSS graphics] $Message"
@@ -202,11 +206,24 @@ function Test-GraphicsDependencies([string]$BinaryRoot) {
         'third-party\\vort_Shaders\\Shaders\\vort_Motion.fx',
         'third-party\\vort_Shaders\\Shaders\\Includes\\vort_MotionUtils.fxh',
         'third-party\\vort_Shaders\\LICENSE',
+        'reshade-shaders\Shaders\Lilium\lilium__tone_mapping.fx',
+        'reshade-shaders\Shaders\Lilium\lilium__include\include_main.fxh',
+        'reshade-shaders\Textures\Lilium\lilium__blue_noise_64x64.png',
         'CK3-DLSS-GRAPHICS.json'
     )
     $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $BinaryRoot $_) -PathType Leaf) })
     if ($missing.Count) { throw "Graphics dependencies are missing: $($missing -join ', ')" }
     Assert-X64Pe (Join-Path $BinaryRoot 'dlss5-vulkan\\ReShade64.dll') 'ReShade64.dll' | Out-Null
+
+    $liliumLicense = Join-Path (Split-Path -Parent $BinaryRoot) 'THIRD-PARTY-LICENSES\Lilium-GPL-3.0.txt'
+    if (-not (Test-Path -LiteralPath $liliumLicense -PathType Leaf)) { throw 'The bundled Lilium GPL-3.0 license is missing.' }
+    $liliumShaderRoot = Join-Path $BinaryRoot 'reshade-shaders\Shaders\Lilium'
+    $liliumTextureRoot = Join-Path $BinaryRoot 'reshade-shaders\Textures\Lilium'
+    $liliumShaderCount = @(Get-ChildItem -LiteralPath $liliumShaderRoot -Recurse -File).Count
+    $liliumTextureCount = @(Get-ChildItem -LiteralPath $liliumTextureRoot -Recurse -File).Count
+    if ($liliumShaderCount -ne 44 -or $liliumTextureCount -ne 3) {
+        throw "The bundled Lilium payload is incomplete: $liliumShaderCount shader files, $liliumTextureCount textures."
+    }
 
     try { $state = Get-Content -LiteralPath (Join-Path $BinaryRoot 'CK3-DLSS-GRAPHICS.json') -Raw | ConvertFrom-Json }
     catch { throw "The graphics dependency receipt is invalid: $($_.Exception.Message)" }
@@ -214,10 +231,11 @@ function Test-GraphicsDependencies([string]$BinaryRoot) {
     if ((Get-Sha256 (Join-Path $BinaryRoot 'dlss5-vulkan\\ReShade64.dll')) -ne [string]$state.Components.ReShade.DllSha256) {
         throw 'ReShade64.dll no longer matches the installed dependency receipt.'
     }
+    if ([string]$state.Components.Lilium.Version -ne $script:LiliumVersion) { throw 'The graphics dependency receipt does not describe the bundled Lilium release.' }
     if ((Get-Sha256 (Join-Path $BinaryRoot 'reshade-shaders\\Shaders\\ReShade.fxh')) -ne [string]$state.Components.ReShadeFfx.Sha256) {
         throw 'ReShade.fxh no longer matches the installed dependency receipt.'
     }
-    Write-GraphicsStatus "Graphics dependencies validated (ReShade $($state.Components.ReShade.Version), VORT $($state.Components.Vort.Commit.Substring(0, 8)))."
+    Write-GraphicsStatus "Graphics dependencies validated (ReShade $($state.Components.ReShade.Version), VORT $($state.Components.Vort.Commit.Substring(0, 8)), Lilium $($state.Components.Lilium.Version))."
     return $state
 }
 
@@ -227,7 +245,7 @@ function Confirm-DependencyInstall {
     Write-Host 'First-run graphics dependency download' -ForegroundColor Yellow
     Write-Host '  ReShade full add-on 6.8.0 will be downloaded from reshade.me and extracted locally.'
     Write-Host '  ReShade.fxh (CC0) and VORT motion vectors (MIT) will be downloaded from their official repositories.'
-    Write-Host '  These third-party files are not contained in the release ZIP.'
+    Write-Host '  ReShade, ReShade.fxh, and VORT are downloaded separately; Lilium 2026.02.28 is bundled under GPL-3.0.'
     Write-Host ''
     $answer = (Read-Host 'Type DOWNLOAD to continue').Trim()
     if ($answer -cne 'DOWNLOAD') { throw 'Graphics dependency setup was cancelled; no renderer setting was changed.' }
@@ -302,6 +320,14 @@ function Install-GraphicsDependencies([string]$BinaryRoot, [string]$DownloadRoot
                     Source = $vort.Source
                     ArchiveSha256 = $vort.Hash
                     License = 'MIT (LICENSE retained beside the installed shaders)'
+                }
+                Lilium = [ordered]@{
+                    Version = $script:LiliumVersion
+                    Source = $script:LiliumSource
+                    ArchiveSha256 = $script:LiliumArchiveSha256
+                    ShaderFiles = 44
+                    TextureFiles = 3
+                    License = 'GPL-3.0 (complete shader source and license bundled)'
                 }
             }
         }

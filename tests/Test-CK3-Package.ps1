@@ -53,6 +53,7 @@ function Write-GraphicsReceipt([string]$BinaryRoot) {
             ReShade = [ordered]@{ Version = 'test'; DllSha256 = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() }
             ReShadeFfx = [ordered]@{ Sha256 = (Get-FileHash -LiteralPath $ffx -Algorithm SHA256).Hash.ToLowerInvariant() }
             Vort = [ordered]@{ Commit = '0000000000000000000000000000000000000000' }
+            Lilium = [ordered]@{ Version = '2026.02.28' }
         }
     }
     Write-Utf8 (Join-Path $BinaryRoot 'CK3-DLSS-GRAPHICS.json') ($state | ConvertTo-Json -Depth 6)
@@ -77,6 +78,13 @@ try {
     Copy-Item -LiteralPath (Join-Path $templateRoot 'binaries\DLSS5-CK3.ini') -Destination (Join-Path $binaryRoot 'DLSS5-CK3.ini')
     Ensure-Directory (Join-Path $binaryRoot 'dlss5-vulkan')
     Copy-Item -LiteralPath (Join-Path $templateRoot 'binaries\dlss5-vulkan\ReShade64.json') -Destination (Join-Path $binaryRoot 'dlss5-vulkan\ReShade64.json') -Force
+    Ensure-Directory (Join-Path $binaryRoot 'reshade-shaders\Shaders')
+    Ensure-Directory (Join-Path $binaryRoot 'reshade-shaders\Textures')
+    Copy-Item -LiteralPath (Join-Path $templateRoot 'binaries\reshade-shaders\Shaders\Lilium') -Destination (Join-Path $binaryRoot 'reshade-shaders\Shaders') -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $templateRoot 'binaries\reshade-shaders\Textures\Lilium') -Destination (Join-Path $binaryRoot 'reshade-shaders\Textures') -Recurse -Force
+    Ensure-Directory (Join-Path $script:fixtureRoot 'THIRD-PARTY-LICENSES')
+    Copy-Item -LiteralPath (Join-Path $templateRoot 'THIRD-PARTY-LICENSES\Lilium-GPL-3.0.txt') -Destination (Join-Path $script:fixtureRoot 'THIRD-PARTY-LICENSES\Lilium-GPL-3.0.txt') -Force
+
 
     New-FakeX64Pe (Join-Path $binaryRoot 'ck3.exe')
     New-FakeX64Pe (Join-Path $binaryRoot 'dlss-payload\dlss5-feed.addon64')
@@ -87,6 +95,7 @@ try {
         New-FakeX64Pe (Join-Path $binaryRoot "dlss-payload\runtimes\$profile\nvngx_dlssnr.dll")
     }
     New-FakeX64Pe (Join-Path $binaryRoot 'dlss-payload\runtimes\shared\renodx-dlss5.addon64')
+    New-FakeX64Pe (Join-Path $binaryRoot 'dxgi.dll')
     New-FakeX64Pe (Join-Path $binaryRoot 'dlss5-vulkan\ReShade64.dll')
     New-FakeX64Pe (Join-Path $binaryRoot 'dlss5-vulkan\VkLayer_feed_vk.dll')
     Write-Utf8 (Join-Path $binaryRoot 'dlss5-vulkan\VkLayer_feed_vk.json') '{"layer":{"name":"VK_LAYER_feed_vk"}}'

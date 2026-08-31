@@ -13,6 +13,11 @@
 *.log
 build/
 
+# The CK3 drag-and-drop template carries our locally built feeder. Keep other
+# add-on build outputs ignored, including third-party runtime add-ons.
+!ck3-package/binaries/dlss-payload/
+!ck3-package/binaries/dlss-payload/dlss5-feed.addon64
+
 # NVIDIA NGX SDK (bring your own — see external/ngx/README.md); not redistributed here
 external/ngx/*.h
 external/ngx/*.lib
