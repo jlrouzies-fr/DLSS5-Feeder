@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 #include <string>
 
 #define ImTextureID ImU64   // required by reshade_overlay.hpp before including imgui.h
@@ -965,12 +966,12 @@ static void CloseListGuarded()
 // NGX crashed while recording into our list: it may hold half-written commands, and
 // executing those is what actually takes the game down (the driver faults later on
 // another thread). Close it guarded, throw it away WITHOUT executing, replace it.
-static void MvProbeAbort();   // defined with the motion-vector probe below
+static void GuideProbeAbort();   // defined with the guide probes below
 
 static void AbortCommands()
 {
     if (g.list == nullptr) return;
-    MvProbeAbort();   // a probe copy recorded into this list will never execute
+    GuideProbeAbort();   // probe copies recorded into this list will never execute
     CloseListGuarded();
     SafeRelease(g.list);
     if (g.alloc[g.frame_slot] != nullptr && g.dev12 != nullptr &&
@@ -982,23 +983,32 @@ static void AbortCommands()
 }
 
 // ---------------------------------------------------------------------------
-// Motion-vector probe. Every kMvProbeEvery frames, copy a 64x64 block from the centre of
-// the MV texture DLSS is about to read into a readback buffer, and analyse the PREVIOUS
-// probe's block -- submitted hundreds of frames ago, so the map never stalls the GPU.
-// It answers, in pixels, the question no other signal can: is the selected provider
-// actually delivering vectors, or is DLSS being fed zeros?
+// Guide probes. Every kGuideProbeEvery frames, copy a small MV block and four distributed
+// depth blocks into readback buffers, then analyse them after the fence confirms completion
+// on a later frame, so mapping never waits for the GPU. This verifies actual contents rather
+// than treating a valid texture handle as proof that DLSS receives useful guides.
 // ---------------------------------------------------------------------------
 
 static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to);   // defined below
 
 static const UINT kMvProbeSize  = 64;
 static const UINT kMvProbePitch = 256;   // 64 texels of R16G16_FLOAT = 256 bytes = the D3D12 row-pitch alignment
-static const UINT kMvProbeEvery = 600;
+static const UINT kDepthProbeSize       = 32;
+static const UINT kDepthProbePitch      = 256;   // one R32_FLOAT row, padded to D3D12's alignment
+static const UINT kDepthProbeBlocks     = 4;
+static const UINT kDepthProbeBlockBytes = kDepthProbePitch * kDepthProbeSize;
+static const UINT kGuideProbeEvery      = 600;
+static_assert(kMvProbePitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT == 0);
+static_assert(kDepthProbePitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT == 0);
+static_assert(kDepthProbeBlockBytes % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT == 0);
 
 static ID3D12Resource *g_mv_probe_buf;
-static UINT64          g_mv_probe_fence;    // fence value that completes the pending copy; 0 = nothing pending
-static UINT64          g_mv_probe_frames;
+static ID3D12Resource *g_depth_probe_buf;
+static UINT64          g_guide_probe_fence;    // fence value that completes the pending copies; 0 = nothing pending
+static UINT64          g_guide_probe_frames;
+static UINT64          g_guide_probe_capture_frame;
 static char            g_mv_probe[200] = "no motion-vector probe yet (first one after 600 frames)";
+static char            g_depth_probe[240] = "no depth probe yet (first one after 600 frames)";
 
 static float HalfToFloat(uint16_t h)
 {
@@ -1035,25 +1045,75 @@ static void MvProbeAnalyse()
     g_mv_probe_buf->Unmap(0, &none);
     const int total = static_cast<int>(kMvProbeSize * kMvProbeSize);
     _snprintf_s(g_mv_probe, sizeof(g_mv_probe), _TRUNCATE,
-                "MV probe (centre 64x64, frame %llu): mean |mv| %.3f px, max %.2f px, %d%% non-zero%s",
-                static_cast<unsigned long long>(g_mv_probe_frames), sum / total, maxlen, nonzero * 100 / total,
-                nonzero * 100 / total < 2 ? "  <-- DLSS is getting (almost) no motion vectors" : "");
+                 "MV probe (centre 64x64, frame %llu): mean |mv| %.3f px, max %.2f px, %d%% non-zero%s",
+                 static_cast<unsigned long long>(g_guide_probe_capture_frame), sum / total, maxlen, nonzero * 100 / total,
+                 nonzero * 100 / total < 2 ? "  <-- DLSS is getting (almost) no motion vectors" : "");
     Log("[feed] %s", g_mv_probe);
 }
 
-// Call while recording, with the MV texture in 'state' (it is returned to that state).
-static void MvProbeRecord(ID3D12Resource *mv, D3D12_RESOURCE_STATES state)
+static void DepthProbeAnalyse()
 {
-    if (mv == nullptr || g.dev12 == nullptr || g.list == nullptr || g.fence12 == nullptr) return;
-    if ((++g_mv_probe_frames % kMvProbeEvery) != 0) return;
-    if (g.width < kMvProbeSize || g.height < kMvProbeSize) return;
+    if (g_depth_probe_buf == nullptr) return;
+    void *p = nullptr;
+    const D3D12_RANGE read = { 0, kDepthProbeBlockBytes * kDepthProbeBlocks };
+    if (FAILED(g_depth_probe_buf->Map(0, &read, &p)) || p == nullptr) return;
 
-    if (g_mv_probe_fence != 0)
+    double sum = 0.0, sum2 = 0.0, min_depth = 1e300, max_depth = -1e300;
+    int finite = 0;
+    for (UINT block = 0; block < kDepthProbeBlocks; ++block)
+        for (UINT y = 0; y < kDepthProbeSize; ++y)
+        {
+            const float *row = reinterpret_cast<const float *>(
+                static_cast<const uint8_t *>(p) + block * kDepthProbeBlockBytes + y * kDepthProbePitch);
+            for (UINT x = 0; x < kDepthProbeSize; ++x)
+            {
+                const double d = row[x];
+                if (!std::isfinite(d)) continue;
+                sum += d;
+                sum2 += d * d;
+                if (d < min_depth) min_depth = d;
+                if (d > max_depth) max_depth = d;
+                ++finite;
+            }
+        }
+
+    const D3D12_RANGE none = { 0, 0 };
+    g_depth_probe_buf->Unmap(0, &none);
+    const int total = static_cast<int>(kDepthProbeSize * kDepthProbeSize * kDepthProbeBlocks);
+    const double mean = finite > 0 ? sum / finite : 0.0;
+    const double variance = finite > 0 ? (std::max)(0.0, sum2 / finite - mean * mean) : 0.0;
+    const bool flat = finite == 0 || max_depth - min_depth < 1e-6;
+    _snprintf_s(g_depth_probe, sizeof(g_depth_probe), _TRUNCATE,
+                "Depth probe (4x 32x32, frame %llu): min %.6g, max %.6g, mean %.6g, variance %.3g, %d%% finite%s",
+                static_cast<unsigned long long>(g_guide_probe_capture_frame),
+                finite > 0 ? min_depth : 0.0, finite > 0 ? max_depth : 0.0, mean, variance,
+                finite * 100 / total,
+                flat ? "  <-- sampled depth is flat; inspect the depth debug view / Generic Depth settings" : "");
+    Log("[feed] %s", g_depth_probe);
+}
+
+static void GuideProbeAnalyse()
+{
+    MvProbeAnalyse();
+    DepthProbeAnalyse();
+}
+
+// Call while recording; both textures are returned to their incoming states.
+static void GuideProbeRecord(ID3D12Resource *mv, D3D12_RESOURCE_STATES mv_state,
+                             ID3D12Resource *depth, D3D12_RESOURCE_STATES depth_state)
+{
+    if (mv == nullptr || depth == nullptr || g.dev12 == nullptr || g.list == nullptr || g.fence12 == nullptr) return;
+    ++g_guide_probe_frames;
+
+    if (g_guide_probe_fence != 0)
     {
-        if (g.fence12->GetCompletedValue() < g_mv_probe_fence) return;   // still in flight (should not happen at this cadence)
-        MvProbeAnalyse();
-        g_mv_probe_fence = 0;
+        if (g.fence12->GetCompletedValue() < g_guide_probe_fence) return;
+        GuideProbeAnalyse();
+        g_guide_probe_fence = 0;
+        g_guide_probe_capture_frame = 0;
     }
+    if ((g_guide_probe_frames % kGuideProbeEvery) != 0) return;
+    if (g.width < kMvProbeSize || g.height < kMvProbeSize) return;
     if (g_mv_probe_buf == nullptr)
     {
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
@@ -1066,6 +1126,18 @@ static void MvProbeRecord(ID3D12Resource *mv, D3D12_RESOURCE_STATES state)
             return;
     }
 
+    if (g_depth_probe_buf == nullptr)
+    {
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC   rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = kDepthProbeBlockBytes * kDepthProbeBlocks;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                    __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g_depth_probe_buf))))
+            return;
+    }
+
     D3D12_TEXTURE_COPY_LOCATION src = {};
     src.pResource = mv; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
     D3D12_TEXTURE_COPY_LOCATION dst = {};
@@ -1075,21 +1147,42 @@ static void MvProbeRecord(ID3D12Resource *mv, D3D12_RESOURCE_STATES state)
     const UINT x0 = (g.width - kMvProbeSize) / 2, y0 = (g.height - kMvProbeSize) / 2;
     const D3D12_BOX box = { x0, y0, 0, x0 + kMvProbeSize, y0 + kMvProbeSize, 1 };
 
-    if (state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(mv, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (mv_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(mv, mv_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
-    if (state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(mv, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
-    g_mv_probe_fence = g.fence_value + 1;   // exactly what EndCommands() signals for this list
+    if (mv_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(mv, D3D12_RESOURCE_STATE_COPY_SOURCE, mv_state);
+
+    D3D12_TEXTURE_COPY_LOCATION depth_src = {};
+    depth_src.pResource = depth; depth_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; depth_src.SubresourceIndex = 0;
+    if (depth_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(depth, depth_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    for (UINT block = 0; block < kDepthProbeBlocks; ++block)
+    {
+        D3D12_TEXTURE_COPY_LOCATION depth_dst = {};
+        depth_dst.pResource = g_depth_probe_buf; depth_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        depth_dst.PlacedFootprint.Offset = block * kDepthProbeBlockBytes;
+        depth_dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_FLOAT, kDepthProbeSize, kDepthProbeSize, 1, kDepthProbePitch };
+        const UINT x0 = ((block & 1) ? 3 : 1) * (g.width - kDepthProbeSize) / 4;
+        const UINT y0 = ((block & 2) ? 3 : 1) * (g.height - kDepthProbeSize) / 4;
+        const D3D12_BOX depth_box = { x0, y0, 0, x0 + kDepthProbeSize, y0 + kDepthProbeSize, 1 };
+        g.list->CopyTextureRegion(&depth_dst, 0, 0, 0, &depth_src, &depth_box);
+    }
+    if (depth_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(depth, D3D12_RESOURCE_STATE_COPY_SOURCE, depth_state);
+    g_guide_probe_capture_frame = g_guide_probe_frames;
+    g_guide_probe_fence = g.fence_value + 1;   // exactly what EndCommands() signals for this list
 }
 
-static void MvProbeAbort()
+static void GuideProbeAbort()
 {
-    g_mv_probe_fence = 0;
+    g_guide_probe_fence = 0;
+    g_guide_probe_capture_frame = 0;
 }
 
-static void MvProbeShutdown()
+static void GuideProbeShutdown()
 {
     SafeRelease(g_mv_probe_buf);
-    g_mv_probe_fence = 0;
+    SafeRelease(g_depth_probe_buf);
+    g_guide_probe_fence = 0;
+    g_guide_probe_frames = 0;
+    g_guide_probe_capture_frame = 0;
 }
 
 static void SafeReleaseFeature(NVSDK_NGX_Handle *f)
@@ -1635,7 +1728,7 @@ static void ShutdownSession()
     if (g.fence_event != nullptr) { CloseHandle(g.fence_event); g.fence_event = nullptr; }
     SafeRelease(g.list);
     for (int i = 0; i < Feed::kFrames; ++i) SafeRelease(g.alloc[i]);
-    MvProbeShutdown();
+    GuideProbeShutdown();
     SafeRelease(g.queue);
     SafeRelease(g.dev12);
     g.session_ready = false;
@@ -2779,7 +2872,8 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 g.need_reset = false;
 
                 // ReShade parked the effect textures as shader_resource (both SR states on D3D12).
-                MvProbeRecord(mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                GuideProbeRecord(mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                 depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
                 NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
                 ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
@@ -3066,7 +3160,8 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                MvProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                GuideProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                 g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
                 NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
@@ -3350,7 +3445,8 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                MvProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                GuideProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                 g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
                 NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
@@ -3594,7 +3690,8 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                MvProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                GuideProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                 g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
                 const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
@@ -3958,6 +4055,11 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                        "0 texMotionVectors (qUINT, dh_uber_motion), 1 Launchpad, 2 VORT, 3 LumeniteFX Kernel, 4 LumeniteFX QuantMotion.");
     if (ImGui::SliderFloat("MV scale X", &g_cfg.mv_scale_x, 0.0f, 4.0f)) dirty = true;
     if (ImGui::SliderFloat("MV scale Y", &g_cfg.mv_scale_y, 0.0f, 4.0f)) dirty = true;
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Depth");
+    ImGui::TextWrapped("%s", g_depth_probe);
+    ImGui::TextWrapped("A flat sample is a diagnostic warning, not an automatic disable: inspect the shader's depth debug view and Generic Depth settings.");
 
     if (ImGui::CollapsingHeader("Advanced"))
     {

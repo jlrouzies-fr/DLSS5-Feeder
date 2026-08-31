@@ -86,6 +86,7 @@ Proven working in seven games covering every supported path:
 | Game | Bitness / API | Result |
 | --- | --- | --- |
 | **Metro 2033 Redux** | 64-bit D3D11 | 4K DLAA + NR, HDR backbuffer |
+| **Subnautica** | 64-bit D3D11 | Contributor-verified: 4K DLAA + NR, Generic Depth clear-selection profile |
 | **The Lord of the Rings: War in the North – Legacy Edition** | 64-bit D3D12 | 4K, same-device path, 120 fps |
 | **Splinter Cell: Blacklist** | 32-bit D3D11 | 60 fps, cross-process host |
 | **BioShock Remastered** | 32-bit D3D11 (D3D9→D3D11 wrapper) | 4K, Luma HDR |
@@ -136,6 +137,10 @@ in fast motion, softness on thin moving geometry), and the HUD is processed alon
 2. Download **`dlss5-feed.addon64`** and **`DLSS5_Feed.fx`** from the
    **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)**. Put
    `dlss5-feed.addon64` next to the game `.exe`, and `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`.
+   The shader includes the standard **`ReShade.fxh`** header. ReShade normally installs it with its
+   standard shader package; if `ReShade.log` says it cannot open that file, copy `ReShade.fxh` from
+   the official [reshade-shaders](https://github.com/crosire/reshade-shaders/tree/slim/Shaders)
+   repository into the same `Shaders\` folder.
 3. Download **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX)** (Code ▸ Download ZIP). Copy
    its `Shaders\` folder (the `lumenite_*.fx` files and `include\`) into `reshade-shaders\Shaders\`,
    and `Textures\lumenite_bluenoise256.png` into `reshade-shaders\Textures\`.
@@ -290,15 +295,17 @@ Rules that apply to all of them:
 > motion vectors at all. Releases up to 0.5.2 recommended it. This release reads the compiler error
 > out of `ReShade.log` and reports it in the overlay and `dlss5-feed.log`.
 
-### Are the vectors actually arriving?
+### Are the guides actually arriving?
 
-Two independent checks, both new in 0.6.0:
+The add-on checks both configuration and the actual textures handed to DLSS:
 
 * The overlay's **Motion vectors** section states the mode, the provider found, and its state
   (`enabled` / `DISABLED` / `FAILED TO COMPILE` / `not installed`), in red when something is wrong.
-* An **MV probe** reads back the vectors *actually handed to DLSS* every 600 frames and logs their
-  mean/max magnitude and non-zero share: `MV probe … N% non-zero`. While you move, that must not
-  be 0%.
+* A low-frequency **guide probe** reads back the vectors *actually handed to DLSS* every 600 frames
+  and logs their mean/max magnitude and non-zero share: `MV probe … N% non-zero`. While you move,
+  that must not be 0%. The same deferred readback samples four distributed depth blocks and reports
+  min/max/mean/variance/finite share. It warns when sampled depth is flat without disabling the feed.
+  Both readbacks analyse an older, completed copy, so they do not introduce a per-frame GPU stall.
 
 ### Validation and the trust mask
 
@@ -316,7 +323,8 @@ the pixel is flagged in a `DLSS5_Mask` texture the add-on passes to DLSS as its
 * `DLSS5_Feed.fx` (companion effect) converts the selected provider's motion vectors (delta-UV,
   `prev_uv = uv + mv`) into `DLSS5_MV` (RG16F, **pixels**), copies the raw hardware depth with
   ReShade's orientation fixes into `DLSS5_Depth` (R32F), and flags every vector it does not trust
-  in `DLSS5_Mask` (R8).
+  in `DLSS5_Mask` (R8). MV, mask and raw depth are emitted by one MRT guide pass, avoiding a second
+  full-screen depth pass while leaving the depth values sent to DLSS unchanged.
 * `dlss5-feed.addon64` registers with the ReShade add-on API. After the `DLSS5_Feed` technique
   renders, it takes the backbuffer + those textures and runs `NGX_D3D12_EVALUATE_DLSS` in DLAA
   mode (render size = output size, no jitter). The DLSS 5 neural-rendering add-on
@@ -513,7 +521,8 @@ In `DLSS5_Feed.fx`'s own UI (settings that only make sense per-shader, not per-s
   not part of the 3D world, gets camera vectors it should not have.
 * **DLSS 5 Feed – debug view** technique — nine views: the vectors/depth being sent (static scene =
   grey, motion = colour), the provider's confidence map, the validation mask alone and over the
-  image, which test fired, and the three geometry views.
+  image, which test fired, and the three geometry views. The depth view applies a display-only
+  contrast curve so reversed and far-heavy hardware depth is visible; `DLSS5_Depth` itself stays raw.
 
 Preprocessor definitions on the shader (overlay → *Preprocessor definitions* → reload effects):
 
@@ -525,7 +534,7 @@ Preprocessor definitions on the shader (overlay → *Preprocessor definitions* �
 
 | File | Contents |
 | --- | --- |
-| `dlss5-feed.log` | next to the game exe: resolved effect handles, the session, the contract (`feature ready: WxH DLAA, flags=…`), `frame N delivered`, timing every 600 frames, crash breadcrumbs. |
+| `dlss5-feed.log` | next to the game exe: resolved effect handles, the session, the contract (`feature ready: WxH DLAA, flags=…`), `frame N delivered`, timing and guide probes every 600 frames, crash breadcrumbs. |
 | `ReShade.log` | which graphics API ReShade attached to, shader compile errors. |
 | `host64\dlss5-feed-host.log` | 32-bit games: the helper's own session and per-frame state. |
 | `host64\ReShade.log` | 32-bit games: the DLSS 5 add-on's messages (`feature 18 created`, `inline feature 18 evaluation succeeded`). |
@@ -540,6 +549,26 @@ Common cases:
   it is installed but **disabled**, it **failed to compile** (DRME on ReShade 6.8 — use LumeniteFX
   Kernel instead), or a *different* provider is enabled than the one `DLSS5_MV_PROVIDER` selects.
   The `MV probe … 0% non-zero` line in `dlss5-feed.log` confirms it independently.
+* **Depth probe says sampled depth is flat** — open **DLSS 5 Feed – debug view**, select the depth
+  view, and verify that scene geometry is visible. Then use ReShade's **Add-ons → Generic Depth**
+  page to select the draw call/clear that contains the scene rather than UI or an already-cleared
+  buffer. The warning is diagnostic only; it does not guess a different buffer or disable DLSS.
+* **Subnautica: flat or wrong depth** — this 4K D3D11 profile was contributor-verified with DLAA +
+  neural rendering. Merge these values into the matching sections of `ReShade.ini` and keep every
+  unrelated key. In `PreprocessorDefinitions`, append or replace only the four definitions shown
+  below in the existing comma-separated list; do not discard other definitions:
+
+  ```ini
+  [DEPTH]
+  DepthCopyAtClearIndex=1
+  DepthCopyBeforeClears=2
+  DrawStatsHeuristic=0
+  FilterFormat=0
+  UseAspectRatioHeuristics=3
+
+  [GENERAL]
+  PreprocessorDefinitions=RESHADE_DEPTH_LINEARIZATION_FAR_PLANE=1000.0,RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN=1,RESHADE_DEPTH_INPUT_IS_REVERSED=1,RESHADE_DEPTH_INPUT_IS_LOGARITHMIC=0
+  ```
 * **Warping / smearing around flames, flickering lights or transparents** — optical flow answers a
   lighting change with a wrong-but-confident vector. Keep validation on (default), try provider
   `3` (LumeniteFX Kernel) rather than Launchpad, and try `preset=5` or `6` in `dlss5-feed.cfg`
