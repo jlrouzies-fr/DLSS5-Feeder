@@ -17,6 +17,20 @@ their respective authors and retain their own licenses and distribution terms.
 - **NVIDIA DLSS Neural Rendering runtime** — selected through RHI's manifest; the Extended profile
   is a third-party modified, unsigned ShortFuse build and is not an official NVIDIA release
 
+- **NVIDIA Streamline SDK headers** - used to build the optional native Vulkan bootstrap under the
+  license reproduced as `NVIDIA-Streamline-LICENSE.txt`; <https://github.com/NVIDIA-RTX/Streamline>
+- **NVIDIA Streamline runtime plugins** - optional donor-supplied, NVIDIA-signed binaries staged only
+  into acknowledged private/offline builds; their inclusion does not grant redistribution permission
+- **Kotlin 2.4.0** - application language and standard library; Apache License 2.0;
+  <https://github.com/JetBrains/kotlin>
+- **Compose Multiplatform 1.12.0** - desktop user-interface runtime; Apache License 2.0;
+  <https://github.com/JetBrains/compose-multiplatform>
+- **Skiko 0.150.1** - Compose Desktop graphics runtime; Apache License 2.0;
+  <https://github.com/JetBrains/skiko>
+
+The Apache License 2.0 text covering the Kotlin installer dependencies is reproduced as
+`THIRD-PARTY-LICENSES\Apache-2.0.txt`.
+
 The default release is a thin bootstrap and does not contain NVIDIA, RenoDX, or ShortFuse runtime
 binaries. Runtime acquisition is opt-in. `CK3-DLSS-RUNTIME.json` records the exact version, source
 URL, signature status, signer, SHA-256 hash, and installation time for every active component.

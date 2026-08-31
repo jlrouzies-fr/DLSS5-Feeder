@@ -3,7 +3,7 @@ param(
     [ValidateSet('Configure', 'Status', 'OpenRHI')]
     [string]$Action = 'Configure',
 
-    [ValidateSet('Auto', 'DLSS45', 'DLSS5', 'DLSS5Extended')]
+    [ValidateSet('Auto', 'DLSS45', 'DLSS5', 'DLSS5Extended', 'NativeStreamline')]
     [string]$Mode = 'Auto',
 
     [string]$GameRoot = $PSScriptRoot,
@@ -221,6 +221,7 @@ function Select-RuntimeMode([string[]]$GpuNames) {
     Write-Host '  1. DLSS 4.5 Neural Reconstruction (Model M DLAA; recommended for RTX 20/30/40)'
     Write-Host '  2. DLSS 5 Neural Rendering       (NVIDIA-signed stock NR preview via RHI; support not promised)'
     Write-Host '  3. DLSS 5 Extended               (experimental RHI/ShortFuse runtime for RTX 20/30/40)'
+    Write-Host '  4. Native Streamline Vulkan      (experimental interposer with NGX fallback)'
     Write-Host '  Q. Cancel'
     Write-Host ''
     $selection = (Read-Host 'Selection [1]').Trim()
@@ -229,8 +230,9 @@ function Select-RuntimeMode([string[]]$GpuNames) {
         '1' { return 'DLSS45' }
         '2' { return 'DLSS5' }
         '3' { return 'DLSS5Extended' }
+        '4' { return 'NativeStreamline' }
         'Q' { throw 'Runtime setup was cancelled.' }
-        default { throw "Unknown selection '$selection'. Run setup again and choose 1, 2, 3, or Q." }
+        default { throw "Unknown selection '$selection'. Run setup again and choose 1, 2, 3, 4, or Q." }
     }
 }
 
@@ -444,6 +446,32 @@ function Get-ComponentRecord([object]$Component) {
     }
 }
 
+function Get-NativeStreamlineRuntime([string]$PayloadRoot) {
+    $root = Join-Path $PayloadRoot 'runtimes\NativeStreamline'
+    $components = [ordered]@{}
+    foreach ($name in @('sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'sl.dlss_nr.dll')) {
+        $path = Join-Path $root $name
+        $components[$name] = Assert-PeFile $path ('NVIDIA Streamline ' + $name) $true $true $false
+    }
+    return [pscustomobject]@{ Root = $root; Components = $components }
+}
+
+function Set-RenoDxHookPolicy([string]$BinaryRoot, [bool]$Native) {
+    $path = Join-Path $BinaryRoot 'ReShade.ini'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return }
+    $value = if ($Native) { '1' } else { '2' }
+    $text = Get-Content -LiteralPath $path -Raw
+    $match = [regex]::Match($text, '(?ms)^\[RenoDX\.DLSS5\]\r?\n.*?(?=^\[|\z)')
+    if ($match.Success) {
+        $block = $match.Value
+        if ($block -match '(?m)^EnableHooks=') { $block = [regex]::Replace($block, '(?m)^EnableHooks=.*$', ('EnableHooks=' + $value)) }
+        else { $block = $block.TrimEnd() + [Environment]::NewLine + 'EnableHooks=' + $value + [Environment]::NewLine + [Environment]::NewLine }
+        $text = $text.Remove($match.Index, $match.Length).Insert($match.Index, $block)
+    }
+    else { $text = $text.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine + '[RenoDX.DLSS5]' + [Environment]::NewLine + 'EnableHooks=' + $value + [Environment]::NewLine }
+    [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($false))
+}
+
 function Save-PreviousProfileConfig([string]$ActiveRoot, [string]$ProfileRoot) {
     $statePath = Join-Path $ActiveRoot 'CK3-DLSS-RUNTIME.json'
     $configPath = Join-Path $ActiveRoot 'dlss5-feed.cfg'
@@ -495,6 +523,7 @@ function Install-ActiveProfile(
     [object]$Dlss,
     [object]$Nr,
     [object]$Reno,
+    [object]$Streamline,
     [string[]]$GpuNames
 ) {
     $activeRoot = Join-Path $BinaryRoot 'dlss-active'
@@ -504,7 +533,7 @@ function Install-ActiveProfile(
     Ensure-Directory $profileRoot
     Save-PreviousProfileConfig $activeRoot $profileRoot
 
-    foreach ($name in @('dlss5-feed.addon64', 'renodx-dlss5.addon64', 'nvngx_dlss.dll', 'nvngx_dlssnr.dll', 'CK3-DLSS-RUNTIME.json')) {
+    foreach ($name in @('dlss5-feed.addon64', 'renodx-dlss5.addon64', 'nvngx_dlss.dll', 'nvngx_dlssnr.dll', 'sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'sl.dlss_nr.dll', 'streamline-native.enabled', 'CK3-DLSS-RUNTIME.json')) {
         $target = Join-Path $activeRoot $name
         if (Test-Path -LiteralPath $target -PathType Leaf) { Remove-Item -LiteralPath $target -Force }
     }
@@ -515,6 +544,13 @@ function Install-ActiveProfile(
         Copy-Item -LiteralPath $Nr.Info.Path -Destination (Join-Path $activeRoot 'nvngx_dlssnr.dll') -Force
         Copy-Item -LiteralPath $Reno.Info.Path -Destination (Join-Path $activeRoot 'renodx-dlss5.addon64') -Force
     }
+    if ($SelectedMode -eq 'NativeStreamline') {
+        foreach ($name in $Streamline.Components.Keys) {
+            Copy-Item -LiteralPath $Streamline.Components[$name].Path -Destination (Join-Path $activeRoot $name) -Force
+        }
+        [IO.File]::WriteAllText((Join-Path $activeRoot 'streamline-native.enabled'), 'Native Streamline Vulkan loader redirect enabled.' + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    }
+    Set-RenoDxHookPolicy $BinaryRoot ($SelectedMode -eq 'NativeStreamline')
 
     $profileConfig = Join-Path (Join-Path $profileRoot $SelectedMode) 'dlss5-feed.cfg'
     $activeConfig = Join-Path $activeRoot 'dlss5-feed.cfg'
@@ -532,6 +568,7 @@ function Install-ActiveProfile(
         'DLSS45' { 'DLSS 4.5 Model M Neural Reconstruction (DLAA)' }
         'DLSS5' { 'DLSS 5 Neural Rendering' }
         'DLSS5Extended' { 'DLSS 5 Extended (experimental RHI/ShortFuse)' }
+        'NativeStreamline' { 'Native Streamline Vulkan (experimental)' }
     }
     $feederInfo = Assert-PeFile (Join-Path $activeRoot 'dlss5-feed.addon64') 'DLSS feeder add-on' $true $false $false
     $state = [ordered]@{
@@ -540,12 +577,14 @@ function Install-ActiveProfile(
         DisplayName = $displayName
         InstalledUtc = [DateTime]::UtcNow.ToString('o')
         DetectedGpus = @($GpuNames)
-        Experimental = $SelectedMode -eq 'DLSS5Extended'
+        Experimental = $SelectedMode -in @('DLSS5Extended', 'NativeStreamline')
+        NativeVulkanBackend = $SelectedMode -eq 'NativeStreamline'
         Components = [ordered]@{
             Feeder = [ordered]@{ Source = 'Package payload'; Sha256 = $feederInfo.Sha256; FileVersion = $feederInfo.FileVersion }
             Dlss = Get-ComponentRecord $Dlss
             DlssNr = Get-ComponentRecord $Nr
             RenoDx = Get-ComponentRecord $Reno
+            Streamline = if ($Streamline) { [ordered]@{ Version = $Streamline.Components['sl.interposer.dll'].FileVersion; Sha256 = $Streamline.Components['sl.interposer.dll'].Sha256; Modules = @($Streamline.Components.Keys) } } else { $null }
         }
         Sources = [ordered]@{
             NvidiaLicense = $script:NvidiaLicense
@@ -563,6 +602,9 @@ function Install-ActiveProfile(
     elseif ($SelectedMode -eq 'DLSS5Extended') {
         Write-Warning 'This profile uses a modified compatibility runtime. Expect instability; DLSS 4.5 Model M neural reconstruction is the safe RTX 3060 baseline.'
     }
+    elseif ($SelectedMode -eq 'NativeStreamline') {
+        Write-Warning 'Native Streamline is experimental. The Vulkan interposer is active, while the existing NGX feeder remains available as a fallback evaluator.'
+    }
 }
 
 function Test-ActiveProfile([string]$BinaryRoot) {
@@ -578,12 +620,13 @@ function Test-ActiveProfile([string]$BinaryRoot) {
         throw "The active runtime state file is invalid: $($_.Exception.Message)"
     }
     $profile = [string]$state.Profile
-    if ($profile -notin @('DLSS45', 'DLSS5', 'DLSS5Extended')) {
+    if ($profile -notin @('DLSS45', 'DLSS5', 'DLSS5Extended', 'NativeStreamline')) {
         throw "The active runtime profile '$profile' is not recognized."
     }
 
     $required = @('dlss5-feed.addon64', 'nvngx_dlss.dll', 'dlss5-feed.cfg')
     if ($profile -ne 'DLSS45') { $required += @('renodx-dlss5.addon64', 'nvngx_dlssnr.dll') }
+    if ($profile -eq 'NativeStreamline') { $required += @('sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'sl.dlss_nr.dll', 'streamline-native.enabled') }
     $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $activeRoot $_) -PathType Leaf) })
     if ($missing.Count) { throw "Active profile '$profile' is missing: $($missing -join ', ')" }
     if ($profile -eq 'DLSS45' -and (Test-Path -LiteralPath (Join-Path $activeRoot 'renodx-dlss5.addon64') -PathType Leaf)) {
@@ -596,6 +639,11 @@ function Test-ActiveProfile([string]$BinaryRoot) {
     if ($profile -ne 'DLSS45') {
         Assert-PeFile (Join-Path $activeRoot 'renodx-dlss5.addon64') 'RenoDX DLSS 5 add-on' $true $false $false | Out-Null
         Assert-PeFile (Join-Path $activeRoot 'nvngx_dlssnr.dll') 'NVIDIA DLSS Neural Rendering runtime' $true $true $allowModified | Out-Null
+    }
+    if ($profile -eq 'NativeStreamline') {
+        foreach ($name in @('sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'sl.dlss_nr.dll')) {
+            Assert-PeFile (Join-Path $activeRoot $name) ('NVIDIA Streamline ' + $name) $true $true $false | Out-Null
+        }
     }
     Write-RuntimeStatus "Active profile: $($state.DisplayName)"
     Write-RuntimeStatus "Runtime metadata: $statePath"
@@ -663,6 +711,9 @@ switch ($Action) {
         $dlssLocal = Find-LocalFile $DlssRuntime @(
             (Join-Path $payloadRoot "runtimes\$selectedMode\nvngx_dlss.dll")
         ) 'NVIDIA DLSS runtime'
+        if ($selectedMode -eq 'NativeStreamline' -and -not $dlssLocal) {
+            $dlssLocal = Find-LocalFile '' @((Join-Path $payloadRoot 'runtimes\DLSS5\nvngx_dlss.dll')) 'NVIDIA DLSS runtime'
+        }
         $nrLocal = $null
         $renoLocal = $null
         if ($selectedMode -ne 'DLSS45') {
@@ -674,6 +725,9 @@ switch ($Action) {
                 (Join-Path $payloadRoot 'runtimes\shared\renodx-dlss5.addon64')
             ) 'RenoDX DLSS 5 add-on'
         }
+        if ($selectedMode -eq 'NativeStreamline' -and -not $nrLocal) {
+            $nrLocal = Find-LocalFile '' @((Join-Path $payloadRoot 'runtimes\DLSS5\nvngx_dlssnr.dll')) 'NVIDIA DLSS Neural Rendering runtime'
+        }
 
         $needsDownload = -not $dlssLocal -or ($selectedMode -ne 'DLSS45' -and (-not $nrLocal -or -not $renoLocal))
         if ($needsDownload) { Confirm-Downloads $selectedMode }
@@ -681,6 +735,8 @@ switch ($Action) {
         $dlss = $null
         $nr = $null
         $reno = $null
+        $streamline = $null
+        if ($selectedMode -eq 'NativeStreamline') { $streamline = Get-NativeStreamlineRuntime $payloadRoot }
         if ($selectedMode -eq 'DLSS45') {
             $dlss = Get-OfficialDlssRuntime $cacheRoot $dlssLocal
         }
@@ -690,7 +746,7 @@ switch ($Action) {
             $nr = $pair.Nr
             $reno = Get-RenoDxAddon $cacheRoot $renoLocal
         }
-        Install-ActiveProfile $selectedMode $binaryRoot $feederPath $dlss $nr $reno $gpuNames
+        Install-ActiveProfile $selectedMode $binaryRoot $feederPath $dlss $nr $reno $streamline $gpuNames
         Test-ActiveProfile $binaryRoot | Out-Null
     }
 }

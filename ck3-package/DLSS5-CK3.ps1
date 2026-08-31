@@ -3,7 +3,7 @@ param(
     [ValidateSet('Install', 'ConfigureRuntime', 'Disable', 'Validate', 'OpenRHI')]
     [string]$Action = 'Install',
 
-    [ValidateSet('Auto', 'DLSS45', 'DLSS5', 'DLSS5Extended')]
+    [ValidateSet('Auto', 'DLSS45', 'DLSS5', 'DLSS5Extended', 'NativeStreamline')]
     [string]$Profile = 'Auto',
 
     [string]$GameRoot = $PSScriptRoot,

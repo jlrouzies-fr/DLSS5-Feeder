@@ -8,6 +8,7 @@ param(
     [string]$Dlss5ExtendedRuntime,
     [string]$Dlss5ExtendedNrRuntime,
     [string]$RenoDxAddon,
+    [string]$StreamlineRuntimeDirectory,
     [string]$OutputDirectory = (Join-Path $PSScriptRoot 'release\CK3-DLSS-Portable'),
     [switch]$AcknowledgeRuntimeRedistributionTerms,
     [switch]$AllowUnsignedTestArtifacts,
@@ -180,7 +181,7 @@ if (-not $output.StartsWith($releaseRoot + [IO.Path]::DirectorySeparatorChar, [S
 }
 
 $hasOptionalRuntimes = $Dlss45Runtime -or $Dlss5Runtime -or $Dlss5NrRuntime -or
-    $Dlss5ExtendedRuntime -or $Dlss5ExtendedNrRuntime -or $RenoDxAddon
+    $Dlss5ExtendedRuntime -or $Dlss5ExtendedNrRuntime -or $RenoDxAddon -or $StreamlineRuntimeDirectory
 if ($hasOptionalRuntimes -and -not $AcknowledgeRuntimeRedistributionTerms) {
     throw 'Optional NVIDIA/RenoDX files are for a private offline build only. Pass -AcknowledgeRuntimeRedistributionTerms after reviewing every supplied file license; do not publish the result without permission.'
 }
@@ -234,6 +235,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'external\\minhook\\LICENSE.txt') -Destination (Join-Path $licenseRoot 'MinHook-LICENSE.txt') -Force
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'external\\imgui\\LICENSE.txt') -Destination (Join-Path $licenseRoot 'Dear-ImGui-LICENSE.txt') -Force
 
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'external/streamline/LICENSE.txt') -Destination (Join-Path $licenseRoot 'NVIDIA-Streamline-LICENSE.txt') -Force
     $provenance = [System.Collections.Generic.List[string]]::new()
     $provenance.Add('CK3 DLSS portable bootstrap build provenance')
     $provenance.Add("BuiltUtc=$([DateTime]::UtcNow.ToString('o'))")
@@ -257,6 +259,12 @@ try {
     Add-RuntimePair 'DLSS5Extended' $Dlss5ExtendedRuntime $Dlss5ExtendedNrRuntime $true $runtimeRoot $provenance
     if ($RenoDxAddon) {
         Add-RuntimeFile $RenoDxAddon (Join-Path $runtimeRoot 'shared\\renodx-dlss5.addon64') 'RenoDX.DLSS5' $false $false $provenance | Out-Null
+    }
+    if ($StreamlineRuntimeDirectory) {
+        $streamlineRoot = [IO.Path]::GetFullPath($StreamlineRuntimeDirectory)
+        foreach ($name in @('sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'sl.dlss_nr.dll')) {
+            Add-RuntimeFile (Join-Path $streamlineRoot $name) (Join-Path $runtimeRoot ('NativeStreamline/' + $name)) ('NativeStreamline.' + $name) $true $false $provenance | Out-Null
+        }
     }
     if (-not $hasOptionalRuntimes) {
         $provenance.Add('OptionalRuntimeFiles=none; acquired on the end-user machine after explicit consent')

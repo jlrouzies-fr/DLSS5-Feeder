@@ -71,6 +71,10 @@ try {
     $extendedNr = Join-Path $inputs 'extended\nvngx_dlssnr.dll'
     $reno = Join-Path $inputs 'renodx-dlss5.addon64'
     foreach ($path in @($dlss45, $dlss5, $dlss5Nr, $extended, $extendedNr, $reno)) { New-FakeX64Pe $path }
+    $streamline = Join-Path $inputs 'streamline'
+    foreach ($name in @('sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'sl.dlss_nr.dll')) {
+        New-FakeX64Pe (Join-Path $streamline $name)
+    }
 
     $layerSource = Join-Path $tempRoot 'layer-source'
     New-FakeX64Pe (Join-Path $layerSource 'dxgi.dll')
@@ -118,6 +122,7 @@ try {
     $offlineArguments.Dlss5ExtendedRuntime = $extended
     $offlineArguments.Dlss5ExtendedNrRuntime = $extendedNr
     $offlineArguments.RenoDxAddon = $reno
+    $offlineArguments.StreamlineRuntimeDirectory = $streamline
     $offlineArguments.AcknowledgeRuntimeRedistributionTerms = $true
     $offlineArguments.AllowUnsignedTestArtifacts = $true
     & (Join-Path $repoRoot 'Build-CK3-Package.ps1') @offlineArguments
@@ -127,10 +132,20 @@ try {
         'DLSS5\nvngx_dlssnr.dll',
         'DLSS5Extended\nvngx_dlss.dll',
         'DLSS5Extended\nvngx_dlssnr.dll',
+        'NativeStreamline\sl.interposer.dll',
+        'NativeStreamline\sl.common.dll',
+        'NativeStreamline\sl.dlss.dll',
+        'NativeStreamline\sl.dlss_nr.dll',
         'shared\renodx-dlss5.addon64'
     )) {
         Assert-True (Test-Path -LiteralPath (Join-Path $offlineOutput "binaries\dlss-payload\runtimes\$relative") -PathType Leaf) "Offline payload is missing $relative."
     }
+
+    Assert-True (Test-Path -LiteralPath (Join-Path $offlineOutput 'THIRD-PARTY-LICENSES\NVIDIA-Streamline-LICENSE.txt') -PathType Leaf) 'Offline payload is missing the Streamline SDK license.'
+
+    Assert-True (Test-Path -LiteralPath (Join-Path $offlineOutput 'Open CK3 DLSS Installer.cmd') -PathType Leaf) 'Offline payload is missing the GUI launcher.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $offlineOutput 'tools\CK3-DLSS-Installer\CK3 DLSS Installer.exe') -PathType Leaf) 'Offline payload is missing the self-contained GUI.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $offlineOutput 'THIRD-PARTY-LICENSES\Apache-2.0.txt') -PathType Leaf) 'Offline payload is missing the installer dependency license.'
 
     Write-Host 'TEST: a partial NR pair is rejected before a ZIP is produced'
     $partialArguments = $common.Clone()
@@ -153,4 +168,3 @@ finally {
     }
     if (Test-Path -LiteralPath $tempRoot -PathType Container) { Remove-Item -LiteralPath $tempRoot -Recurse -Force }
 }
-

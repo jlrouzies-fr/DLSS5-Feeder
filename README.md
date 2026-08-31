@@ -1,9 +1,13 @@
 # Crusader Kings III DLSS Vulkan
 
+<p align="center">
+  <img src="resources/CK3DLSS5.jpg" alt="CK3 DLSS 5" width="720">
+</p>
+
 Drag-and-drop Vulkan/ReShade/DLSS integration for the Windows version of **Crusader Kings III**.
 
 The package changes CK3 to Vulkan, loads ReShade and the DLSS feeder through package-local Vulkan
-layers, bootstraps RenoDX through its own app-local `binaries\dxgi.dll`, and provides three selectable
+layers, bootstraps RenoDX through its own app-local `binaries\dxgi.dll`, and provides four selectable
 runtime profiles. It does not replace `ck3.exe`, register a global Vulkan layer, or affect other games.
 
 ## Download
@@ -17,12 +21,15 @@ Download **`CK3-DLSS-Vulkan-All-Profiles.zip`** from the latest GitHub release.
 3. Copy everything inside `CK3-DLSS-Vulkan-All-Profiles.zip` directly into that folder.
 4. Confirm `Launch CK3 with DLSS.cmd` is beside the existing `binaries`, `game`, and `launcher`
    folders. Do not extract the package directly into `binaries` or leave it inside an extra folder.
-5. Run one profile installer:
+5. Run **`Open CK3 DLSS Installer.cmd`**. The desktop app checks the game folder, shows the active
+   profile, explains the three supported choices, and requires license acknowledgement before it
+   enables installation:
 
-   - **`Install CK3 DLSS 4.5 RTX 3060 Test.cmd`** — recommended RTX 3060 baseline.
-   - **`Install CK3 DLSS 5 Stock Test.cmd`** — signed DLSS 5 Neural Rendering runtime.
-   - **`Install CK3 DLSS 5 Extended Test.cmd`** — experimental compatibility runtime.
-   - **`Install CK3 DLSS.cmd`** — automatic profile selection.
+   - **DLSS 4.5 Model M** — recommended baseline.
+   - **DLSS 5 Stock** — signed DLSS 5 Neural Rendering runtime.
+   - **DLSS 5 Extended** — experimental compatibility runtime.
+
+   The original profile-specific `.cmd` installers remain available as command-line fallbacks.
 
 6. Start CK3 with **`Launch CK3 with DLSS.cmd`**.
 
@@ -31,19 +38,31 @@ normal Play button does not activate this package.
 
 ## Runtime profiles
 
+The fourth installer, **`Install CK3 DLSS Native Streamline Experimental.cmd`**, enables the opt-in
+native Streamline Vulkan experiment.
+
 | Profile | Components | Intended use |
 |---|---|---|
 | **DLSS 4.5 Neural Reconstruction / DLAA** | Local feeder + NVIDIA DLSS runtime | RTX 20/30/40 baseline; second-generation transformer Model M (`preset=13`) by default |
 | **DLSS 5 Stock** | Feeder + RenoDX + signed DLSS/Neural Rendering pair | Hardware supported by the stock preview runtime |
 | **DLSS 5 Extended** | Feeder + RenoDX + modified ShortFuse Neural Rendering runtime | Experimental compatibility testing |
+| **Native Streamline Vulkan** | NVIDIA Streamline interposer + DLSS/DLSS-RR plugins + stock NGX fallback | Experimental Vulkan interception and integration testing |
 
 DLSS 4.5 uses native-resolution DLAA with Model M neural reconstruction across the entire frame,
 including character faces. It consumes the current color frame, depth, and motion vectors to reconstruct
 a temporally stable native-resolution result; it is not an upscaling performance mode. This is distinct
 from the separate DLSS 5 Neural Rendering extension. The Extended profile is experimental and may be unstable.
 
-To change profiles, close CK3 and run another profile installer. You can also use
-**`Configure CK3 DLSS Runtime.cmd`**.
+Native Streamline initializes NVIDIA's Vulkan interposer before CK3 loads `vulkan-1.dll`. A
+compatibility shim keeps the system Vulkan loader handle expected by CK3 and owns
+`vkGetInstanceProcAddr` plus `vkGetDeviceProcAddr`. Device and swapchain calls continue through Streamline,
+while Win32 surface creation, destruction, presentation support, and capability queries use the system
+Vulkan loader to avoid the donor interposer's unbound surface thunk during CK3's device-first startup.
+The feeder's existing NGX path remains the evaluator fallback; direct Streamline resource tagging and
+feature evaluation are not yet implemented.
+
+To change profiles, close CK3 and reopen **`Open CK3 DLSS Installer.cmd`**. You can also use the
+profile-specific installers or **`Configure CK3 DLSS Runtime.cmd`** from a terminal.
 
 ## ReShade
 
@@ -80,6 +99,13 @@ calls its `DLSS5Bootstrap` export before Vulkan device creation. The bridge then
 5. Leaves the existing Vulkan/D3D12 shared-texture and shared-fence transport responsible for moving
    CK3's frame to DLSS and returning the processed result to Vulkan.
 
+For the opt-in Native Streamline profile, the bridge calls `slInit` for Vulkan with the DLSS and
+DLSS-RR plugins when CK3 dynamically loads `vulkan-1.dll`. It returns the normal system Vulkan
+loader handle, tracks surviving instances across CK3's temporary probes, and routes proc-address
+lookups through typed wrappers. Surface operations use the system Vulkan loader; device and swapchain
+operations remain routed through Streamline. If initialization fails, CK3 uses the normal Vulkan
+loader without interception. The package records the result in `binaries\dlss5-dxgi.log`.
+
 ```text
 CK3 Vulkan -> package Vulkan layers -> shared textures/fences
                                       -> private D3D12 feeder -> DLSS
@@ -109,10 +135,12 @@ Vulkan layers are inactive when CK3 is launched normally.
 
 ```text
 Crusader Kings III\
+  Open CK3 DLSS Installer.cmd
   Install CK3 DLSS.cmd
   Install CK3 DLSS 4.5 RTX 3060 Test.cmd
   Install CK3 DLSS 5 Stock Test.cmd
   Install CK3 DLSS 5 Extended Test.cmd
+  Install CK3 DLSS Native Streamline Experimental.cmd
   Configure CK3 DLSS Runtime.cmd
   Launch CK3 with DLSS.cmd
   Disable CK3 DLSS.cmd
@@ -120,6 +148,8 @@ Crusader Kings III\
   DLSS-Runtime-Setup.ps1
   Graphics-Dependency-Setup.ps1
   tools\
+    CK3-DLSS-Installer\
+      CK3 DLSS Installer.exe
     RHI-Setup.exe
   binaries\
     ck3.exe                              (provided by CK3)
@@ -136,6 +166,7 @@ Crusader Kings III\
       runtimes\DLSS45\...
       runtimes\DLSS5\...
       runtimes\DLSS5Extended\...
+      runtimes\NativeStreamline\...
     dlss-active\                         (created by the installer)
     reshade-shaders\Shaders\
       DLSS5_Feed.fx
@@ -152,6 +183,7 @@ Requirements:
 - Visual Studio 2022 Build Tools with the MSVC x64 toolchain and Windows SDK.
 - NVIDIA NGX SDK headers and `nvsdk_ngx_d.lib` under `external\ngx`.
 - Khronos Vulkan headers under `external\vulkan`.
+- JDK 17 for the optional Compose Desktop installer GUI.
 
 Build the local feeder and layer:
 
@@ -169,6 +201,11 @@ layer\dxgi.dll
 ```
 
 CK3 packaging scripts and the drag-and-drop template are under [`ck3-package`](ck3-package).
+Build and stage the self-contained installer app before creating a release package:
+
+```powershell
+.\Build-Installer-GUI.ps1
+```
 
 ## Known limitations
 
@@ -180,6 +217,10 @@ CK3 packaging scripts and the drag-and-drop template are under [`ck3-package`](c
   the CK3 process and explicitly loads this package's private layers.
 - Do not replace `binaries\dxgi.dll` with another ReShade proxy or combine the active package with
   OptiScaler, Smooth Motion, or a second DLSS/Streamline injector.
+- Native Streamline is a bootstrap/interposer experiment; the existing NGX feeder remains available
+  as its evaluator fallback.
+- The donor Streamline runtime does not have a valid NVIDIA application identity for CK3, so direct
+  NGX features may remain disabled until supported project identity and resource tagging are added.
 
 ## Troubleshooting
 

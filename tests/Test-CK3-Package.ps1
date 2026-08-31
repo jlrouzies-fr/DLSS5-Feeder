@@ -95,6 +95,9 @@ try {
         New-FakeX64Pe (Join-Path $binaryRoot "dlss-payload\runtimes\$profile\nvngx_dlssnr.dll")
     }
     New-FakeX64Pe (Join-Path $binaryRoot 'dlss-payload\runtimes\shared\renodx-dlss5.addon64')
+    foreach ($name in @('sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'sl.dlss_nr.dll')) {
+        New-FakeX64Pe (Join-Path $binaryRoot ('dlss-payload\runtimes\NativeStreamline\' + $name))
+    }
     New-FakeX64Pe (Join-Path $binaryRoot 'dxgi.dll')
     New-FakeX64Pe (Join-Path $binaryRoot 'dlss5-vulkan\ReShade64.dll')
     New-FakeX64Pe (Join-Path $binaryRoot 'dlss5-vulkan\VkLayer_feed_vk.dll')
@@ -138,6 +141,17 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $active 'nvngx_dlssnr.dll')) 'DLSS NR was not activated.'
     Assert-True (Test-Path -LiteralPath (Join-Path $active 'renodx-dlss5.addon64')) 'RenoDX was not activated.'
 
+    Write-Host 'TEST: native Streamline profile activates the signed interposer set and marker'
+    Invoke-Setup @(
+        '-Action', 'ConfigureRuntime', '-Profile', 'NativeStreamline', '-GameRoot', $script:fixtureRoot,
+        '-SettingsPath', $settings, '-AcceptRuntimeLicenses', '-AllowUnsignedNvidiaRuntime'
+    )
+    $state = Get-Content -LiteralPath (Join-Path $active 'CK3-DLSS-RUNTIME.json') -Raw | ConvertFrom-Json
+    Assert-True ($state.Profile -eq 'NativeStreamline') 'Native Streamline state was not selected.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $active 'sl.interposer.dll')) 'Streamline interposer was not activated.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $active 'streamline-native.enabled')) 'Native Streamline marker was not activated.'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $binaryRoot 'ReShade.ini') -Raw) -match '(?m)^EnableHooks=1\r?$') 'RenoDX Streamline hooks were not enabled.'
+
     Write-Host 'TEST: switching back removes NR files and full validation succeeds'
     Invoke-Setup @(
         '-Action', 'ConfigureRuntime', '-Profile', 'DLSS45', '-GameRoot', $script:fixtureRoot,
@@ -145,6 +159,8 @@ try {
     )
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $active 'nvngx_dlssnr.dll'))) 'DLSS NR remained after switching to DLSS45.'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $active 'renodx-dlss5.addon64'))) 'RenoDX remained after switching to DLSS45.'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $active 'sl.interposer.dll'))) 'Streamline remained after switching to DLSS45.'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $binaryRoot 'ReShade.ini') -Raw) -match '(?m)^EnableHooks=2\r?$') 'RenoDX hook policy did not return to NGX-only.'
     Invoke-Setup @('-Action', 'Validate', '-GameRoot', $script:fixtureRoot, '-SettingsPath', $settings, '-AllowUnsignedNvidiaRuntime')
 
     Write-Host 'TEST: Disable restores the renderer recorded before installation'
@@ -174,4 +190,3 @@ try {
 finally {
     if (Test-Path -LiteralPath $tempRoot -PathType Container) { Remove-Item -LiteralPath $tempRoot -Recurse -Force }
 }
-

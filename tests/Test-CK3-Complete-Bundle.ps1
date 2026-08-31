@@ -48,7 +48,8 @@ function Assert-Profile {
         if ($present -ne $ExpectNeuralRendering) { throw "$Profile has incorrect $name state." }
     }
 
-    $payload = Join-Path $Fixture "binaries\dlss-payload\runtimes\$Profile"
+    $payloadProfile = if ($Profile -eq 'NativeStreamline') { 'DLSS5' } else { $Profile }
+    $payload = Join-Path $Fixture "binaries\dlss-payload\runtimes\$payloadProfile"
     $activeDlss = (Get-FileHash -LiteralPath (Join-Path $active 'nvngx_dlss.dll') -Algorithm SHA256).Hash
     $payloadDlss = (Get-FileHash -LiteralPath (Join-Path $payload 'nvngx_dlss.dll') -Algorithm SHA256).Hash
     if ($activeDlss -ne $payloadDlss) { throw "$Profile copied the wrong base DLSS runtime." }
@@ -57,6 +58,12 @@ function Assert-Profile {
         $activeNr = (Get-FileHash -LiteralPath (Join-Path $active 'nvngx_dlssnr.dll') -Algorithm SHA256).Hash
         $payloadNr = (Get-FileHash -LiteralPath (Join-Path $payload 'nvngx_dlssnr.dll') -Algorithm SHA256).Hash
         if ($activeNr -ne $payloadNr) { throw "$Profile copied the wrong neural-rendering runtime." }
+    }
+
+    if ($Profile -eq 'NativeStreamline') {
+        foreach ($name in @('sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'sl.dlss_nr.dll', 'streamline-native.enabled')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $active $name) -PathType Leaf)) { throw "NativeStreamline is missing $name." }
+        }
     }
 }
 
@@ -82,6 +89,10 @@ try {
 
     $installer = Join-Path $resolvedFixture 'DLSS5-CK3.ps1'
     $settings = Join-Path $resolvedFixture 'pdx_settings.txt'
+
+if (-not (Test-Path -LiteralPath (Join-Path $resolvedFixture 'Open CK3 DLSS Installer.cmd') -PathType Leaf)) { throw 'Complete ZIP is missing the GUI launcher.' }
+if (-not (Test-Path -LiteralPath (Join-Path $resolvedFixture 'tools\CK3-DLSS-Installer\CK3 DLSS Installer.exe') -PathType Leaf)) { throw 'Complete ZIP is missing the self-contained installer GUI.' }
+if (-not (Test-Path -LiteralPath (Join-Path $resolvedFixture 'THIRD-PARTY-LICENSES\Apache-2.0.txt') -PathType Leaf)) { throw 'Complete ZIP is missing the installer dependency license.' }
     Copy-Item -LiteralPath (Join-Path $resolvedFixture 'binaries\dlss-payload\dlss5-feed.addon64') `
         -Destination (Join-Path $resolvedFixture 'binaries\ck3.exe')
 
@@ -100,7 +111,7 @@ try {
     Assert-Profile $resolvedFixture DLSS45 $false 13
     if ((Get-Content -LiteralPath $settings -Raw) -notmatch 'value="Vulkan"') { throw 'Install did not select Vulkan.' }
 
-    foreach ($profile in @('DLSS5', 'DLSS5Extended')) {
+    foreach ($profile in @('DLSS5', 'DLSS5Extended', 'NativeStreamline')) {
         Invoke-Installer $installer $resolvedFixture $settings ConfigureRuntime $profile
         Invoke-Installer $installer $resolvedFixture $settings Validate $profile
         Assert-Profile $resolvedFixture $profile $true 0
@@ -116,7 +127,7 @@ try {
         throw 'Disable did not remove the install receipt.'
     }
 
-    Write-Host 'Complete ZIP validation passed: DLSS45 -> DLSS5 -> DLSS5Extended -> DLSS45 -> Disable.' -ForegroundColor Green
+    Write-Host 'Complete ZIP validation passed: DLSS45 -> DLSS5 -> DLSS5Extended -> NativeStreamline -> DLSS45 -> Disable.' -ForegroundColor Green
 }
 finally {
     if (Test-Path -LiteralPath $resolvedFixture -PathType Container) {

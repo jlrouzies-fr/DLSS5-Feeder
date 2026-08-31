@@ -1,0 +1,5 @@
+<?xml version="1.0" ?>
+<jpackage-state version="17.0.2" platform="windows">
+  <app-version>1.0.0</app-version>
+  <main-launcher>CK3 DLSS Installer</main-launcher>
+  <signed>false</signed></jpackage-state>

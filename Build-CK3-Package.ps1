@@ -8,6 +8,7 @@ param(
     [string]$Dlss5ExtendedRuntime,
     [string]$Dlss5ExtendedNrRuntime,
     [string]$RenoDxAddon,
+    [string]$StreamlineRuntimeDirectory,
     [string]$OutputDirectory = (Join-Path $PSScriptRoot 'release\CK3-DLSS-Portable'),
     [switch]$AcknowledgeRuntimeRedistributionTerms,
     [switch]$AllowUnsignedTestArtifacts,

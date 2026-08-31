@@ -2,9 +2,12 @@
 param(
     [string]$OutputDirectory = '',
     [string]$DeployTo,
-    [ValidateSet('DLSS45', 'DLSS5', 'DLSS5Extended')]
+    [string]$FeederAddon,
+    [string]$FeedLayerZip,
+    [ValidateSet('DLSS45', 'DLSS5', 'DLSS5Extended', 'NativeStreamline')]
     [string]$InstallProfile = 'DLSS45',
     [string]$SettingsPath,
+    [string]$StreamlineRuntimeDirectory,
     [switch]$InstallAfterDeploy,
     [switch]$ForceDownload
 )
@@ -77,10 +80,22 @@ if (-not $output.StartsWith($releaseRoot + [IO.Path]::DirectorySeparatorChar, [S
 $temp = Join-Path ([IO.Path]::GetTempPath()) ('ck3-dlss-complete-' + [guid]::NewGuid().ToString('N'))
 Ensure-Directory $temp
 try {
-    $feeder = Download 'https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest/download/dlss5-feed.addon64' `
-        (Join-Path $temp 'dlss5-feed.addon64') 'DLSS5 Feeder add-on'
-    $layer = Download 'https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest/download/feed-vk-layer.zip' `
-        (Join-Path $temp 'feed-vk-layer.zip') 'feeder Vulkan layer'
+    if ($FeederAddon) {
+        $feeder = (Resolve-Path -LiteralPath $FeederAddon).Path
+        Write-Step "Using current-tree feeder add-on '$feeder'."
+    }
+    else {
+        $feeder = Download 'https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest/download/dlss5-feed.addon64' `
+            (Join-Path $temp 'dlss5-feed.addon64') 'DLSS5 Feeder add-on'
+    }
+    if ($FeedLayerZip) {
+        $layer = (Resolve-Path -LiteralPath $FeedLayerZip).Path
+        Write-Step "Using current-tree Vulkan layer archive '$layer'."
+    }
+    else {
+        $layer = Download 'https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest/download/feed-vk-layer.zip' `
+            (Join-Path $temp 'feed-vk-layer.zip') 'feeder Vulkan layer'
+    }
     $dlss45 = Download 'https://raw.githubusercontent.com/NVIDIA/DLSS/refs/tags/v310.7.0/lib/Windows_x86_64/rel/nvngx_dlss.dll' `
         (Join-Path $temp 'nvngx_dlss_310.7.0.dll') 'NVIDIA DLSS 310.7.0' $script:Expected.Dlss45
 
@@ -113,6 +128,7 @@ try {
         -Dlss5ExtendedRuntime $base3108 `
         -Dlss5ExtendedNrRuntime $extendedNr `
         -RenoDxAddon $reno `
+        -StreamlineRuntimeDirectory $StreamlineRuntimeDirectory `
         -OutputDirectory $output `
         -AcknowledgeRuntimeRedistributionTerms `
         -AllowUpstreamFeederForTesting `
@@ -152,10 +168,12 @@ Included locally:
 - RHI DLSS 310.8.0 + signed stock NR 310.8.0
 - RHI DLSS 310.8.0 + ShortFuse NR 310.8.SF-v2
 - RenoDX DLSS 5 add-on 4.55
+- NVIDIA Streamline Vulkan interposer (when -StreamlineRuntimeDirectory is supplied)
 - ReShade.fxh and VORT motion-vector shaders
 - RHI setup tool
+- Self-contained Compose Desktop profile installer
 
-Extract over Crusader Kings III and run one of the Install CK3 DLSS *.cmd files.
+Extract over Crusader Kings III and run Open CK3 DLSS Installer.cmd.
 "@
     [IO.File]::WriteAllText((Join-Path $output 'COMPLETE-TEST-BUNDLE.txt'), $description, [Text.UTF8Encoding]::new($false))
 

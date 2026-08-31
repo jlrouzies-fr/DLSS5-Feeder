@@ -2,7 +2,7 @@
 
 This is a drag-and-drop Vulkan/ReShade/DLSS package for the Windows version of **Crusader Kings III**.
 It includes the locally built DLSS feeder, an app-local DXGI/D3D12 bootstrap, portable Vulkan layers,
-ReShade, VORT motion-vector shaders, the complete Lilium HDR Shaders 2026.02.28 suite, RHI, and the files for all three runtime profiles.
+ReShade, VORT motion-vector shaders, the complete Lilium HDR Shaders 2026.02.28 suite, RHI, and the files for four runtime profiles.
 
 ## Install
 
@@ -13,15 +13,14 @@ ReShade, VORT motion-vector shaders, the complete Lilium HDR Shaders 2026.02.28 
 4. Confirm the layout is correct. `Launch CK3 with DLSS.cmd` must be beside the existing `binaries`,
    `game`, and `launcher` folders. Do not extract the package into `binaries` and do not leave it
    inside an extra `CK3-DLSS-Vulkan-All-Profiles` folder.
-5. Run exactly one profile installer:
+5. Run **`Open CK3 DLSS Installer.cmd`**. The app validates the selected CK3 folder, reports the
+   active profile, and offers the three supported choices:
 
-   - **`Install CK3 DLSS 4.5 RTX 3060 Test.cmd`** — recommended RTX 3060 baseline; DLAA with
-     DLSS 4.5 Model M neural reconstruction (`preset=13`) across the entire frame, including character
-     faces. RenoDX and the separate DLSS 5 Neural Rendering extension are not loaded.
-   - **`Install CK3 DLSS 5 Stock Test.cmd`** — DLSS 5 Neural Rendering with the signed stock runtime.
-   - **`Install CK3 DLSS 5 Extended Test.cmd`** — experimental compatibility profile using the
-     modified ShortFuse runtime.
-   - **`Install CK3 DLSS.cmd`** — automatic profile selection.
+   - **DLSS 4.5 Model M** — recommended native-resolution DLAA baseline.
+   - **DLSS 5 Stock** — DLSS 5 Neural Rendering with the signed stock runtime.
+   - **DLSS 5 Extended** — experimental compatibility profile using the modified ShortFuse runtime.
+
+   The original profile-specific `.cmd` installers remain available as command-line fallbacks.
 
 6. Start the game with **`Launch CK3 with DLSS.cmd`**. This launcher supplies the package-local
    Vulkan-layer environment. Launching CK3 normally through Steam does not activate these layers.
@@ -48,8 +47,16 @@ controls for the separate RenoDX/Neural Rendering extension.
 
 ## Change profiles
 
-Close CK3, then run another profile installer listed above. You can also run
-**`Configure CK3 DLSS Runtime.cmd`** for the interactive selector. Each switch rebuilds
+Run **`Install CK3 DLSS Native Streamline Experimental.cmd`** to enable the opt-in NVIDIA
+Streamline Vulkan interposer profile. It initializes the DLSS and DLSS-RR plugins before CK3 requests
+`vulkan-1.dll`, keeps CK3 on the system Vulkan loader handle, and routes proc-address lookups
+through a compatibility shim. Device and swapchain calls continue through Streamline, while Win32
+surface lifecycle and capability calls use the system loader to accommodate CK3's device-first startup.
+Direct Streamline resource tagging and evaluation are not yet wired, so the existing Vulkan-to-D3D12
+NGX feeder remains the evaluation fallback.
+
+Close CK3, then reopen **`Open CK3 DLSS Installer.cmd`** and select another profile. You can also
+run a profile-specific command or **`Configure CK3 DLSS Runtime.cmd`**. Each switch rebuilds
 `binaries\dlss-active` so files from the previous profile are not left loaded.
 
 ## Disable or restore CK3
