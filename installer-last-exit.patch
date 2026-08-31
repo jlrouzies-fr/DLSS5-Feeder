@@ -1,7 +1,0 @@
-diff --git a/ck3-package/DLSS5-CK3.ps1 b/ck3-package/DLSS5-CK3.ps1
---- a/ck3-package/DLSS5-CK3.ps1
-+++ b/ck3-package/DLSS5-CK3.ps1
-@@ -235 +234,0 @@
--    if ($LASTEXITCODE) { throw "Graphics dependency setup exited with code $LASTEXITCODE." }
-@@ -250 +248,0 @@
--    if ($LASTEXITCODE) { throw "Runtime setup exited with code $LASTEXITCODE." }

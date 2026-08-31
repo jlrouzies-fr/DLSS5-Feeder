@@ -164,7 +164,7 @@ static void DetectRenodxAddon()
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE)
     {
-        Log("[feed] DLSS 5 add-on: not installed; using standard DLAA without Neural Rendering");
+        Log("[feed] DLSS 5 add-on: not installed; using standalone DLSS neural reconstruction (DLAA) without the DLSS 5 Neural Rendering extension");
         return;
     }
     g_renodx_present = true;
@@ -1132,8 +1132,8 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
         return false;
     }
 
-    Log("[feed] feature ready: %ux%u DLAA, flags=%d (%s%s%s%s), color %s -> output %s, depth R32_FLOAT%s, mv R16G16_FLOAT",
-        w, h, flags,
+    Log("[feed] feature ready: %ux%u DLAA neural reconstruction, preset=%d%s, flags=%d (%s%s%s%s), color %s -> output %s, depth R32_FLOAT%s, mv R16G16_FLOAT",
+        w, h, g_cfg.preset, g_cfg.preset == 13 ? " (DLSS 4.5 Model M)" : "", flags,
         (flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) ? "HDR " : "SDR ",
         (flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) ? "MVLowRes " : "",
         (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) ? "DepthInverted " : "",
@@ -2777,6 +2777,7 @@ static void HelpMarker(const char *desc)
 static void DrawOverlay(reshade::api::effect_runtime *)
 {
     bool dirty = false;
+    bool rebuild_requested = false;
     bool enabled = g_cfg.enabled != 0;
     if (ImGui::Checkbox("Enabled", &enabled)) { g_cfg.enabled = enabled ? 1 : 0; dirty = true; }
 
@@ -2788,7 +2789,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     if (g_renodx_present)
         ImGui::Text("DLSS 5 add-on: v%s (%s)", g_renodx_ver, g_renodx_lazy ? "v45+ engine" : "classic engine");
     else
-        ImGui::TextUnformatted("DLSS 5 add-on: not installed (standard DLAA only)");
+        ImGui::Text("DLSS neural reconstruction (DLAA), preset %d; DLSS 5 extension not installed", g_cfg.preset);
     if (g.disabled && ImGui::Button("Re-enable"))
     {
         g.disabled = false;
@@ -2799,23 +2800,29 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Separator();
     ImGui::TextUnformatted("DLSS contract");
     static const char *kModes[] = { "Inert", "Transport test (no NGX)", "Full DLSS path" };
-    if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) dirty = true;
+    if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) { dirty = true; rebuild_requested = true; }
     static const char *kTri[] = { "Auto", "Force off", "Force on" };
     int hdr_idx = g_cfg.hdr + 1, di_idx = g_cfg.depth_inverted + 1;
-    if (ImGui::Combo("HDR", &hdr_idx, kTri, 3)) { g_cfg.hdr = hdr_idx - 1; dirty = true; }
-    if (ImGui::Combo("Depth inverted", &di_idx, kTri, 3)) { g_cfg.depth_inverted = di_idx - 1; dirty = true; }
+    if (ImGui::Combo("HDR", &hdr_idx, kTri, 3)) { g_cfg.hdr = hdr_idx - 1; dirty = true; rebuild_requested = true; }
+    if (ImGui::Combo("Depth inverted", &di_idx, kTri, 3)) { g_cfg.depth_inverted = di_idx - 1; dirty = true; rebuild_requested = true; }
     bool reset_every = g_cfg.reset_every != 0;
     if (ImGui::Checkbox("Reset every frame (diagnostic)", &reset_every)) { g_cfg.reset_every = reset_every ? 1 : 0; dirty = true; }
 
     ImGui::Separator();
-    ImGui::TextUnformatted("DLSS render preset");
-    static const char *kPresetNames[] = { "Default", "E (legacy CNN)", "F (legacy CNN)", "J (transformer)", "K (recommended DLAA)", "L (DLSS 4.5 Ultra Performance model)", "M (DLSS 4.5 Performance model)" };
+    ImGui::TextUnformatted("Neural reconstruction model");
+    static const char *kPresetNames[] = {
+        "Runtime default", "E - legacy CNN", "F - legacy CNN", "J - first-generation transformer",
+        "K - transformer (recommended DLAA)", "L - DLSS 4.5 (Ultra Performance tuned)",
+        "M - DLSS 4.5 (Performance tuned)"
+    };
     static const int   kPresetValues[] = { 0, 5, 6, 10, 11, 12, 13 };
     int preset_idx = 0;
     for (int i = 0; i < 7; ++i) if (kPresetValues[i] == g_cfg.preset) preset_idx = i;
-    if (ImGui::Combo("Preset", &preset_idx, kPresetNames, 7)) { g_cfg.preset = kPresetValues[preset_idx]; dirty = true; }
-    ImGui::TextWrapped("K is NVIDIA's recommended DLAA model. L and M enable DLSS 4.5 for comparison, "
-                       "but cost more on RTX 20/30 GPUs without native FP8. If motion warps around "
+    if (ImGui::Combo("Model", &preset_idx, kPresetNames, 7)) {
+        g_cfg.preset = kPresetValues[preset_idx]; dirty = true; rebuild_requested = true;
+    }
+    ImGui::TextWrapped("Changing the model rebuilds the NGX feature immediately. K is NVIDIA's recommended DLAA model. "
+                       "L and M select DLSS 4.5 models but cost more on RTX 20/30 GPUs without native FP8. If motion warps around "
                        "transparents (dust, smoke, flames), try E or F.");
 
     ImGui::Separator();
@@ -2843,12 +2850,19 @@ static void DrawOverlay(reshade::api::effect_runtime *)
                                           "the classic DLSS 5 add-on latching STANDBY on its first create. "
                                           "Skipped automatically on v45+ (not shown as adjustable there).");
         }
-        if (ImGui::InputInt("Raw create flags (-1 = auto)", &g_cfg.flags)) dirty = true;
+        if (ImGui::InputInt("Raw create flags (-1 = auto)", &g_cfg.flags)) { dirty = true; rebuild_requested = true; }
         if (ImGui::SliderInt("Log first N frames", &g_cfg.log_frames, 0, 20)) dirty = true;
-        if (ImGui::Button("Force one rebuild")) { ++g_cfg.rebuild; dirty = true; }
+        if (ImGui::Button("Force one rebuild")) { ++g_cfg.rebuild; dirty = true; rebuild_requested = true; }
     }
 
     if (dirty) CfgSave();
+    if (rebuild_requested)
+    {
+        g.frame_ready = false;
+        g.warmup_done = false;
+        g.create_grace = 0;
+        Log("[feed] ReShade requested an immediate feature rebuild: preset=%d mode=%d", g_cfg.preset, g_cfg.mode);
+    }
 }
 
 // ---------------------------------------------------------------------------

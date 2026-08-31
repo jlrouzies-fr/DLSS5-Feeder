@@ -100,7 +100,7 @@ try {
     $settings = Join-Path $tempRoot 'pdx_settings.txt'
     Write-Settings $settings 'DX11'
 
-    Write-Host 'TEST: RTX 3060 baseline installs with Model K and no Neural Rendering hook'
+    Write-Host 'TEST: RTX 3060 baseline installs with Model M neural reconstruction and no DLSS 5 extension'
     Invoke-Setup @(
         '-Action', 'Install', '-Profile', 'DLSS45', '-GameRoot', $script:fixtureRoot,
         '-SettingsPath', $settings, '-AcceptDependencyLicenses', '-AcceptRuntimeLicenses', '-AllowUnsignedNvidiaRuntime'

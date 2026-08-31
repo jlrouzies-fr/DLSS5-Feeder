@@ -16,7 +16,8 @@ RHI, and the files for all three runtime profiles.
 5. Run exactly one profile installer:
 
    - **`Install CK3 DLSS 4.5 RTX 3060 Test.cmd`** — recommended RTX 3060 baseline; DLAA with
-     DLSS 4.5 Model M (`preset=13`). RenoDX and Neural Rendering are not loaded.
+     DLSS 4.5 Model M neural reconstruction (`preset=13`) across the entire frame, including character
+     faces. RenoDX and the separate DLSS 5 Neural Rendering extension are not loaded.
    - **`Install CK3 DLSS 5 Stock Test.cmd`** — DLSS 5 Neural Rendering with the signed stock runtime.
    - **`Install CK3 DLSS 5 Extended Test.cmd`** — experimental compatibility profile using the
      modified ShortFuse runtime.
@@ -37,8 +38,10 @@ Press **Home** in game to open ReShade. The focused DLSS preset intentionally co
 3. `vort_StaticEffects`
 
 Keep the motion effect above `DLSS5_Feed`. Generic color, bloom, CRT, and sharpening shader packs are
-not required for DLSS and are not included. Feeder controls, including DLSS preset selection, appear
-under ReShade's **Add-ons** tab. DLSS 5 profiles also expose the RenoDX/Neural Rendering controls.
+not required for DLSS and are not included. Open **Add-ons -> DLSS 5 Feed -> Neural reconstruction
+model** to switch live among Runtime Default, E, F, J, K, L, and M. Changing the model immediately
+rebuilds the NGX feature and saves the selection to `dlss5-feed.cfg`. DLSS 5 profiles also expose
+controls for the separate RenoDX/Neural Rendering extension.
 
 ## Change profiles
 
@@ -64,5 +67,6 @@ remain available, but its portable Vulkan layers are inactive when CK3 is launch
 - **Artifacts or ghosting** — CK3 has no native DLSS motion-vector integration. VORT estimates motion,
   so fast map movement, UI, smoke, and transparency can ghost.
 
-The default profile is native-resolution DLAA, not an upscaling performance mode. It primarily tests
-reconstruction and anti-aliasing quality.
+The default profile is native-resolution DLAA with Model M neural reconstruction, not an upscaling
+performance mode. The reconstruction processes the entire frame, including character faces, using
+color, depth, and motion-vector inputs.

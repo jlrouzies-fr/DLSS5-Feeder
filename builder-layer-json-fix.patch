@@ -1,8 +1,0 @@
-diff --git a/Build-CK3-Package.Portable.Core.ps1 b/Build-CK3-Package.Portable.Core.ps1
---- a/Build-CK3-Package.Portable.Core.ps1
-+++ b/Build-CK3-Package.Portable.Core.ps1
-@@ -203,0 +204,4 @@
-+    $layerManifestPath = Join-Path $layerRoot 'VkLayer_feed_vk.json'
-+    $layerManifestText = Get-Content -LiteralPath $layerManifestPath -Raw
-+    $layerManifestText = $layerManifestText.Replace('".\VkLayer_feed_vk.dll"', '".\\VkLayer_feed_vk.dll"')
-+    [IO.File]::WriteAllText($layerManifestPath, $layerManifestText, [Text.UTF8Encoding]::new($false))

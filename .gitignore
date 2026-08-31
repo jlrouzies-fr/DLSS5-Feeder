@@ -1,3 +1,9 @@
+# Local edit/recovery artifacts; never part of the product or build inputs
+*.patch
+*.codex-rewrite-backup
+*.orig
+*.rej
+
 *.obj
 *.exp
 *.lib

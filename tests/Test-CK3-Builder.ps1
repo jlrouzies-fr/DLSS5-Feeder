@@ -63,7 +63,7 @@ try {
     Ensure-Directory $inputs
 
     $feeder = Join-Path $inputs 'dlss5-feed.addon64'
-    New-FakeX64Pe $feeder @('standard DLAA only', 'DLSS 4.5 Ultra Performance model')
+    New-FakeX64Pe $feeder @('standalone DLSS neural reconstruction', 'L - DLSS 4.5 (Ultra Performance tuned)')
     $dlss45 = Join-Path $inputs 'dlss45\nvngx_dlss.dll'
     $dlss5 = Join-Path $inputs 'dlss5\nvngx_dlss.dll'
     $dlss5Nr = Join-Path $inputs 'dlss5\nvngx_dlssnr.dll'

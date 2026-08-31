@@ -218,7 +218,7 @@ function Select-RuntimeMode([string[]]$GpuNames) {
     Write-Host 'Choose the CK3 DLSS profile:' -ForegroundColor Cyan
     Write-Host "  Detected: $gpuText"
     Write-Host ''
-    Write-Host '  1. DLSS 4.5 / DLAA compatibility  (recommended for RTX 20/30/40, including RTX 3060)'
+    Write-Host '  1. DLSS 4.5 Neural Reconstruction (Model M DLAA; recommended for RTX 20/30/40)'
     Write-Host '  2. DLSS 5 Neural Rendering       (NVIDIA-signed stock NR preview via RHI; support not promised)'
     Write-Host '  3. DLSS 5 Extended               (experimental RHI/ShortFuse runtime for RTX 20/30/40)'
     Write-Host '  Q. Cancel'
@@ -529,7 +529,7 @@ function Install-ActiveProfile(
     }
 
     $displayName = switch ($SelectedMode) {
-        'DLSS45' { 'DLSS 4.5 / DLAA compatibility' }
+        'DLSS45' { 'DLSS 4.5 Model M Neural Reconstruction (DLAA)' }
         'DLSS5' { 'DLSS 5 Neural Rendering' }
         'DLSS5Extended' { 'DLSS 5 Extended (experimental RHI/ShortFuse)' }
     }
@@ -558,10 +558,10 @@ function Install-ActiveProfile(
 
     Write-RuntimeStatus "Activated $displayName."
     if ($SelectedMode -eq 'DLSS45') {
-        Write-RuntimeStatus 'RenoDX and nvngx_dlssnr.dll are not loaded in this profile.'
+        Write-RuntimeStatus 'Model M neural reconstruction is active. RenoDX and the separate DLSS 5 nvngx_dlssnr.dll extension are not loaded.'
     }
     elseif ($SelectedMode -eq 'DLSS5Extended') {
-        Write-Warning 'This profile uses a modified compatibility runtime. Expect instability; DLSS 4.5 / DLAA is the safe RTX 3060 baseline.'
+        Write-Warning 'This profile uses a modified compatibility runtime. Expect instability; DLSS 4.5 Model M neural reconstruction is the safe RTX 3060 baseline.'
     }
 }
 

@@ -1,5 +1,0 @@
-diff --git a/tests/Test-CK3-Package.ps1 b/tests/Test-CK3-Package.ps1
---- a/tests/Test-CK3-Package.ps1
-+++ b/tests/Test-CK3-Package.ps1
-@@ -77,0 +78 @@
-+    Ensure-Directory (Join-Path $binaryRoot 'dlss5-vulkan')

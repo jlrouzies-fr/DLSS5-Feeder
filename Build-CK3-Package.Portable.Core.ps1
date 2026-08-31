@@ -81,7 +81,7 @@ function Assert-NvidiaPe([string]$Path, [string]$Label, [bool]$AllowModified) {
 function Assert-ForkFeeder([string]$Path) {
     $item = Assert-X64Pe $Path 'DLSS feeder add-on'
     $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($item.FullName))
-    foreach ($marker in @('standard DLAA only', 'DLSS 4.5 Ultra Performance model')) {
+    foreach ($marker in @('standalone DLSS neural reconstruction', 'L - DLSS 4.5 (Ultra Performance tuned)')) {
         if ($text.IndexOf($marker, [StringComparison]::Ordinal) -lt 0) {
             if ($AllowUpstreamFeederForTesting) {
                 Write-Warning "Using the upstream feeder binary for a private test; CK3 fork overlay labels are unavailable."

@@ -33,12 +33,14 @@ normal Play button does not activate this package.
 
 | Profile | Components | Intended use |
 |---|---|---|
-| **DLSS 4.5 / DLAA** | Local feeder + NVIDIA DLSS runtime | RTX 20/30/40 baseline; Model M (`preset=13`) by default |
+| **DLSS 4.5 Neural Reconstruction / DLAA** | Local feeder + NVIDIA DLSS runtime | RTX 20/30/40 baseline; second-generation transformer Model M (`preset=13`) by default |
 | **DLSS 5 Stock** | Feeder + RenoDX + signed DLSS/Neural Rendering pair | Hardware supported by the stock preview runtime |
 | **DLSS 5 Extended** | Feeder + RenoDX + modified ShortFuse Neural Rendering runtime | Experimental compatibility testing |
 
-DLSS 4.5 uses native-resolution DLAA. It improves reconstruction and anti-aliasing but is not an
-upscaling performance mode. The Extended profile is experimental and may be unstable.
+DLSS 4.5 uses native-resolution DLAA with Model M neural reconstruction across the entire frame,
+including character faces. It consumes the current color frame, depth, and motion vectors to reconstruct
+a temporally stable native-resolution result; it is not an upscaling performance mode. This is distinct
+from the separate DLSS 5 Neural Rendering extension. The Extended profile is experimental and may be unstable.
 
 To change profiles, close CK3 and run another profile installer. You can also use
 **`Configure CK3 DLSS Runtime.cmd`**.
