@@ -47,6 +47,13 @@ static PFN_vkCreateDevice g_vk_create_device_orig;   // MinHook trampoline to th
 static void              *g_vk_create_device_target;  // the export itself (hook target)
 static int                g_vk_hook_devices;          // how many vkCreateDevice calls we have seen
 
+// The graphics queue family the game asked for. ReShade's effect runtime (and so the
+// command buffer every raw vkCmd* here records into) rides the game's present queue,
+// which is a graphics queue -- the queue-family ownership transfers to/from
+// VK_QUEUE_FAMILY_EXTERNAL (FeedVkExternalTransfer) need its family index.
+// VK_QUEUE_FAMILY_IGNORED until a vkCreateDevice has been seen.
+static uint32_t g_vk_gfx_family = VK_QUEUE_FAMILY_IGNORED;
+
 static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice physicalDevice,
                                                              const VkDeviceCreateInfo *pCreateInfo,
                                                              const VkAllocationCallbacks *pAllocator,
@@ -136,8 +143,28 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice ph
     ci.enabledExtensionCount   = static_cast<uint32_t>(exts.size());
     ci.ppEnabledExtensionNames = exts.data();
 
-    Log("[feed] vkCreateDevice #%d: app asked for %u extension(s), added %d, timelineSemaphore %s",
-        g_vk_hook_devices, pCreateInfo->enabledExtensionCount, added, timeline_how);
+    // Which of the requested queue families is the graphics one? The enumerate entry
+    // point is a plain vulkan-1.dll export, same as the extension query above.
+    if (HMODULE lib = GetModuleHandleW(L"vulkan-1.dll"))
+    {
+        if (const auto qprops = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+                GetProcAddress(lib, "vkGetPhysicalDeviceQueueFamilyProperties")))
+        {
+            uint32_t nf = 0;
+            qprops(physicalDevice, &nf, nullptr);
+            std::vector<VkQueueFamilyProperties> fams(nf);
+            if (nf > 0) qprops(physicalDevice, &nf, fams.data());
+            for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; ++i)
+            {
+                const uint32_t f = pCreateInfo->pQueueCreateInfos[i].queueFamilyIndex;
+                if (f < nf && (fams[f].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) { g_vk_gfx_family = f; break; }
+            }
+        }
+    }
+
+    Log("[feed] vkCreateDevice #%d: app asked for %u extension(s), added %d, timelineSemaphore %s, graphics queue family %u",
+        g_vk_hook_devices, pCreateInfo->enabledExtensionCount, added, timeline_how,
+        g_vk_gfx_family);
     for (const char *want : kFeedVkWanted)
         Log("[feed]   %-40s %s", want,
             already(want) ? "(app)" : driver_has(want) ? "ADDED" : "unsupported by driver");
