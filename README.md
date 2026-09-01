@@ -50,8 +50,21 @@
 >
 > **Since 0.8.0 the feeder serializes its whole per-frame path and turns on D3D11 multithread
 > protection**, and it detects Smooth Motion and says so in the overlay and `dlss5-feed.log`. That
-> removes the feeder-side race, but **the combination is still unverified** — no game row below has
-> been run with Smooth Motion on.
+> removes the feeder-side race. First data point (2026-09-01, 0.8.0-beta.4): Metro 2033 Redux ran
+> with Smooth Motion **active** — session open, frames delivered at the usual per-frame cost, no
+> re-entrant or off-thread Present observed. Full visual verification is still pending, and the
+> Vulkan path has no Smooth Motion run yet.
+>
+> Two things Smooth Motion *did* break on that machine, neither of them this feeder — both crash
+> the game 1–2 s into boot with a null read on the present path, before the feeder feeds a frame:
+>
+> - **Luma** (`Luma-Metro Redux.addon`): reads `GetCurrentBackBufferIndex()` and passes it to
+>   `GetBuffer()`, which fails under Smooth Motion's flip-model wrapper; the null back buffer is
+>   then dereferenced. Fix offered upstream to Filoppi/Luma-Framework. Remove the Luma add-on to
+>   boot, or turn Smooth Motion off for the game.
+> - **`NRStyle=2`** (RenoDX v4.6's own setting, from its overlay panel): crashes at the next boot
+>   even without Luma. The feeder now warns when it sees it; set `NRStyle=0` in `ReShade.ini`'s
+>   `[RenoDX.DLSS5]` section to recover.
 >
 > If the image corrupts or flickers, turn Smooth Motion off **for this game's API only** rather
 > than everywhere, in NVIDIA Profile Inspector:

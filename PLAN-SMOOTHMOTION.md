@@ -5,6 +5,14 @@
 > known-good regression run with Smooth Motion off, nor a run with it on. Steps 1 and 2 (the issue
 > replies and the reporter data) are still to do, and the Deferred section stays deferred.
 >
+> **Update (2026-09-01, later):** first Smooth Motion run is in. Metro 2033 Redux, Smooth Motion
+> active, 0.8.0-beta.4: session open, feature ready, 6600+ frames delivered, feed CPU 0.52 ms/frame
+> against the 0.50 pre-lock baseline — the serialization costs nothing measurable. No off-thread or
+> re-entrant Present was observed in this game, so the guard is armed but untriggered; the Vulkan
+> data point (#10) is still needed. The session also root-caused two *external* startup crashes that
+> Smooth Motion exposes (Luma's unchecked `GetBuffer(GetCurrentBackBufferIndex())`, fix offered
+> upstream; and RenoDX v4.6's `NRStyle=2`, which the feeder now warns about).
+>
 > Two things landed that the plan did not call for, both found while implementing:
 > - A `CRITICAL_SECTION` is *recursive*, so a lock alone cannot stop a re-entrant Present on the
 >   same thread — it would walk straight into a half-built frame. Hence the busy flag beside it.
