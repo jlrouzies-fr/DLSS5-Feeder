@@ -170,6 +170,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 
 static char g_renodx_ver[48] = "not found";
 static char g_renodx_gen[16] = "";       // the add-on's own banner, e.g. "v4.7" (v4.6+ only)
+static bool g_renodx_present = false;
 static bool g_renodx_lazy    = false;
 static bool g_renodx_v46     = false;
 static bool g_renodx_v47     = false;
@@ -241,6 +242,7 @@ static void DetectRenodxAddon()
         Log("[feed] DLSS 5 add-on: renodx-dlss5.addon64 not found next to this add-on");
         return;
     }
+    g_renodx_present = true;
     const DWORD size = GetFileSize(f, nullptr);
     DWORD got = 0;
     char *buf = (size > 0 && size < 8u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
@@ -828,6 +830,7 @@ struct Feed
     bool need_reset;
     bool warmup_done;
     int  consecutive_fails;
+    int  create_fail_count; // consecutive CreateFeature failures/crashes (reset on success)
     int  cfg_rebuild_seen;
     int  create_grace;     // frames counted while holding the first feature create
 
@@ -1150,8 +1153,28 @@ static bool BeginCommands()
         ResetEvent(g.fence_event);
         const DWORD timeout = static_cast<DWORD>(g_cfg.gpu_timeout_ms);
         g.fence12->SetEventOnCompletion(retire, g.fence_event);
-        if (WaitForSingleObject(g.fence_event, timeout) != WAIT_OBJECT_0 ||
-            g.fence12->GetCompletedValue() < retire)
+        // Wait in slices, checking for device removal between them: a removed device's
+        // fence never completes, and without this the feed blocked the present thread
+        // for the full timeout, three frames in a row, before latching off with the
+        // generic "repeated failures" (Starfield, issue #16).
+        bool signaled = false;
+        for (DWORD waited = 0; waited < timeout && !signaled; )
+        {
+            const DWORD slice = timeout - waited < 250 ? timeout - waited : 250;
+            signaled = WaitForSingleObject(g.fence_event, slice) == WAIT_OBJECT_0;
+            waited += slice;
+            if (!signaled && g.dev12 != nullptr)
+            {
+                const HRESULT removed = g.dev12->GetDeviceRemovedReason();
+                if (FAILED(removed))
+                {
+                    Log("[feed] the D3D12 device was removed (0x%08X) while waiting on the fence", removed);
+                    FeedDisable("the D3D12 device was removed (see dlss5-feed.log)");
+                    return false;
+                }
+            }
+        }
+        if (!signaled || g.fence12->GetCompletedValue() < retire)
         {
             // Fail this frame, do not latch the add-on off: one slow frame -- a
             // contended GPU, a present-path interposer stealing submission slots --
@@ -1785,6 +1808,69 @@ static bool MakeBlitShaders()
 
 static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed);
 
+// A failed create with two NGX module copies loaded is nearly always the game-local
+// nvngx_dlss.dll: an NGX interposer (the DLSS 5 add-on) detours BOTH copies, and the
+// pair has produced 0xBAD00010 and caught access violations here (issues #4, #14, #16).
+static void LogNgxModuleHint()
+{
+    if (GetModuleHandleW(L"nvngx_dlss.dll") != nullptr && GetModuleHandleW(L"_nvngx.dll") != nullptr)
+        Log("[feed] two copies of the DLSS NGX module are loaded (the game-local nvngx_dlss.dll and the driver's "
+            "_nvngx.dll), and the DLSS 5 add-on hooks both -- if the create keeps failing, try removing the "
+            "game-local nvngx_dlss.dll, or update renodx-dlss5 to a v4.7+ build");
+}
+
+// The 32-bit host has recovered real machines with this since 0.5: a CreateFeature that
+// failed (or crashed -- caught, nothing submitted) often works after NGX itself is torn
+// down and re-initialised on the same device. Never ported to this add-on until now.
+static bool ReinitNgx()
+{
+    Log("[feed] re-initialising NGX after repeated feature-create failures");
+    if (g.params != nullptr) { NVSDK_NGX_D3D12_DestroyParameters(g.params); g.params = nullptr; }
+    if (g.ngx_inited && g.dev12 != nullptr) { NVSDK_NGX_D3D12_Shutdown1(g.dev12); g.ngx_inited = false; }
+
+    wchar_t data_path[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, data_path, MAX_PATH);
+    if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
+
+    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
+    if (NVSDK_NGX_FAILED(r))
+        r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+                                                "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
+    Log("[feed] NGX re-init -> 0x%08X (%s)", r, NgxResultName(r));
+    if (NVSDK_NGX_FAILED(r)) return false;
+    g.ngx_inited = true;
+
+    r = NVSDK_NGX_D3D12_AllocateParameters(&g.params);
+    if (NVSDK_NGX_FAILED(r) || g.params == nullptr) { Log("[feed] AllocateParameters failed 0x%08X on re-init", r); return false; }
+    return true;
+}
+
+// A first-build CreateFeature failure no longer latches the feed off on the spot (three
+// identical retries three frames apart never worked; see the DS3/GTA V/Starfield reports).
+// Each failure re-arms the hook-grace so the next attempt is a create_delay away, the
+// second failure re-initialises NGX first, and only the third gives up -- with the
+// specific reason, not the generic "repeated failures".
+static bool OnCreateFeatureFailed(bool crashed)
+{
+    ++g.create_fail_count;
+    LogNgxModuleHint();
+    if (g.create_fail_count >= 3)
+    {
+        FeedDisable(crashed ? "creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)"
+                            : "creating the DLSS feature keeps failing (see dlss5-feed.log)");
+        return false;
+    }
+    if (g.create_fail_count == 2 && !ReinitNgx())
+    {
+        FeedDisable("NGX would not re-initialise after a failed feature create");
+        return false;
+    }
+    g.create_grace = 0;   // space the retry behind a fresh hook-arming grace, not one frame
+    Log("[feed] feature create %s; retrying after the hook-arming grace (attempt %d of 3)",
+        crashed ? "crashed (caught; nothing was submitted)" : "failed", g.create_fail_count + 1);
+    return false;
+}
+
 // A same-size rebuild (warm-up, runtime recreation, cfg knob) only needs a fresh feature:
 // the textures stay put, the new feature is created FIRST, and if that fails or crashes
 // the old feature keeps working -- a flaky re-create can no longer take the feed down.
@@ -1900,10 +1986,7 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
 
     bool crashed = false;
     if (!CreateDlssFeature(w, h, inverted, &crashed))
-    {
-        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
-        return false;
-    }
+        return OnCreateFeatureFailed(crashed);
     return true;
 }
 
@@ -1946,6 +2029,7 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
     {
         AbortCommands();  // half-recorded NGX work must never reach the GPU
         Log("[feed] CreateFeature raised exception 0x%08X (caught; nothing was submitted)", ccode);
+        g.feature = nullptr;   // NGX may have partially written the handle before the fault; never trust it
         if (crashed != nullptr) *crashed = true;
         return false;
     }
@@ -1956,8 +2040,17 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
         g.fence12->SetEventOnCompletion(v, g.fence_event);
         if (WaitForSingleObject(g.fence_event, 4000) != WAIT_OBJECT_0 || g.fence12->GetCompletedValue() < v)
         {
-            Log("[feed] feature creation did not complete within 4 s");
-            FeedDisable("creating the DLSS feature hung");
+            const HRESULT removed = g.dev12 != nullptr ? g.dev12->GetDeviceRemovedReason() : S_OK;
+            if (FAILED(removed))
+            {
+                Log("[feed] the D3D12 device was removed (0x%08X) during feature creation", removed);
+                FeedDisable("the D3D12 device was removed (see dlss5-feed.log)");
+            }
+            else
+            {
+                Log("[feed] feature creation did not complete within 4 s");
+                FeedDisable("creating the DLSS feature hung");
+            }
             return false;
         }
     }
@@ -1975,8 +2068,9 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
         (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) ? "DepthInverted " : "",
         (flags & NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) ? "AutoExposure" : "",
         FormatName(g.color_fmt), FormatName(g.output_fmt), inverted ? " (reversed)" : "");
-    g.need_reset  = true;
-    g.frame_ready = true;
+    g.need_reset        = true;
+    g.frame_ready       = true;
+    g.create_fail_count = 0;
     return true;
 }
 
@@ -2338,10 +2432,7 @@ static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 
     bool crashed = false;
     if (!CreateDlssFeature(w, h, inverted, &crashed))
-    {
-        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
-        return false;
-    }
+        return OnCreateFeatureFailed(crashed);
     return true;
 }
 
@@ -2699,10 +2790,7 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 
     bool crashed = false;
     if (!CreateDlssFeature(w, h, inverted, &crashed))
-    {
-        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
-        return false;
-    }
+        return OnCreateFeatureFailed(crashed);
     return true;
 }
 
@@ -2986,10 +3074,7 @@ static bool BuildResourcesGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_ha
 
     bool crashed = false;
     if (!CreateDlssFeature(w, h, inverted, &crashed))
-    {
-        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
-        return false;
-    }
+        return OnCreateFeatureFailed(crashed);
     return true;
 }
 
@@ -3301,11 +3386,16 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
     if (g.frame_ready && needs_build12) g.create_grace = 0;
-    if (ok && needs_build12 && g.create_grace < g_cfg.create_delay)
+    // A classic (single hook pass) DLSS 5 add-on engine needs far longer than the default
+    // 60 frames on the game's own device: Starfield lost the device with 60 and survived
+    // with 600 (issue #16). Lazy (v4.5+) engines re-scan per present and keep the default.
+    int create_delay12 = g_cfg.create_delay;
+    if (!g_renodx_lazy && g_renodx_present && create_delay12 < 300) create_delay12 = 300;
+    if (ok && needs_build12 && g.create_grace < create_delay12)
     {
         if (++g.create_grace == 1)
-            Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously)",
-                g_cfg.create_delay);
+            Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously%s)",
+                create_delay12, create_delay12 != g_cfg.create_delay ? "; classic engine on the game's device, so longer than configured" : "");
         ok = false;
     }
 
@@ -4622,8 +4712,19 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
         g.mv_var.handle ? "found" : "MISSING",
         g.depth_var.handle ? "found" : "MISSING", g.mask_var.handle ? "found" : "absent (older shader: no bias mask)",
         g_mv_status, g.depth_reversed ? 1 : 0);
+    static bool effect_ever_ok = false;
+    if (g.handles_ok) effect_ever_ok = true;
     if (!g.handles_ok)
-        Warn("DLSS5_Feed.fx is not loaded (technique/textures missing) -- install it into reshade-shaders\\Shaders.");
+    {
+        // Once the effect has resolved in this process, a MISSING transition is just a
+        // reload in flight (games and add-ons can trigger those in bursts); re-warning
+        // every time filled both logs (Space Engineers). The state-change log line above
+        // still records each transition.
+        if (effect_ever_ok)
+            Log("[feed] DLSS5_Feed.fx handles gone during an effect reload; waiting for the recompile");
+        else
+            Warn("DLSS5_Feed.fx is not loaded (technique/textures missing) -- install it into reshade-shaders\\Shaders.");
+    }
     else if (g.launchpad.handle == 0)
         _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
                     "DLSS5_Feed.fx is compiled for motion-vector provider %d (%s) but no known %s shader is installed: motion vectors will be zero (still images only). "
@@ -4671,12 +4772,17 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
     if (rt != g.runtime) return;
     static int destroys = 0;
     if (++destroys <= 8) Log("[feed] effect runtime %p destroyed", (void *)rt);
-    // D3D11 path: the DLSS 5 add-on re-arms its hooks with the runtime, so the feature is
-    // rebuilt anyway. Same-device D3D12: feature and textures live on the GAME's device and
-    // survive runtime churn -- keep them. Every feature create near a hook re-arm has been
-    // a crash risk (EXEC 0x0 inside the add-on, sometimes fatal on a foreign thread), so
-    // the fewer creates, the better.
-    if (g.dev12_owned) ReleaseFrameResources();
+    // Same-device D3D12: feature and textures live on the GAME's device and survive runtime
+    // churn -- keep them. D3D11 bridge: the shared textures live on the game's D3D11 device
+    // and our private D3D12 device, neither of which dies with the ReShade runtime -- keep
+    // them too, so the re-init goes through RecreateFeatureOnly (feature-only, keeps the old
+    // feature if the new create fails or crashes) instead of a full rebuild whose crashed
+    // create latched the feed off permanently (alt-tab, issue #25). Every feature create
+    // near a hook re-arm has been a crash risk (EXEC 0x0 inside the add-on, sometimes fatal
+    // on a foreign thread), so the fewer creates -- and the smaller each one -- the better.
+    // Vulkan/OpenGL transports keep their release: their game-side imports are tied to
+    // swapchain state that churns with the runtime.
+    if (g.dev12_owned && g.dev11 == nullptr) ReleaseFrameResources();
     g.runtime = nullptr;
     g.technique = {}; g.launchpad = {}; g.color_var = {}; g.mv_var = {}; g.depth_var = {}; g.mask_var = {};
     g.handles_ok = false;
@@ -4684,7 +4790,15 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 
 static void OnReloadedEffects(reshade::api::effect_runtime *rt)
 {
-    if (rt == g.runtime || g.runtime == nullptr) { g.runtime = rt; ResolveHandles(rt); }
+    if (rt == g.runtime || g.runtime == nullptr)
+    {
+        g.runtime = rt;
+        ResolveHandles(rt);
+        // A reload recompiles the MV provider, which writes zero vectors until its own
+        // history re-fills -- discard the DLSS history built on those frames instead of
+        // smearing it forward (Space Engineers reload bursts).
+        g.need_reset = true;
+    }
 }
 
 static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::effect_technique technique,

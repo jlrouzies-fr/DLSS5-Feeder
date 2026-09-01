@@ -422,7 +422,12 @@ the pixel is flagged in a `DLSS5_Mask` texture the add-on passes to DLSS as its
   survives alt-tabs and effect reloads untouched (only a real resolution change rebuilds).
 * NGX calls are wrapped in SEH, a command list the add-on crashed in is discarded rather than
   submitted, and NGX is reinitialized after repeated failures — a faulting closed-source add-on
-  disables the feed instead of taking the game down.
+  disables the feed instead of taking the game down. A failed or crashed feature create is
+  retried up to twice, each attempt spaced a full hook-arming grace apart (with an NGX
+  re-initialisation before the second), instead of latching the feed off on the spot. On the
+  D3D11 bridge the shared textures and the live feature also survive alt-tabs and effect
+  reloads now: a runtime recreation re-creates only the feature, and keeps the old one if the
+  new create fails.
 
 ### The 32-bit path
 
