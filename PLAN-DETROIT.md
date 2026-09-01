@@ -185,6 +185,74 @@ points at `G:\Games\Ryujing-DLSS\dlss5-vk-bridge.json`, which **does not exist o
 loader skips a dangling manifest, so it is not the cause, but it should be cleaned up so it
 cannot confuse a future Vulkan investigation.
 
+## Resolution (2026-09-01, DOOM 2016 + Smooth Motion, branch `vulkanAndOptimization`)
+
+DOOM 2016 with Smooth Motion on turned out to be the better test bed than Detroit — a
+proven-working row that breaks only when the pacer is switched on. Three builds later the
+mechanism is identified, and it is **not fixable from inside a ReShade add-on**.
+
+**What the runs established, in order:**
+
+1. **`async_home=1`** — copy home carries frame `n-1` and waits on fence `n-1`, so the game's
+   present path holds no cross-API stall. **No change.** The stall was not the mechanism.
+2. **The present hook** reported `last swapchain image index 0` on *every* present. Under the
+   pacer the app is writing one image over and over, so there is no ring protecting a frame that
+   is still being read. (The present *ratio* it also reports is an undercount and should not be
+   trusted: the hook sits on `vulkan-1.dll`'s exported `vkQueuePresentKHR`, and an engine using
+   device-level dispatch bypasses it entirely. The earlier reading of "no pacer warning fired,
+   therefore presents ≈ feeds" was wrong for that reason.)
+3. **`sync_home=1`** — flush and CPU-block until the copy home has actually finished on the GPU
+   before the technique callback returns, i.e. before the game presents. **This changed the
+   symptom**, the only thing in the whole investigation that did: from "stuck on old frames" to
+   **"flicker between the correct image and the previously stuck frames"**.
+
+4. **`SmoothMotionTest.fx`** (`shaders/`, kept) — feeder disabled, one diagnostic effect on:
+   a full-frame tint, a wall-clock-driven sweeping bar, and a per-frame alternating corner
+   block. Read at the time as "ReShade survives the pacer". **That reading was too confident**:
+   a moving bar and a 1-frame-alternating block both look "steady" at 100+ fps even if every
+   second frame drops them entirely, and the tint used a *saturating add*, which is invisible on
+   an already-bright centre and reads as a vignette — exactly what was reported. The shader now
+   blends instead of adding, so a future run of it means something. Treat that pass as
+   inconclusive, not as evidence.
+5. **`async_home=2`** — one queue submit per frame. Our two submits per frame (inputs+release,
+   then a second buffer for the copy home after the cross-API fence) were the last structural
+   difference between us and a normal game, and a pacer inferring frame boundaries from
+   submissions would pair the wrong frames. With the copy home carrying `n-1` it no longer
+   depends on this frame's evaluate, so it rides the input command buffer and the frame leaves
+   as a single submission. **Symptom changed again, to the same place `sync_home` reached:**
+   flicker between frames that are correctly DLSS-processed and frames that are not.
+
+**Tests 3 and 5 converge, and that convergence is the diagnosis.** Two independent routes — force
+the writes complete before present, or make the frame a single normal-shaped submission — both
+end at: *real* presented frames carry our output correctly, and the frames in between do not.
+Those in-between frames are the pacer's **generated** ones. The interpolator builds them from its
+own source, captured at a point that does not include anything done during the effect chain. So:
+
+- Our side can be made arbitrarily correct, arbitrarily early, and structurally
+  indistinguishable from a normal game's frame — tests 3 and 5 prove all three.
+- We still cannot make the driver's interpolator read what we wrote. Its source and capture point
+  are internal to the ICD, below every layer, and nothing an add-on can reach.
+
+**Net effect of the two knobs, if anyone wants the least-bad behaviour under a pacer:** the
+symptom moves from *stuck on very old frames* (unusable) to *alternating processed/unprocessed
+frames* (still unusable, but every real frame is correct). That is a strictly better failure
+mode, not a fix, and neither knob is on by default.
+
+**Conclusion: Vulkan + NVIDIA Smooth Motion + this feeder is not reconcilable in-process.** The
+supported answer is the per-API opt-out — "Smooth Motion - Enabled APIs" (`0xB0CC0875`), clear
+bit `4` (Vulkan), which leaves Smooth Motion working for D3D11/D3D12 games. Vulkan itself is
+unaffected and stays a proven path: DOOM 2016 is correct with the pacer off.
+
+**Detroit is very likely the same thing** and was never independently confirmed to have Smooth
+Motion off — the Debug Bars check (item 1 below) is still the two-minute way to settle it. If the
+bars appear, Detroit is not a separate bug and this document closes with it.
+
+**The one avenue not tried**, recorded rather than pursued: doing the feed inside a Vulkan
+**layer** rather than a ReShade add-on. A layer sits above the ICD, so its writes would land
+before the interpolator's snapshot rather than after it. That is a second implementation of the
+whole transport for an uncertain payoff, and `layer/VkLayer_feed_vk.dll` as it exists today does
+**not** do this — it only hooks `vkCreateDevice` to append extensions.
+
 ## What to check next
 
 Reordered around the Smooth Motion clue. The first two are minutes of work and could close this
@@ -243,6 +311,17 @@ elsewhere, and a real spec-correctness fix regardless of whether it turns out su
 | `buffer_home` | `1` | Routes the Vulkan-transport copy-home (and, if it built, the inputs too) through shared linear D3D12 buffers instead of the imported images. Live-reloads (rebuild trigger). |
 | `half_home` | `0` | Diagnostic: the mode-2 copy-home paints only the **left half** of the frame, leaving the right half as whatever ReShade/the game already put there — an unambiguous split-screen "feeder output" vs. "live game" comparison, the mode-1 trick extended to the full DLSS path. |
 | `passthrough` | `0` | Diagnostic: swaps the NGX evaluate for a plain `CopyResource(OUTPUT <- COLOR)` on the same D3D12 list — identical transport, no DLSS. Requires `color_fmt == output_fmt` (an `sprintf`-format check already covers the mismatch case). |
+| `async_home` | `0` | Copy home carries the previous frame's output and waits on fence `n-1`, taking the cross-API stall out of the game's present path (the home buffer is double-slotted so the two never alias). Costs one frame of latency. Did not fix the pacer case; kept as a latency/stall option worth measuring on its own. |
+| `sync_home` | `0` | Diagnostic: flush and CPU-wait for the copy home to complete before the callback returns, i.e. before present. A full GPU drain per frame — never a shipping default. One of the two knobs that isolated the pacer's capture point (see Resolution). |
+
+`async_home=2` additionally collapses the Vulkan frame to **one queue submit** (the copy home
+rides the input command buffer). That is worth measuring as a plain optimization with no pacer
+involved — it halves our submissions per frame — but it is unverified for latency and correctness
+outside the Smooth Motion tests, which is why it is not the default.
+
+`shaders/SmoothMotionTest.fx` is the ReShade-only diagnostic: it answers "does the effect chain's
+output reach the displayed frames at all", with the feeder disabled. Its first run was misread
+(see Resolution, test 4); the tint marker has since been fixed to a blend.
 | `reset_every` | `0` | (Pre-existing.) Forces `InReset=1` on every evaluate — throws away DLSS temporal history every frame. |
 
 Plus two always-on, log-only probes (no config needed, both sample every 60 frames):
@@ -250,7 +329,13 @@ Plus two always-on, log-only probes (no config needed, both sample every 60 fram
 - **Stale probe** — `StaleProbeRecord`/`StaleProbeAnalyse` in `src/dlss5-feed.cpp`. Logs
   `stale probe (frame N): colour-in {SAME|changed} (hash), output {SAME|changed} (hash)`.
 - **Sync probe** — inline in the Vulkan-transport per-frame function. Logs
-  `sync probe: n=N sig=B wait=B | d12 in=X out=Y | vk in=X out=Y`.
+  `sync probe: n=N (waited out=M) sig=B wait=B | d12 in=X out=Y | vk in=X out=Y`.
+- **Present probe / pacer detector** — `feed_vk_hook.h` hooks `vkQueuePresentKHR` and logs
+  `present probe: P presents / F frames fed (R), last swapchain image index I` every 120 frames,
+  warning once when presents outnumber frames fed. **Caveat: `P` is an undercount** — the hook is
+  on `vulkan-1.dll`'s exported symbol, so presents dispatched through a device-level function
+  pointer never reach it. Treat the *ratio* as a lower bound; the *image index* is reliable and
+  was the useful half.
 
 Both are cheap (a 64×64 readback / a semaphore query) and safe to leave on in any deploy; they
 only add log lines.

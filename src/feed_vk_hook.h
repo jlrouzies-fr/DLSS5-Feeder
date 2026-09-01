@@ -91,7 +91,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookQueuePresent(VkQueue queue, cons
     // The pacer signature. Only meaningful once the feed has run for a while, and
     // only said once: a real pacer keeps the ratio up for the whole session.
     const LONG64 fed = g_vk_feed_frames;
-    if (!g_vk_pacer_warned && fed > 300 && presents > fed + fed / 4)
+    if (!g_vk_pacer_warned && fed > 120 && presents > fed + fed / 4)
     {
         g_vk_pacer_warned = true;
         Log("[feed] an external frame pacer is presenting this swapchain: %lld presents against %lld frames fed "

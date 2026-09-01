@@ -556,6 +556,15 @@ struct Cfg
                            // output and waits on fence n-1, so the game's present path never
                            // stalls on this frame's cross-API evaluate. Costs one frame of
                            // latency; needs buffer_home (the buffer is double-slotted).
+                           // 2 = the same, recorded into the SAME command buffer as the input
+                           // copies, so the whole frame is ONE queue submit -- the shape a
+                           // normal game has, and the one structural difference left between
+                           // us and a game an in-driver frame pacer is happy with.
+    int   sync_home;       // Vulkan transport: 1 = flush and CPU-wait for the copy home to
+                           // FINISH before the technique callback returns, i.e. before the
+                           // game presents. Costs a full GPU drain every frame. It exists to
+                           // answer one question: does an external consumer of the swapchain
+                           // image (a driver frame pacer) read it before our writes land?
     int   passthrough;     // diagnostic: mode-2 with the NGX evaluate swapped for a plain
                            // CopyResource(OUTPUT <- COLOR) -- the whole transport runs, DLSS
                            // does not. Separates "transport lags" from "DLSS output lags".
@@ -563,7 +572,7 @@ struct Cfg
     float mv_scale_y;
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 2000, 1, 0, 0, 0, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 2000, 1, 0, 0, 0, 0, 1.0f, 1.0f };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -598,12 +607,13 @@ static void CfgWriteDefault()
             "gpu_timeout_ms=%d\n"
             "buffer_home=%d\n"
             "async_home=%d\n"
+            "sync_home=%d\n"
             "mv_scale_x=%.3f\n"
             "mv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
-            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -639,6 +649,7 @@ static bool CfgReload()
         else if (_stricmp(key, "gpu_timeout_ms") == 0) next.gpu_timeout_ms  = iv;
         else if (_stricmp(key, "buffer_home")    == 0) next.buffer_home    = iv;
         else if (_stricmp(key, "async_home")     == 0) next.async_home     = iv;
+        else if (_stricmp(key, "sync_home")      == 0) next.sync_home      = iv;
         else if (_stricmp(key, "half_home")      == 0) next.half_home      = iv;
         else if (_stricmp(key, "passthrough")    == 0) next.passthrough    = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
@@ -659,11 +670,11 @@ static bool CfgReload()
     if (!changed) return false;
     g_cfg = next;
     Log("[feed] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d warmup_rebuild=%d "
-        "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% gpu_timeout_ms=%d buffer_home=%d async_home=%d mv_scale=%.3f,%.3f",
+        "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% gpu_timeout_ms=%d buffer_home=%d async_home=%d sync_home=%d mv_scale=%.3f,%.3f",
         g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
         g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay,
         g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
-        g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+        g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     return rebuild;
 }
 
@@ -679,11 +690,11 @@ static void CfgSave()
     fprintf(f,
         "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
             "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\ngpu_timeout_ms=%d\n"
-            "buffer_home=%d\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+            "buffer_home=%d\nasync_home=%d\nsync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
-            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
 }
 
@@ -3688,6 +3699,28 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
             g.need_reset = false;
 
+            // async_home=2: the copy home carries frame n-1, which does not depend on
+            // anything this frame does on the D3D12 side -- so it can ride the SAME
+            // command buffer as the input copies. One submit per frame, the shape a
+            // normal game has. The entry acquire above already published last frame's
+            // D3D12 writes; the fence wait before the flush orders them.
+            const bool one_submit = g_cfg.async_home >= 2 && g.home_slice != 0 &&
+                                    g.vk_home_buf != VK_NULL_HANDLE;
+            if (one_submit)
+            {
+                if (n > 1)
+                {
+                    const UINT wh1 = g_cfg.half_home != 0 ? w / 2 : w;
+                    FeedVkCopyBufferToImage(&g.vk, cb, g.vk_home_buf, bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                            wh1, h, g.home_pitch / HomeTexelBytes(g.output_fmt),
+                                            g.home_slice * ((n - 1) & 1));
+                }
+                const resource       res1[1]  = { bb_res };
+                const resource_usage from1[1] = { resource_usage::copy_dest };
+                const resource_usage to1[1]   = { resource_usage::render_target };
+                cl->barrier(1, res1, from1, to1);
+            }
+
             // Hand the images to the D3D12 device: release ownership to
             // VK_QUEUE_FAMILY_EXTERNAL. This is what makes this frame's input copies
             // *available* to the evaluate over there -- the in-fence below only orders
@@ -3706,6 +3739,11 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             g.vk_released = true;
 
             Breadcrumb("signalling the game-side fence (Vulkan)");
+            // One-submit mode orders the copy home against the PREVIOUS frame's evaluate
+            // here, so the whole frame still leaves as a single submission. (If ReShade's
+            // backend flushes inside wait(), the count goes back to two and the experiment
+            // is inconclusive -- the log line below says which we got.)
+            if (one_submit && n > 1) g.rs_queue->wait(g.rs_fence_out, n - 1);
             g.rs_queue->flush_immediate_command_list();
             const bool sig_ok = g.rs_queue->signal(g.rs_fence_in, n);
 
@@ -3837,6 +3875,36 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
             // The copy home lands on the fresh immediate list, which executes on the
             // game's queue after the wait below -- GPU-ordered, no CPU stall.
+            if (one_submit)
+            {
+                // Nothing more to record: the copy home already went out with the inputs.
+                static bool said_one = false;
+                if (!said_one)
+                {
+                    said_one = true;
+                    Log("[feed] async_home=2: one queue submit per frame (copy home rides the input buffer)");
+                }
+                if (done)
+                {
+                    const UINT64 fn = ++g.frames_done;
+                    g.consecutive_fails = 0;
+                    if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
+                        Log("[feed] frame %llu delivered (%ux%u, reset=%d, Vulkan transport, 1 submit)",
+                            fn, g.width, g.height, reset);
+                    FeedVkPresentTick(fn, 120);
+                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy &&
+                        fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                    {
+                        g.warmup_done = true;
+                        g.frame_ready = false;
+                        Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu, Vulkan transport)", fn);
+                    }
+                }
+                QueryPerformanceCounter(&t1);
+                TimingTick(t0.QuadPart, t1.QuadPart);
+                return;
+            }
+
             Breadcrumb("waiting for the result (Vulkan)");
             // async_home: wait for the PREVIOUS frame's evaluate, not this one. The game's
             // present path then never carries a cross-API stall of unbounded length -- which
@@ -3907,6 +3975,20 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 cl->barrier(1, res, from, to);
             }
 
+            // sync_home: submit the copy home and block until the GPU has finished it,
+            // before this callback returns and the game presents. Everything else in this
+            // path is GPU-ordered against the game's own queue, which is sufficient for a
+            // normal swapchain -- but an in-driver frame pacer consumes the presented image
+            // on its own schedule and may not be ordered against us at all. If forcing the
+            // writes to be complete before present fixes the image, that is the answer; if
+            // it does not, no in-process ordering can, because there is nothing left to
+            // order. Costs a full drain per frame: a diagnostic, not a shipping default.
+            if (g_cfg.sync_home != 0)
+            {
+                g.rs_queue->flush_immediate_command_list();
+                g.rs_queue->wait_idle();
+            }
+
             if (done)
             {
                 const UINT64 fn = ++g.frames_done;
@@ -3914,7 +3996,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
                     Log("[feed] frame %llu delivered (%ux%u, reset=%d, Vulkan transport)", fn, g.width, g.height, reset);
                 // Feeds the pacer detector (presents vs. frames fed) and reports periodically.
-                FeedVkPresentTick(fn, 600);
+                FeedVkPresentTick(fn, 120);
 
                 if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
                 {

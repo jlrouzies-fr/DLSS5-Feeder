@@ -20,6 +20,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <mmsystem.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <cstdio>
@@ -429,7 +430,6 @@ static ID3D12CommandAllocator     *g_pump_alloc;
 static ID3D12GraphicsCommandList  *g_pump_list;
 static ID3D12Fence                *g_pump_fence;
 static UINT64                      g_pump_val;
-static HANDLE                      g_pump_ev;
 
 static bool BeginCommands();
 static UINT64 EndCommands();
@@ -558,7 +558,6 @@ static void InitBanner()
                                  __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g_pump_list));
     if (g_pump_list != nullptr) g_pump_list->Close();
     h.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g_pump_fence));
-    g_pump_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     h.swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_swap3));
     Log("[host] banner ready");
 }
@@ -566,11 +565,21 @@ static void InitBanner()
 typedef HRESULT (WINAPI *PFN_D3D12CreateDevice_)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
 typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1_)(REFIID, void **);
 
-static void PumpPresent()
+// The message drain always runs -- it is what keeps the window responsive. The banner
+// copy and the Present behind it are throttled: they used to run on every frame message,
+// putting a swapchain Present and a CPU wait for our own copy inside the game's frame
+// (issue #15). The banner is static, so ~10 Hz is indistinguishable; force=true is for
+// the settle loops that genuinely need the Presents to happen now.
+static void PumpPresent(bool force = false)
 {
     MSG msg;
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     if (h.swap == nullptr) return;
+
+    static ULONGLONG last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (!force && now - last < 100) return;
+    last = now;
 
     // Paint the banner into the backbuffer (ReShade's overlay composites on top at Present).
     if (g_banner != nullptr && g_pump_list != nullptr && g_swap3 != nullptr)
@@ -579,7 +588,10 @@ static void PumpPresent()
         if (SUCCEEDED(g_swap3->GetBuffer(g_swap3->GetCurrentBackBufferIndex(), __uuidof(ID3D12Resource),
                                          reinterpret_cast<void **>(&bb))) && bb != nullptr)
         {
-            if (SUCCEEDED(g_pump_alloc->Reset()) && SUCCEEDED(g_pump_list->Reset(g_pump_alloc, nullptr)))
+            // Resetting an allocator the GPU is still reading is the hazard the old
+            // blocking wait guarded against; skip this tick rather than wait for it.
+            if (g_pump_fence->GetCompletedValue() >= g_pump_val &&
+                SUCCEEDED(g_pump_alloc->Reset()) && SUCCEEDED(g_pump_list->Reset(g_pump_alloc, nullptr)))
             {
                 D3D12_RESOURCE_BARRIER b = {};
                 b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -596,11 +608,6 @@ static void PumpPresent()
                 ID3D12CommandList *lists[] = { g_pump_list };
                 h.pump_queue->ExecuteCommandLists(1, lists);
                 h.pump_queue->Signal(g_pump_fence, ++g_pump_val);
-                if (g_pump_fence->GetCompletedValue() < g_pump_val && g_pump_ev != nullptr)
-                {
-                    g_pump_fence->SetEventOnCompletion(g_pump_val, g_pump_ev);
-                    WaitForSingleObject(g_pump_ev, 100);
-                }
             }
             bb->Release();
         }
@@ -670,7 +677,7 @@ static bool InitDisguise()
         SetWindowPos(h.hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     Log("[host] disguise up: hidden window + D3D12 swapchain (ReShade should be attached now)");
 
-    for (int i = 0; i < 60; ++i) PumpPresent();   // let ReShade + the DLSS 5 add-on settle
+    for (int i = 0; i < 60; ++i) PumpPresent(true);   // let ReShade + the DLSS 5 add-on settle
 
     // Ring + internal fence for our own submissions.
     for (int i = 0; i < Host::kFrames; ++i)
@@ -884,7 +891,7 @@ static int RunTest()
     if (!color || !output || !depth || !mv) { Log("[host] test texture creation failed"); return 1; }
 
     // Give the DLSS 5 add-on its hook-arming time, with the swapchain pumping.
-    for (int i = 0; i < 120; ++i) { PumpPresent(); Sleep(8); }
+    for (int i = 0; i < 120; ++i) { PumpPresent(true); Sleep(8); }
 
     int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure |
                 NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
@@ -894,7 +901,7 @@ static int RunTest()
     int good = 0;
     for (int i = 0; i < 300; ++i)
     {
-        PumpPresent();
+        PumpPresent(true);
         if (Evaluate(color, output, depth, mv, W, H, i == 0 ? 1 : 0, 1.0f, 1.0f)) ++good;
         else break;
         if (i == 180)   // the warm-up re-create, same medicine as in-game
@@ -915,22 +922,58 @@ static int RunTest()
 // Serve mode: the real pipe server for a 32-bit game
 // ---------------------------------------------------------------------------
 
-static bool ReadFull(HANDLE pipe, void *buf, DWORD len)
+// The pipe is opened FILE_FLAG_OVERLAPPED (the serve loop needs a pended read it can
+// wait on alongside the window's message queue), so every synchronous transfer has to
+// carry an OVERLAPPED and block on it here. Byte-mode pipes may satisfy a read short,
+// hence the loop; the game's end stays an ordinary blocking handle and is unaffected.
+static bool TransferFull(HANDLE pipe, void *buf, DWORD len, bool write)
 {
-    DWORD got = 0;
-    return ReadFile(pipe, buf, len, &got, nullptr) && got == len;
+    HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (ev == nullptr) return false;
+    BYTE *p = static_cast<BYTE *>(buf);
+    bool ok = true;
+    for (DWORD left = len; left > 0; )
+    {
+        OVERLAPPED ov = {};
+        ov.hEvent = ev;
+        ResetEvent(ev);
+        DWORD moved = 0;
+        const BOOL started = write ? WriteFile(pipe, p, left, nullptr, &ov)
+                                   : ReadFile(pipe, p, left, nullptr, &ov);
+        if (!started && GetLastError() != ERROR_IO_PENDING) { ok = false; break; }
+        if (!GetOverlappedResult(pipe, &ov, &moved, TRUE) || moved == 0) { ok = false; break; }
+        p    += moved;
+        left -= moved;
+    }
+    CloseHandle(ev);
+    return ok;
 }
+
+static bool ReadFull(HANDLE pipe, void *buf, DWORD len) { return TransferFull(pipe, buf, len, false); }
+static bool WriteFull(HANDLE pipe, const void *buf, DWORD len)
+{ return TransferFull(pipe, const_cast<void *>(buf), len, true); }
 
 static int Serve(DWORD game_pid)
 {
     char name[128];
     sprintf_s(name, FEED_PIPE_FMT, static_cast<unsigned long>(game_pid));
-    HANDLE pipe = CreateNamedPipeA(name, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+    HANDLE pipe = CreateNamedPipeA(name, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                                    1, 1024, 1024, 0, nullptr);
     if (pipe == INVALID_HANDLE_VALUE) { Log("[host] CreateNamedPipe failed %lu", GetLastError()); return 1; }
     Log("[host] serving on %s", name);
-    if (!ConnectNamedPipe(pipe, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED)
-    { Log("[host] ConnectNamedPipe failed %lu", GetLastError()); return 1; }
+    {
+        HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        OVERLAPPED ov = {};
+        ov.hEvent = ev;
+        DWORD ignored = 0;
+        const BOOL connected = ConnectNamedPipe(pipe, &ov);
+        const DWORD err = GetLastError();
+        if (!connected && err == ERROR_IO_PENDING) GetOverlappedResult(pipe, &ov, &ignored, TRUE);
+        else if (!connected && err != ERROR_PIPE_CONNECTED)
+        { Log("[host] ConnectNamedPipe failed %lu", err); CloseHandle(ev); return 1; }
+        CloseHandle(ev);
+    }
 
     // A v1 client's hello is three uint32s; v2 appends client_kind. Read the common
     // prefix, then only what this client's version actually sent -- reading the full
@@ -946,8 +989,7 @@ static int Serve(DWORD game_pid)
     // Nothing else may be read -- FeedBuild and FeedBuildAck changed size between
     // versions, so a mismatched pair would desync the pipe on the very next message.
     FeedHelloAck ack = { FEED_IPC_MAGIC, FEED_IPC_VERSION };
-    DWORD put = 0;
-    WriteFile(pipe, &ack, sizeof(ack), &put, nullptr);
+    WriteFull(pipe, &ack, sizeof(ack));
     if (hello.version != FEED_IPC_VERSION)
     {
         Log("[host] the game add-on speaks protocol v%u, this host v%u -- the two halves are from "
@@ -989,26 +1031,42 @@ static int Serve(DWORD game_pid)
     bool   warm_done  = g_renodx_lazy;   // v45+ adopts missed creates on its own
     int    build_fails = 0;
 
+    // The tag read stays pended across pump ticks: a plain blocking ReadFile starves
+    // the message pump (and Present) whenever the game stops feeding frames -- paused,
+    // loading, a menu -- and Windows shows the host window as "Not Responding". Polling
+    // it with a Sleep instead cost the game a whole timer quantum of latency on EVERY
+    // frame (issue #15). Waiting on the read's own event together with the message queue
+    // gives both: an instant wake on the next tag byte, and a live window in between.
+    HANDLE     ev_tag  = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    OVERLAPPED ov_tag  = {};
+    bool       pending = false;
+    BYTE       tag     = 0;
+    if (ev_tag == nullptr) { Log("[host] tag event creation failed %lu", GetLastError()); return 1; }
+
     for (;;)
     {
-        // Peek the next message type by size: Build (big) vs FrameMsg (small).
-        // The pipe is byte-mode from a single writer, so read the smaller header
-        // first and decide -- FeedFrameMsg and FeedBuild share no prefix, so the
-        // client precedes every message with a 1-byte tag instead.
-        //
-        // A plain blocking ReadFile here starves the message pump (and Present)
-        // whenever the game stops feeding frames -- paused, loading, a menu -- and
-        // Windows shows the host window as "Not Responding". Poll instead, so the
-        // window (and its ReShade overlay) stays alive and clickable at all times.
-        BYTE tag = 0;
+        // Build (big) and FrameMsg (small) share no prefix, so the client precedes
+        // every message with a 1-byte tag and we dispatch on that.
         bool tag_read = false;
         for (;;)
         {
-            DWORD avail = 0;
-            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr)) break;   // pipe broken
-            if (avail > 0) { tag_read = ReadFull(pipe, &tag, 1); break; }
-            PumpPresent();
-            Sleep(8);
+            if (!pending)
+            {
+                ov_tag = {};
+                ov_tag.hEvent = ev_tag;
+                ResetEvent(ev_tag);
+                if (!ReadFile(pipe, &tag, 1, nullptr, &ov_tag) && GetLastError() != ERROR_IO_PENDING)
+                    break;                                   // pipe broken or closed
+                pending = true;
+            }
+            const DWORD r = MsgWaitForMultipleObjects(1, &ev_tag, FALSE, 100, QS_ALLINPUT);
+            if (r == WAIT_OBJECT_0 + 1 || r == WAIT_TIMEOUT) { PumpPresent(); continue; }
+            if (r != WAIT_OBJECT_0) break;
+            DWORD got = 0;
+            if (!GetOverlappedResult(pipe, &ov_tag, &got, FALSE) || got != 1) { pending = false; break; }
+            pending  = false;
+            tag_read = true;
+            break;
         }
         if (!tag_read) { Log("[host] pipe closed by the game"); break; }
 
@@ -1117,7 +1175,7 @@ static int Serve(DWORD game_pid)
             back.fence_out  = reinterpret_cast<uint64_t>(game_out);
             back.output_fmt = static_cast<uint32_t>(out_fmt);
             for (int i = 0; i < FEED_SLOTS; ++i) { back.tex[i] = game_tex[i]; back.tex_size[i] = tex_size[i]; }
-            WriteFile(pipe, &back, sizeof(back), &put, nullptr);
+            WriteFull(pipe, &back, sizeof(back));
         }
         else if (tag == 'F')
         {
@@ -1125,9 +1183,13 @@ static int Serve(DWORD game_pid)
             if (!ReadFull(pipe, &fm, sizeof(fm))) break;
             if (h.feature == nullptr && !transport_only) { h.fence_out->Signal(fm.n); continue; }
 
-            if (!WaitFenceValue(h.fence_in, fm.n, 2000))
-            { Log("[host] frame %llu: in-fence never arrived", (unsigned long long)fm.n); h.fence_out->Signal(fm.n); continue; }
-            h.queue->Wait(h.fence_in, fm.n);   // belt and braces on the GPU timeline
+            // Order the evaluate behind the game's input copies on the GPU timeline and
+            // move on. This used to block the CPU on the same value first, which
+            // serialized the two processes frame by frame for no ordering benefit
+            // (issue #15). A game whose GPU never reaches fm.n now surfaces three frames
+            // later as BeginCommands' allocator-retire timeout, which fails the evaluate
+            // and CPU-signals fence_out below -- the never-hang guarantee is unchanged.
+            h.queue->Wait(h.fence_in, fm.n);
 
             bool done = false;
             if (transport_only)
@@ -1188,6 +1250,8 @@ static int Serve(DWORD game_pid)
     // nothing will ever satisfy, wedging the game's whole GPU queue -- Present
     // included -- until the driver TDRs (seen once as a system-wide freeze). Drain our
     // own queue, then release every wait the game could possibly hold.
+    if (pending) { CancelIo(pipe); DWORD got = 0; GetOverlappedResult(pipe, &ov_tag, &got, TRUE); }
+    CloseHandle(ev_tag);
     WaitFenceValue(h.fence, h.fence_value, 2000);
     if (h.fence_out != nullptr) h.fence_out->Signal(UINT64_MAX);
     Log("[host] pending game fence waits released; exiting");
@@ -1204,6 +1268,12 @@ int main(int argc, char **argv)
     { FILE *f = nullptr; if (fopen_s(&f, g_log_path, "w") == 0 && f) fclose(f); }
 
     Log("dlss5-feed-host64 (built %s %s)", __DATE__, __TIME__);
+
+    // Every Sleep in this process is a frame-pacing decision: at the default 15.6 ms
+    // timer tick a Sleep(1) lands at 15.6 ms, and the serve loop's poll alone used to
+    // cap the game near 35 fps (issue #15). No timeEndPeriod -- this is a dedicated
+    // helper, and process exit restores the resolution anyway.
+    timeBeginPeriod(1);
 
     bool  test = false, hide = false;
     DWORD pid = 0;
