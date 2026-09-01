@@ -740,7 +740,7 @@ static void HostLost(const char *why)
 {
     Log("[feed32] host lost: %s", why);
     HostClose();
-    FeedDisable("the 64-bit host went away");
+    FeedDisable("the 64-bit host went away -- its own dlss5-feed-host.log (in host64\\) names the reason");
 }
 
 static bool HostAlive()
@@ -819,7 +819,17 @@ static bool EnsureHost()
 
     const uint32_t kind = g.is_vulkan ? FEED_CLIENT_VULKAN : g.is_gl ? FEED_CLIENT_GL : FEED_CLIENT_D3D11;
     const char *kind_name = g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : "D3D11";
-    FeedHello hello = { FEED_IPC_MAGIC, FEED_IPC_VERSION, GetCurrentProcessId(), kind };
+    // Hand the host a handle to this process instead of making it OpenProcess(pid): a
+    // protective DACL on the game (anti-cheat/DRM; seen on vanilla WoW) denies that with
+    // error 5, and this duplication never consults the game's DACL -- both process handles
+    // involved are ours (the pseudo-handle, and the one CreateProcess just returned).
+    HANDLE self_in_host = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), g.hproc, &self_in_host,
+                         PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, 0))
+        Log("[feed32] could not duplicate our process handle into the host (%lu); it will fall back to OpenProcess",
+            GetLastError());
+    FeedHello hello = { FEED_IPC_MAGIC, FEED_IPC_VERSION, GetCurrentProcessId(), kind,
+                        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(self_in_host)) };
     FeedHelloAck ack = {};
     if (!PipeWrite(&hello, sizeof(hello)) || !PipeRead(&ack, sizeof(ack)) || ack.magic != FEED_IPC_MAGIC)
     { HostLost("handshake failed"); return false; }
@@ -2570,7 +2580,14 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 
 static void OnReloadedEffects(reshade::api::effect_runtime *rt)
 {
-    if (rt == g.runtime || g.runtime == nullptr) { g.runtime = rt; ResolveHandles(rt); }
+    if (rt == g.runtime || g.runtime == nullptr)
+    {
+        g.runtime = rt;
+        ResolveHandles(rt);
+        // A reload recompiles the MV provider, which writes zero vectors until its own
+        // history re-fills -- discard the DLSS history built on those frames.
+        g.need_reset = true;
+    }
 }
 
 static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::effect_technique technique,

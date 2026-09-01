@@ -986,6 +986,8 @@ static int Serve(DWORD game_pid)
     { Log("[host] bad hello"); return 1; }
     if (hello.version >= 2 && !ReadFull(pipe, &hello.client_kind, sizeof(hello.client_kind)))
     { Log("[host] truncated hello"); return 1; }
+    if (hello.version >= 4 && !ReadFull(pipe, &hello.self_process, sizeof(hello.self_process)))
+    { Log("[host] truncated hello (v4 self_process)"); return 1; }
 
     // Answer first, THEN bail on a mismatch: the ack carries our version, so the
     // add-on can name the problem in the game's log instead of just timing out.
@@ -1008,8 +1010,29 @@ static int Serve(DWORD game_pid)
     Log("[host] game pid %u connected (protocol v%u, %s client -- %s creates the shared textures)",
         hello.pid, hello.version, client_name, host_creates ? "this host" : "the game");
 
-    HANDLE hgame = OpenProcess(PROCESS_DUP_HANDLE, FALSE, hello.pid);
-    if (hgame == nullptr) { Log("[host] OpenProcess failed %lu", GetLastError()); return 1; }
+    // Prefer the handle the game duplicated in (v4+): OpenProcess is denied with error 5
+    // by DACL-protected game processes (anti-cheat/DRM -- the vanilla-WoW report), and
+    // the handed-over handle needs no access check at all.
+    HANDLE hgame = nullptr;
+    if (hello.version >= 4 && hello.self_process != 0)
+    {
+        HANDLE h2 = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(hello.self_process));
+        if (GetProcessId(h2) == hello.pid)
+            hgame = h2;
+        else
+            Log("[host] the handed-over process handle does not name pid %u; falling back to OpenProcess", hello.pid);
+    }
+    if (hgame == nullptr)
+    {
+        hgame = OpenProcess(PROCESS_DUP_HANDLE, FALSE, hello.pid);
+        if (hgame == nullptr)
+        {
+            Log("[host] OpenProcess failed %lu -- the game's process denies handle access "
+                "(a protective DACL from anti-cheat/DRM, or an elevation mismatch), and the "
+                "add-on did not hand a handle over", GetLastError());
+            return 1;
+        }
+    }
 
     // Shared fences live for the whole session.
     HANDLE hin = nullptr, hout = nullptr;

@@ -38,7 +38,9 @@
 // FEED_CLIENT_VULKAN and FeedBuildAck::output_fmt -- when the host creates the
 // textures it also OWNS the output-format choice (the typed-UAV-store fallback needs
 // a D3D12 device to ask), and the game must know the real format to import the
-// VkImage and to decide copy-vs-blit for the way home.
+// VkImage and to decide copy-vs-blit for the way home. Version 4 added
+// FeedHello::self_process so the host no longer OpenProcess()es the game, which a
+// protective DACL on the game process denies (error 5 -- the vanilla-WoW report).
 //
 // Both sides refuse a version they do not understand rather than misparsing it: the
 // struct sizes differ between versions, so a mismatched pair would desync the pipe.
@@ -47,7 +49,7 @@
 #include <cstdint>
 
 #define FEED_IPC_MAGIC   0x35534C44u  // 'DLS5'
-#define FEED_IPC_VERSION 3u
+#define FEED_IPC_VERSION 4u
 #define FEED_PIPE_FMT    "\\\\.\\pipe\\dlss5-feed.%lu"   // %lu = game PID
 
 // The bytes a version-1 client sends as its hello: magic, version, pid.
@@ -72,6 +74,12 @@ struct FeedHello        // game -> host, once
     uint32_t version;
     uint32_t pid;
     uint32_t client_kind;   // v2+: FeedClientKind. Absent (and 0) from a v1 client.
+    uint64_t self_process;  // v4+: a handle to the game process, valid IN THE HOST -- the game
+                            // duplicates it in via the process handle CreateProcess gave it.
+                            // The host used to OpenProcess(pid), which a protective DACL on the
+                            // game process denies (error 5: anti-cheat/DRM, elevation mismatch);
+                            // handing the handle over needs no access to the game's DACL at all.
+                            // 0 = the duplication failed; the host falls back to OpenProcess.
 };
 
 struct FeedHelloAck     // host -> game, once
