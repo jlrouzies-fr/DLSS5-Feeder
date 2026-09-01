@@ -56,7 +56,7 @@
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
 
-#define FEED_VERSION "0.10.0-beta.2"
+#define FEED_VERSION "0.10.0-beta.3"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -447,6 +447,80 @@ static void DetectToolkitAddon()
 // from the DriverStore, not the game folder. It can also arrive after this add-on
 // does, so OnInitEffectRuntime re-checks.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// A stale d3dcompiler_47.dll in the game folder
+//
+// LoadLibrary("d3dcompiler_47.dll") is resolved by the normal search order, and the
+// application directory beats System32 (it is not a KnownDLL). Plenty of games ship
+// their own copy from the Windows 8.1 SDK era; that build knows nothing newer than
+// Shader Model 5.0 and rejects a cs_5_1 target outright:
+//
+//   error X3506: unrecognized compiler target 'cs_5_1'
+//
+// The DLSS 5 add-on's neural proxy-encode pass is compiled as cs_5_1, so under such a
+// copy it fails EVERY frame while everything else keeps working -- our own blit shaders
+// are vs_5_0/ps_5_0, the feed reports frames delivered, and neural rendering silently
+// does nothing. Reported on Space Engineers; confirmed fixed by deleting the file.
+//
+// The verdict is a live compile, not the path: a copy outside System32 may well be a
+// NEWER one, and only the compiler itself can say what it accepts.
+// ---------------------------------------------------------------------------
+
+static bool g_d3dcompiler_stale = false;
+static char g_d3dcompiler_path[MAX_PATH] = "";
+
+static void DetectStaleD3DCompiler()
+{
+    static bool checked = false;
+    if (checked) return;
+    checked = true;
+
+    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+    if (m == nullptr) return;   // MakeBlitShaders reports its own absence
+
+    wchar_t wpath[MAX_PATH] = {};
+    if (GetModuleFileNameW(m, wpath, MAX_PATH) == 0) return;
+    WideCharToMultiByte(CP_UTF8, 0, wpath, -1, g_d3dcompiler_path, sizeof(g_d3dcompiler_path), nullptr, nullptr);
+
+    wchar_t sysdir[MAX_PATH] = {};
+    GetSystemDirectoryW(sysdir, MAX_PATH);
+    const bool from_system = _wcsnicmp(wpath, sysdir, wcslen(sysdir)) == 0;
+
+    auto compile = reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile"));
+    if (compile == nullptr) return;
+
+    static const char kProbe[] =
+        "RWTexture2D<float4> o : register(u0);\n"
+        "[numthreads(8,8,1)] void cs(uint3 t : SV_DispatchThreadID) { o[t.xy] = 0; }\n";
+    ID3DBlob *code = nullptr, *err = nullptr;
+    const HRESULT hr = compile(kProbe, sizeof(kProbe) - 1, "sm51probe", nullptr, nullptr, "cs", "cs_5_1", 0, 0, &code, &err);
+    const bool sm51_ok = SUCCEEDED(hr) && code != nullptr;
+    if (code != nullptr) code->Release();
+
+    if (sm51_ok)
+    {
+        // Only worth a line when it is not the ordinary system copy, so a healthy run
+        // still leaves the path in the log for the next report to compare against.
+        if (!from_system) Log("[feed] d3dcompiler_47.dll: %s (not System32, but it accepts cs_5_1 -- fine)", g_d3dcompiler_path);
+        if (err != nullptr) err->Release();
+        return;
+    }
+
+    g_d3dcompiler_stale = true;
+    char msg[256] = {};
+    if (err != nullptr && err->GetBufferPointer() != nullptr)
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE, " (%.180s)", static_cast<const char *>(err->GetBufferPointer()));
+    if (err != nullptr) err->Release();
+    Log("[feed] d3dcompiler_47.dll: %s -- rejects cs_5_1, hr=0x%08X%s", g_d3dcompiler_path, hr, msg);
+    Warn("%s is too old for Shader Model 5.1. The DLSS 5 add-on compiles its neural pass as cs_5_1, so neural "
+         "rendering will silently do nothing -- this add-on will still report frames delivered, and ReShade.log "
+         "will show \"error X3506: unrecognized compiler target 'cs_5_1'\". %s",
+         g_d3dcompiler_path,
+         from_system ? "Unexpectedly this IS the System32 copy; update Windows / the graphics tools."
+                     : "Windows loads this copy in preference to the current one in System32 because it sits in "
+                       "the game folder: delete or rename it and the game will use System32's instead.");
+}
 
 static bool g_smooth_motion = false;
 
@@ -4754,6 +4828,8 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
     // The driver injects NvPresent64.dll around swapchain creation, which can be after
     // this add-on attached -- so this is the re-check DllMain's first look cannot be.
     DetectSmoothMotion();
+    // Not in DllMain: this LoadLibrary()s, which under the loader lock can deadlock.
+    DetectStaleD3DCompiler();
     // A recreated runtime means the DLSS 5 add-on has re-armed its hooks on our private
     // device: give it a fresh feature (a cheap feature-only re-create -- the textures stay).
     // On the same-device D3D12 path its hooks live on the game's device and survive; the
@@ -4880,6 +4956,12 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                            g_toolkit_ver, g_toolkit_passes, g_toolkit_passes);
     else if (strcmp(g_toolkit_ver, "not found") != 0)
         ImGui::Text("Alex's Toolkit %s: present, cascade off (single pass)", g_toolkit_ver);
+    if (g_d3dcompiler_stale)
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
+                           "d3dcompiler_47.dll is too old for Shader Model 5.1 -- NEURAL RENDERING IS DOING NOTHING.\n"
+                           "The DLSS 5 add-on's neural pass is cs_5_1 and cannot compile against it (ReShade.log: "
+                           "\"error X3506: unrecognized compiler target 'cs_5_1'\").\n"
+                           "Delete or rename %s, then restart the game.", g_d3dcompiler_path);
     if (g_smooth_motion)
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
                            "NVIDIA Smooth Motion is active (NvPresent64.dll) -- unverified with this add-on. "

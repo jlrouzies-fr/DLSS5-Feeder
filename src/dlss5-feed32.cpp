@@ -48,7 +48,7 @@
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 
-#define FEED_VERSION "0.10.0-beta.2"
+#define FEED_VERSION "0.10.0-beta.3"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =

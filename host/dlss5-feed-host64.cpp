@@ -191,6 +191,56 @@ static void DetectRenodxAddon()
 // keeps its OWN temporal history, so the cascade multiplies the effective history
 // length. With screen-space estimated motion vectors that means visible smearing behind
 // fast motion and a much slower settle after a hard camera cut. Report only.
+// A d3dcompiler_47.dll sitting next to this exe is loaded in preference to System32's
+// (it is not a KnownDLL). A Windows 8.1-SDK-era copy knows nothing past Shader Model 5.0
+// and rejects the DLSS 5 add-on's cs_5_1 neural pass with "error X3506: unrecognized
+// compiler target", every frame, silently -- the add-on keeps reporting evaluates while
+// neural rendering does nothing. The verdict is a live compile, since a copy outside
+// System32 may equally be a newer one. (Reported on Space Engineers; the 64-bit add-on
+// runs the same probe in-process, and for the split path renodx lives HERE, not in the
+// game, so this is the copy that matters.)
+static void DetectStaleD3DCompiler()
+{
+    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+    if (m == nullptr) { Log("[host] d3dcompiler_47.dll not loadable"); return; }
+
+    char path[MAX_PATH] = "?";
+    GetModuleFileNameA(m, path, MAX_PATH);
+
+    wchar_t sysdir[MAX_PATH] = {}, wpath[MAX_PATH] = {};
+    GetSystemDirectoryW(sysdir, MAX_PATH);
+    GetModuleFileNameW(m, wpath, MAX_PATH);
+    const bool from_system = _wcsnicmp(wpath, sysdir, wcslen(sysdir)) == 0;
+
+    using PFN_D3DCompile_ = HRESULT (WINAPI *)(LPCVOID, SIZE_T, LPCSTR, const void *, void *, LPCSTR, LPCSTR,
+                                               UINT, UINT, ID3DBlob **, ID3DBlob **);
+    auto compile = reinterpret_cast<PFN_D3DCompile_>(GetProcAddress(m, "D3DCompile"));
+    if (compile == nullptr) return;
+
+    static const char kProbe[] =
+        "RWTexture2D<float4> o : register(u0);\n"
+        "[numthreads(8,8,1)] void cs(uint3 t : SV_DispatchThreadID) { o[t.xy] = 0; }\n";
+    ID3DBlob *code = nullptr, *err = nullptr;
+    const HRESULT hr = compile(kProbe, sizeof(kProbe) - 1, "sm51probe", nullptr, nullptr, "cs", "cs_5_1", 0, 0, &code, &err);
+    const bool ok = SUCCEEDED(hr) && code != nullptr;
+    if (code != nullptr) code->Release();
+    if (err != nullptr) err->Release();
+
+    if (ok)
+    {
+        if (!from_system) Log("[host] d3dcompiler_47.dll: %s (not System32, but it accepts cs_5_1 -- fine)", path);
+        return;
+    }
+    Log("[host] ###############################################################");
+    Log("[host] %s is TOO OLD for Shader Model 5.1 (cs_5_1 rejected, hr=0x%08X).", path, hr);
+    Log("[host] The DLSS 5 add-on compiles its neural pass as cs_5_1, so NEURAL RENDERING WILL DO NOTHING");
+    Log("[host] while everything else looks healthy. host64\\ReShade.log will show:");
+    Log("[host]     error X3506: unrecognized compiler target 'cs_5_1'");
+    Log("[host] Fix: %s", from_system ? "unexpectedly this is the System32 copy -- update Windows."
+                                      : "delete or rename that file; System32's current copy is then used.");
+    Log("[host] ###############################################################");
+}
+
 static void DetectToolkitAddon()
 {
     char dir[MAX_PATH], path[MAX_PATH];
@@ -1318,6 +1368,7 @@ int main(int argc, char **argv)
 
     DetectRenodxAddon();   // must run BEFORE ReShade loads, so an EnableHooks write is read
     DetectToolkitAddon();
+    DetectStaleD3DCompiler();
 
     if (!InitDisguise()) return 1;
     if (!InitNgx()) { Log("[host] NGX unavailable"); return 1; }
