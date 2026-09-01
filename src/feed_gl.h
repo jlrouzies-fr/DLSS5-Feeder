@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 
 // ---------------------------------------------------------------------------
 // Types and tokens the Windows SDK's <gl/GL.h> (an OpenGL 1.1 header) lacks
@@ -205,6 +206,8 @@ struct FeedGl
     char missing[256];      // the first extension/entry point that was absent
     char renderer[128];     // GL_RENDERER, so a wrong-GPU hybrid laptop is obvious
     char version[64];       // GL_VERSION
+    char diag[448];         // how the extension query itself behaved (see FeedGlLoad)
+    bool probe_rescued;     // the string denied the interop and a live probe overrode it
 
     bool ok;
 };
@@ -229,10 +232,16 @@ static bool FeedGlHasExtension(FeedGl *gl, const char *name)
             const GLubyte *e = gl->GetStringi(GL_EXTENSIONS, static_cast<GLuint>(i));
             if (e != nullptr && strcmp(reinterpret_cast<const char *>(e), name) == 0) return true;
         }
-        if (count > 0) return false;
     }
+    // The legacy form, consulted even when the modern one answered with a non-empty
+    // list -- it is not a fallback for an empty enumeration alone. When ReShade is
+    // installed for OpenGL it IS the local opengl32.dll, and a proxy that answers one
+    // of the two enumerations need not answer the other. Letting whichever form spoke
+    // first be authoritative turns a half-answer into "this GPU cannot do interop",
+    // which disables the feed outright.
     if (gl->GetString == nullptr) return false;
     const GLubyte *all = gl->GetString(GL_EXTENSIONS);
+    if (gl->GetError != nullptr) (void)gl->GetError();       // GL_INVALID_ENUM in a core profile
     if (all == nullptr) return false;
     const char *s = reinterpret_cast<const char *>(all);
     const size_t n = strlen(name);
@@ -241,10 +250,45 @@ static bool FeedGlHasExtension(FeedGl *gl, const char *name)
     return false;
 }
 
+// Does this context actually do external-object interop, whatever the extension
+// string claims? NVIDIA's per-application profiles cap the string they report to old
+// engines -- id Tech 3 and its descendants copy glGetString(GL_EXTENSIONS) into a
+// fixed 4 KB buffer, so the driver truncates the advertised set for those executables
+// and GL_EXT_memory_object falls off the end. The capability is untouched; only the
+// advertisement is. Asking the driver to hand back a live memory object and a live
+// semaphore settles it, and settles the stub worry with it: a stub cannot produce a
+// non-zero object name and leave GL_NO_ERROR behind.
+static bool FeedGlProbeInterop(FeedGl *gl)
+{
+    const auto CreateMem = reinterpret_cast<PFN_glCreateMemoryObjectsEXT_>(gl->wglGetProcAddress("glCreateMemoryObjectsEXT"));
+    const auto DeleteMem = reinterpret_cast<PFN_glDeleteMemoryObjectsEXT_>(gl->wglGetProcAddress("glDeleteMemoryObjectsEXT"));
+    const auto GenSem    = reinterpret_cast<PFN_glGenSemaphoresEXT_>(gl->wglGetProcAddress("glGenSemaphoresEXT"));
+    const auto DelSem    = reinterpret_cast<PFN_glDeleteSemaphoresEXT_>(gl->wglGetProcAddress("glDeleteSemaphoresEXT"));
+    if (CreateMem == nullptr || DeleteMem == nullptr || GenSem == nullptr || DelSem == nullptr) return false;
+
+    // Start from a clean error state, and never trust the driver to drain (a context
+    // that reports an error forever must not hang the game in here).
+    for (int i = 0; i < 32 && gl->GetError() != GL_NO_ERROR; ++i) {}
+
+    GLuint mem = 0;
+    CreateMem(1, &mem);
+    const bool mem_ok = mem != 0 && gl->GetError() == GL_NO_ERROR;
+    if (mem != 0) DeleteMem(1, &mem);
+
+    GLuint sem = 0;
+    GenSem(1, &sem);
+    const bool sem_ok = sem != 0 && gl->GetError() == GL_NO_ERROR;
+    if (sem != 0) DelSem(1, &sem);
+
+    for (int i = 0; i < 32 && gl->GetError() != GL_NO_ERROR; ++i) {}
+    return mem_ok && sem_ok;
+}
+
 // Resolve everything on the context current RIGHT NOW. Returns false (with
 // gl->missing naming the culprit) if the interop extensions are absent or any
-// entry point is missing. The presence gate is the extension string, never a
-// non-null ProcAddress: drivers happily return stubs for unsupported entries.
+// entry point is missing. The gate is the extension string first and a live probe
+// second -- never a non-null ProcAddress on its own, because drivers happily return
+// stubs for unsupported entries.
 static bool FeedGlLoad(FeedGl *gl)
 {
     *gl = {};
@@ -284,15 +328,67 @@ static bool FeedGlLoad(FeedGl *gl)
     if (const GLubyte *r = gl->GetString(GL_RENDERER)) strncpy_s(gl->renderer, reinterpret_cast<const char *>(r), _TRUNCATE);
     if (const GLubyte *v = gl->GetString(GL_VERSION))  strncpy_s(gl->version,  reinterpret_cast<const char *>(v), _TRUNCATE);
 
-    // The gate. Missing here means this frame is not being rendered on an NVIDIA GPU
+    // Record how each enumeration behaves before anything is looked up in it. A bare
+    // "GL_EXT_memory_object missing" cannot tell a GPU that lacks the interop apart
+    // from a query that answered nothing -- and on hardware that plainly has it, the
+    // second is what happened. mem_obj counts entries containing "memory_object" in
+    // each form, so "the driver lists it and our matcher missed it" reads differently
+    // from "the driver never listed it".
+    {
+        GLint count = 0;
+        GLenum err_i = 0;
+        int hits_i = 0;
+        // Drain first: the game and ReShade share this context, so an error left
+        // behind by either would otherwise be reported as ours and read as evidence
+        // about a query that in fact succeeded.
+        for (int i = 0; i < 32 && gl->GetError() != GL_NO_ERROR; ++i) {}
+        if (gl->GetStringi != nullptr)
+        {
+            gl->GetIntegerv(GL_NUM_EXTENSIONS, &count);
+            err_i = gl->GetError();
+            for (GLint i = 0; i < count; ++i)
+            {
+                const GLubyte *e = gl->GetStringi(GL_EXTENSIONS, static_cast<GLuint>(i));
+                if (e != nullptr && strstr(reinterpret_cast<const char *>(e), "memory_object") != nullptr) ++hits_i;
+            }
+        }
+        const GLubyte *all = gl->GetString(GL_EXTENSIONS);
+        const GLenum err_s = gl->GetError();
+        int hits_s = 0;
+        if (all != nullptr)
+            for (const char *p = strstr(reinterpret_cast<const char *>(all), "memory_object");
+                 p != nullptr; p = strstr(p + 1, "memory_object")) ++hits_s;
+        sprintf_s(gl->diag,
+                  "glGetStringi=%s GL_NUM_EXTENSIONS=%d err=0x%04X mem_obj=%d | "
+                  "glGetString(GL_EXTENSIONS)=%s len=%u err=0x%04X mem_obj=%d",
+                  gl->GetStringi != nullptr ? "resolved" : "NULL", static_cast<int>(count),
+                  static_cast<unsigned>(err_i), hits_i,
+                  all != nullptr ? "ok" : "NULL",
+                  all != nullptr ? static_cast<unsigned>(strlen(reinterpret_cast<const char *>(all))) : 0u,
+                  static_cast<unsigned>(err_s), hits_s);
+    }
+
+    // The gate. Failing it means this frame is not being rendered on an NVIDIA GPU
     // (wrong GPU on a hybrid laptop, or non-NVIDIA hardware) -- DLSS could not run
     // there anyway, so the caller disables the feed rather than falling back.
     static const char *const kNeeded[] = {
         "GL_EXT_memory_object", "GL_EXT_memory_object_win32",
         "GL_EXT_semaphore",     "GL_EXT_semaphore_win32",
     };
+    const char *unadvertised = nullptr;
     for (const char *ext : kNeeded)
-        if (!FeedGlHasExtension(gl, ext)) { strcpy_s(gl->missing, ext); return false; }
+        if (!FeedGlHasExtension(gl, ext)) { unadvertised = ext; break; }
+
+    // An unadvertised extension is a question, not a verdict: on a capped extension
+    // string the interop is there and works. Only a probe that also fails is absence.
+    if (unadvertised != nullptr)
+    {
+        if (!FeedGlProbeInterop(gl)) { strcpy_s(gl->missing, unadvertised); return false; }
+        gl->probe_rescued = true;
+        char note[192];
+        sprintf_s(note, " | %s unadvertised, live probe PASSED (capped extension string)", unadvertised);
+        strcat_s(gl->diag, note);
+    }
 
     // glCopyImageSubData is core since 4.3; on anything older it needs an extension.
     // ReShade's own OpenGL minimum is 4.3, so this is belt and braces.

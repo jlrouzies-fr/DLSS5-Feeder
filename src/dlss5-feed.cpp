@@ -2146,6 +2146,7 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
         Log("[feed] renderer=\"%s\" version=\"%s\" context=%p thread=%lu",
             g.gl.renderer, g.gl.version, (void *)(g.gl.wglGetCurrentContext ? g.gl.wglGetCurrentContext() : nullptr),
             GetCurrentThreadId());
+        Log("[feed] extension query: %s", g.gl.diag);
         Log("[feed] GL_EXT_memory_object_win32 + GL_EXT_semaphore_win32 are NVIDIA-supported on every");
         Log("[feed] DLSS-capable driver. Their absence means this frame is not being rendered on the");
         Log("[feed] NVIDIA GPU -- on a hybrid laptop, force the game onto it (Windows graphics settings).");
@@ -2155,6 +2156,12 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
     g.gl_ctx = g.gl.wglGetCurrentContext();
     Log("[feed] OpenGL: renderer=\"%s\" version=\"%s\" context=%p thread=%lu (interop extensions present)",
         g.gl.renderer, g.gl.version, (void *)g.gl_ctx, GetCurrentThreadId());
+    // The driver hid the extensions from this executable (an NVIDIA per-application
+    // cap on the extension string, applied to old engines) and the live probe found
+    // them anyway. Worth a line: it is the difference between a driver quirk and a
+    // GPU that genuinely cannot do interop.
+    if (g.gl.probe_rescued)
+        Log("[feed] extension query: %s", g.gl.diag);
 
     // Private D3D12 device, loaded so ReShade hooks it -- that hook is what lets the
     // DLSS 5 add-on see the device. Proven under dxgi.dll and Vulkan-layer loading;
