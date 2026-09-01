@@ -196,6 +196,34 @@ in `ReShade.ini` does nothing for this. `deploy/templates/ReShadePreset.ini` alr
 right — this was confirmed by diffing against a live, working DOOM (2016) Vulkan
 install's `ReShadePreset.ini` on 2026-08-31, not by guessing.
 
+## 5b. The `d3dcompiler_47.dll` trap (check this before believing any "NR does nothing" report)
+
+If a game folder contains its own `d3dcompiler_47.dll`, Windows loads **that** one instead of
+System32's — it is not a KnownDLL, so the application directory wins the search order. A
+Windows 8.1-SDK-era copy (file version `6.3.9600.*`, shipped by plenty of games — Space
+Engineers among them) knows nothing past Shader Model 5.0, and the DLSS 5 add-on compiles its
+neural pass as `cs_5_1`:
+
+```
+DLSS5 Generic proxy encode compilation failed with HRESULT 0x8876086c:
+error X3506: unrecognized compiler target 'cs_5_1'
+```
+
+That pass then fails **every frame, silently**: our own blit shaders are `vs_5_0`/`ps_5_0` and
+compile fine, `dlss5-feed.log` reports frames delivered, and neural rendering does nothing.
+**Fix: delete or rename the game-folder copy.** For the 32-bit split path the copy that matters
+is the one next to `host64\dlss5-feed-host64.exe`, because renodx lives in the host process.
+
+Since 0.10.0-beta.3 both the add-on and the host probe this at startup with a live `cs_5_1`
+compile and say so in the log (and the add-on shows a red overlay line). The check is a compile,
+not a path test — a game-folder copy may equally be a *newer* one, which is fine (`G:\Games\Dusk`
+has a `10.0.26100` copy and is unaffected). One-liner to audit a folder:
+
+```powershell
+Get-ChildItem <game folder> -Recurse -Filter d3dcompiler_47.dll |
+  ForEach-Object { "{0}  {1}" -f $_.VersionInfo.FileVersion, $_.FullName }
+```
+
 ## 6. Enable the techniques
 
 `deploy/templates/ReShadePreset.ini`'s `Techniques=` line already pre-enables
