@@ -147,6 +147,16 @@ It is not game-specific: any D3D11, D3D12, Vulkan or OpenGL game with a working 
 and a motion vector provider should work — 64-bit directly, 32-bit via a bundled 64-bit helper
 process, D3D9 via a wrapper.
 
+**Known not working: Detroit: Become Human (Demo), 64-bit Vulkan.** DLSS runs (frames evaluated,
+fences honoured, D3D12-side probes show fresh input/output every sample) but the displayed image
+freezes on stale content for far longer than a normal one-frame lag would explain. Eight tests —
+including a passthrough diagnostic that swaps the whole DLSS evaluate for a plain byte copy and
+still reproduces it — rule out DLSS/NGX, renodx NR, the HDR/format detection, the image-import
+coherence theory, and missing queue-family ownership transfers, without finding the actual cause.
+Leading open theory: a `minImageCount=3` swapchain-image desync, not a transport ordering bug. See
+[`PLAN-DETROIT.md`](PLAN-DETROIT.md) for the full investigation and what to try next. `enabled=0`
+is the recommended `dlss5-feed.cfg` setting for this title until it's resolved.
+
 **32-bit Vulkan (DXVK) is implemented but has no game row yet** (issue #15). The transport is the
 same `src/feed_vk.h` the 64-bit Vulkan path uses, compiled x86, with the host creating the shared
 textures the way the OpenGL path already does; the cross-bitness half is proven end-to-end on this
