@@ -41,3 +41,8 @@ layer/*.log
 # launcher are tracked; the build output is not, same as the x64 pair above.
 layer/x86/*.dll
 layer/x86/*.pdb
+
+# Local, deliberately untracked scratch: tools that are not part of the feeder
+# and must never be pushed (e.g. sdr-guard, a standalone ReShade add-on for a
+# capture app). See local/sdr-guard/README.txt.
+/local/
