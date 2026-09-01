@@ -338,6 +338,7 @@ static void DetectRenodxAddon()
 static char g_toolkit_ver[64]     = "not found";
 static char g_toolkit_status[192] = "not present";
 static int  g_toolkit_passes      = 0;   // 0 = absent or disabled, 2 = two-pass, 3 = three-pass
+static bool g_toolkit_inert       = false; // cascade configured on, but the add-on generation refuses it
 
 // Reads "key=<int>" from a small ini-style file. Returns 'fallback' if absent.
 static int ToolkitCfgInt(const char *text, const char *key, int fallback)
@@ -427,6 +428,24 @@ static void DetectToolkitAddon()
     Log("[feed] Alex's Toolkit config: %s (enabled=%d two_pass=%d three_pass=%d); it re-reads that file live, "
         "so the cascade can change without restarting", have_cfg ? "alexs-toolkit.cfg" : "no cfg file, using its defaults",
         enabled, two_pass, three_pass);
+
+    // The toolkit attaches by recognising a structural layout inside the DLSS 5 add-on and
+    // hooking its resolver IAT slot. That signature only matches the older (v4.55-era) build:
+    // against v4.6 and v4.7 its scan finds "candidates=0 (expected exactly 1)", it declines to
+    // touch the IAT, and it STOPS RETRYING for the whole process -- so the cascade silently
+    // does nothing while its own overlay page still reads as enabled. Verified both ways with
+    // the host's --test mode, one folder, only the add-on swapped: v4.55 arms and cascades,
+    // v4.6 and v4.7 are both rejected (DLSS itself is fine either way, 300/300 evaluates).
+    if (g_toolkit_passes >= 2 && (g_renodx_v46 || g_renodx_v47))
+    {
+        g_toolkit_inert = true;
+        Warn("Alex's Toolkit %s cannot attach to DLSS 5 add-on %s: it only recognises the older (v4.55-era) "
+             "build, and against v4.6/v4.7 it gives up after one attempt -- alexs-toolkit.log will say "
+             "\"Generic structural layout rejected\". The cascade will do NOTHING this run. For the cascade, "
+             "put the v4.55-era renodx-dlss5.addon64 next to this add-on; to keep v4.6/v4.7, remove "
+             "alexs-toolkit.addon64 so nothing claims a cascade that is not running.",
+             g_toolkit_ver, g_renodx_gen[0] != '\0' ? g_renodx_gen : g_renodx_ver);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4950,7 +4969,13 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                 g_renodx_gen[0] != '\0' ? g_renodx_gen : g_renodx_ver,
                 g_renodx_v47 ? "v4.7+ engine" : g_renodx_v46 ? "v4.6 engine"
                              : g_renodx_lazy ? "v45+ engine" : "classic engine");
-    if (g_toolkit_passes >= 2)
+    if (g_toolkit_inert)
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
+                           "Alex's Toolkit %s cannot attach to DLSS 5 add-on %s -- THE CASCADE IS DOING NOTHING.\n"
+                           "It only recognises the v4.55-era build (alexs-toolkit.log: \"Generic structural layout rejected\").\n"
+                           "Use the v4.55-era renodx-dlss5.addon64 for the cascade, or remove alexs-toolkit.addon64.",
+                           g_toolkit_ver, g_renodx_gen[0] != '\0' ? g_renodx_gen : g_renodx_ver);
+    else if (g_toolkit_passes >= 2)
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
                            "Alex's Toolkit %s: %d-pass cascade -- ~%dx temporal history (smearing, slow settle)",
                            g_toolkit_ver, g_toolkit_passes, g_toolkit_passes);

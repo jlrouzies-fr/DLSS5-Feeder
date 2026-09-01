@@ -308,6 +308,17 @@ static void DetectToolkitAddon()
             ver, enabled ? "two_pass=0" : "enabled=0");
     Log("[host] Alex's Toolkit config: enabled=%d two_pass=%d three_pass=%d (it re-reads that file live)",
         enabled, two_pass, three_pass);
+
+    // The toolkit attaches by recognising a structural layout inside the DLSS 5 add-on. That
+    // signature only matches the v4.55-era build; against v4.6/v4.7 its scan reports
+    // "candidates=0 (expected exactly 1)", it leaves the IAT alone and stops retrying for the
+    // process, so the cascade silently does nothing. Verified with --test in one folder,
+    // swapping only the add-on: v4.55 arms, v4.6 and v4.7 are both rejected.
+    if (passes >= 2 && (g_renodx_v46 || g_renodx_v47))
+        Log("[host] WARNING: Alex's Toolkit %s cannot attach to this DLSS 5 add-on generation -- it only "
+            "recognises the v4.55-era build, and alexs-toolkit.log will say \"Generic structural layout "
+            "rejected\". THE CASCADE WILL DO NOTHING. Use the v4.55-era renodx-dlss5.addon64 for the "
+            "cascade, or remove alexs-toolkit.addon64 from this folder.", ver);
 }
 
 static void Log(const char *fmt, ...)
