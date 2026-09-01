@@ -71,10 +71,15 @@ int main()
     {
         printf("CLIENT FAIL: the OpenGL interop is unavailable in this 32-bit process: %s\n", gl.missing);
         printf("             renderer=\"%s\" version=\"%s\"\n", gl.renderer, gl.version);
+        printf("             extension query: %s\n", gl.diag);
         printf("             (this is exactly the x86 parity question design A depends on)\n");
         return 1;
     }
     printf("gl: renderer=\"%s\" version=\"%s\" (interop extensions present in x86)\n", gl.renderer, gl.version);
+    // Printed on the pass too: the gate can be carried by the live probe when a driver
+    // caps the extension string, and a spike that only says PASS cannot tell that apart
+    // from the matcher having found the extensions itself.
+    printf("gl: extension query: %s\n", gl.diag);
 
     HMODULE m = GetModuleHandleW(L"opengl32.dll");
     auto GetTexImage = reinterpret_cast<PFN_glGetTexImage_>(GetProcAddress(m, "glGetTexImage"));
