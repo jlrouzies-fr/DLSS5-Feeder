@@ -36,7 +36,31 @@
 > shows no remaining conflict, but **no game row has verified a v4.6 run yet** — with the
 > released feeder builds, stay on v4.55.
 
-## ⚠️ Not compatible with Nvidia Smooth Motion / Optiscaler. Disable them to avoid issues.
+> ## ⚠️ NVIDIA Smooth Motion and Optiscaler
+>
+> **Optiscaler** replaces the same upscaling path this feeder drives. Do not run both.
+>
+> **Smooth Motion** is not a pure driver feature: the driver injects `NvPresent64.dll` into the
+> game, which hooks `CreateDXGIFactory*`, wraps the game's swapchain, and **calls `Present` more
+> than once per game frame from its own pacer thread**. ReShade's effect chain — and so this
+> add-on — runs *inside* `Present`, so that turns one caller per frame into several, possibly
+> concurrent ones. Two open reports: corruption or a silent stop in D3D11
+> ([#1](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/1)), flicker in Vulkan
+> ([#10](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/10)).
+>
+> **Since 0.8.0 the feeder serializes its whole per-frame path and turns on D3D11 multithread
+> protection**, and it detects Smooth Motion and says so in the overlay and `dlss5-feed.log`. That
+> removes the feeder-side race, but **the combination is still unverified** — no game row below has
+> been run with Smooth Motion on.
+>
+> If the image corrupts or flickers, turn Smooth Motion off **for this game's API only** rather
+> than everywhere, in NVIDIA Profile Inspector:
+>
+> | Setting | ID | Value |
+> | --- | --- | --- |
+> | Smooth Motion - Enabled APIs | `0xB0CC0875` | bitfield, default `7`: `1` DX12, `2` DX11, `4` Vulkan — clear only the bit for this game |
+> | Smooth Motion - Enable | `0xB0D384C0` | `0` / `1`, per application |
+> | Smooth Motion - Debug Bars | `0xB01B8B02` | draws coloured bars on generated frames — use it to check whether bad frames *are* the generated ones |
 
 # DLSS5-Feeder
 
@@ -505,6 +529,7 @@ if you prefer editing the file directly:
 | `log_frames` | 3 | first N frames logged in detail. |
 | `create_delay` | 60 | frames to hold a feature (re)build after a runtime (re)init — the DLSS 5 add-on arms its NGX hooks asynchronously, and calling in too early can crash. 0 disables. |
 | `preset` | 0 | DLSS render-preset hint: `0` default, `5`/`6` = legacy CNN presets E/F (clamp history harder — try these if motion warps around transparents like dust or flames), `10`/`11` = transformer presets J/K. |
+| `gpu_timeout_ms` | 2000 | how long a frame waits for the GPU to retire a command allocator before that frame is abandoned. Three abandoned frames in a row stop the feed. Raise it on a heavily contended GPU; clamped to 100–60000. |
 | `mv_scale_x/y` | 1.0 | extra motion-vector multiplier. |
 | `host_window` | 1 | **32-bit games only.** 1 shows the helper's window; 0 hides it (its own settings are now on the overlay page above, so you rarely need it). |
 
@@ -592,6 +617,15 @@ Common cases:
   halves from the same release rather than mixing them.
 * **DLSS 5 panel stuck in STANDBY** — the add-on missed the first create; the built-in warm-up
   re-creates the feature a few seconds in, which normally clears it.
+* **Neural rendering stops mid-session, no crash** — the overlay's **Status** section now names the
+  reason next to `Session: disabled`, and **Re-enable** restarts it. If the log says `the GPU did
+  not retire allocator slot N within 2000 ms`, the GPU is not keeping up rather than broken: raise
+  `gpu_timeout_ms`. A single slow frame no longer stops the session — three consecutive failures do.
+* **Corruption or flicker with Smooth Motion on** — see the Smooth Motion warning at the top of
+  this README. The overlay says whether Smooth Motion was detected, and `dlss5-feed.log` records the feeding
+  thread: `frame fed from thread N, not the usual M` means `Present` is arriving off-thread, and
+  `re-entrant frame … dropped` means it arrived twice at once. Both lines are worth quoting on an
+  issue. Turn Smooth Motion off for this game's API only, with Profile Inspector.
 
 ## Building
 

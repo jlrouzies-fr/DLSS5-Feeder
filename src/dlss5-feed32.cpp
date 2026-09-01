@@ -102,6 +102,95 @@ static const char *volatile g_where = "starting up";
 static void Breadcrumb(const char *what) { g_where = what; }
 
 // ---------------------------------------------------------------------------
+// NVIDIA Smooth Motion, and the serialization it forces -- the 64-bit add-on's
+// note explains the mechanism in full. In short: the driver injects a present
+// interposer that wraps the game's swapchain and calls Present more than once
+// per game frame from its own pacer thread. ReShade's effect chain, and so
+// FeedFrame, runs inside Present, which makes FeedFrame re-entrant and possibly
+// off-thread -- and everything it touches (the g struct, the shared textures,
+// the host protocol) assumes exactly one caller at a time.
+//
+// Detection is best-effort here. NVIDIA documents no 32-bit Smooth Motion
+// interposer and a WOW64 process cannot load the 64-bit one, so this is likely
+// to stay false in practice; the lock below is what actually matters, and it
+// costs nothing when there is only ever one thread.
+// ---------------------------------------------------------------------------
+
+static bool g_smooth_motion = false;
+
+static bool DetectSmoothMotion()
+{
+    if (g_smooth_motion) return true;
+    static const wchar_t *kNames[] = { L"NvPresent32.dll", L"NvPresent.dll" };
+    for (const wchar_t *n : kNames)
+    {
+        if (GetModuleHandleW(n) == nullptr) continue;
+        g_smooth_motion = true;
+        Warn("NVIDIA Smooth Motion appears to be active in this process (%ls). It presents more than once "
+             "per game frame from its own thread. If the image corrupts or flickers, turn it off for this "
+             "game's API only -- NVIDIA Profile Inspector, \"Smooth Motion - Enabled APIs\" (0xB0CC0875).", n);
+        return true;
+    }
+    return false;
+}
+
+// One lock for the whole per-frame path plus a busy flag: the lock serializes two
+// Present threads, and the flag catches a re-entrant Present on the SAME thread,
+// which a recursive CRITICAL_SECTION would wave straight through into a half-built
+// frame. A re-entrant call is dropped -- there is one set of shared textures and one
+// host request in flight, and driving them twice at once corrupts both.
+static CRITICAL_SECTION g_feed_cs;
+static bool             g_feed_busy   = false;   // guarded by g_feed_cs
+static DWORD            g_feed_thread = 0;
+static int              g_feed_offthread_logged = 0;
+static int              g_feed_reentry_logged   = 0;
+static unsigned         g_feed_reentries = 0;
+
+// Called with g_feed_cs held, so these counters need no synchronization of their own.
+static void FeedThreadTrace()
+{
+    const DWORD tid = GetCurrentThreadId();
+    if (g_feed_thread == 0)
+    {
+        g_feed_thread = tid;
+        Log("[feed32] first frame fed from thread %lu", tid);
+    }
+    else if (tid != g_feed_thread && g_feed_offthread_logged < 8)
+    {
+        ++g_feed_offthread_logged;
+        Log("[feed32] frame fed from thread %lu, not the usual %lu -- Present is off-thread%s", tid, g_feed_thread,
+            g_feed_offthread_logged == 8 ? "; further thread changes not logged" : "");
+    }
+}
+
+// The lock order is always g_feed_cs then g_log_cs (Log's own); nothing takes them
+// the other way round, so logging from inside the critical section is safe.
+static bool FeedEnter()
+{
+    EnterCriticalSection(&g_feed_cs);
+    if (g_feed_busy)
+    {
+        ++g_feed_reentries;
+        if (g_feed_reentry_logged < 8)
+        {
+            ++g_feed_reentry_logged;
+            Log("[feed32] re-entrant frame on thread %lu dropped (%u so far)%s", GetCurrentThreadId(),
+                g_feed_reentries, g_feed_reentry_logged == 8 ? "; further drops not logged" : "");
+        }
+        LeaveCriticalSection(&g_feed_cs);
+        return false;
+    }
+    g_feed_busy = true;
+    return true;
+}
+
+static void FeedLeave()
+{
+    g_feed_busy = false;
+    LeaveCriticalSection(&g_feed_cs);
+}
+
+// ---------------------------------------------------------------------------
 // Configuration: same dlss5-feed.cfg as the 64-bit add-on (extra keys ignored)
 // ---------------------------------------------------------------------------
 
@@ -336,6 +425,8 @@ struct Feed32
     bool             fence_wait_queued;  // a GPU-side Wait(fence_out, frame_n) is outstanding
     ID3D11DeviceContext4 *ctx4;
     ID3D11Device    *dev;         // not owned
+    ID3D11Multithread *mt;        // immediate-context serialization, restored on teardown
+    bool             mt_was_on;   // what the game had set before we turned it on
 
     // OpenGL client: the host creates the shared textures and duplicates the handles
     // in; we import them raw (feed_gl.h) and never touch D3D11 at all. tex_handle[]
@@ -431,10 +522,14 @@ static bool IsHdrFormat(DXGI_FORMAT typed)
     return typed == DXGI_FORMAT_R16G16B16A16_FLOAT || typed == DXGI_FORMAT_R11G11B10_FLOAT;
 }
 
+// Kept for the overlay, which otherwise can only point at a log file.
+static char g_disable_why[256] = "";
+
 static void FeedDisable(const char *why)
 {
     if (g.disabled) return;
     g.disabled = true;
+    _snprintf_s(g_disable_why, sizeof(g_disable_why), _TRUNCATE, "%s", why);
     Warn("stopped: %s. The game renders normally. See dlss5-feed.log for the detail.", why);
 }
 
@@ -1968,11 +2063,9 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     TimingTick(t0.QuadPart, t1.QuadPart);
 }
 
-static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::command_list *cl,
+                              reshade::api::resource_view rtv)
 {
-
-    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
-
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
 
@@ -2037,6 +2130,15 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
         if (g.dev != nullptr) g.dev->Release();   // not owned; the game outlives us
         if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g.ctx4))))
         { FeedDisable("ID3D11DeviceContext4 unavailable (Windows 10 1703+ required)"); ok = false; }
+        // The immediate context is not thread-safe unless asked, and BlitOutputToBackbuffer
+        // save/restores a slice of device state around its own draw -- which a second
+        // present thread would tear. A game that already had protection on is left alone.
+        if (ok && SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11Multithread), reinterpret_cast<void **>(&g.mt))) &&
+            g.mt != nullptr)
+        {
+            g.mt_was_on = g.mt->SetMultithreadProtected(TRUE) != FALSE;
+            Log("[feed32] D3D11 multithread protection enabled (the game had it %s)", g.mt_was_on ? "on" : "off");
+        }
     }
 
     const UINT work_w = ScaledExtent(cd.Width, g_cfg.work_resolution);
@@ -2107,6 +2209,19 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
 
     QueryPerformanceCounter(&t1);
     TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
+// The one place the feed is serialized: every backend above reaches the shared
+// textures and the host protocol through here, and all of it assumes a single
+// caller per frame. See the Smooth Motion note next to FeedEnter.
+static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+{
+    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
+
+    if (!FeedEnter()) return;   // logs the dropped call, with its thread id
+    FeedThreadTrace();
+    FeedFrameDispatch(rt, cl, rtv);
+    FeedLeave();
 }
 
 // ---------------------------------------------------------------------------
@@ -2195,6 +2310,7 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
     g.runtime = rt;
     ResolveHandles(rt);
+    DetectSmoothMotion();   // a present interposer can arrive after this add-on did
     static int inits = 0;
     if (++inits <= 8) Log("[feed32] effect runtime %p initialised", (void *)rt);
 }
@@ -2243,6 +2359,12 @@ static void OnDestroyDevice(reshade::api::device *dev)
     g.gl_fbo_read = g.gl_fbo_draw = 0;
     g.gl = {};
     g.gl_ctx = nullptr;
+    if (g.mt != nullptr)
+    {
+        if (!g.mt_was_on) g.mt->SetMultithreadProtected(FALSE);
+        SafeRelease(g.mt);
+        g.mt_was_on = false;
+    }
     SafeRelease(g.ctx4);
     SafeRelease(g.blit_vs);
     SafeRelease(g.blit_ps);
@@ -2278,18 +2400,26 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
     ImGui::Separator();
     ImGui::TextUnformatted("Status");
-    ImGui::Text("Feed: %s", g.disabled ? "disabled (see dlss5-feed.log)" : g.built ? "built" : "not built");
+    ImGui::Text("Feed: %s", g.disabled ? "disabled" : g.built ? "built" : "not built");
+    if (g.disabled && g_disable_why[0])
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "Stopped: %s", g_disable_why);
     ImGui::Text("Render API: %s", g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : "Direct3D 11");
     ImGui::Text("Host process: %s", HostAlive() ? "running" : "not running");
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
     ImGui::TextWrapped("Motion vectors: %s", g_mv_status);
     if (g_mv_problem[0])
         ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "%s", g_mv_problem);
+    if (g_smooth_motion)
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                           "NVIDIA Smooth Motion is active -- unverified with this add-on. If the image "
+                           "corrupts or flickers, disable it for this game's API only: Profile Inspector, "
+                           "\"Smooth Motion - Enabled APIs\" (1=DX12, 2=DX11, 4=Vulkan).");
     if (g.disabled && ImGui::Button("Re-enable"))
     {
         g.disabled = false;
         g.consecutive_fails = 0;
         g_retry_at = 0;
+        g_disable_why[0] = '\0';
         Log("[feed32] re-enabled from the overlay");
     }
 
@@ -2437,6 +2567,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_self = module;
         DisableThreadLibraryCalls(module);
         InitializeCriticalSection(&g_log_cs);
+        InitializeCriticalSection(&g_feed_cs);
         GetModuleFileNameA(module, g_log_path, MAX_PATH);
         if (char *s = strrchr(g_log_path, '\\'))
             strcpy_s(s + 1, MAX_PATH - (s + 1 - g_log_path), "dlss5-feed.log");

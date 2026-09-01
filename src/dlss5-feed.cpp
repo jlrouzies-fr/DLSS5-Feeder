@@ -361,6 +361,105 @@ static void DetectToolkitAddon()
         enabled, two_pass, three_pass);
 }
 
+// ---------------------------------------------------------------------------
+// NVIDIA Smooth Motion -- driver frame generation that is implemented in-process.
+// The driver injects NvPresent64.dll from the DriverStore; it hooks
+// CreateDXGIFactory* and the factory vtables, wraps the game's IDXGISwapChain,
+// and calls Present more than once per game frame from its own pacer thread.
+//
+// That matters here because ReShade's effect chain -- and therefore FeedFrame --
+// runs inside Present. Under Smooth Motion, Present is re-entrant and can arrive
+// on a thread that is not the game's render thread, so every piece of shared
+// state this add-on owns (the g struct, the D3D12 allocator ring, the shared
+// textures, the game's immediate context) needs serializing. That is what
+// g_feed_cs below and the ID3D11Multithread protection in InitSession are for.
+//
+// Unlike DetectToolkitAddon, which scans a *file* because ReShade may not have
+// loaded that add-on yet, this has to be a loaded-module check: the module comes
+// from the DriverStore, not the game folder. It can also arrive after this add-on
+// does, so OnInitEffectRuntime re-checks.
+// ---------------------------------------------------------------------------
+
+static bool g_smooth_motion = false;
+
+static bool DetectSmoothMotion()
+{
+    if (g_smooth_motion) return true;
+    if (GetModuleHandleW(L"NvPresent64.dll") == nullptr) return false;
+    g_smooth_motion = true;
+    Warn("NVIDIA Smooth Motion is active in this process (NvPresent64.dll). It presents more than once "
+         "per game frame from its own thread; this add-on serializes its own work against that, but the "
+         "combination is not verified. If the image corrupts or flickers, turn Smooth Motion off for this "
+         "game's API only -- NVIDIA Profile Inspector, \"Smooth Motion - Enabled APIs\" (0xB0CC0875): "
+         "clear bit 1 for DX12, 2 for DX11, 4 for Vulkan.");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Feed serialization
+//
+// One lock for the whole per-frame path, plus a busy flag. The lock keeps two
+// Present threads out of each other's way; the flag is what a CRITICAL_SECTION
+// alone cannot do, since it is recursive and would let a genuinely re-entrant
+// Present on the SAME thread run straight through into a half-built frame.
+// A re-entrant call is dropped rather than nested: there is one allocator ring
+// and one set of shared textures, and feeding them twice at once corrupts both.
+// ---------------------------------------------------------------------------
+
+static CRITICAL_SECTION g_feed_cs;
+static bool             g_feed_busy    = false;   // guarded by g_feed_cs
+static DWORD            g_feed_thread  = 0;       // first thread seen in FeedFrame
+static int              g_feed_offthread_logged = 0;
+static int              g_feed_reentry_logged   = 0;
+static unsigned         g_feed_reentries = 0;
+
+// Records which thread drives the feed. A change mid-run is the signature of an
+// off-thread Present (Smooth Motion's pacer thread above all) and is the single
+// most useful line in the log when diagnosing this class of report. Called with
+// g_feed_cs held, so the counters below need no synchronization of their own.
+static void FeedThreadTrace()
+{
+    const DWORD tid = GetCurrentThreadId();
+    if (g_feed_thread == 0)
+    {
+        g_feed_thread = tid;
+        Log("[feed] first frame fed from thread %lu", tid);
+    }
+    else if (tid != g_feed_thread && g_feed_offthread_logged < 8)
+    {
+        ++g_feed_offthread_logged;
+        Log("[feed] frame fed from thread %lu, not the usual %lu -- Present is off-thread%s%s", tid, g_feed_thread,
+            g_smooth_motion ? " (Smooth Motion is loaded)" : "",
+            g_feed_offthread_logged == 8 ? "; further thread changes not logged" : "");
+    }
+}
+
+// The counters and the log call stay inside g_feed_cs: the lock order is always
+// g_feed_cs then g_log_cs (Log's own), and nothing takes them the other way round.
+static bool FeedEnter()
+{
+    EnterCriticalSection(&g_feed_cs);
+    if (g_feed_busy)
+    {
+        ++g_feed_reentries;
+        if (g_feed_reentry_logged < 8)
+        {
+            ++g_feed_reentry_logged;
+            Log("[feed] re-entrant frame on thread %lu dropped (%u so far)%s", GetCurrentThreadId(),
+                g_feed_reentries, g_feed_reentry_logged == 8 ? "; further drops not logged" : "");
+        }
+        LeaveCriticalSection(&g_feed_cs);
+        return false;
+    }
+    g_feed_busy = true;
+    return true;
+}
+
+static void FeedLeave()
+{
+    g_feed_busy = false;
+    LeaveCriticalSection(&g_feed_cs);
+}
 
 // ---------------------------------------------------------------------------
 // Configuration (dlss5-feed.cfg next to the add-on, re-read every 60 frames)
@@ -380,11 +479,12 @@ struct Cfg
     int   create_delay;    // frames to hold the FIRST feature create (the DLSS 5 add-on arms its NGX hooks asynchronously)
     int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer)
     int   work_resolution; // 64-bit D3D11 only: 50..100 percent of each backbuffer axis
+    int   gpu_timeout_ms;  // how long BeginCommands waits for the GPU to retire an allocator slot
     float mv_scale_x;      // multiplier applied to the motion vectors (the FX already outputs pixels)
     float mv_scale_y;
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 2000, 1.0f, 1.0f };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -416,11 +516,12 @@ static void CfgWriteDefault()
             "create_delay=%d\n"
             "preset=%d\n"
             "work_resolution=%d\n"
+            "gpu_timeout_ms=%d\n"
             "mv_scale_x=%.3f\n"
             "mv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
-            g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -453,12 +554,16 @@ static bool CfgReload()
         else if (_stricmp(key, "create_delay")   == 0) next.create_delay   = iv;
         else if (_stricmp(key, "preset")         == 0) next.preset         = iv;
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
+        else if (_stricmp(key, "gpu_timeout_ms") == 0) next.gpu_timeout_ms  = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
     fclose(f);
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
+    // 0 would mean "give up instantly"; an unbounded wait would hang the game on a
+    // genuinely dead GPU. Clamp to something a contended machine can still live with.
+    if (next.gpu_timeout_ms < 100 || next.gpu_timeout_ms > 60000) next.gpu_timeout_ms = g_cfg.gpu_timeout_ms;
 
     const bool rebuild = next.hdr != g_cfg.hdr || next.depth_inverted != g_cfg.depth_inverted ||
                          next.flags != g_cfg.flags || next.rebuild != g_cfg.rebuild ||
@@ -467,10 +572,10 @@ static bool CfgReload()
     if (!changed) return false;
     g_cfg = next;
     Log("[feed] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d warmup_rebuild=%d "
-        "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% mv_scale=%.3f,%.3f",
+        "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% gpu_timeout_ms=%d mv_scale=%.3f,%.3f",
         g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
         g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay,
-        g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+        g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     return rebuild;
 }
 
@@ -485,10 +590,11 @@ static void CfgSave()
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f,
         "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
-            "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+            "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\ngpu_timeout_ms=%d\n"
+            "mv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
-            g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
 }
 
@@ -637,6 +743,8 @@ struct Feed
     ID3D12Fence               *fence12;
     ID3D11Fence               *fence11;
     ID3D11DeviceContext4      *ctx4;
+    ID3D11Multithread         *mt;          // immediate-context serialization, restored on teardown
+    bool                       mt_was_on;   // what the game had set before we turned it on
     UINT64                     fence_value;
     ID3D11Device              *dev11;      // not owned
     bool                       dev12_owned; // true on the D3D11/Vulkan paths (we created the private device)
@@ -877,10 +985,15 @@ static const char *NgxResultName(NVSDK_NGX_Result r)
     }
 }
 
+// Kept for the overlay: "disabled (see dlss5-feed.log)" on its own sends the player
+// to a file to find out what happened, and Warn() only reaches the two logs.
+static char g_disable_why[256] = "";
+
 static void FeedDisable(const char *why)
 {
     if (g.disabled) return;
     g.disabled = true;
+    _snprintf_s(g_disable_why, sizeof(g_disable_why), _TRUNCATE, "%s", why);
     Warn("stopped: %s. The game renders normally. See dlss5-feed.log for the detail.", why);
 }
 
@@ -901,11 +1014,22 @@ static bool BeginCommands()
     const UINT64 retire = g.alloc_fence[slot];
     if (retire != 0 && g.fence12->GetCompletedValue() < retire)
     {
+        // The event is auto-reset and a timed-out wait leaves its registration armed,
+        // so a later completion can signal it spuriously. Clear it first and confirm
+        // the fence really passed 'retire' afterwards -- resetting an allocator the
+        // GPU is still reading from is worse than dropping a frame.
+        ResetEvent(g.fence_event);
+        const DWORD timeout = static_cast<DWORD>(g_cfg.gpu_timeout_ms);
         g.fence12->SetEventOnCompletion(retire, g.fence_event);
-        if (WaitForSingleObject(g.fence_event, 2000) != WAIT_OBJECT_0)
+        if (WaitForSingleObject(g.fence_event, timeout) != WAIT_OBJECT_0 ||
+            g.fence12->GetCompletedValue() < retire)
         {
-            Log("[feed] the GPU did not retire allocator slot %d within 2 s", slot);
-            FeedDisable("the GPU stopped completing work");
+            // Fail this frame, do not latch the add-on off: one slow frame -- a
+            // contended GPU, a present-path interposer stealing submission slots --
+            // used to stop neural rendering permanently, with the overlay's Re-enable
+            // button as the only way back. FeedFail's 3-strikes rule decides instead,
+            // which is what the 32-bit host has always done.
+            Log("[feed] the GPU did not retire allocator slot %d within %u ms", slot, timeout);
             return false;
         }
     }
@@ -1568,8 +1692,9 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
     const UINT64 v = EndCommands();
     if (g.fence12->GetCompletedValue() < v)
     {
+        ResetEvent(g.fence_event);   // as in BeginCommands: never trust a leftover signal
         g.fence12->SetEventOnCompletion(v, g.fence_event);
-        if (WaitForSingleObject(g.fence_event, 4000) != WAIT_OBJECT_0)
+        if (WaitForSingleObject(g.fence_event, 4000) != WAIT_OBJECT_0 || g.fence12->GetCompletedValue() < v)
         {
             Log("[feed] feature creation did not complete within 4 s");
             FeedDisable("creating the DLSS feature hung");
@@ -1695,6 +1820,20 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g.ctx4))) || g.ctx4 == nullptr)
         { Log("[feed] ID3D11DeviceContext4 unavailable"); goto fail; }
 
+        // A present-path interposer (Smooth Motion, see DetectSmoothMotion) can drive
+        // ReShade's effect chain from a second thread. The immediate context is not
+        // thread-safe unless asked, and BlitOutputToBackbuffer save/restores a slice of
+        // device state around its own draw -- which a concurrent user of the context
+        // would tear. Turn protection on for as long as we are attached; a game that
+        // already had it on is left exactly as it was.
+        if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11Multithread), reinterpret_cast<void **>(&g.mt))) && g.mt != nullptr)
+        {
+            g.mt_was_on = g.mt->SetMultithreadProtected(TRUE) != FALSE;
+            Log("[feed] D3D11 multithread protection enabled (the game had it %s)", g.mt_was_on ? "on" : "off");
+        }
+        else
+            Log("[feed] ID3D11Multithread unavailable; the immediate context stays unprotected");
+
         if (g.queue == nullptr || g.list == nullptr) { Log("[feed] D3D12 queue/list creation failed"); goto fail; }
 
         Log("[feed] session ready: queue=%p list=%p fence12=%p fence11=%p", (void *)g.queue, (void *)g.list,
@@ -1722,6 +1861,12 @@ static void ShutdownSession()
     SafeRelease(g.blit_sampler);
     SafeRelease(g.point_sampler);
     SafeRelease(g.resample_cb);
+    if (g.mt != nullptr)
+    {
+        if (!g.mt_was_on) g.mt->SetMultithreadProtected(FALSE);
+        SafeRelease(g.mt);
+        g.mt_was_on = false;
+    }
     SafeRelease(g.ctx4);
     SafeRelease(g.fence11);
     SafeRelease(g.fence12);
@@ -3777,9 +3922,9 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     TimingTick(t0.QuadPart, t1.QuadPart);
 }
 
-static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::command_list *cl,
+                              reshade::api::resource_view rtv)
 {
-    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
     switch (rt->get_device()->get_api())
     {
     case reshade::api::device_api::d3d11: FeedFrame11(rt, cl, rtv); break;
@@ -3788,6 +3933,21 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
     case reshade::api::device_api::opengl: FeedFrameGl(rt, cl, rtv); break;
     default: FeedDisable("only Direct3D 11/12, Vulkan and OpenGL games are supported"); break;
     }
+}
+
+// The single entry point for every backend, and so the one place the whole feed is
+// serialized. Everything below this line assumes it owns the g struct, the allocator
+// ring and the shared textures for the duration of a frame -- true when Present is
+// the game's own render thread and nothing else, and false the moment a present-path
+// interposer joins in. See the Smooth Motion note above FeedEnter.
+static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+{
+    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
+
+    if (!FeedEnter()) return;   // logs the dropped call, with its thread id
+    FeedThreadTrace();
+    FeedFrameDispatch(rt, cl, rtv);
+    FeedLeave();
 }
 
 // ---------------------------------------------------------------------------
@@ -3883,6 +4043,9 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
     g.runtime = rt;
     ResolveHandles(rt);
+    // The driver injects NvPresent64.dll around swapchain creation, which can be after
+    // this add-on attached -- so this is the re-check DllMain's first look cannot be.
+    DetectSmoothMotion();
     // A recreated runtime means the DLSS 5 add-on has re-armed its hooks on our private
     // device: give it a fresh feature (a cheap feature-only re-create -- the textures stay).
     // On the same-device D3D12 path its hooks live on the game's device and survive; the
@@ -3981,7 +4144,9 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
 
     ImGui::Separator();
     ImGui::TextUnformatted("Status");
-    ImGui::Text("Session: %s", g.disabled ? "disabled (see dlss5-feed.log)" : g.session_ready ? "open" : "not started");
+    ImGui::Text("Session: %s", g.disabled ? "disabled" : g.session_ready ? "open" : "not started");
+    if (g.disabled && g_disable_why[0])
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "Stopped: %s", g_disable_why);
     ImGui::Text("Feature: %s", g.frame_ready ? "ready" : "not built");
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
     ImGui::Text("DLSS 5 add-on: v%s (%s)", g_renodx_ver,
@@ -3992,10 +4157,16 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                            g_toolkit_ver, g_toolkit_passes, g_toolkit_passes);
     else if (strcmp(g_toolkit_ver, "not found") != 0)
         ImGui::Text("Alex's Toolkit %s: present, cascade off (single pass)", g_toolkit_ver);
+    if (g_smooth_motion)
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                           "NVIDIA Smooth Motion is active (NvPresent64.dll) -- unverified with this add-on. "
+                           "If the image corrupts or flickers, disable it for this game's API only: "
+                           "Profile Inspector, \"Smooth Motion - Enabled APIs\" (1=DX12, 2=DX11, 4=Vulkan).");
     if (g.disabled && ImGui::Button("Re-enable"))
     {
         g.disabled = false;
         g.consecutive_fails = 0;
+        g_disable_why[0] = '\0';
         Log("[feed] re-enabled from the overlay");
     }
 
@@ -4100,6 +4271,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_self = module;
         DisableThreadLibraryCalls(module);
         InitializeCriticalSection(&g_log_cs);
+        InitializeCriticalSection(&g_feed_cs);
         GetModuleFileNameA(module, g_log_path, MAX_PATH);
         if (char *s = strrchr(g_log_path, '\\'))
             strcpy_s(s + 1, MAX_PATH - (s + 1 - g_log_path), "dlss5-feed.log");
@@ -4118,6 +4290,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         CfgReload();
         DetectRenodxAddon();
         DetectToolkitAddon();
+        // Usually too early to see it (the driver injects it around swapchain creation);
+        // OnInitEffectRuntime re-checks. Worth one look here for the case where ReShade
+        // itself was loaded late.
+        DetectSmoothMotion();
 
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);

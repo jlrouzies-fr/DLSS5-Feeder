@@ -287,8 +287,15 @@ static bool BeginCommands()
     const UINT64 retire = h.alloc_fence[slot];
     if (retire != 0 && h.fence->GetCompletedValue() < retire)
     {
+        // fence_event is auto-reset and shared with WaitFenceValue, and a timed-out wait
+        // leaves its registration armed -- so it can be signalled later by a completion
+        // nobody is waiting for. Clear it first, then confirm the fence really passed
+        // 'retire': resetting an allocator the GPU still reads from is far worse than
+        // dropping a frame.
+        ResetEvent(h.fence_event);
         h.fence->SetEventOnCompletion(retire, h.fence_event);
-        if (WaitForSingleObject(h.fence_event, 2000) != WAIT_OBJECT_0)
+        if (WaitForSingleObject(h.fence_event, 2000) != WAIT_OBJECT_0 ||
+            h.fence->GetCompletedValue() < retire)
         { Log("[host] GPU did not retire allocator slot %d", slot); return false; }
     }
     if (FAILED(h.alloc[slot]->Reset())) return false;
@@ -310,8 +317,9 @@ static UINT64 EndCommands()
 static bool WaitFenceValue(ID3D12Fence *f, UINT64 v, DWORD ms)
 {
     if (f->GetCompletedValue() >= v) return true;
+    ResetEvent(h.fence_event);   // drop any signal left armed by an earlier timed-out wait
     f->SetEventOnCompletion(v, h.fence_event);
-    return WaitForSingleObject(h.fence_event, ms) == WAIT_OBJECT_0;
+    return WaitForSingleObject(h.fence_event, ms) == WAIT_OBJECT_0 && f->GetCompletedValue() >= v;
 }
 
 static void CloseListGuarded()
