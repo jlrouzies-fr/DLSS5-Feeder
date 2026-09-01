@@ -565,12 +565,14 @@ static void InitBanner()
 typedef HRESULT (WINAPI *PFN_D3D12CreateDevice_)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
 typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1_)(REFIID, void **);
 
-// The message drain always runs -- it is what keeps the window responsive. The banner
-// copy and the Present behind it are throttled: they used to run on every frame message,
-// putting a swapchain Present and a CPU wait for our own copy inside the game's frame
-// (issue #15). The banner is static, so a 30 Hz cap is invisible on it and still leaves
-// the add-on's tuning overlay -- which composites at Present -- comfortable to drag
-// sliders in; force=true is for the settle loops that genuinely need Presents now.
+// The message drain always runs -- it is what keeps the window responsive. When idle
+// (no frames arriving), the banner copy and the Present behind it are throttled to
+// 30 Hz; what made the old per-frame call expensive was the CPU wait for our own
+// banner copy, and that is gone either way (the retire check below). The per-EVALUATE
+// call stays force=true: the DLSS 5 add-on rides this swapchain, and its engine keys
+// per-frame state to Present (the v4.7 banner says "workset pool") -- letting several
+// evaluates land between presents made consecutive evaluates share state and the game
+// flicker. One cheap Present per evaluate keeps its world consistent.
 static void PumpPresent(bool force = false)
 {
     MSG msg;
@@ -1236,7 +1238,7 @@ static int Serve(DWORD game_pid)
 
             if (fm.n <= 3 || (fm.n % 1800) == 0)
                 Log("[host] frame %llu evaluated", (unsigned long long)fm.n);
-            PumpPresent();
+            PumpPresent(true);   // per evaluate, deliberately -- see PumpPresent
         }
         else
         {
