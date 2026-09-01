@@ -1796,6 +1796,7 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
         {
             Log("[feed32] OpenGL interop unavailable: %s", g.gl.missing);
             Log("[feed32] renderer=\"%s\" version=\"%s\"", g.gl.renderer, g.gl.version);
+            Log("[feed32] extension query: %s", g.gl.diag);
             Log("[feed32] GL_EXT_memory_object_win32 + GL_EXT_semaphore_win32 are NVIDIA-supported on every");
             Log("[feed32] DLSS-capable driver. Their absence means this frame is not being rendered on the");
             Log("[feed32] NVIDIA GPU -- on a hybrid laptop, force the game onto it (Windows graphics settings).");
@@ -1805,6 +1806,7 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
         g.gl_ctx = g.gl.wglGetCurrentContext();
         Log("[feed32] OpenGL: renderer=\"%s\" version=\"%s\" context=%p thread=%lu (interop extensions present)",
             g.gl.renderer, g.gl.version, (void *)g.gl_ctx, GetCurrentThreadId());
+        Log("[feed32] extension query: %s", g.gl.diag);
     }
     // GL names live in the share group of the context current at import: a context
     // change strands every one of them, so start over on the new one.

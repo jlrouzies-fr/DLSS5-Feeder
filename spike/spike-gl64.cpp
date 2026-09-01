@@ -350,10 +350,15 @@ static int RunInProcess()
     {
         printf("FAIL: the OpenGL interop is unavailable: %s\n", gl.missing);
         printf("      renderer=\"%s\" version=\"%s\"\n", gl.renderer, gl.version);
+        printf("      extension query: %s\n", gl.diag);
         printf("      (on a hybrid laptop, force this process onto the NVIDIA GPU)\n");
         return 1;
     }
     printf("gl: renderer=\"%s\" version=\"%s\" (interop extensions present)\n", gl.renderer, gl.version);
+    // Printed on the pass too: the gate can be carried by the live probe when a driver
+    // caps the extension string, and a spike that only says PASS cannot tell that apart
+    // from the matcher having found the extensions itself.
+    printf("gl: extension query: %s\n", gl.diag);
     GlExtra x;
     if (!LoadGlExtra(&x)) { printf("FAIL: glGetTexImage/glClear missing\n"); return 1; }
 
