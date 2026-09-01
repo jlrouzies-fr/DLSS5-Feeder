@@ -589,6 +589,7 @@ if you prefer editing the file directly:
 | `preset` | 0 | DLSS render-preset hint: `0` default, `5`/`6` = legacy CNN presets E/F (clamp history harder — try these if motion warps around transparents like dust or flames), `10`/`11` = transformer presets J/K. |
 | `gpu_timeout_ms` | 2000 | how long a frame waits for the GPU to retire a command allocator before that frame is abandoned. Three abandoned frames in a row stop the feed. Raise it on a heavily contended GPU; clamped to 100–60000. |
 | `mv_scale_x/y` | 1.0 | extra motion-vector multiplier. |
+| `async_home` | 1 | **32-bit games only.** 1 = pipelined handoff: each frame carries the DLSS output of the frame *before* it, so the game never waits for the helper process inside a frame — this is what lifts the ~35 fps ceiling of the original same-frame contract (issue #15). Costs one frame of latency on the DLSS output, which the temporal history hides. 0 = the original same-frame behaviour. Also on the overlay as "Pipelined handoff". |
 | `host_window` | 1 | **32-bit games only.** 1 shows the helper's window; 0 hides it (its own settings are now on the overlay page above, so you rarely need it). |
 
 In `DLSS5_Feed.fx`'s own UI (settings that only make sense per-shader, not per-session):

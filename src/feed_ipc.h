@@ -19,9 +19,20 @@
 // Either way the host creates the two shared fences on D3D12 and duplicates them
 // INTO the game process. The pipe carries only these fixed-size structs.
 //
-// Sync per frame n: game copies inputs, Signal(in_fence, n), sends FeedFrameMsg,
-// records Wait(out_fence, n) + blit; host waits in_fence >= n, evaluates,
-// Signal(out_fence, n). A pipe break on either side means "stop feeding".
+// Sync per frame n: the host always waits in_fence >= n, evaluates, Signal(out_fence, n).
+// The game has two shapes for its half, chosen by its async_home setting:
+//
+//  * same frame (async_home=0): copy inputs, Signal(in_fence, n), send FeedFrameMsg,
+//    record Wait(out_fence, n) + blit. The frame cannot be presented until the host
+//    has finished it, so the game's frame time carries the whole round trip.
+//  * pipelined (async_home=1, the default): record Wait(out_fence, m) for the frame m
+//    sent previously, copy inputs, blit the output the host produced for m, THEN
+//    Signal(in_fence, n) and send FeedFrameMsg. The blit reads Output before the
+//    signal that lets the host overwrite it, so one shared Output slot stays
+//    race-free; the cost is that the DLSS result is one frame old.
+//
+// Either way it is the same protocol -- the host cannot tell, and does not care.
+// A pipe break on either side means "stop feeding".
 //
 // Version 2 added client_kind and the host-created texture handles. Version 3 added
 // FEED_CLIENT_VULKAN and FeedBuildAck::output_fmt -- when the host creates the

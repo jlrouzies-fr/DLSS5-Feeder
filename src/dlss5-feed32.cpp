@@ -205,10 +205,16 @@ struct Cfg
     int   log_frames;
     int   host_window;     // 1 = show the host's window (it carries the DLSS 5 tuning panel: press Home there)
     int   work_resolution; // 50..100 percent of each backbuffer axis; the game stays native-sized
+    int   async_home;      // 1 = the copy home carries the PREVIOUS frame's output and waits on
+                           // the fence value of the frame BEFORE this one, so the game's present
+                           // never waits on this frame's round trip through the host process.
+                           // Costs one frame of DLSS latency, which the temporal history hides.
+                           // 0 = the same-frame contract this add-on shipped with. Same name and
+                           // meaning as the 64-bit add-on's knob for its Vulkan transport.
     float mv_scale_x, mv_scale_y;
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 1, 100, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 1, 100, 1, 1.0f, 1.0f };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -237,9 +243,10 @@ static void CfgWriteDefault()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+               "host_window=%d\nwork_resolution=%d\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.async_home,
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
 }
 
@@ -253,9 +260,10 @@ static void CfgSave()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+               "host_window=%d\nwork_resolution=%d\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.async_home,
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
 }
 
@@ -278,6 +286,24 @@ static bool CfgReload()   // true when a build-affecting value changed
 {
     char path[MAX_PATH];
     CfgPath(path);
+    // Runs on the game thread every 60 frames. Opening and parsing the file each time
+    // is a needless visit to the filesystem when, almost always, nothing has changed --
+    // so ask for the stamp first and go no further if it matches. The overlay's own
+    // CfgSave rewrites the file, which moves the stamp, so edits still land.
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fad = {};
+        static FILETIME last_write = {};
+        static DWORD    last_size  = 0xFFFFFFFFu;
+        if (GetFileAttributesExA(path, GetFileExInfoStandard, &fad))
+        {
+            if (fad.ftLastWriteTime.dwLowDateTime  == last_write.dwLowDateTime &&
+                fad.ftLastWriteTime.dwHighDateTime == last_write.dwHighDateTime &&
+                fad.nFileSizeLow == last_size)
+                return false;
+            last_write = fad.ftLastWriteTime;
+            last_size  = fad.nFileSizeLow;
+        }
+    }
     FILE *f = nullptr;
     if (fopen_s(&f, path, "r") != 0 || f == nullptr) return false;
     Cfg next = g_cfg;
@@ -297,6 +323,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
         else if (_stricmp(key, "host_window")    == 0) next.host_window    = iv;
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
+        else if (_stricmp(key, "async_home")     == 0) next.async_home     = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
@@ -460,6 +487,15 @@ struct Feed32
     UINT        backbuffer_width, backbuffer_height;
     DXGI_FORMAT bb_fmt, color_fmt, output_fmt;
     UINT64      frame_n;
+    // async_home bookkeeping. frame_n counts every frame this add-on has ever sent and
+    // never restarts; the FENCES do, because each host process creates its own pair from
+    // zero. So the value to wait on is the last frame THIS host accepted, not frame_n - 1:
+    // after a respawn the latter is a value the new fence will never reach, and the wait
+    // sits in front of the very submit whose signal would let the host produce it -- a
+    // deadlock that ends in a TDR rather than a stall.
+    UINT64      sent_n;       // last frame message this host session took (0 = none yet)
+    UINT64      wait_n;       // newest GPU-side wait queued on fence_out; what HostDrain owes
+    bool        out_valid;    // Output holds a host-written frame that is safe to carry home
     bool        need_reset;
 
     // blit
@@ -555,9 +591,10 @@ static void FeedFail(const char *what)
 
 static void HostDrain()
 {
-    // A GPU-side Wait(fence_out, frame_n) is queued on the immediate context every
-    // frame BEFORE the host has signalled it. If the host goes away first, that wait
-    // can never be satisfied, and everything queued behind it -- Present included --
+    // A GPU-side Wait(fence_out, wait_n) is queued on the immediate context every frame
+    // BEFORE the host has signalled it -- wait_n is this frame under the same-frame
+    // contract, and the one before it under async_home. If the host goes away first,
+    // that wait can never be satisfied, and everything queued behind it -- Present --
     // wedges until the driver TDRs (seen as a system-wide freeze when it happened on
     // a settings apply). Never let go of a live host before the last submitted frame
     // has been signalled. The host also catch-up-signals fence_out on its way out,
@@ -578,16 +615,16 @@ static void HostDrain()
             if (g.rs_queue != nullptr) g.rs_queue->wait_idle();
             return;
         }
-        if (FeedVkTimelineValue(&g.vk, g.vk_sem_out) >= g.frame_n) return;
+        if (FeedVkTimelineValue(&g.vk, g.vk_sem_out) >= g.wait_n) return;
         if (g.hproc == nullptr || WaitForSingleObject(g.hproc, 0) != WAIT_TIMEOUT)
         {
             Log("[feed32] drain: host died before signalling frame %llu",
-                static_cast<unsigned long long>(g.frame_n));
+                static_cast<unsigned long long>(g.wait_n));
             return;
         }
-        if (!FeedVkWaitTimeline(&g.vk, g.vk_sem_out, g.frame_n, 2000))
+        if (!FeedVkWaitTimeline(&g.vk, g.vk_sem_out, g.wait_n, 2000))
             Log("[feed32] drain: frame %llu never signalled by the host",
-                static_cast<unsigned long long>(g.frame_n));
+                static_cast<unsigned long long>(g.wait_n));
         return;
     }
     if (g.is_gl)
@@ -601,32 +638,37 @@ static void HostDrain()
         if (!g.gl.ok || g.gl.wglGetCurrentContext() != g.gl_ctx || g.gl_ctx == nullptr) return;
         if (!FeedGlWaitIdle(&g.gl, 2000))
             Log("[feed32] drain: the GL stream did not finish within 2 s (frame %llu never signalled by the host)",
-                static_cast<unsigned long long>(g.frame_n));
+                static_cast<unsigned long long>(g.wait_n));
         return;
     }
     if (g.fence_out == nullptr) return;
     g.fence_wait_queued = false;
-    if (g.fence_out->GetCompletedValue() >= g.frame_n) return;
+    if (g.fence_out->GetCompletedValue() >= g.wait_n) return;
     if (g.hproc == nullptr || WaitForSingleObject(g.hproc, 0) != WAIT_TIMEOUT)
     {
         // The host is already dead and can no longer signal: the wait (if the GPU
         // reached it) is unsatisfiable and there is nothing we can do from D3D11.
         Log("[feed32] drain: host died before signalling frame %llu",
-            static_cast<unsigned long long>(g.frame_n));
+            static_cast<unsigned long long>(g.wait_n));
         return;
     }
     HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (evt == nullptr) return;
-    if (SUCCEEDED(g.fence_out->SetEventOnCompletion(g.frame_n, evt)) &&
+    if (SUCCEEDED(g.fence_out->SetEventOnCompletion(g.wait_n, evt)) &&
         WaitForSingleObject(evt, 2000) != WAIT_OBJECT_0)
         Log("[feed32] drain: frame %llu never signalled by the host",
-            static_cast<unsigned long long>(g.frame_n));
+            static_cast<unsigned long long>(g.wait_n));
     CloseHandle(evt);
 }
 
 static void HostClose()
 {
     HostDrain();   // BEFORE the pipe closes: the host must still be around to signal
+    // The next host starts its fences at zero, so nothing this session sent is a value
+    // the new pair will ever reach. Forget them, and stop trusting Output's contents.
+    g.sent_n    = 0;
+    g.wait_n    = 0;
+    g.out_valid = false;
     if (g.pipe != nullptr)  { CloseHandle(g.pipe); g.pipe = nullptr; }
     if (g.hproc != nullptr)
     {
@@ -710,6 +752,19 @@ static bool PipeWrite(const void *buf, DWORD len)
 {
     DWORD put = 0;
     return g.pipe != nullptr && WriteFile(g.pipe, buf, len, &put, nullptr) && put == len;
+}
+
+// The tag and the message go in ONE write. Two writes put two round trips through the
+// pipe on the frame path, and the host reads them back-to-back anyway; the wire format
+// is byte-for-byte what it always was.
+#pragma pack(push, 1)
+struct FeedTaggedFrame { BYTE tag; FeedFrameMsg fm; };
+#pragma pack(pop)
+
+static bool PipeWriteFrame(const FeedFrameMsg &fm)
+{
+    const FeedTaggedFrame msg = { 'F', fm };
+    return PipeWrite(&msg, sizeof(msg));
 }
 
 static bool PipeRead(void *buf, DWORD len)
@@ -1009,7 +1064,8 @@ static void ReleaseShared()
         SafeRelease(g.tex[i]);
         if (g.tex_handle[i] != nullptr) { CloseHandle(g.tex_handle[i]); g.tex_handle[i] = nullptr; }
     }
-    g.built = false;
+    g.built     = false;
+    g.out_valid = false;
 }
 
 static bool MakeShared(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, bool render_target)
@@ -1224,6 +1280,7 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         g.color_fmt, g.output_fmt, ack.ngx_result, g_cfg.mode == 1 ? "transport" : "DLSS");
     g.built      = true;
     g.need_reset = true;
+    g.out_valid  = false;   // a fresh Output slot holds nothing worth carrying home
     g.consecutive_fails = 0;
     return true;
 }
@@ -1345,6 +1402,7 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
         w, h, g.color_fmt, g.output_fmt, ack.ngx_result, g_cfg.mode == 1 ? "transport" : "DLSS");
     g.built      = true;
     g.need_reset = true;
+    g.out_valid  = false;   // a fresh Output slot holds nothing worth carrying home
     g.consecutive_fails = 0;
     return true;
 }
@@ -1516,6 +1574,7 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         g_cfg.mode == 1 ? "transport" : "DLSS");
     g.built      = true;
     g.need_reset = true;
+    g.out_valid  = false;   // a fresh Output slot holds nothing worth carrying home
     g.consecutive_fails = 0;
     return true;
 }
@@ -1844,6 +1903,18 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
         {
             FeedGlStateGuard guard(&g.gl);
 
+            // async_home: wait for the frame we sent last, not this one -- see the Vulkan
+            // sibling below for why the wait moves to the top and the copy home with it.
+            const bool async_home = g_cfg.async_home != 0;
+            if (async_home && g.sent_n != 0)
+            {
+                Breadcrumb("waiting for the previous result (OpenGL)");
+                const GLuint outputs[1] = { g.gl_tex[FEED_OUTPUT] };
+                FeedGlWait(&g.gl, g.gl_sem_out, g.sent_n, outputs, 1);   // server-side; no CPU stall
+                g.fence_wait_queued = true;
+                g.wait_n            = g.sent_n;
+            }
+
             Breadcrumb("copying inputs (OpenGL)");
             FeedGlCopy(&g.gl, FeedGlHandleName(mv_res.handle),    g.gl_tex[FEED_MV],    w, h);
             FeedGlCopy(&g.gl, FeedGlHandleName(depth_res.handle), g.gl_tex[FEED_DEPTH], w, h);
@@ -1862,23 +1933,48 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
             const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
             g.need_reset = false;
 
+            // The copy home goes before the in-fence signal: that signal is the host's
+            // permission to overwrite Output, so our read of it must already be in the
+            // stream. (Same-frame mode blits below instead, after waiting on n.)
+            const bool carried = async_home && g.out_valid;
+            if (carried)
+                FeedGlBlit(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
+                           g.gl_tex[FEED_OUTPUT], true, bb_res.handle, false, w, h);
+
             {
-                const GLuint inputs[3] = { g.gl_tex[FEED_COLOR], g.gl_tex[FEED_DEPTH], g.gl_tex[FEED_MV] };
-                FeedGlSignal(&g.gl, g.gl_sem_in, n, inputs, 3);   // includes the glFlush the host's wait needs
+                // async_home also releases Output across the signal, so the host's next
+                // write is ordered against the blit above.
+                const GLuint inputs[4] = { g.gl_tex[FEED_COLOR], g.gl_tex[FEED_DEPTH], g.gl_tex[FEED_MV],
+                                           g.gl_tex[FEED_OUTPUT] };
+                FeedGlSignal(&g.gl, g.gl_sem_in, n, inputs, async_home ? 4 : 3);   // includes the glFlush the host's wait needs
             }
 
-            BYTE tag = 'F';
-            FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
-            if (!PipeWrite(&tag, 1) || !PipeWrite(&fm, sizeof(fm)))
+            const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
+            if (!PipeWriteFrame(fm))
                 HostLost("frame message failed");
+            else if (async_home)
+            {
+                g.sent_n    = n;
+                g.out_valid = true;
+                if (carried)
+                {
+                    const UINT64 done = ++g.frames_done;
+                    g.consecutive_fails = 0;
+                    if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                        Log("[feed32] frame %llu delivered (%ux%u, reset=%d, OpenGL)", done, g.width, g.height, reset);
+                }
+            }
             else
             {
                 Breadcrumb("waiting for the host's result (OpenGL)");
                 const GLuint outputs[1] = { g.gl_tex[FEED_OUTPUT] };
                 FeedGlWait(&g.gl, g.gl_sem_out, n, outputs, 1);   // server-side; the host CPU-signals on failure
                 g.fence_wait_queued = true;                       // HostDrain must resolve this before any close
+                g.wait_n            = n;
+                g.sent_n            = n;
                 FeedGlBlit(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
                            g.gl_tex[FEED_OUTPUT], true, bb_res.handle, false, w, h);
+                g.out_valid = true;
                 const UINT64 done = ++g.frames_done;
                 g.consecutive_fails = 0;
                 if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
@@ -2010,6 +2106,30 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 gfx_family = 0;
             }
 
+            // async_home: wait for the result of the frame we sent LAST, not the one we
+            // are about to send. Everything below -- the input copies AND the copy home --
+            // then rides a submit that only ever waits on work the host has had a whole
+            // frame to finish, so the game's present stops carrying a round trip through
+            // another process. The flush first puts the effect passes before us into their
+            // own submit, so the wait orders only our own recording and not theirs.
+            const bool async_home = g_cfg.async_home != 0;
+            if (async_home && g.sent_n != 0)
+            {
+                Breadcrumb("waiting for the previous result (Vulkan)");
+                g.rs_queue->flush_immediate_command_list();
+                g.rs_queue->wait(g.rs_fence_out, g.sent_n);
+                g.fence_wait_queued = true;
+                g.wait_n            = g.sent_n;
+                cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());   // fresh buffer after the flush
+            }
+
+            // The shared set moves as a group, so collect it once and transition it in
+            // one barrier rather than four.
+            VkImage group[FEED_SLOTS];
+            uint32_t group_n = 0;
+            for (int i = 0; i < FEED_SLOTS; ++i)
+                if (g.vk_img[i] != VK_NULL_HANDLE) group[group_n++] = g.vk_img[i];
+
             // Our imported images live permanently in GENERAL; only these raw barriers
             // ever move them, and only the first frame after a build starts UNDEFINED.
             // A frame that released them to VK_QUEUE_FAMILY_EXTERNAL and then bailed
@@ -2017,22 +2137,18 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             Breadcrumb("copying inputs (Vulkan)");
             if (!g.vk_layout_init)
             {
-                for (int i = 0; i < FEED_SLOTS; ++i)
-                    FeedVkBarrier(&g.vk, cb, g.vk_img[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+                FeedVkBarrierN(&g.vk, cb, group, group_n, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
                 g.vk_layout_init = true;
                 g.vk_released    = false;   // fresh images; nothing has been handed to the host yet
             }
             else if (g.vk_released)
             {
-                for (int i = 0; i < FEED_SLOTS; ++i)
-                    if (g.vk_img[i] != VK_NULL_HANDLE)
-                        FeedVkExternalTransfer(&g.vk, cb, g.vk_img[i], gfx_family, false /*acquire*/);
+                FeedVkExternalTransferN(&g.vk, cb, group, group_n, gfx_family, false /*acquire*/);
                 g.vk_released = false;
             }
             else
             {
-                for (int i = 0; i < FEED_SLOTS; ++i)
-                    FeedVkBarrier(&g.vk, cb, g.vk_img[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+                FeedVkBarrierN(&g.vk, cb, group, group_n, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
             }
             // The game's own images go through ReShade's barrier API so its layout
             // tracking stays correct; the copies themselves are raw.
@@ -2062,38 +2178,62 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
             g.need_reset = false;
 
+            // async_home: carry home what the host produced for the frame we waited on
+            // above. It has to be recorded HERE -- after the input copies, because the
+            // backbuffer is still the Color source until they are done, and before the
+            // in-fence signal below, because that signal is the host's permission to
+            // start overwriting Output for frame n. Between those two points the read is
+            // exclusive, which is why one shared Output slot is enough and the 64-bit
+            // transport's double-slotted home buffer is not needed here.
+            const bool carried = async_home && g.out_valid;
+            if (carried)
+            {
+                Breadcrumb("carrying the previous result home (Vulkan)");
+                if (FeedFmtSameTexelLayout(g.output_fmt, g.bb_fmt))
+                    FeedVkCopyImage(&g.vk, cb, g.vk_img[FEED_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                else
+                    FeedVkBlitImage(&g.vk, cb, g.vk_img[FEED_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+            }
+
             // Hand the images to the host's D3D12 device: release ownership to
             // VK_QUEUE_FAMILY_EXTERNAL. This is what makes this frame's input copies
             // *available* to the evaluate over there -- the in-fence below only orders
             // the work, it does not publish the bytes. Recorded before the flush so it
             // rides the same submit as the copies.
-            for (int i = 0; i < FEED_SLOTS; ++i)
-                if (g.vk_img[i] != VK_NULL_HANDLE)
-                    FeedVkExternalTransfer(&g.vk, cb, g.vk_img[i], gfx_family, true /*release*/);
+            FeedVkExternalTransferN(&g.vk, cb, group, group_n, gfx_family, true /*release*/);
             g.vk_released = true;
 
             Breadcrumb("signalling the host (Vulkan)");
             g.rs_queue->flush_immediate_command_list();
             g.rs_queue->signal(g.rs_fence_in, n);
 
-            BYTE tag = 'F';
-            FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
+            const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
             bool delivered = false;
-            if (!PipeWrite(&tag, 1) || !PipeWrite(&fm, sizeof(fm)))
+            if (!PipeWriteFrame(fm))
                 HostLost("frame message failed");
+            else if (async_home)
+            {
+                // Nothing more to do this frame: the result of n is picked up at the top
+                // of the next one. The images stay released to the host until then.
+                g.sent_n    = n;
+                g.out_valid = true;
+                delivered   = carried;   // nothing was carried home on the first frame of a build
+            }
             else
             {
                 Breadcrumb("waiting for the host's result (Vulkan)");
                 g.rs_queue->wait(g.rs_fence_out, n);   // GPU-side; the host CPU-signals on failure
                 g.fence_wait_queued = true;            // HostDrain must resolve this before any close
+                g.wait_n            = n;
+                g.sent_n            = n;
                 cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());   // fresh buffer after the flush
                 // Take the images back from the host: acquire from
                 // VK_QUEUE_FAMILY_EXTERNAL, making the evaluate's output writes visible
                 // to the copy home. This submit waits on the out-fence, so the acquire
                 // is GPU-ordered after the evaluate.
-                for (int i = 0; i < FEED_SLOTS; ++i)
-                    if (g.vk_img[i] != VK_NULL_HANDLE)
-                        FeedVkExternalTransfer(&g.vk, cb, g.vk_img[i], gfx_family, false /*acquire*/);
+                FeedVkExternalTransferN(&g.vk, cb, group, group_n, gfx_family, false /*acquire*/);
                 g.vk_released = false;
                 // Prefer the raw copy: vkCmdBlitImage CONVERTS, and that conversion is
                 // sRGB-aware, so blitting our linear-typed output into a VK_FORMAT_*_SRGB
@@ -2106,7 +2246,8 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 else
                     FeedVkBlitImage(&g.vk, cb, g.vk_img[FEED_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
                                     bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
-                delivered = true;
+                g.out_valid = true;
+                delivered   = true;
             }
 
             // The backbuffer goes back to render_target whether or not the round trip
@@ -2233,6 +2374,19 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
         if (!HostAlive()) { HostLost("process died"); }
         else
         {
+            // async_home: wait for the frame we sent last, not this one. The wait goes
+            // ahead of the input copies as well -- the host may still be READING Color,
+            // Depth and MV for that evaluate, and this is the only thing ordering our
+            // overwrite of them against it.
+            const bool async_home = g_cfg.async_home != 0;
+            if (async_home && g.sent_n != 0)
+            {
+                Breadcrumb("waiting for the previous result");
+                g.ctx4->Wait(g.fence_out, g.sent_n);   // GPU-side; the host CPU-signals on failure
+                g.fence_wait_queued = true;
+                g.wait_n            = g.sent_n;
+            }
+
             Breadcrumb("preparing work-resolution inputs");
             if (!CopyOrResampleInputs(ctx, color, mv, depth,
                                       reinterpret_cast<ID3D11ShaderResourceView *>(mv_srv.handle),
@@ -2252,19 +2406,39 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
             const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
             g.need_reset = false;
 
+            // The blit home goes before the in-fence signal: the immediate context is
+            // in-order, so the signal -- the host's permission to overwrite Output --
+            // cannot pass our read of it.
+            const bool carried = async_home && g.out_valid;
+            if (carried) BlitOutputToBackbuffer(ctx, rtv11);
+
             g.ctx4->Signal(g.fence_in, n);
             ctx->Flush();
 
-            BYTE tag = 'F';
-            FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
-            if (!PipeWrite(&tag, 1) || !PipeWrite(&fm, sizeof(fm)))
+            const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
+            if (!PipeWriteFrame(fm))
                 HostLost("frame message failed");
+            else if (async_home)
+            {
+                g.sent_n    = n;
+                g.out_valid = true;
+                if (carried)
+                {
+                    const UINT64 done = ++g.frames_done;
+                    g.consecutive_fails = 0;
+                    if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                        Log("[feed32] frame %llu delivered (%ux%u, reset=%d)", done, g.width, g.height, reset);
+                }
+            }
             else
             {
                 Breadcrumb("waiting for the host's result");
                 g.ctx4->Wait(g.fence_out, n);       // GPU-side; the host CPU-signals on failure
                 g.fence_wait_queued = true;         // HostDrain must resolve this before any close
+                g.wait_n            = n;
+                g.sent_n            = n;
                 BlitOutputToBackbuffer(ctx, rtv11);
+                g.out_valid = true;
                 const UINT64 done = ++g.frames_done;
                 g.consecutive_fails = 0;
                 if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
@@ -2475,6 +2649,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     if (g.disabled && g_disable_why[0])
         ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "Stopped: %s", g_disable_why);
     ImGui::Text("Render API: %s", g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : "Direct3D 11");
+    ImGui::Text("Handoff: %s", g_cfg.async_home ? "pipelined (+1 frame)" : "same frame");
     ImGui::Text("Host process: %s", HostAlive() ? "running" : "not running");
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
     ImGui::TextWrapped("Motion vectors: %s", g_mv_status);
@@ -2535,6 +2710,13 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     if (ImGui::Combo("HDR", &hdr_idx, kTri, 3)) { g_cfg.hdr = hdr_idx - 1; dirty = true; }
     if (ImGui::Combo("Depth inverted", &di_idx, kTri, 3)) { g_cfg.depth_inverted = di_idx - 1; dirty = true; }
     bool reset_every = g_cfg.reset_every != 0;
+    bool async_home = g_cfg.async_home != 0;
+    if (ImGui::Checkbox("Pipelined handoff", &async_home)) { g_cfg.async_home = async_home ? 1 : 0; dirty = true; }
+    ImGui::SameLine(); HelpMarker("Shows the frame DLSS finished LAST, instead of making the game wait for the "
+                                  "one it is presenting now. The helper process then works alongside the game "
+                                  "instead of inside its frame, which is what lifts the frame-rate ceiling. "
+                                  "Costs one frame of latency on the DLSS output; the temporal history hides it. "
+                                  "Turn it off to get the original same-frame behaviour back.");
     if (ImGui::Checkbox("Reset every frame (diagnostic)", &reset_every)) { g_cfg.reset_every = reset_every ? 1 : 0; dirty = true; }
     if (ImGui::SliderFloat("MV scale X", &g_cfg.mv_scale_x, 0.0f, 4.0f)) dirty = true;
     if (ImGui::SliderFloat("MV scale Y", &g_cfg.mv_scale_y, 0.0f, 4.0f)) dirty = true;

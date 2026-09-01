@@ -388,6 +388,58 @@ static void FeedVkExternalBufferTransfer(FeedVk *vk, VkCommandBuffer cb, VkBuffe
 // without it each side keeps reading its own cached view and the other side's
 // writes land never or sporadically (Detroit: Become Human, frozen output).
 // Layout stays GENERAL on both sides; only ownership moves.
+// Array forms of the two barriers below. The shared set moves as a group -- four
+// images acquired together, then released together -- and issuing that as one
+// CmdPipelineBarrier instead of four costs the pipeline one full ALL_COMMANDS stall
+// per group rather than four. The single-image forms stay: they are what the 64-bit
+// add-on and the spike use, and what a one-off transition still wants.
+#define FEED_VK_MAX_GROUP 8
+
+static void FeedVkBarrierN(FeedVk *vk, VkCommandBuffer cb, const VkImage *imgs, uint32_t count,
+                           VkImageLayout from, VkImageLayout to)
+{
+    if (count == 0) return;
+    if (count > FEED_VK_MAX_GROUP) count = FEED_VK_MAX_GROUP;
+    VkImageMemoryBarrier b[FEED_VK_MAX_GROUP] = {};
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        b[i].sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b[i].srcAccessMask       = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+        b[i].dstAccessMask       = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+        b[i].oldLayout           = from;
+        b[i].newLayout           = to;
+        b[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b[i].image               = imgs[i];
+        b[i].subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    }
+    vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                           0, 0, nullptr, 0, nullptr, count, b);
+}
+
+static void FeedVkExternalTransferN(FeedVk *vk, VkCommandBuffer cb, const VkImage *imgs, uint32_t count,
+                                    uint32_t family, bool release)
+{
+    if (count == 0) return;
+    if (count > FEED_VK_MAX_GROUP) count = FEED_VK_MAX_GROUP;
+    VkImageMemoryBarrier b[FEED_VK_MAX_GROUP] = {};
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        b[i].sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        // Per spec the dst side of a release and the src side of an acquire are ignored.
+        b[i].srcAccessMask       = release ? (VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT) : 0;
+        b[i].dstAccessMask       = release ? 0 : (VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT);
+        b[i].oldLayout           = VK_IMAGE_LAYOUT_GENERAL;
+        b[i].newLayout           = VK_IMAGE_LAYOUT_GENERAL;
+        b[i].srcQueueFamilyIndex = release ? family : VK_QUEUE_FAMILY_EXTERNAL;
+        b[i].dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : family;
+        b[i].image               = imgs[i];
+        b[i].subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    }
+    vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                           0, 0, nullptr, 0, nullptr, count, b);
+}
+
 static void FeedVkExternalTransfer(FeedVk *vk, VkCommandBuffer cb, VkImage img,
                                    uint32_t family, bool release)
 {
