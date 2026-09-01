@@ -578,7 +578,7 @@ static void PumpPresent(bool force = false)
 
     static ULONGLONG last = 0;
     const ULONGLONG now = GetTickCount64();
-    if (!force && now - last < 100) return;
+    if (!force && now - last < 33) return;
     last = now;
 
     // Paint the banner into the backbuffer (ReShade's overlay composites on top at Present).

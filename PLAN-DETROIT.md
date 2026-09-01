@@ -1,22 +1,30 @@
 # Detroit: Become Human (Demo) — 64-bit Vulkan copy-home stays stale (unresolved)
 
-> ## Status — open, but there is now a lead: this looks like issue #10, not a Detroit-specific bug
+> ## Status — CLOSED for the Smooth Motion case; Detroit itself still needs one 2-minute check
 >
-> **New data point (2026-09-01, from the user): enabling NVIDIA Smooth Motion in DOOM 2016
-> (64-bit Vulkan) reproduces the Detroit symptom exactly** — in a game that is otherwise a proven
-> working row. Detroit shows it without Smooth Motion having been deliberately enabled. See
-> "The Smooth Motion clue" below: it reframes everything under it, supplies the Vulkan data point
-> [`PLAN-SMOOTHMOTION.md`](PLAN-SMOOTHMOTION.md) was explicitly waiting on for
-> [#10](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/10), and invalidates the reasoning
-> that ruled Smooth Motion out for Detroit in the first place.
+> **Root cause (2026-09-01): an in-driver frame pacer, i.e. NVIDIA Smooth Motion.** Enabling it in
+> DOOM 2016 (64-bit Vulkan) — an otherwise proven working row — reproduces the Detroit symptom
+> exactly. That is the Vulkan data point [`PLAN-SMOOTHMOTION.md`](PLAN-SMOOTHMOTION.md) was
+> waiting on for [#10](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/10).
 >
-> `enabled=0` is set in the deployed `dlss5-feed.cfg` next to the demo's exe so the game plays
-> cleanly. Eight independent tests (below) all reproduce the same symptom and rule out —
-> individually — transport, format, HDR, NR, DLSS itself, image import, and queue-family
-> ownership. What none of them touched is **what happens to the frame after we write it**, which
-> is exactly where Smooth Motion operates. The diagnostic scaffolding (four new `dlss5-feed.cfg`
-> knobs, two probes) stays in the code for whoever picks this up next; see "Diagnostic tools now
-> in the codebase" below.
+> **It is not fixable from inside a ReShade add-on.** See "Resolution" below: five tests show our
+> side can be made byte-correct, complete before present, and structurally identical to a normal
+> game's frame — and the pacer's *generated* frames still never carry our output, because it
+> builds them from a source captured where the effect chain has not run. The supported answer is
+> the per-API opt-out: "Smooth Motion - Enabled APIs" (`0xB0CC0875`), clear bit `4` (Vulkan),
+> which leaves Smooth Motion working for D3D11/D3D12 games. **Vulkan without a pacer is
+> unaffected and stays a proven path.**
+>
+> **Still owed for Detroit specifically:** it was never independently confirmed to have Smooth
+> Motion *off*, and the feeder cannot detect it on Vulkan (see "The Smooth Motion clue"). The
+> Debug Bars check (`0xB01B8B02`, item 1 under "What to check next") settles in two minutes
+> whether Detroit is this same issue or a second one. `enabled=0` is set in the deployed
+> `dlss5-feed.cfg` next to the demo's exe until then.
+>
+> Eight earlier tests (below) individually rule out transport, format, HDR, NR, DLSS itself,
+> image import and queue-family ownership. The diagnostic scaffolding they left behind — six
+> `dlss5-feed.cfg` knobs, three probes and a shader — stays in the code; see "Diagnostic tools
+> now in the codebase".
 
 ## The report
 
