@@ -152,13 +152,59 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 //  - v4.6 builds keep the v45+ engine (rescan every present, adopt lazily) and add
 //    global hotkeys, a rejected-upscaling latch and richer decline diagnostics;
 //    nothing they gate on is missing from the contract this feeder publishes.
-// The 'EnableHooks' string in the binary is the v45+ marker; 'NRToggleKey' is the
-// v4.6 one (its only new config keys are EnableHooks and the two hotkey binds).
+//  - v4.7 builds keep that engine again and rework the colour path: the Control-style
+//    soft-clip/paper-white codec is replaced by a reversible colour bridge that picks
+//    SDR sRGB, linear HDR BT.709 or PQ BT.2020 from the contract it is handed, with a
+//    diffuse-white-in-nits control instead of a paper-white scale, plus a new
+//    global-tone strength and a fenced D3D12 workset pool. Everything it decides on --
+//    the IsHDR create flag and the colour format -- is already in what this feeder
+//    publishes, so no contract change is needed here.
+// Markers, each a NUL-terminated literal in the add-on's string table: 'EnableHooks'
+// is v45+, 'NRToggleKey' is v4.6+, 'NRGlobalTone' is v4.7+ (each generation's new
+// config keys are the only reliable, purely additive fingerprint).
+// The file version resource cannot separate them -- v4.6 and v4.7 both report
+// 0.2026.0828.0517 -- but v4.6+ builds carry their own generation banner ("v4.6",
+// "v4.7") next to 'RenoDX DLSS5 Generic ', so read that when it is present and fall
+// back to the version resource on older builds that have none.
 // ---------------------------------------------------------------------------
 
 static char g_renodx_ver[48] = "not found";
+static char g_renodx_gen[16] = "";       // the add-on's own banner, e.g. "v4.7" (v4.6+ only)
 static bool g_renodx_lazy    = false;
 static bool g_renodx_v46     = false;
+static bool g_renodx_v47     = false;
+
+// Does the add-on's string table hold this literal? The terminator is part of the
+// match, so a marker key can never be found inside a longer string that starts with
+// it (the "EnableHooks=0: NR disabled by policy" message, for one).
+static bool RenodxHasLiteral(const char *buf, DWORD size, const char *needle)
+{
+    const DWORD n = static_cast<DWORD>(strlen(needle)) + 1;   // include the NUL
+    if (buf == nullptr || size < n) return false;
+    for (DWORD i = 0; i + n <= size; ++i)
+        if (buf[i] == needle[0] && memcmp(buf + i, needle, n) == 0) return true;
+    return false;
+}
+
+// Find the add-on's generation banner: a NUL-terminated "v<d>.<d>[<d>]" literal, which
+// only v4.6+ builds carry (older classic-engine builds have none; fall back to the resource).
+static void RenodxFindBanner(const char *buf, DWORD size, char *out, size_t out_size)
+{
+    const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+    for (DWORD i = 1; i + 5 <= size; ++i)
+    {
+        if (buf[i - 1] != '\0' || buf[i] != 'v' || !digit(buf[i + 1]) || buf[i + 2] != '.' || !digit(buf[i + 3]))
+            continue;
+        DWORD end = i + 4;
+        while (end < size && digit(buf[end])) ++end;
+        if (end < size && buf[end] == '\0' && end - i < out_size)
+        {
+            memcpy(out, buf + i, end - i);
+            out[end - i] = '\0';
+            return;
+        }
+    }
+}
 
 // Set when the game's device (or the process) is being destroyed: from that moment,
 // never call back into NGX. The DLSS 5 add-on tears its hooks down during device
@@ -199,15 +245,16 @@ static void DetectRenodxAddon()
     DWORD got = 0;
     char *buf = (size > 0 && size < 8u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
     if (buf != nullptr && ReadFile(f, buf, size, &got, nullptr) && got == size)
-        for (DWORD i = 0; i + 11 < size; ++i)   // both markers happen to be 11 bytes
-        {
-            if (!g_renodx_lazy && memcmp(buf + i, "EnableHooks", 11) == 0) g_renodx_lazy = true;
-            if (!g_renodx_v46  && memcmp(buf + i, "NRToggleKey", 11) == 0) g_renodx_v46  = true;
-            if (g_renodx_lazy && g_renodx_v46) break;
-        }
+    {
+        g_renodx_lazy = RenodxHasLiteral(buf, size, "EnableHooks");
+        g_renodx_v46  = RenodxHasLiteral(buf, size, "NRToggleKey");
+        g_renodx_v47  = RenodxHasLiteral(buf, size, "NRGlobalTone");
+        RenodxFindBanner(buf, size, g_renodx_gen, sizeof(g_renodx_gen));
+    }
     free(buf);
     CloseHandle(f);
-    if (g_renodx_v46) g_renodx_lazy = true;   // v4.6 is a per-present-rescan engine too
+    if (g_renodx_v47) g_renodx_v46 = true;    // each generation keeps the previous engine
+    if (g_renodx_v46) g_renodx_lazy = true;   // v4.6+ is a per-present-rescan engine too
 
     DWORD dummy = 0;
     const DWORD vsize = GetFileVersionInfoSizeA(path, &dummy);
@@ -223,8 +270,10 @@ static void DetectRenodxAddon()
         free(vdata);
     }
 
-    Log("[feed] DLSS 5 add-on: renodx-dlss5.addon64 v%s -- %s engine", g_renodx_ver,
-        g_renodx_v46  ? "v4.6+ (per-present rescan, lazy adoption, global hotkeys, upscaling latch)"
+    Log("[feed] DLSS 5 add-on: renodx-dlss5.addon64 %s%s (file version %s) -- %s engine",
+        g_renodx_gen[0] != '\0' ? "" : "v", g_renodx_gen[0] != '\0' ? g_renodx_gen : g_renodx_ver, g_renodx_ver,
+        g_renodx_v47  ? "v4.7+ (per-present rescan, lazy adoption, reversible colour bridge, fenced workset pool)"
+      : g_renodx_v46  ? "v4.6+ (per-present rescan, lazy adoption, global hotkeys, upscaling latch)"
       : g_renodx_lazy ? "v45+ (per-present rescan, lazy feature adoption; warm-up re-create skipped)"
                       : "classic (single hook pass; warm-up re-create stays on)");
 
@@ -242,7 +291,7 @@ static void DetectRenodxAddon()
     RenodxDefault("NeuralUplift", "1", "neural rendering on");
     RenodxDefault("NREnableUpscaling", "0", "upscaling off; this feeder publishes a complete 1:1 DLAA contract");
 
-    // NRStyle is v4.6's own setting, changed from ITS overlay panel and applied at the
+    // NRStyle is the add-on's own setting (v4.6+), changed from ITS overlay panel and applied at the
     // next launch. On the reference machine (Metro 2033 Redux, Smooth Motion active),
     // NRStyle=2 crashed the game 1-2 s into every boot with a null read on the present
     // path -- landing in whichever module presented next (Luma once, the game's CRT with
@@ -497,11 +546,20 @@ struct Cfg
     int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer)
     int   work_resolution; // 64-bit D3D11 only: 50..100 percent of each backbuffer axis
     int   gpu_timeout_ms;  // how long BeginCommands waits for the GPU to retire an allocator slot
+    int   buffer_home;     // Vulkan transport: 1 = route the output home through a shared linear
+                           // BUFFER instead of the shared image (dodges a one-directional
+                           // image-coherence driver bug -- Detroit: Become Human), 0 = image
+    int   half_home;       // diagnostic: mode-2 copy home writes only the LEFT half of the
+                           // frame (mode-1 style split screen), so the right half shows the
+                           // live game next to what DLSS handed back
+    int   passthrough;     // diagnostic: mode-2 with the NGX evaluate swapped for a plain
+                           // CopyResource(OUTPUT <- COLOR) -- the whole transport runs, DLSS
+                           // does not. Separates "transport lags" from "DLSS output lags".
     float mv_scale_x;      // multiplier applied to the motion vectors (the FX already outputs pixels)
     float mv_scale_y;
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 2000, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 2000, 1, 0, 0, 1.0f, 1.0f };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -534,11 +592,12 @@ static void CfgWriteDefault()
             "preset=%d\n"
             "work_resolution=%d\n"
             "gpu_timeout_ms=%d\n"
+            "buffer_home=%d\n"
             "mv_scale_x=%.3f\n"
             "mv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
-            g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -572,6 +631,9 @@ static bool CfgReload()
         else if (_stricmp(key, "preset")         == 0) next.preset         = iv;
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
         else if (_stricmp(key, "gpu_timeout_ms") == 0) next.gpu_timeout_ms  = iv;
+        else if (_stricmp(key, "buffer_home")    == 0) next.buffer_home    = iv;
+        else if (_stricmp(key, "half_home")      == 0) next.half_home      = iv;
+        else if (_stricmp(key, "passthrough")    == 0) next.passthrough    = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
@@ -584,15 +646,15 @@ static bool CfgReload()
 
     const bool rebuild = next.hdr != g_cfg.hdr || next.depth_inverted != g_cfg.depth_inverted ||
                          next.flags != g_cfg.flags || next.rebuild != g_cfg.rebuild ||
-                         next.preset != g_cfg.preset;
+                         next.preset != g_cfg.preset || next.buffer_home != g_cfg.buffer_home;
     const bool changed = rebuild || memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
     if (!changed) return false;
     g_cfg = next;
     Log("[feed] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d warmup_rebuild=%d "
-        "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% gpu_timeout_ms=%d mv_scale=%.3f,%.3f",
+        "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% gpu_timeout_ms=%d buffer_home=%d mv_scale=%.3f,%.3f",
         g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
         g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay,
-        g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+        g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     return rebuild;
 }
 
@@ -608,10 +670,10 @@ static void CfgSave()
     fprintf(f,
         "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
             "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\ngpu_timeout_ms=%d\n"
-            "mv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+            "buffer_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
-            g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
 }
 
@@ -781,8 +843,20 @@ struct Feed
     FeedVk                 vk;
     VkImage                vk_img[SLOT_COUNT];
     VkDeviceMemory         vk_mem[SLOT_COUNT];
+    ID3D12Resource        *home_buf12;       // buffer_home: shared linear buffer for the output hop
+    HANDLE                 home_buf_handle;
+    VkBuffer               vk_home_buf;
+    VkDeviceMemory         vk_home_mem;
+    UINT                   home_pitch;       // bytes per row in the buffer (256-aligned)
+    ID3D12Resource        *in_buf12[SLOT_COUNT];    // buffer_home, input direction: one shared linear
+    HANDLE                 in_buf_handle[SLOT_COUNT];  // buffer per input slot (OUTPUT unused) -- the
+    VkBuffer               vk_in_buf[SLOT_COUNT];      // image imports proved stale for D3D12 reads of
+    VkDeviceMemory         vk_in_mem[SLOT_COUNT];      // Vulkan writes on this driver, same as the
+    UINT                   in_pitch[SLOT_COUNT];       // output direction (Detroit: Become Human)
     VkSemaphore            vk_sem_in, vk_sem_out;
     bool                   vk_layout_init;   // our images transitioned UNDEFINED->GENERAL once
+    bool                   vk_released;      // our images are released to VK_QUEUE_FAMILY_EXTERNAL
+                                             // (the D3D12 device owns them until the next acquire)
     UINT64                 vk_frame;
 
     // OpenGL transport: raw-GL imports of the very same D3D12 shared objects. Nothing
@@ -939,6 +1013,21 @@ static bool SameTexelLayout(DXGI_FORMAT a, DXGI_FORMAT b)
 {
     const int fa = TexelLayoutFamily(a);
     return fa != 0 && fa == TexelLayoutFamily(b);
+}
+
+// Bytes per texel for the formats the copy home can meet; 0 = not supported by the
+// buffer_home path (which must know the row pitch exactly).
+static UINT HomeTexelBytes(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R11G11B10_FLOAT:      return 4;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:   return 8;
+    default:                               return 0;
+    }
 }
 
 // NGX writes the output through a UAV, and typed UAV *stores* to B8G8R8A8_UNORM are an
@@ -1311,10 +1400,116 @@ static void GuideProbeRecord(ID3D12Resource *mv, D3D12_RESOURCE_STATES mv_state,
     g_guide_probe_fence = g.fence_value + 1;   // exactly what EndCommands() signals for this list
 }
 
+// ---------------------------------------------------------------------------
+// Staleness probe. Every kStaleProbeEvery frames, copy a 64x64 centre block of the
+// D3D12 view of the colour INPUT (exactly what the evaluate is about to read) and of
+// the OUTPUT (exactly what the evaluate just wrote) into a readback buffer, hash both
+// once the fence confirms completion, and log whether each changed since the previous
+// probe. When the screen freezes but every frame reports "delivered", this says WHICH
+// hop of the cross-API transport is stale: colour-in SAME = the Vulkan->D3D12 input
+// copy is not landing; colour-in CHANGED but output SAME = DLSS is producing a
+// constant; both CHANGED = the D3D12->Vulkan copy home is the stale hop.
+// ---------------------------------------------------------------------------
+
+static const UINT kStaleProbeSize  = 64;
+static const UINT kStaleProbePitch = 256;   // 64 texels of a 4-byte format, already row-pitch aligned
+static const UINT kStaleProbeBlock = kStaleProbePitch * kStaleProbeSize;
+static const UINT kStaleProbeEvery = 60;
+static_assert(kStaleProbeBlock % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT == 0);
+
+static ID3D12Resource *g_stale_buf;
+static UINT64          g_stale_fence;          // fence value that completes the pending copies; 0 = none
+static UINT64          g_stale_frames;
+static UINT64          g_stale_capture_frame;
+static uint64_t        g_stale_hash[2];        // previous colour-in / output hashes
+static bool            g_stale_have_hash;
+
+static uint64_t StaleProbeHash(const uint8_t *p)   // FNV-1a over one block
+{
+    uint64_t h = 1469598103934665603ull;
+    for (UINT i = 0; i < kStaleProbeBlock; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+static void StaleProbeAnalyse()
+{
+    void *p = nullptr;
+    const D3D12_RANGE read = { 0, kStaleProbeBlock * 2 };
+    if (FAILED(g_stale_buf->Map(0, &read, &p)) || p == nullptr) return;
+    const uint64_t hc = StaleProbeHash(static_cast<const uint8_t *>(p));
+    const uint64_t ho = StaleProbeHash(static_cast<const uint8_t *>(p) + kStaleProbeBlock);
+    const D3D12_RANGE none = { 0, 0 };
+    g_stale_buf->Unmap(0, &none);
+    if (g_stale_have_hash)
+        Log("[feed] stale probe (frame %llu): colour-in %s (%016llx), output %s (%016llx)",
+            static_cast<unsigned long long>(g_stale_capture_frame),
+            hc == g_stale_hash[0] ? "SAME" : "changed", static_cast<unsigned long long>(hc),
+            ho == g_stale_hash[1] ? "SAME" : "changed", static_cast<unsigned long long>(ho));
+    g_stale_hash[0] = hc;
+    g_stale_hash[1] = ho;
+    g_stale_have_hash = true;
+}
+
+// Call while recording, after the evaluate: colour still in its input state, output in
+// its evaluate state. Both are returned to the states they came in with.
+static void StaleProbeRecord(ID3D12Resource *color, D3D12_RESOURCE_STATES color_state,
+                             ID3D12Resource *output, D3D12_RESOURCE_STATES output_state)
+{
+    if (color == nullptr || output == nullptr || g.dev12 == nullptr || g.list == nullptr || g.fence12 == nullptr) return;
+    ++g_stale_frames;
+
+    if (g_stale_fence != 0)
+    {
+        if (g.fence12->GetCompletedValue() < g_stale_fence) return;
+        StaleProbeAnalyse();
+        g_stale_fence = 0;
+    }
+    if ((g_stale_frames % kStaleProbeEvery) != 0) return;
+    if (g.width < kStaleProbeSize || g.height < kStaleProbeSize) return;
+    if (g_stale_buf == nullptr)
+    {
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC   rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = kStaleProbeBlock * 2;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                    __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g_stale_buf))))
+            return;
+    }
+
+    const UINT x0 = (g.width - kStaleProbeSize) / 2, y0 = (g.height - kStaleProbeSize) / 2;
+    const D3D12_BOX box = { x0, y0, 0, x0 + kStaleProbeSize, y0 + kStaleProbeSize, 1 };
+
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = g_stale_buf; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+
+    src.pResource = color;
+    dst.PlacedFootprint.Offset = 0;
+    dst.PlacedFootprint.Footprint = { g.color_fmt, kStaleProbeSize, kStaleProbeSize, 1, kStaleProbePitch };
+    if (color_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(color, color_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    if (color_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(color, D3D12_RESOURCE_STATE_COPY_SOURCE, color_state);
+
+    src.pResource = output;
+    dst.PlacedFootprint.Offset = kStaleProbeBlock;
+    dst.PlacedFootprint.Footprint = { g.output_fmt, kStaleProbeSize, kStaleProbeSize, 1, kStaleProbePitch };
+    if (output_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(output, output_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    if (output_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(output, D3D12_RESOURCE_STATE_COPY_SOURCE, output_state);
+
+    g_stale_capture_frame = g_stale_frames;
+    g_stale_fence = g.fence_value + 1;   // exactly what EndCommands() signals for this list
+}
+
 static void GuideProbeAbort()
 {
     g_guide_probe_fence = 0;
     g_guide_probe_capture_frame = 0;
+    g_stale_fence = 0;
+    g_stale_capture_frame = 0;
 }
 
 static void GuideProbeShutdown()
@@ -1324,6 +1519,11 @@ static void GuideProbeShutdown()
     g_guide_probe_fence = 0;
     g_guide_probe_frames = 0;
     g_guide_probe_capture_frame = 0;
+    SafeRelease(g_stale_buf);
+    g_stale_fence = 0;
+    g_stale_frames = 0;
+    g_stale_capture_frame = 0;
+    g_stale_have_hash = false;
 }
 
 static void SafeReleaseFeature(NVSDK_NGX_Handle *f)
@@ -1354,11 +1554,20 @@ static void ReleaseFrameResources()
     // Vulkan transport: drop our raw VkImage imports (the memory is the D3D12 resource's;
     // freeing the import does not free the D3D12 resource, which SafeRelease(tex12) does).
     if (g.vk.ok)
+    {
         for (int i = 0; i < SLOT_COUNT; ++i)
         {
             if (g.vk_img[i] != VK_NULL_HANDLE) { g.vk.DestroyImage(g.vk.dev, g.vk_img[i], nullptr); g.vk_img[i] = VK_NULL_HANDLE; }
             if (g.vk_mem[i] != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_mem[i], nullptr);   g.vk_mem[i] = VK_NULL_HANDLE; }
         }
+        if (g.vk_home_buf != VK_NULL_HANDLE) { g.vk.DestroyBuffer(g.vk.dev, g.vk_home_buf, nullptr); g.vk_home_buf = VK_NULL_HANDLE; }
+        if (g.vk_home_mem != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_home_mem, nullptr);    g.vk_home_mem = VK_NULL_HANDLE; }
+        for (int i = 0; i < SLOT_COUNT; ++i)
+        {
+            if (g.vk_in_buf[i] != VK_NULL_HANDLE) { g.vk.DestroyBuffer(g.vk.dev, g.vk_in_buf[i], nullptr); g.vk_in_buf[i] = VK_NULL_HANDLE; }
+            if (g.vk_in_mem[i] != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_in_mem[i], nullptr);    g.vk_in_mem[i] = VK_NULL_HANDLE; }
+        }
+    }
     // OpenGL transport: same idea -- deleting the texture and its memory object drops
     // our alias, not the D3D12 resource behind it. GL objects can only be deleted from
     // the context they live in; from anywhere else they are left to the driver, which
@@ -1383,7 +1592,17 @@ static void ReleaseFrameResources()
     }
     for (int i = 0; i < SLOT_COUNT; ++i)
         if (g.tex_shared_ext[i] != nullptr) { CloseHandle(g.tex_shared_ext[i]); g.tex_shared_ext[i] = nullptr; }
+    if (g.home_buf_handle != nullptr) { CloseHandle(g.home_buf_handle); g.home_buf_handle = nullptr; }
+    SafeRelease(g.home_buf12);
+    g.home_pitch = 0;
+    for (int i = 0; i < SLOT_COUNT; ++i)
+    {
+        if (g.in_buf_handle[i] != nullptr) { CloseHandle(g.in_buf_handle[i]); g.in_buf_handle[i] = nullptr; }
+        SafeRelease(g.in_buf12[i]);
+        g.in_pitch[i] = 0;
+    }
     g.vk_layout_init = false;
+    g.vk_released    = false;
     SafeRelease(g.output_srv);
     SafeRelease(g.color_stage_srv);
     SafeRelease(g.color_stage);
@@ -2357,6 +2576,92 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         return false;
     }
 
+    // buffer_home: a shared LINEAR buffer for the output hop. The imported OUTPUT
+    // VkImage stays (NGX needs the texture, and it remains the fallback), but the copy
+    // home reads this buffer instead: on at least one driver/format combination the
+    // D3D12 image writes never became visible through the imported VkImage (Detroit:
+    // Become Human -- Vulkan kept presenting a stale snapshot while the D3D12 side
+    // demonstrably produced fresh frames; see the stale probe). A buffer has no opaque
+    // tiling or compression metadata to fall out of sync. Only the raw-copy layouts
+    // qualify -- the blit fallback converts formats, which a buffer copy cannot.
+    const UINT home_bpp = HomeTexelBytes(g.output_fmt);
+    if (g_cfg.buffer_home != 0 && home_bpp != 0 && SameTexelLayout(g.output_fmt, bb_fmt))
+    {
+        g.home_pitch = (w * home_bpp + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+        const UINT64 home_size = static_cast<UINT64>(g.home_pitch) * h;
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC   rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = home_size;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                      nullptr, __uuidof(ID3D12Resource),
+                                                      reinterpret_cast<void **>(&g.home_buf12));
+        if (SUCCEEDED(hr))
+            hr = g.dev12->CreateSharedHandle(g.home_buf12, nullptr, GENERIC_ALL, nullptr, &g.home_buf_handle);
+        if (SUCCEEDED(hr) && !FeedVkImportBuffer(&g.vk, g.home_buf_handle, home_size, &g.vk_home_buf, &g.vk_home_mem))
+            hr = E_FAIL;
+        if (FAILED(hr))
+        {
+            Log("[feed] buffer_home: shared buffer failed 0x%08X -- falling back to the image copy home", hr);
+            if (g.home_buf_handle != nullptr) { CloseHandle(g.home_buf_handle); g.home_buf_handle = nullptr; }
+            SafeRelease(g.home_buf12);
+            g.home_pitch = 0;
+        }
+        else
+            Log("[feed] buffer_home: output goes home through a shared linear buffer (%ux%u, pitch %u)", w, h, g.home_pitch);
+    }
+
+    // Input direction of the same workaround: one shared linear buffer per input slot.
+    // The evaluate keeps reading the D3D12 TEXTURES; each frame D3D12 fills them from
+    // these buffers, which Vulkan wrote with vkCmdCopyImageToBuffer -- the image
+    // imports stay only as fallback and for mode 1.
+    if (g.home_buf12 != nullptr)
+    {
+        static const struct { int slot; DXGI_FORMAT fmt; UINT bpp; } kIn[] = {
+            { SLOT_COLOR, DXGI_FORMAT_UNKNOWN,       4 },   // fmt filled from g.color_fmt below
+            { SLOT_DEPTH, DXGI_FORMAT_R32_FLOAT,     4 },
+            { SLOT_MV,    DXGI_FORMAT_R16G16_FLOAT,  4 },
+            { SLOT_MASK,  DXGI_FORMAT_R8_UNORM,      1 },
+        };
+        bool all_ok = true;
+        for (const auto &d : kIn)
+        {
+            const UINT bpp = d.slot == SLOT_COLOR ? HomeTexelBytes(g.color_fmt) : d.bpp;
+            if (bpp == 0) { all_ok = false; break; }
+            g.in_pitch[d.slot] = (w * bpp + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+            const UINT64 size = static_cast<UINT64>(g.in_pitch[d.slot]) * h;
+            D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC   rd = {};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = size;
+            rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                          nullptr, __uuidof(ID3D12Resource),
+                                                          reinterpret_cast<void **>(&g.in_buf12[d.slot]));
+            if (SUCCEEDED(hr))
+                hr = g.dev12->CreateSharedHandle(g.in_buf12[d.slot], nullptr, GENERIC_ALL, nullptr, &g.in_buf_handle[d.slot]);
+            if (SUCCEEDED(hr) && !FeedVkImportBuffer(&g.vk, g.in_buf_handle[d.slot], size,
+                                                     &g.vk_in_buf[d.slot], &g.vk_in_mem[d.slot]))
+                hr = E_FAIL;
+            if (FAILED(hr)) { Log("[feed] buffer_home: input buffer %s failed 0x%08X", kSlotName[d.slot], hr); all_ok = false; break; }
+        }
+        if (!all_ok)
+        {
+            Log("[feed] buffer_home: input buffers unavailable -- inputs stay on the image imports");
+            for (int i = 0; i < SLOT_COUNT; ++i)
+            {
+                if (g.vk_in_buf[i] != VK_NULL_HANDLE) { g.vk.DestroyBuffer(g.vk.dev, g.vk_in_buf[i], nullptr); g.vk_in_buf[i] = VK_NULL_HANDLE; }
+                if (g.vk_in_mem[i] != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_in_mem[i], nullptr);    g.vk_in_mem[i] = VK_NULL_HANDLE; }
+                if (g.in_buf_handle[i] != nullptr)    { CloseHandle(g.in_buf_handle[i]); g.in_buf_handle[i] = nullptr; }
+                SafeRelease(g.in_buf12[i]);
+                g.in_pitch[i] = 0;
+            }
+        }
+        else
+            Log("[feed] buffer_home: inputs travel through shared linear buffers too");
+    }
+
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
     bool crashed = false;
@@ -3236,14 +3541,51 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         VkImage mv_img = FeedVkHandle<VkImage>(mv_res.handle);
         VkImage dp_img = FeedVkHandle<VkImage>(depth_res.handle);
 
-        // Our imported images -> GENERAL (first frame after a build, from UNDEFINED).
-        // ReShade never touches them; only these raw barriers do.
-        Breadcrumb("copying inputs (Vulkan)");
+        // The transfers to/from VK_QUEUE_FAMILY_EXTERNAL below need the graphics queue
+        // family. The vkCreateDevice hook captured it; family 0 is graphics on every
+        // Windows desktop driver, so that is the (loudly logged) fallback.
+        uint32_t gfx_family = g_vk_gfx_family;
+        if (gfx_family == VK_QUEUE_FAMILY_IGNORED)
         {
-            const VkImageLayout f = g.vk_layout_init ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+            static bool said_family = false;
+            if (!said_family)
+            {
+                said_family = true;
+                Log("[feed] the vkCreateDevice hook never saw this device; assuming graphics queue family 0 for the external ownership transfers");
+            }
+            gfx_family = 0;
+        }
+
+        // Our imported images -> GENERAL (first frame after a build, from UNDEFINED).
+        // ReShade never touches them; only these raw barriers do. A frame that released
+        // them to VK_QUEUE_FAMILY_EXTERNAL and then bailed before acquiring them back
+        // (evaluate crash, command-list failure) is picked up here instead.
+        Breadcrumb("copying inputs (Vulkan)");
+        if (!g.vk_layout_init)
+        {
             for (int i = 0; i < SLOT_COUNT; ++i)
-                FeedVkBarrier(&g.vk, cb, g.vk_img[i], f, VK_IMAGE_LAYOUT_GENERAL);
+                FeedVkBarrier(&g.vk, cb, g.vk_img[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
             g.vk_layout_init = true;
+            g.vk_released    = false;   // fresh images; nothing has been handed to D3D12 yet
+        }
+        else if (g.vk_released)
+        {
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                if (g.vk_img[i] != VK_NULL_HANDLE)
+                    FeedVkExternalTransfer(&g.vk, cb, g.vk_img[i], gfx_family, false /*acquire*/);
+            if (g.vk_home_buf != VK_NULL_HANDLE)
+                FeedVkExternalBufferTransfer(&g.vk, cb, g.vk_home_buf,
+                                             static_cast<VkDeviceSize>(g.home_pitch) * g.height, gfx_family, false);
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                if (g.vk_in_buf[i] != VK_NULL_HANDLE)
+                    FeedVkExternalBufferTransfer(&g.vk, cb, g.vk_in_buf[i],
+                                                 static_cast<VkDeviceSize>(g.in_pitch[i]) * g.height, gfx_family, false);
+            g.vk_released = false;
+        }
+        else
+        {
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                FeedVkBarrier(&g.vk, cb, g.vk_img[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
         }
         // Game images -> copy_source via ReShade (its layout tracking stays correct),
         // then raw-copy each into our GENERAL image.
@@ -3253,9 +3595,20 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             const resource_usage to[3]   = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source };
             cl->barrier(3, res, from, to);
         }
-        FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
-        FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MV],    VK_IMAGE_LAYOUT_GENERAL, w, h);
-        FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
+        const bool staged_in = g_cfg.mode >= 2 && g.vk_in_buf[SLOT_COLOR] != VK_NULL_HANDLE;
+        const UINT cbpp = HomeTexelBytes(g.color_fmt) != 0 ? HomeTexelBytes(g.color_fmt) : 4;
+        if (staged_in)
+        {
+            FeedVkCopyImageToBuffer(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_in_buf[SLOT_COLOR], w, h, g.in_pitch[SLOT_COLOR] / cbpp);
+            FeedVkCopyImageToBuffer(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_in_buf[SLOT_MV],    w, h, g.in_pitch[SLOT_MV] / 4);
+            FeedVkCopyImageToBuffer(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_in_buf[SLOT_DEPTH], w, h, g.in_pitch[SLOT_DEPTH] / 4);
+        }
+        else
+        {
+            FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
+            FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MV],    VK_IMAGE_LAYOUT_GENERAL, w, h);
+            FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
+        }
         if (g.mask_ok)
         {
             // The mask goes the same way, and is handed straight back to shader_resource here.
@@ -3266,7 +3619,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 const resource_usage to[1]   = { resource_usage::copy_source };
                 cl->barrier(1, res, from, to);
             }
-            FeedVkCopyImage(&g.vk, cb, mk_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MASK], VK_IMAGE_LAYOUT_GENERAL, w, h);
+            if (staged_in)
+                FeedVkCopyImageToBuffer(&g.vk, cb, mk_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_in_buf[SLOT_MASK], w, h, g.in_pitch[SLOT_MASK]);
+            else
+                FeedVkCopyImage(&g.vk, cb, mk_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MASK], VK_IMAGE_LAYOUT_GENERAL, w, h);
             {
                 const resource       res[1]  = { mask_res };
                 const resource_usage from[1] = { resource_usage::copy_source };
@@ -3308,9 +3664,26 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
             g.need_reset = false;
 
+            // Hand the images to the D3D12 device: release ownership to
+            // VK_QUEUE_FAMILY_EXTERNAL. This is what makes this frame's input copies
+            // *available* to the evaluate over there -- the in-fence below only orders
+            // the work, it does not publish the bytes. Recorded before the flush so it
+            // rides the same submit as the copies.
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                if (g.vk_img[i] != VK_NULL_HANDLE)
+                    FeedVkExternalTransfer(&g.vk, cb, g.vk_img[i], gfx_family, true /*release*/);
+            if (g.vk_home_buf != VK_NULL_HANDLE)
+                FeedVkExternalBufferTransfer(&g.vk, cb, g.vk_home_buf,
+                                             static_cast<VkDeviceSize>(g.home_pitch) * g.height, gfx_family, true);
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                if (g.vk_in_buf[i] != VK_NULL_HANDLE)
+                    FeedVkExternalBufferTransfer(&g.vk, cb, g.vk_in_buf[i],
+                                                 static_cast<VkDeviceSize>(g.in_pitch[i]) * g.height, gfx_family, true);
+            g.vk_released = true;
+
             Breadcrumb("signalling the game-side fence (Vulkan)");
             g.rs_queue->flush_immediate_command_list();
-            g.rs_queue->signal(g.rs_fence_in, n);
+            const bool sig_ok = g.rs_queue->signal(g.rs_fence_in, n);
 
             // D3D12: wait for the copies, evaluate, signal back. Unchanged machinery.
             g.queue->Wait(g.fence12_in, n);
@@ -3318,6 +3691,33 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             if (!BeginCommands()) FeedFail("command list");
             else
             {
+                if (g.in_buf12[SLOT_COLOR] != nullptr && g_cfg.mode >= 2)
+                {
+                    // buffer_home inputs: the Vulkan side wrote the shared buffers;
+                    // land them in the textures the evaluate actually reads.
+                    static const struct { int slot; DXGI_FORMAT fmt; } kFill[] = {
+                        { SLOT_COLOR, DXGI_FORMAT_UNKNOWN }, { SLOT_DEPTH, DXGI_FORMAT_R32_FLOAT },
+                        { SLOT_MV, DXGI_FORMAT_R16G16_FLOAT }, { SLOT_MASK, DXGI_FORMAT_R8_UNORM },
+                    };
+                    for (const auto &d : kFill)
+                    {
+                        if (g.in_buf12[d.slot] == nullptr) continue;
+                        if (d.slot == SLOT_MASK && !g.mask_ok) continue;
+                        D3D12_TEXTURE_COPY_LOCATION src = {};
+                        src.pResource = g.in_buf12[d.slot];
+                        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                        src.PlacedFootprint.Offset = 0;
+                        src.PlacedFootprint.Footprint = { d.slot == SLOT_COLOR ? g.color_fmt : d.fmt,
+                                                          g.width, g.height, 1, g.in_pitch[d.slot] };
+                        D3D12_TEXTURE_COPY_LOCATION dst = {};
+                        dst.pResource = g.tex12[d.slot];
+                        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                        dst.SubresourceIndex = 0;
+                        Barrier(g.tex12[d.slot], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                        g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                        Barrier(g.tex12[d.slot], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+                    }
+                }
                 Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -3345,7 +3745,22 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
                 Breadcrumb("running the D3D12 evaluate (Vulkan transport)");
                 DWORD ecode = 0;
-                NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+                NVSDK_NGX_Result re;
+                if (g_cfg.passthrough != 0 && g.color_fmt == g.output_fmt)
+                {
+                    // Diagnostic passthrough: identical machinery, no DLSS. The output
+                    // becomes a byte copy of this frame's colour input.
+                    static bool said_pass = false;
+                    if (!said_pass) { said_pass = true; Log("[feed] passthrough=1: NGX evaluate replaced by CopyResource (diagnostic)"); }
+                    Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                    g.list->CopyResource(g.tex12[SLOT_OUTPUT], g.tex12[SLOT_COLOR]);
+                    Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    re = static_cast<NVSDK_NGX_Result>(0x1);   // NVSDK_NGX_Result_Success
+                }
+                else
+                    re = SafeEvaluateDLSS(&ep, &ecode);
                 if (ecode != 0)
                 {
                     AbortCommands();  // never execute a list NGX crashed while recording
@@ -3355,6 +3770,26 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 }
                 else
                 {
+                    StaleProbeRecord(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                     g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    if (g.home_buf12 != nullptr)
+                    {
+                        // buffer_home: linearise the output into the shared buffer on
+                        // this same list, so the out-fence signal below covers it too.
+                        // The buffer itself needs no barrier (COMMON promotion).
+                        Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        D3D12_TEXTURE_COPY_LOCATION src = {};
+                        src.pResource = g.tex12[SLOT_OUTPUT];
+                        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                        src.SubresourceIndex = 0;
+                        D3D12_TEXTURE_COPY_LOCATION dst = {};
+                        dst.pResource = g.home_buf12;
+                        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                        dst.PlacedFootprint.Offset = 0;
+                        dst.PlacedFootprint.Footprint = { g.output_fmt, g.width, g.height, 1, g.home_pitch };
+                        g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                        Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    }
                     Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -3379,8 +3814,36 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             // The copy home lands on the fresh immediate list, which executes on the
             // game's queue after the wait below -- GPU-ordered, no CPU stall.
             Breadcrumb("waiting for the result (Vulkan)");
-            g.rs_queue->wait(g.rs_fence_out, n);
+            const bool wait_ok = g.rs_queue->wait(g.rs_fence_out, n);
+            // Sync probe: does the cross-API fence machinery actually connect? The two
+            // D3D12 completed values are what the D3D12 device has retired; the two
+            // Vulkan values are what the IMPORTED timeline semaphores read from this
+            // side. If vk_out trails d12_out by hundreds, the fence import is broken
+            // and nothing orders the copy home against the evaluate. sig/wait are
+            // ReShade's own return values -- 0 means it refused the imported semaphore.
+            if ((n % 60) == 1)
+                Log("[feed] sync probe: n=%llu sig=%d wait=%d | d12 in=%llu out=%llu | vk in=%llu out=%llu",
+                    static_cast<unsigned long long>(n), sig_ok ? 1 : 0, wait_ok ? 1 : 0,
+                    static_cast<unsigned long long>(g.fence12_in  != nullptr ? g.fence12_in->GetCompletedValue()  : 0),
+                    static_cast<unsigned long long>(g.fence12_out != nullptr ? g.fence12_out->GetCompletedValue() : 0),
+                    static_cast<unsigned long long>(FeedVkTimelineValue(&g.vk, g.vk_sem_in)),
+                    static_cast<unsigned long long>(FeedVkTimelineValue(&g.vk, g.vk_sem_out)));
             cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());  // fresh buffer after the flush
+            // Take the images back from the D3D12 device: acquire from
+            // VK_QUEUE_FAMILY_EXTERNAL, making the evaluate's output writes visible to
+            // the copy home. This submit waits on the out-fence, so the acquire is
+            // GPU-ordered after the evaluate.
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                if (g.vk_img[i] != VK_NULL_HANDLE)
+                    FeedVkExternalTransfer(&g.vk, cb, g.vk_img[i], gfx_family, false /*acquire*/);
+            if (g.vk_home_buf != VK_NULL_HANDLE)
+                FeedVkExternalBufferTransfer(&g.vk, cb, g.vk_home_buf,
+                                             static_cast<VkDeviceSize>(g.home_pitch) * g.height, gfx_family, false);
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                if (g.vk_in_buf[i] != VK_NULL_HANDLE)
+                    FeedVkExternalBufferTransfer(&g.vk, cb, g.vk_in_buf[i],
+                                                 static_cast<VkDeviceSize>(g.in_pitch[i]) * g.height, gfx_family, false);
+            g.vk_released = false;
             if (done)
             {
                 // Prefer the raw copy. vkCmdBlitImage converts, and that conversion is
@@ -3389,12 +3852,16 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 // brighter with lifted blacks (issue #11). The frame we were handed is
                 // already encoded, so the bytes must go home untouched. The blit stays
                 // only for the layouts a raw copy genuinely cannot express.
-                if (SameTexelLayout(g.output_fmt, g.bb_fmt))
+                const UINT wh = g_cfg.half_home != 0 ? w / 2 : w;   // half_home: leave the right half raw
+                if (g.vk_home_buf != VK_NULL_HANDLE)
+                    FeedVkCopyBufferToImage(&g.vk, cb, g.vk_home_buf, bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                            wh, h, g.home_pitch / HomeTexelBytes(g.output_fmt));
+                else if (SameTexelLayout(g.output_fmt, g.bb_fmt))
                     FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
-                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, wh, h);
                 else
                     FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
-                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, wh, h);
             }
             {
                 const resource       res[1]  = { bb_res };
@@ -3640,6 +4107,8 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
                 }
                 else
                 {
+                    StaleProbeRecord(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                     g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                     Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -4166,8 +4635,10 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "Stopped: %s", g_disable_why);
     ImGui::Text("Feature: %s", g.frame_ready ? "ready" : "not built");
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
-    ImGui::Text("DLSS 5 add-on: v%s (%s)", g_renodx_ver,
-                g_renodx_v46 ? "v4.6+ engine" : g_renodx_lazy ? "v45+ engine" : "classic engine");
+    ImGui::Text("DLSS 5 add-on: %s%s (%s)", g_renodx_gen[0] != '\0' ? "" : "v",
+                g_renodx_gen[0] != '\0' ? g_renodx_gen : g_renodx_ver,
+                g_renodx_v47 ? "v4.7+ engine" : g_renodx_v46 ? "v4.6 engine"
+                             : g_renodx_lazy ? "v45+ engine" : "classic engine");
     if (g_toolkit_passes >= 2)
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
                            "Alex's Toolkit %s: %d-pass cascade -- ~%dx temporal history (smearing, slow settle)",

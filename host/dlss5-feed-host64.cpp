@@ -43,6 +43,7 @@ static char g_log_path[MAX_PATH];
 static bool g_show_window = false;   // visible host window = the user's door to the DLSS 5 panel
 static bool g_renodx_lazy = false;   // DLSS 5 add-on is v45+ (per-present rescan, lazy adoption)
 static bool g_renodx_v46  = false;   // DLSS 5 add-on is v4.6+ (global hotkeys, upscaling latch)
+static bool g_renodx_v47  = false;   // DLSS 5 add-on is v4.7+ (reversible colour bridge, workset pool)
 
 static void Log(const char *fmt, ...);
 
@@ -66,7 +67,41 @@ static void HostRenodxDefault(const char *ini, const char *key, const char *valu
 // re-create is unnecessary -- and its EnableHooks key should be '2' (NGX-only) for this
 // feeder, written into OUR ReShade.ini before ReShade loads and the add-on reads it.
 // v4.6+ ('NRToggleKey' marker) keeps that engine and adds two GetAsyncKeyState-polled
-// global hotkeys, which this background helper must unbind (see below).
+// global hotkeys, which this background helper must unbind (see below). v4.7+
+// ('NRGlobalTone' marker) keeps both and reworks its own colour path -- a reversible
+// SDR/linear-HDR/PQ bridge chosen from the contract we publish -- which needs nothing
+// new from this host. Each marker is a NUL-terminated config key, so the match includes
+// the terminator and cannot hit a longer string that merely starts with it.
+// Mirrors DetectRenodxAddon() in src/dlss5-feed.cpp; keep the two in step.
+static bool RenodxHasLiteral(const char *buf, DWORD size, const char *needle)
+{
+    const DWORD n = static_cast<DWORD>(strlen(needle)) + 1;   // include the NUL
+    if (buf == nullptr || size < n) return false;
+    for (DWORD i = 0; i + n <= size; ++i)
+        if (buf[i] == needle[0] && memcmp(buf + i, needle, n) == 0) return true;
+    return false;
+}
+
+// The add-on's own generation banner ("v4.6", "v4.7"), which only v4.6+ builds carry.
+// The version resource cannot tell those two apart -- both report 0.2026.0828.0517.
+static void RenodxFindBanner(const char *buf, DWORD size, char *out, size_t out_size)
+{
+    const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+    for (DWORD i = 1; i + 5 <= size; ++i)
+    {
+        if (buf[i - 1] != '\0' || buf[i] != 'v' || !digit(buf[i + 1]) || buf[i + 2] != '.' || !digit(buf[i + 3]))
+            continue;
+        DWORD end = i + 4;
+        while (end < size && digit(buf[end])) ++end;
+        if (end < size && buf[end] == '\0' && end - i < out_size)
+        {
+            memcpy(out, buf + i, end - i);
+            out[end - i] = '\0';
+            return;
+        }
+    }
+}
+
 static void DetectRenodxAddon()
 {
     char dir[MAX_PATH], path[MAX_PATH], ini[MAX_PATH];
@@ -80,16 +115,18 @@ static void DetectRenodxAddon()
     const DWORD size = GetFileSize(f, nullptr);
     DWORD got = 0;
     char *buf = (size > 0 && size < 8u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
+    char gen[16] = "";
     if (buf != nullptr && ReadFile(f, buf, size, &got, nullptr) && got == size)
-        for (DWORD i = 0; i + 11 < size; ++i)   // both markers happen to be 11 bytes
-        {
-            if (!g_renodx_lazy && memcmp(buf + i, "EnableHooks", 11) == 0) g_renodx_lazy = true;
-            if (!g_renodx_v46  && memcmp(buf + i, "NRToggleKey", 11) == 0) g_renodx_v46  = true;
-            if (g_renodx_lazy && g_renodx_v46) break;
-        }
+    {
+        g_renodx_lazy = RenodxHasLiteral(buf, size, "EnableHooks");
+        g_renodx_v46  = RenodxHasLiteral(buf, size, "NRToggleKey");
+        g_renodx_v47  = RenodxHasLiteral(buf, size, "NRGlobalTone");
+        RenodxFindBanner(buf, size, gen, sizeof(gen));
+    }
     free(buf);
     CloseHandle(f);
-    if (g_renodx_v46) g_renodx_lazy = true;   // v4.6 is a per-present-rescan engine too
+    if (g_renodx_v47) g_renodx_v46 = true;    // each generation keeps the previous engine
+    if (g_renodx_v46) g_renodx_lazy = true;   // v4.6+ is a per-present-rescan engine too
 
     char ver[48] = "?";
     DWORD dummy = 0;
@@ -105,8 +142,10 @@ static void DetectRenodxAddon()
                       HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS));
         free(vdata);
     }
-    Log("[host] DLSS 5 add-on: v%s -- %s engine", ver,
-        g_renodx_v46  ? "v4.6+ (lazy adoption, global hotkeys, upscaling latch)"
+    Log("[host] DLSS 5 add-on: %s%s (file version %s) -- %s engine",
+        gen[0] != '\0' ? "" : "v", gen[0] != '\0' ? gen : ver, ver,
+        g_renodx_v47  ? "v4.7+ (lazy adoption, colour bridge, workset pool)"
+      : g_renodx_v46  ? "v4.6 (lazy adoption, global hotkeys, upscaling latch)"
       : g_renodx_lazy ? "v45+ (lazy adoption; warm-up skipped)" : "classic (warm-up stays on)");
 
     if (g_renodx_lazy)
@@ -121,13 +160,25 @@ static void DetectRenodxAddon()
 
     if (g_renodx_v46)
     {
-        // v4.6 polls its NR-toggle and screenshot hotkeys with GetAsyncKeyState, which
+        // v4.6+ polls its NR-toggle and screenshot hotkeys with GetAsyncKeyState, which
         // sees keys pressed in the game's window too. This helper usually runs headless,
         // so a gameplay keypress (F5 is a common quicksave key) would silently toggle NR
         // off, or fire GPU-readback screenshots, in a process with no visible feedback.
         // Unbind both unless the user bound them deliberately.
         HostRenodxDefault(ini, "NRToggleKey", "0", "unbound; gameplay keys must not reach this background helper");
         HostRenodxDefault(ini, "NRScreenshotKey", "0", "unbound; same reason");
+
+        // Same warning the in-game add-on gives (src/dlss5-feed.cpp): NRStyle=2 crashed the
+        // reference machine 1-2 s into every boot with a null read on the present path. It
+        // matters more here -- this helper is usually headless, and on the 32-bit path the
+        // setting is edited from a panel whose values land in THIS ini, where nothing else
+        // would ever show it. Warn, never rewrite: it is the user's explicit choice.
+        char style[16] = {};
+        GetPrivateProfileStringA("RenoDX.DLSS5", "NRStyle", "", style, sizeof(style), ini);
+        if (atoi(style) == 2)
+            Log("[host] WARNING: RenoDX.DLSS5 NRStyle=2 is set in this host's ReShade.ini -- this crashed at "
+                "startup on the reference machine (null read on the present path, blamed on whichever module "
+                "presents next). If the game or this host dies on launch, set NRStyle=0 in host64\\ReShade.ini.");
     }
 }
 

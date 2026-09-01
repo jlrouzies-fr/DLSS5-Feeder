@@ -452,6 +452,8 @@ struct Feed32
     VkDeviceMemory             vk_mem[FEED_SLOTS];
     VkSemaphore                vk_sem_in, vk_sem_out;
     bool                       vk_layout_init;   // our images transitioned UNDEFINED->GENERAL once
+    bool                       vk_released;      // our images are released to VK_QUEUE_FAMILY_EXTERNAL
+                                                 // (the host's D3D12 device owns them until the next acquire)
 
     bool        built;
     UINT        width, height;                  // the work resolution DLSS runs at
@@ -796,6 +798,13 @@ static bool EnsureHost()
 // here and in the host window -- a slider here where the add-on has a dropdown is
 // how NRStyle=2 got written into a two-entry ("Natural"/"Cinematic") setting.
 //
+// The order and the labels follow v4.7, the newest generation (it renamed most of
+// the strength sliders and added NRGlobalTone and NRDiffuseWhiteNits). v4.6 and
+// older builds still read every key here, and v4.7 still reads the three colour-
+// transfer keys it dropped from its own panel, so the union is safe in both
+// directions: a build that does not know a key simply never reads it, and this
+// panel never writes a key the user did not touch.
+//
 // Ranges: the add-on does not publish its min/max, so these are supersets of every
 // value observed in real ReShade.ini files written by the add-on's own panel on this
 // machine. Where a range is a judgement call the tooltip says so, and the host
@@ -821,7 +830,7 @@ static const char *const kNRStyleItems[]  = { "Default", "Natural", "Cinematic" 
 static const char *const kNRDepthItems[]  = { "Use game NGX flag", "Force normal depth", "Force inverted depth" };
 
 // Section boundaries, matching the add-on's own grouping.
-enum { NR_TRANSFER_FIRST = 10, NR_GUIDE_FIRST = 13, NR_COUNT = 16 };
+enum { NR_BRIDGE_FIRST = 11, NR_LEGACY_FIRST = 12, NR_GUIDE_FIRST = 15, NR_COUNT = 18 };
 
 static const NRSetting kNR[NR_COUNT] = {
     { "NeuralUplift",      "Enable DLSS Neural Rendering", NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
@@ -833,16 +842,25 @@ static const NRSetting kNR[NR_COUNT] = {
       "Maps to the DLSSNR render-preset hint." },
     { "NRStyle",           "NR Style",                     NR_COMBO,  0.0f,  0.0f,  2.0f, nullptr, kNRStyleItems, 3,
       "Default keeps the add-on's own choice; Natural and Cinematic force it." },
-    { "NRIntensity",       "NR Intensity",                 NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0,
-      "Overall strength of the relighting. Community guides suggest 1.00-1.05; the slider "
-      "allows the full observed 0-2 range." },
-    { "NRLocalTone",       "Local Tone Strength",          NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
-    { "NRLocalStructure",  "Local Structure Strength",     NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
-    { "NRSkinStructure",   "Skin Structure Strength",      NR_FLOAT, -1.0f, -1.0f,  1.0f, "%.2f", nullptr, 0,
+    { "NRIntensity",       "Overall Intensity",            NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0,
+      "Overall strength of the relighting (\"NR Intensity\" before v4.7). Community guides "
+      "suggest 1.00-1.05; the slider allows the full observed 0-2 range." },
+    { "NRGlobalTone",      "Global Tone Intensity",        NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0,
+      "v4.7 and newer only. Older add-on builds never read this key, so setting it there "
+      "does nothing." },
+    { "NRLocalTone",       "Local Tone Intensity",         NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
+    { "NRLocalStructure",  "Structure Intensity",          NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
+    { "NRSkinStructure",   "Character/Skin Structure",     NR_FLOAT, -1.0f, -1.0f,  1.0f, "%.2f", nullptr, 0,
       "Facial detail. Defaults to -1; positive values sharpen skin." },
-    { "NRAutoMask",        "Automatic Mask",               NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0, nullptr },
+    { "NRAutoMask",        "Automatic / Character Mask",   NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0, nullptr },
     { "NRUICorrection",    "NR UI Correction",             NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
       "Keeps HUD/UI from being re-lit. The feed inserts before ReShade's UI pass, so leave on." },
+
+    { "NRDiffuseWhiteNits","Diffuse White (nits)",         NR_FLOAT, 203.0f, 80.0f, 1000.0f, "%.0f", nullptr, 0,
+      "v4.7 and newer only. The nit level the bridge treats as diffuse white when the "
+      "contract is HDR; ignored on the SDR sRGB bridge, which is what this feed publishes "
+      "for an SDR game. The value shown when the key is absent is this panel's guess, not "
+      "a value read from the add-on -- the host window's own panel is the authority." },
 
     { "NRPaperWhiteScale", "Scene Paper-White Scale",      NR_FLOAT,  1.0f,  0.0f, 10.0f, "%.3f", nullptr, 0,
       "Normalises scene brightness for the neural pass. 1.0 for an SDR game like this one; "
@@ -909,7 +927,7 @@ static void WriteHostNR()
 
 static void LogHostNR(const char *what)
 {
-    char line[512];
+    char line[768];   // 18 keys with "(default)" markers overflow 512 and stop the loop early
     int  n = sprintf_s(line, "[feed32] %s:", what);
     for (int i = 0; i < NR_COUNT && n > 0 && n < static_cast<int>(sizeof(line)) - 48; ++i)
     {
@@ -959,6 +977,7 @@ static void ReleaseShared()
             if (g.vk_mem[i] != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_mem[i], nullptr);   g.vk_mem[i] = VK_NULL_HANDLE; }
         }
         g.vk_layout_init = false;   // the next set starts from UNDEFINED again
+        g.vk_released    = false;
     }
     // OpenGL: drop our aliases of the host's textures. Deleting them frees the import,
     // not the host's D3D12 resource. GL objects can only be deleted from the context
@@ -1941,6 +1960,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         g.vk_sem_in = g.vk_sem_out = VK_NULL_HANDLE;
         g.rs_fence_in = g.rs_fence_out = {};
         g.vk_layout_init = false;
+        g.vk_released    = false;
         g.rs_queue = nullptr;
         HostClose();
         ReleaseShared();
@@ -1973,14 +1993,44 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             const VkImage mv_img = FeedVkHandle<VkImage>(mv_res.handle);
             const VkImage dp_img = FeedVkHandle<VkImage>(depth_res.handle);
 
+            // The transfers to/from VK_QUEUE_FAMILY_EXTERNAL below need the graphics
+            // queue family. The vkCreateDevice hook captured it; family 0 is graphics
+            // on every Windows desktop driver, so that is the (loudly logged) fallback.
+            uint32_t gfx_family = g_vk_gfx_family;
+            if (gfx_family == VK_QUEUE_FAMILY_IGNORED)
+            {
+                static bool said_family = false;
+                if (!said_family)
+                {
+                    said_family = true;
+                    Log("[feed32] the vkCreateDevice hook never saw this device; assuming graphics queue family 0 for the external ownership transfers");
+                }
+                gfx_family = 0;
+            }
+
             // Our imported images live permanently in GENERAL; only these raw barriers
             // ever move them, and only the first frame after a build starts UNDEFINED.
+            // A frame that released them to VK_QUEUE_FAMILY_EXTERNAL and then bailed
+            // before acquiring them back (host lost mid-frame) is picked up here.
             Breadcrumb("copying inputs (Vulkan)");
+            if (!g.vk_layout_init)
             {
-                const VkImageLayout from = g.vk_layout_init ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
                 for (int i = 0; i < FEED_SLOTS; ++i)
-                    FeedVkBarrier(&g.vk, cb, g.vk_img[i], from, VK_IMAGE_LAYOUT_GENERAL);
+                    FeedVkBarrier(&g.vk, cb, g.vk_img[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
                 g.vk_layout_init = true;
+                g.vk_released    = false;   // fresh images; nothing has been handed to the host yet
+            }
+            else if (g.vk_released)
+            {
+                for (int i = 0; i < FEED_SLOTS; ++i)
+                    if (g.vk_img[i] != VK_NULL_HANDLE)
+                        FeedVkExternalTransfer(&g.vk, cb, g.vk_img[i], gfx_family, false /*acquire*/);
+                g.vk_released = false;
+            }
+            else
+            {
+                for (int i = 0; i < FEED_SLOTS; ++i)
+                    FeedVkBarrier(&g.vk, cb, g.vk_img[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
             }
             // The game's own images go through ReShade's barrier API so its layout
             // tracking stays correct; the copies themselves are raw.
@@ -2010,6 +2060,16 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
             g.need_reset = false;
 
+            // Hand the images to the host's D3D12 device: release ownership to
+            // VK_QUEUE_FAMILY_EXTERNAL. This is what makes this frame's input copies
+            // *available* to the evaluate over there -- the in-fence below only orders
+            // the work, it does not publish the bytes. Recorded before the flush so it
+            // rides the same submit as the copies.
+            for (int i = 0; i < FEED_SLOTS; ++i)
+                if (g.vk_img[i] != VK_NULL_HANDLE)
+                    FeedVkExternalTransfer(&g.vk, cb, g.vk_img[i], gfx_family, true /*release*/);
+            g.vk_released = true;
+
             Breadcrumb("signalling the host (Vulkan)");
             g.rs_queue->flush_immediate_command_list();
             g.rs_queue->signal(g.rs_fence_in, n);
@@ -2025,6 +2085,14 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 g.rs_queue->wait(g.rs_fence_out, n);   // GPU-side; the host CPU-signals on failure
                 g.fence_wait_queued = true;            // HostDrain must resolve this before any close
                 cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());   // fresh buffer after the flush
+                // Take the images back from the host: acquire from
+                // VK_QUEUE_FAMILY_EXTERNAL, making the evaluate's output writes visible
+                // to the copy home. This submit waits on the out-fence, so the acquire
+                // is GPU-ordered after the evaluate.
+                for (int i = 0; i < FEED_SLOTS; ++i)
+                    if (g.vk_img[i] != VK_NULL_HANDLE)
+                        FeedVkExternalTransfer(&g.vk, cb, g.vk_img[i], gfx_family, false /*acquire*/);
+                g.vk_released = false;
                 // Prefer the raw copy: vkCmdBlitImage CONVERTS, and that conversion is
                 // sRGB-aware, so blitting our linear-typed output into a VK_FORMAT_*_SRGB
                 // swapchain re-encodes it and the frame comes back washed out (issue #11).
@@ -2351,6 +2419,7 @@ static void OnDestroyDevice(reshade::api::device *dev)
     g.rs_dev = nullptr;
     g.rs_queue = nullptr;
     g.vk_layout_init = false;
+    g.vk_released    = false;
     if (g.gl.ok && g.gl.wglGetCurrentContext() == g.gl_ctx && g.gl_ctx != nullptr)
     {
         if (g.gl_fbo_read != 0) { g.gl.DeleteFramebuffers(1, &g.gl_fbo_read); g.gl_fbo_read = 0; }
@@ -2491,10 +2560,15 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
     for (int i = 0; i < NR_COUNT; ++i)
     {
-        if (i == NR_TRANSFER_FIRST)
+        if (i == NR_BRIDGE_FIRST)
         {
             ImGui::Spacing();
-            ImGui::TextDisabled("Control-compatible color transfer");
+            ImGui::TextDisabled("HDR color bridge (v4.7 and newer add-on builds)");
+        }
+        else if (i == NR_LEGACY_FIRST)
+        {
+            ImGui::Spacing();
+            ImGui::TextDisabled("Control-compatible color transfer (v4.6 and older; v4.7 replaced it above)");
         }
         else if (i == NR_GUIDE_FIRST)
         {

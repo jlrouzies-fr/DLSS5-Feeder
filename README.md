@@ -18,23 +18,32 @@
 > - **Real motion vectors on D3D9** — renodx-dlss evaluates only the finished backbuffer there
 >   (no temporal inputs); the feeder drives a full temporal evaluate from ReShade motion vectors.
 
-> ## ⚠️ Pin the DLSS 5 neural-rendering add-on to v4.55
+> ## ⚠️ Which DLSS 5 add-on to install next to this one
 >
-> `renodx-dlss5.addon64` — the separate add-on this project detours, required by every install
-> below — has started building part of the synthetic DLSS contract itself in builds past v4.55.
-> Running a newer build alongside DLSS5-Feeder conflicts. **Use v4.55**, from the same RenoDX
-> Discord, `#DLSS5` channel:
-> <https://discord.com/channels/1408098019194310818/1542647972695904317/1543568908017995818>
+> Every install below needs the separate neural-rendering add-on this project detours. Use
+> **Krish's `renodx-dlss5.addon64`** — the `#DLSS5` build, from the RenoDX Discord, `#DLSS5`
+> channel: <https://discord.com/channels/1408098019194310818/1542647972695904317>
 >
-> **v4.6 status (2026-08-31):** building from current `main` adds v4.6 support. The feeder
-> detects a v4.6 build (`NRToggleKey` marker), keeps the lazy-adoption path, writes
-> `EnableHooks=2`, `NeuralUplift=1` and `NREnableUpscaling=0` when unset (v4.6 pairs its WIP
-> upscaling with a rejection latch, and this feeder's contract is always 1:1 DLAA), and in the
-> `host64` helper unbinds v4.6's new global hotkeys so a gameplay keypress cannot silently
-> toggle NR in the background process. Older add-on builds are unaffected — every guard is
-> keyed to a marker only newer builds carry, or writes a key only they read. Static analysis
-> shows no remaining conflict, but **no game row has verified a v4.6 run yet** — with the
-> released feeder builds, stay on v4.55.
+> **Not ShortFuse's `renodx-dlss` add-on.** That is a different add-on: it builds the DLSS
+> contract itself (see the banner above), so it does not need — and conflicts with — this
+> feeder. One or the other, never both.
+>
+> **Add-on generations.** The feeder fingerprints the build it finds next to it and adapts,
+> so any recent one works; take the newest in the channel. It writes `EnableHooks=2`,
+> `NeuralUplift=1` and `NREnableUpscaling=0` when they are unset, and in the `host64` helper
+> unbinds the global hotkeys so a gameplay keypress cannot silently toggle NR in a background
+> process. Every guard is keyed to a marker only the build that needs it carries.
+>
+> | Build | Marker | What the feeder does about it |
+> | --- | --- | --- |
+> | v4.7 | `NRGlobalTone` | Newest, checked 2026-09-01. Replaces the paper-white codec with a reversible colour bridge (SDR sRGB / linear HDR BT.709 / PQ BT.2020) picked from the contract the feeder already publishes, plus a fenced D3D12 workset pool. Nothing new is required from the feeder; the 32-bit overlay mirrors its renamed sliders and its two new keys. |
+> | v4.6 | `NRToggleKey` | Global hotkeys, WIP upscaling with a rejection latch, richer decline diagnostics. See the `NRStyle=2` note below. |
+> | v45+ | `EnableHooks` | Rescans every present and adopts missed features lazily, so the feeder skips its warm-up re-create. |
+> | older | — | Classic single hook pass; the warm-up re-create stays on. |
+>
+> **Verification status:** no game row has verified a v4.6 or v4.7 run end-to-end yet. The
+> compatibility work is static — marker detection, key defaults, panel mirroring — and both
+> generations were checked against the shipped binaries.
 
 > ## ⚠️ NVIDIA Smooth Motion and Optiscaler
 >
@@ -62,7 +71,7 @@
 >   `GetBuffer()`, which fails under Smooth Motion's flip-model wrapper; the null back buffer is
 >   then dereferenced. Fix offered upstream to Filoppi/Luma-Framework. Remove the Luma add-on to
 >   boot, or turn Smooth Motion off for the game.
-> - **`NRStyle=2`** (RenoDX v4.6's own setting, from its overlay panel): crashes at the next boot
+> - **`NRStyle=2`** (the RenoDX add-on's own setting, v4.6+, from its overlay panel): crashes at the next boot
 >   even without Luma. The feeder now warns when it sees it; set `NRStyle=0` in `ReShade.ini`'s
 >   `[RenoDX.DLSS5]` section to recover.
 >
@@ -182,8 +191,8 @@ in fast motion, softness on thin moving geometry), and the HUD is processed alon
    its `Shaders\` folder (the `lumenite_*.fx` files and `include\`) into `reshade-shaders\Shaders\`,
    and `Textures\lumenite_bluenoise256.png` into `reshade-shaders\Textures\`.
    *(Other providers: see [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider).)*
-4. Get **`renodx-dlss5.addon64`** (**v4.55** — see the warning above) and **`nvngx_dlssnr.dll`** from
-   the RenoDX Discord. Put both next to the game `.exe`, plus a **`nvngx_dlss.dll`** (from any DLSS
+4. Get **`renodx-dlss5.addon64`** (Krish's `#DLSS5` build — see the warning above) and
+   **`nvngx_dlssnr.dll`** from the RenoDX Discord. Put both next to the game `.exe`, plus a **`nvngx_dlss.dll`** (from any DLSS
    game, or [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper)).
 5. Press **Home** for the ReShade overlay, select `DLSS5_Feed.fx`, set **`DLSS5_MV_PROVIDER` = `3`**
    in its Preprocessor definitions, and reload effects.
@@ -209,7 +218,7 @@ exists as 64-bit code.
    **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)**. Put
    `dlss5-feed.addon32` next to the game `.exe`, `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`,
    and `dlss5-feed-host64.exe` into a new `host64\` folder next to the game `.exe`.
-3. Put a 64-bit ReShade `dxgi.dll`, `renodx-dlss5.addon64` (**v4.55** — see the warning above),
+3. Put a 64-bit ReShade `dxgi.dll`, `renodx-dlss5.addon64` (Krish's `#DLSS5` build — see the warning above),
    `nvngx_dlssnr.dll` and `nvngx_dlss.dll` into `host64\`. (Get the x64 `dxgi.dll` by running the
    ReShade installer once against any 64-bit game.)
 4. Install a motion-vector provider into the game's `reshade-shaders\`, same as steps 3 and 5 of the
@@ -510,7 +519,7 @@ memory objects are import-only and a GL process cannot export one. Both directio
 | --- | --- |
 | D3D11, D3D12, Vulkan or OpenGL game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan works out of the box at both bitnesses (the add-on adds the interop extensions itself; a small bundled layer is the fallback — [64-bit](#install-for-a-vulkan-game), [32-bit/DXVK](#32-bit-vulkan-dxvk)); OpenGL needs nothing extra at all, but the game must be rendering on the NVIDIA GPU (see [Install for an OpenGL game](#install-for-an-opengl-game)). D3D10 is not supported. |
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
-| DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | from its own author, **pinned to v4.55** — newer builds conflict with this project (see the warning near the top). Not included here. |
+| DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | **Krish's `#DLSS5` build**, from its own author — not ShortFuse's `renodx-dlss`, which is a different add-on that replaces this project rather than working with it (see the warning near the top). Not included here. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
 | A motion vector provider | one of five, selected with the `DLSS5_MV_PROVIDER` definition — **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) Kernel is recommended** (`=3`); also iMMERSE Launchpad, VORT, LumeniteFX QuantMotion, or anything writing `texMotionVectors` (qUINT, `dh_uber_motion`). **Not DRME — it does not compile on ReShade 6.8.** See [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider). Install it yourself — nothing third-party is bundled, and our shader includes no third-party files. |
 | `dlss5-feed.addon64` (or `.addon32` + `host64\`) + `DLSS5_Feed.fx` | this project. |
