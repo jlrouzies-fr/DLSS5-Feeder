@@ -49,31 +49,51 @@
 >
 > **Optiscaler** replaces the same upscaling path this feeder drives. Do not run both.
 >
-> **Smooth Motion** is not a pure driver feature: the driver injects `NvPresent64.dll` into the
-> game, which hooks `CreateDXGIFactory*`, wraps the game's swapchain, and **calls `Present` more
-> than once per game frame from its own pacer thread**. ReShade's effect chain — and so this
-> add-on — runs *inside* `Present`, so that turns one caller per frame into several, possibly
-> concurrent ones. Two open reports: corruption or a silent stop in D3D11
-> ([#1](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/1)), flicker in Vulkan
-> ([#10](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/10)).
+> ### Smooth Motion — the short version
 >
-> **Since 0.8.0 the feeder serializes its whole per-frame path and turns on D3D11 multithread
-> protection**, and it detects Smooth Motion and says so in the overlay and `dlss5-feed.log`. That
-> removes the feeder-side race. First data point (2026-09-01, 0.8.0-beta.4): Metro 2033 Redux ran
-> with Smooth Motion **active** — session open, frames delivered at the usual per-frame cost, no
-> re-entrant or off-thread Present observed. Full visual verification is still pending.
+> **In a Vulkan game, turn Smooth Motion off.** The two cannot work together, and this is not
+> something a future release can fix (the reason is below). Use the per-API switch in the table
+> at the end of this section so you keep Smooth Motion for your D3D11/D3D12 games — you only
+> need to give it up for Vulkan ones.
 >
-> **On Vulkan, Smooth Motion is still broken and the detection does not work.** DOOM 2016 with
-> Smooth Motion on holds very old frames on screen while the feeder reports normal delivery
-> (#10, reproduced 2026-09-01). And the detector looks for `NvPresent64.dll`, which is the
-> **D3D-only** implementation — on Vulkan the driver does it inside its own ICD, so **no warning
-> will ever appear in a Vulkan game even when Smooth Motion is on.** Do not read a silent log as
-> "Smooth Motion is off" there; check NVIDIA Profile Inspector, or turn on "Smooth Motion - Debug
-> Bars" (`0xB01B8B02`) and look for coloured bars. For a Vulkan game, turn Smooth Motion off
-> using the per-API bitfield below. See [`PLAN-DETROIT.md`](PLAN-DETROIT.md).
+> **In a D3D11/D3D12 game** it may well be fine. Since 0.8.0 the feeder is thread-safe against
+> Smooth Motion's extra `Present` calls, and Metro 2033 Redux ran with it active (2026-09-01):
+> session open, frames delivered at the normal cost, nothing raced. Full visual sign-off is still
+> pending, so if you see corruption there, say so on
+> [#1](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/1).
 >
-> Two things Smooth Motion *did* break on that machine, neither of them this feeder — both crash
-> the game 1–2 s into boot with a null read on the present path, before the feeder feeds a frame:
+> ### Why it can't work on Vulkan
+>
+> Smooth Motion doubles your frame rate by **inventing an extra frame in between each pair of
+> real ones**. On Vulkan it does that inside the graphics driver itself — the very last step
+> before the picture reaches your monitor, past everything ReShade or any add-on can touch.
+>
+> This feeder does its work earlier, while the frame is still being built. So the frames the game
+> really renders get DLSS 5 applied correctly — but the frames the *driver invents* are built
+> from a copy it took before we ran, so they have no DLSS on them at all.
+>
+> The result is that **half the frames you see are DLSS-processed and half are not**, which looks
+> like heavy flickering, or like the picture is stuck on an old frame. Nothing is crashing, and
+> the log will happily report every frame delivered — because from the feeder's point of view
+> they were.
+>
+> We tried to close that gap and could not, which is why this is documented rather than fixed.
+> Across five rebuilds on DOOM 2016 (a game that works perfectly with Smooth Motion off) we
+> confirmed the feeder's own work is correct and complete before the frame is handed over, that
+> it can finish early enough, and that it can be made to look structurally identical to a normal
+> game's frame. The invented frames still never carried our output. The driver simply does not
+> read what we wrote. Full detail in [`PLAN-DETROIT.md`](PLAN-DETROIT.md).
+>
+> **Note the feeder cannot warn you about this on Vulkan.** Its Smooth Motion check looks for a
+> file the driver only loads for D3D games, so **a silent log does not mean Smooth Motion is
+> off**. To check for certain, turn on "Smooth Motion - Debug Bars" (`0xB01B8B02`) in NVIDIA
+> Profile Inspector and launch: coloured bars on screen mean it is running. (0.9.0 also watches
+> for the tell-tale extra frames and warns when it spots them, but the Debug Bars check is the
+> reliable one.)
+>
+> **Two other add-ons Smooth Motion breaks**, found during the Metro 2033 Redux run above and
+> neither of them this feeder — both crash the game 1–2 s into boot with a null read on the
+> present path, before the feeder feeds a frame:
 >
 > - **Luma** (`Luma-Metro Redux.addon`): reads `GetCurrentBackBufferIndex()` and passes it to
 >   `GetBuffer()`, which fails under Smooth Motion's flip-model wrapper; the null back buffer is
@@ -83,8 +103,7 @@
 >   even without Luma. The feeder now warns when it sees it; set `NRStyle=0` in `ReShade.ini`'s
 >   `[RenoDX.DLSS5]` section to recover.
 >
-> If the image corrupts or flickers, turn Smooth Motion off **for this game's API only** rather
-> than everywhere, in NVIDIA Profile Inspector:
+> **How to turn it off for one API only** (rather than everywhere), in NVIDIA Profile Inspector:
 >
 > | Setting | ID | Value |
 > | --- | --- | --- |
@@ -155,18 +174,14 @@ It is not game-specific: any D3D11, D3D12, Vulkan or OpenGL game with a working 
 and a motion vector provider should work — 64-bit directly, 32-bit via a bundled 64-bit helper
 process, D3D9 via a wrapper.
 
-**Known not working: Detroit: Become Human (Demo), 64-bit Vulkan.** DLSS runs (frames evaluated,
-fences honoured, D3D12-side probes show fresh input/output every sample) but the displayed image
-holds stale content far longer than a normal one-frame lag would explain. Eight tests — including
-a passthrough diagnostic that swaps the whole DLSS evaluate for a plain byte copy and still
-reproduces it — rule out DLSS/NGX, renodx NR, the HDR/format detection, the image-import coherence
-theory, and missing queue-family ownership transfers. **Leading theory: this is the Smooth Motion
-bug ([#10](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/10)), not a Detroit-specific
-fault** — enabling Smooth Motion in DOOM 2016 (Vulkan) reproduces it exactly, and the feeder's
-Smooth Motion detection is blind on Vulkan (it looks for `NvPresent64.dll`, which is the D3D-only
-implementation), so an absent warning proves nothing there. See
-[`PLAN-DETROIT.md`](PLAN-DETROIT.md) for the full investigation and what to try next. `enabled=0`
-is the recommended `dlss5-feed.cfg` setting for this title until it's resolved.
+**Detroit: Become Human (Demo), 64-bit Vulkan — almost certainly the Smooth Motion case above.**
+The picture holds stale frames while the log reports every frame delivered, which is exactly the
+signature described in the Smooth Motion warning. Enabling Smooth Motion in DOOM 2016 reproduces
+it in a game that otherwise works, and the feeder cannot detect Smooth Motion on Vulkan, so its
+silent log never ruled it out here. **If you hit this: check "Smooth Motion - Debug Bars"
+(`0xB01B8B02`), and if the bars appear, turn Smooth Motion off for Vulkan.** Eight further tests
+(DLSS/NGX, renodx NR, HDR and format detection, cross-API memory coherence, queue-family
+ownership) all came back clean — full investigation in [`PLAN-DETROIT.md`](PLAN-DETROIT.md).
 
 **32-bit Vulkan (DXVK) is implemented but has no game row yet** (issue #15). The transport is the
 same `src/feed_vk.h` the 64-bit Vulkan path uses, compiled x86, with the host creating the shared

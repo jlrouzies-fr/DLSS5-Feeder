@@ -568,8 +568,9 @@ typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1_)(REFIID, void **);
 // The message drain always runs -- it is what keeps the window responsive. The banner
 // copy and the Present behind it are throttled: they used to run on every frame message,
 // putting a swapchain Present and a CPU wait for our own copy inside the game's frame
-// (issue #15). The banner is static, so ~10 Hz is indistinguishable; force=true is for
-// the settle loops that genuinely need the Presents to happen now.
+// (issue #15). The banner is static, so a 30 Hz cap is invisible on it and still leaves
+// the add-on's tuning overlay -- which composites at Present -- comfortable to drag
+// sliders in; force=true is for the settle loops that genuinely need Presents now.
 static void PumpPresent(bool force = false)
 {
     MSG msg;
