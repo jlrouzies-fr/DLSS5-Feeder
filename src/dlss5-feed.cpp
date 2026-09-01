@@ -241,6 +241,23 @@ static void DetectRenodxAddon()
     // it, so both writes are inert on older generations.
     RenodxDefault("NeuralUplift", "1", "neural rendering on");
     RenodxDefault("NREnableUpscaling", "0", "upscaling off; this feeder publishes a complete 1:1 DLAA contract");
+
+    // NRStyle is v4.6's own setting, changed from ITS overlay panel and applied at the
+    // next launch. On the reference machine (Metro 2033 Redux, Smooth Motion active),
+    // NRStyle=2 crashed the game 1-2 s into every boot with a null read on the present
+    // path -- landing in whichever module presented next (Luma once, the game's CRT with
+    // Luma removed), which made it look like anything BUT this setting. NRStyle=0 boots
+    // clean. Warn, do not rewrite: it is the user's explicit choice in the RenoDX panel,
+    // and the warning reaches both logs even when the game dies before any overlay.
+    if (g_renodx_v46)
+    {
+        char v[16];
+        size_t n = sizeof(v);
+        if (reshade::get_config_value(nullptr, "RenoDX.DLSS5", "NRStyle", v, &n) && atoi(v) == 2)
+            Warn("RenoDX.DLSS5 NRStyle=2 is set -- this crashed at startup on the reference machine "
+                 "(null read on the present path, blamed on whichever module presents next). If this "
+                 "game crashes on launch, set NRStyle=0 in ReShade.ini's [RenoDX.DLSS5] section.");
+    }
 }
 // ---------------------------------------------------------------------------
 // Alex's Toolkit (alexs-toolkit.addon64) -- a third-party NGX interposer that sits
