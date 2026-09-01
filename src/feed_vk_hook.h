@@ -54,6 +54,70 @@ static int                g_vk_hook_devices;          // how many vkCreateDevice
 // VK_QUEUE_FAMILY_IGNORED until a vkCreateDevice has been seen.
 static uint32_t g_vk_gfx_family = VK_QUEUE_FAMILY_IGNORED;
 
+// ---------------------------------------------------------------------------
+// vkQueuePresentKHR hook -- the pacer detector.
+//
+// An external frame pacer (NVIDIA Smooth Motion above all) presents MORE times
+// than the game renders frames. On D3D that is NvPresent64.dll, which
+// DetectSmoothMotion() can see as a loaded module; on Vulkan the driver does it
+// inside its own ICD, below every layer, so there is no module and no implicit
+// layer to find -- the module check is structurally blind there (issues #1, #10).
+//
+// Counting presents against frames actually fed is vendor- and API-agnostic: it
+// detects any interposer that adds presents, whoever wrote it. The image indices
+// come along for free and answer the other open question (whether the swapchain
+// ring the copy home writes into is the one being scanned out).
+//
+// Read-only: this hook never changes what it is handed, it only counts and calls
+// through. Hooking present is otherwise exactly what this add-on avoids doing.
+// ---------------------------------------------------------------------------
+
+static PFN_vkQueuePresentKHR g_vk_present_orig;
+static void                 *g_vk_present_target;
+static volatile LONG64       g_vk_presents;        // vkQueuePresentKHR calls seen
+static uint32_t              g_vk_last_image;      // last pImageIndices[0]
+static bool                  g_vk_pacer_warned;
+
+// Set by the feed each time it completes a frame, so the hook can compare.
+// (Plain long long: single writer, and a torn read only misprints one log line.)
+static volatile LONG64       g_vk_feed_frames;
+
+static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookQueuePresent(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
+{
+    const LONG64 presents = InterlockedIncrement64(&g_vk_presents);
+    if (pPresentInfo != nullptr && pPresentInfo->swapchainCount > 0 && pPresentInfo->pImageIndices != nullptr)
+        g_vk_last_image = pPresentInfo->pImageIndices[0];
+
+    // The pacer signature. Only meaningful once the feed has run for a while, and
+    // only said once: a real pacer keeps the ratio up for the whole session.
+    const LONG64 fed = g_vk_feed_frames;
+    if (!g_vk_pacer_warned && fed > 300 && presents > fed + fed / 4)
+    {
+        g_vk_pacer_warned = true;
+        Log("[feed] an external frame pacer is presenting this swapchain: %lld presents against %lld frames fed "
+            "(%.2fx). NVIDIA Smooth Motion does exactly this, and on Vulkan it lives inside the driver, so no "
+            "module check can see it. This combination is NOT verified and is the subject of issues #1 and #10 "
+            "-- if the image holds old frames or corrupts, turn Smooth Motion off for THIS API only in NVIDIA "
+            "Profile Inspector: \"Smooth Motion - Enabled APIs\" (0xB0CC0875), clear bit 4 for Vulkan.",
+            static_cast<long long>(presents), static_cast<long long>(fed),
+            fed > 0 ? static_cast<double>(presents) / static_cast<double>(fed) : 0.0);
+    }
+    return g_vk_present_orig(queue, pPresentInfo);
+}
+
+// Called by the feed once per delivered frame; also drives the periodic report.
+static void FeedVkPresentTick(unsigned long long fed_frames, int every)
+{
+    g_vk_feed_frames = static_cast<LONG64>(fed_frames);
+    if (g_vk_present_orig == nullptr || every <= 0 || (fed_frames % static_cast<unsigned long long>(every)) != 0)
+        return;
+    const LONG64 presents = g_vk_presents;
+    Log("[feed] present probe: %lld presents / %llu frames fed (%.2fx), last swapchain image index %u",
+        static_cast<long long>(presents), fed_frames,
+        fed_frames > 0 ? static_cast<double>(presents) / static_cast<double>(fed_frames) : 0.0,
+        g_vk_last_image);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice physicalDevice,
                                                              const VkDeviceCreateInfo *pCreateInfo,
                                                              const VkAllocationCallbacks *pAllocator,
@@ -220,6 +284,28 @@ static bool FeedVkHookInstall()
     g_vk_create_device_target = target;
     Log("[feed] vkCreateDevice hook installed on vulkan-1!vkCreateDevice (%p): the KHR external-interop "
         "extensions will be appended to every device this game creates", target);
+
+    // vkQueuePresentKHR: counting only, and strictly optional -- a game that cannot
+    // be hooked here still feeds fine, it just gets no pacer detection.
+    if (void *ptarget = GetProcAddress(lib, "vkQueuePresentKHR"))
+    {
+        MH_STATUS ps = MH_CreateHook(ptarget, reinterpret_cast<void *>(&FeedVkHookQueuePresent),
+                                     reinterpret_cast<void **>(&g_vk_present_orig));
+        if (ps == MH_OK) ps = MH_EnableHook(ptarget);
+        if (ps == MH_OK)
+        {
+            g_vk_present_target = ptarget;
+            Log("[feed] vkQueuePresentKHR hook installed (%p): counting presents against frames fed, to detect "
+                "an external frame pacer (Smooth Motion is invisible to a module check on Vulkan)", ptarget);
+        }
+        else
+        {
+            MH_RemoveHook(ptarget);
+            g_vk_present_orig = nullptr;
+            Log("[feed] vkQueuePresentKHR hook: %s -- no pacer detection this session (harmless)",
+                MH_StatusToString(ps));
+        }
+    }
     return true;
 }
 
@@ -227,6 +313,13 @@ static bool FeedVkHookInstall()
 static void FeedVkHookRemove()
 {
     if (g_vk_create_device_target == nullptr) return;
+    if (g_vk_present_target != nullptr)
+    {
+        MH_DisableHook(g_vk_present_target);
+        MH_RemoveHook(g_vk_present_target);
+        g_vk_present_target = nullptr;
+        g_vk_present_orig   = nullptr;
+    }
     MH_DisableHook(g_vk_create_device_target);
     MH_RemoveHook(g_vk_create_device_target);
     MH_Uninitialize();

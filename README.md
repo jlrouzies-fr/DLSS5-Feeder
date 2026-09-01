@@ -61,8 +61,16 @@
 > protection**, and it detects Smooth Motion and says so in the overlay and `dlss5-feed.log`. That
 > removes the feeder-side race. First data point (2026-09-01, 0.8.0-beta.4): Metro 2033 Redux ran
 > with Smooth Motion **active** — session open, frames delivered at the usual per-frame cost, no
-> re-entrant or off-thread Present observed. Full visual verification is still pending, and the
-> Vulkan path has no Smooth Motion run yet.
+> re-entrant or off-thread Present observed. Full visual verification is still pending.
+>
+> **On Vulkan, Smooth Motion is still broken and the detection does not work.** DOOM 2016 with
+> Smooth Motion on holds very old frames on screen while the feeder reports normal delivery
+> (#10, reproduced 2026-09-01). And the detector looks for `NvPresent64.dll`, which is the
+> **D3D-only** implementation — on Vulkan the driver does it inside its own ICD, so **no warning
+> will ever appear in a Vulkan game even when Smooth Motion is on.** Do not read a silent log as
+> "Smooth Motion is off" there; check NVIDIA Profile Inspector, or turn on "Smooth Motion - Debug
+> Bars" (`0xB01B8B02`) and look for coloured bars. For a Vulkan game, turn Smooth Motion off
+> using the per-API bitfield below. See [`PLAN-DETROIT.md`](PLAN-DETROIT.md).
 >
 > Two things Smooth Motion *did* break on that machine, neither of them this feeder — both crash
 > the game 1–2 s into boot with a null read on the present path, before the feeder feeds a frame:
@@ -149,11 +157,14 @@ process, D3D9 via a wrapper.
 
 **Known not working: Detroit: Become Human (Demo), 64-bit Vulkan.** DLSS runs (frames evaluated,
 fences honoured, D3D12-side probes show fresh input/output every sample) but the displayed image
-freezes on stale content for far longer than a normal one-frame lag would explain. Eight tests —
-including a passthrough diagnostic that swaps the whole DLSS evaluate for a plain byte copy and
-still reproduces it — rule out DLSS/NGX, renodx NR, the HDR/format detection, the image-import
-coherence theory, and missing queue-family ownership transfers, without finding the actual cause.
-Leading open theory: a `minImageCount=3` swapchain-image desync, not a transport ordering bug. See
+holds stale content far longer than a normal one-frame lag would explain. Eight tests — including
+a passthrough diagnostic that swaps the whole DLSS evaluate for a plain byte copy and still
+reproduces it — rule out DLSS/NGX, renodx NR, the HDR/format detection, the image-import coherence
+theory, and missing queue-family ownership transfers. **Leading theory: this is the Smooth Motion
+bug ([#10](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/10)), not a Detroit-specific
+fault** — enabling Smooth Motion in DOOM 2016 (Vulkan) reproduces it exactly, and the feeder's
+Smooth Motion detection is blind on Vulkan (it looks for `NvPresent64.dll`, which is the D3D-only
+implementation), so an absent warning proves nothing there. See
 [`PLAN-DETROIT.md`](PLAN-DETROIT.md) for the full investigation and what to try next. `enabled=0`
 is the recommended `dlss5-feed.cfg` setting for this title until it's resolved.
 

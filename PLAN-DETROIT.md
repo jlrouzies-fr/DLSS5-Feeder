@@ -1,13 +1,22 @@
 # Detroit: Become Human (Demo) — 64-bit Vulkan copy-home stays stale (unresolved)
 
-> ## Status — open, feed disabled for this game pending a new hypothesis
+> ## Status — open, but there is now a lead: this looks like issue #10, not a Detroit-specific bug
+>
+> **New data point (2026-09-01, from the user): enabling NVIDIA Smooth Motion in DOOM 2016
+> (64-bit Vulkan) reproduces the Detroit symptom exactly** — in a game that is otherwise a proven
+> working row. Detroit shows it without Smooth Motion having been deliberately enabled. See
+> "The Smooth Motion clue" below: it reframes everything under it, supplies the Vulkan data point
+> [`PLAN-SMOOTHMOTION.md`](PLAN-SMOOTHMOTION.md) was explicitly waiting on for
+> [#10](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/10), and invalidates the reasoning
+> that ruled Smooth Motion out for Detroit in the first place.
 >
 > `enabled=0` is set in the deployed `dlss5-feed.cfg` next to the demo's exe so the game plays
-> cleanly. Eight independent tests (below) all reproduce the same symptom and have exhausted
-> every hypothesis raised so far — transport, format, HDR, NR, DLSS itself, image import, and
-> queue-family ownership are each individually ruled out. The diagnostic scaffolding (four new
-> `dlss5-feed.cfg` knobs, two probes) stays in the code for whoever picks this up next; see
-> "Diagnostic tools now in the codebase" below.
+> cleanly. Eight independent tests (below) all reproduce the same symptom and rule out —
+> individually — transport, format, HDR, NR, DLSS itself, image import, and queue-family
+> ownership. What none of them touched is **what happens to the frame after we write it**, which
+> is exactly where Smooth Motion operates. The diagnostic scaffolding (four new `dlss5-feed.cfg`
+> knobs, two probes) stays in the code for whoever picks this up next; see "Diagnostic tools now
+> in the codebase" below.
 
 ## The report
 
@@ -112,40 +121,117 @@ reconcile:
   Vulkan game so far (DOOM 2016) is `B8G8R8A8_UNORM`/`FIFO`, not this swapchain's mix of
   10-bit/HDR10 formats and mutable-format flag.
 
+## The Smooth Motion clue (2026-09-01) — the current leading theory
+
+**The observation.** Turning NVIDIA Smooth Motion on in **DOOM 2016 (64-bit Vulkan)** — the
+proven-working Vulkan row in `README.md` — reproduces the Detroit symptom exactly. Detroit shows
+it with Smooth Motion never deliberately enabled.
+
+That is the [#10](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/10) reporter's case
+(RDR2, 64-bit Vulkan, "everything just flickers" once Smooth Motion is on), reproduced locally,
+and it is the Vulkan data point `PLAN-SMOOTHMOTION.md` says is "still needed".
+
+**A correction, because it changes what to do next.** Earlier in this investigation, Smooth
+Motion was ruled out for Detroit on the grounds that `dlss5-feed.log` carried no Smooth Motion
+warning. **That inference is invalid for a Vulkan game.** `DetectSmoothMotion()`
+(`src/dlss5-feed.cpp`) tests exactly one thing:
+
+```c
+if (GetModuleHandleW(L"NvPresent64.dll") == nullptr) return false;
+```
+
+`NvPresent64.dll` is the **DXGI/D3D** implementation — it hooks `CreateDXGIFactory*` and wraps
+`IDXGISwapChain`. On Vulkan there is no such module: NVIDIA implements Smooth Motion **inside the
+ICD's own swapchain**, and it is not a separate implicit layer either (verified on this machine —
+`HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers` lists GOG, ReShade, OBS, EOS, RTSS and Steam, and
+nothing from NVIDIA). So the detector is **structurally blind on Vulkan**: it would have stayed
+silent in the DOOM run *with Smooth Motion demonstrably on*, and it proves nothing about Detroit.
+The absence of that warning in the Detroit logs is not evidence of absence.
+
+**Why this fits the evidence better than anything above.** Smooth Motion presents *more often
+than the game renders*, from its own pacer, holding real frames back to interpolate between them.
+Every test 1–8 above instrumented **our side of the frame** — inputs, evaluate, output, fences,
+memory routes — and every probe agreed our side is fresh and correctly ordered every frame.
+Nothing in this investigation ever measured **what actually reaches the screen**. A pacer that
+holds and re-presents frames on its own schedule sits precisely in that unmeasured gap, and it
+explains the two findings that otherwise refuse to reconcile:
+
+- Both probes clean, every frame (our writes land, fences honoured), *and*
+- `passthrough=1` still stale (a plain byte copy through the same pipe still displays old
+  content) — because the staleness is not produced by anything we do to the frame. It is
+  produced by whoever presents it afterwards.
+
+It also explains the "way too long" duration far better than a fixed one-or-two-frame ordering
+slip, and it retro-fits data point 4 (`reset_every=1` giving *partial* unfreezing — real frames
+getting through intermittently between held/generated ones).
+
+**The open question is what plays that role in Detroit**, which the user did not knowingly
+enable. Three candidates, cheapest test first:
+
+1. **Smooth Motion is in fact active in Detroit** without having been turned on per-game — the
+   "Smooth Motion - Enabled APIs" DRS bitfield (`0xB0CC0875`) **defaults to `7`, which includes
+   bit `4` = Vulkan**, so a global/NVIDIA App enable, or a shipped per-app profile, would apply
+   silently. Nothing in our logs could tell us, per the correction above.
+2. **Another present-path interposer.** This machine has five implicit Vulkan layers loaded into
+   every Vulkan app (GOG Galaxy overlay, OBS, EOS overlay, **RTSS**, Steam overlay). RTSS in
+   particular is documented in `PLAN-SMOOTHMOTION.md` as switching its presentation handling when
+   it detects a pacer. DOOM works with all of these present and Smooth Motion off, so none is
+   sufficient alone — but one of them may behave differently against Detroit's HDR10 /
+   mutable-format / 3-image swapchain.
+3. **The game's own presentation** doing something pacer-shaped natively.
+
+Note also a **stale implicit-layer registration** found while checking: `HKCU\...\ImplicitLayers`
+points at `G:\Games\Ryujing-DLSS\dlss5-vk-bridge.json`, which **does not exist on disk**. The
+loader skips a dangling manifest, so it is not the cause, but it should be cleaned up so it
+cannot confuse a future Vulkan investigation.
+
 ## What to check next
 
-In rough order of how cheap the test is:
+Reordered around the Smooth Motion clue. The first two are minutes of work and could close this
+out; everything after assumes they came back negative.
 
-1. **Confirm Present is even being called normally.** Does the ReShade overlay (Home key) —
-   FPS counter, cursor, any animated overlay element — update live while the game view is
-   frozen? If yes, Present fires every frame and the game's own render loop is not the problem;
-   the fault is specifically in which image gets shown. If the overlay is frozen too, the whole
-   presentation pipeline is stalled and every finding above needs re-reading in that light.
-2. **Log the actual swapchain image index / VkImage handle the copy-home writes into, every
-   frame**, and separately whatever ReShade exposes for "current back buffer index" (check
-   `reshade::api::effect_runtime`/`swapchain` for an index accessor, or hook
-   `vkQueuePresentKHR`'s `pImageIndices` directly the way `feed_vk_hook.h` already hooks
-   `vkCreateDevice`). Compare the index written against the index actually presented that frame.
-   A mismatch that grows or cycles wrong would confirm the swapchain-ring-desync hypothesis in
-   "what the probes don't prove" above.
-3. **A visible per-frame marker**: have the copy-home XOR a 1-pixel corner block with the frame
-   parity (or write a solid colour that alternates red/green by `frame_n & 1`) instead of the
-   real content, with DLSS/passthrough irrelevant. If the on-screen corner marker itself lags or
-   skips, that isolates the fault to presentation/image-selection with zero ambiguity — no probe
-   reading required, just watching the corner.
-4. **Try forcing a smaller `minImageCount`** (2, if the swapchain create info can be intercepted
-   the way `vkCreateDevice` already is) or a different present mode, to see if the symptom
-   changes shape — a ring-desync theory predicts the lag would change with the ring size; a pure
-   fence/ordering bug would not.
-5. **Try another Vulkan game with a similar swapchain** (10-bit/HDR10 colour space, mutable
-   format, `minImageCount=3`) to find out whether this is Detroit-specific or a broader gap in
-   the Vulkan-transport path that DOOM's simpler swapchain never exercised. None of the working
-   Vulkan rows in `README.md`'s Status table match this swapchain shape.
-6. **Re-run the full test 8 (`passthrough=1`) with `half_home=1` while also watching whether the
-   staleness duration is constant or grows over the session** — "way too long" from the user
-   reads as possibly unbounded/growing, which would point more at an accumulating desync
-   (matches the ring-index theory) than at a fixed one-or-two-frame lag (which would point back
-   at ordering).
+1. **Is Smooth Motion actually running in Detroit? Turn on "Smooth Motion - Debug Bars"**
+   (DRS `0xB01B8B02`, NVIDIA Profile Inspector) and launch. It draws coloured bars on generated
+   frames. **Bars present = answered**: Detroit has Smooth Motion on without you enabling it,
+   this is [#10](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/10), and Detroit stops being
+   a separate investigation. No logs, no build, purely visual.
+2. **Then turn Smooth Motion off for Vulkan only and retest both games** — "Smooth Motion -
+   Enabled APIs" (`0xB0CC0875`), clear bit `4` (leaving DX11/DX12 alone), or "Smooth Motion -
+   Enable" (`0xB0D384C0`) `= 0` on the Detroit profile specifically. If Detroit comes good, the
+   root cause is confirmed and the remaining work is all in `PLAN-SMOOTHMOTION.md`'s scope, not
+   here. If DOOM comes good but Detroit does not, Detroit has a *second* interposer of the same
+   shape and candidates 2–3 in the section above are next.
+3. **Count presents against feed frames.** Hook `vkQueuePresentKHR` the way `feed_vk_hook.h`
+   already hooks `vkCreateDevice`, and log the present count against `g.frames_done` every 60
+   frames. **`presents > feeds` is the pacer signature** — it says frames are reaching the
+   display that we never touched, which is both the mechanism and, generalised, a *better
+   Smooth Motion detector than the module-name check* (see "Still worth doing"). The same hook
+   gives `pImageIndices` for free, which answers the swapchain-ring question below in the same
+   run — one hook, both theories.
+4. **A visible per-frame marker**: have the copy-home write a solid colour block in a corner that
+   alternates by `frame_n & 1` (or a small binary frame counter), instead of trusting probes. If
+   the marker on screen holds or skips while the log says frames are delivered, the fault is
+   downstream of us with zero ambiguity — and filming/step-framing it shows exactly *how* the
+   sequence is being reordered or held, which distinguishes a pacer (regular held/generated
+   pattern) from a ring desync (index cycling wrong).
+5. **Rule out the other interposers**: close RTSS, OBS, GOG Galaxy and the Steam overlay (or
+   temporarily unregister their implicit layers) and retest Detroit. Cheap, and candidate 2 in
+   the section above names RTSS specifically.
+6. **Confirm Present is being called normally at all.** Does the ReShade overlay (Home key) —
+   FPS counter, cursor, animated elements — update live while the game view is frozen? If yes,
+   Present fires every frame and only the *content* is stale. If the overlay is frozen too, the
+   whole presentation pipeline is stalled and every finding above needs re-reading. (This was
+   never actually confirmed and is a one-second check.)
+7. **Try forcing a smaller `minImageCount`** (2, intercepting the swapchain create info the way
+   `vkCreateDevice` is already intercepted) or a different present mode. A ring-desync theory
+   predicts the lag changes with ring size; a pacer or a pure ordering bug does not.
+8. **Try another Vulkan game with a similar swapchain** (10-bit/HDR10, mutable format,
+   `minImageCount=3`), Smooth Motion confirmed off, to separate "Detroit's swapchain shape" from
+   "Detroit specifically". No working Vulkan row in `README.md`'s Status table matches this
+   swapchain shape.
+9. **Watch whether the staleness duration is constant or grows** across a long session
+   (`passthrough=1` + `half_home=1`). Unbounded growth points at an accumulating queue (pacer or
+   ring desync); a fixed lag points back at ordering.
 
 ## Diagnostic tools now in the codebase (kept for the next session)
 
@@ -171,6 +257,19 @@ only add log lines.
 
 ## Still worth doing regardless of this bug
 
+- **`DetectSmoothMotion()` is blind on Vulkan and OpenGL** — it checks for `NvPresent64.dll`,
+  which only exists on the DXGI/D3D path (see "The Smooth Motion clue"). Every Vulkan user hits
+  #10 with no warning at all, and this investigation lost hours to reading that silence as
+  "Smooth Motion is off". The module check should stay as a fast positive, but the *real* fix is
+  behavioural and vendor-agnostic: **compare `vkQueuePresentKHR` count against feed frames** (or
+  the equivalent per API) and warn when presents meaningfully outnumber fed frames, which
+  catches any external pacer regardless of vendor, API or module name. Item 3 in "What to check
+  next" builds exactly this instrumentation; promoting it from probe to shipped detector is a
+  small step afterwards. Until then, `README.md`'s Smooth Motion warning should say explicitly
+  that the runtime detection does not work on Vulkan.
+- **Clean up the dangling implicit Vulkan layer** on this machine:
+  `HKCU\SOFTWARE\Khronos\Vulkan\ImplicitLayers` registers
+  `G:\Games\Ryujing-DLSS\dlss5-vk-bridge.json`, which no longer exists on disk.
 - **`IsHdrFormat()` (`src/dlss5-feed.cpp`) should key off the Vulkan swapchain's actual
   `imageColorSpace`**, not guess from the DXGI format alone — `R10G10B10A2_UNORM` is legitimately
   either 10-bit SDR or HDR10 depending on colour space, and the format-only heuristic will

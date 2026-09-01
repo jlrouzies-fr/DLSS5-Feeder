@@ -552,6 +552,10 @@ struct Cfg
     int   half_home;       // diagnostic: mode-2 copy home writes only the LEFT half of the
                            // frame (mode-1 style split screen), so the right half shows the
                            // live game next to what DLSS handed back
+    int   async_home;      // Vulkan transport: 1 = the copy home carries the PREVIOUS frame's
+                           // output and waits on fence n-1, so the game's present path never
+                           // stalls on this frame's cross-API evaluate. Costs one frame of
+                           // latency; needs buffer_home (the buffer is double-slotted).
     int   passthrough;     // diagnostic: mode-2 with the NGX evaluate swapped for a plain
                            // CopyResource(OUTPUT <- COLOR) -- the whole transport runs, DLSS
                            // does not. Separates "transport lags" from "DLSS output lags".
@@ -559,7 +563,7 @@ struct Cfg
     float mv_scale_y;
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 2000, 1, 0, 0, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 2000, 1, 0, 0, 0, 1.0f, 1.0f };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -593,11 +597,13 @@ static void CfgWriteDefault()
             "work_resolution=%d\n"
             "gpu_timeout_ms=%d\n"
             "buffer_home=%d\n"
+            "async_home=%d\n"
             "mv_scale_x=%.3f\n"
             "mv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
-            g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -632,6 +638,7 @@ static bool CfgReload()
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
         else if (_stricmp(key, "gpu_timeout_ms") == 0) next.gpu_timeout_ms  = iv;
         else if (_stricmp(key, "buffer_home")    == 0) next.buffer_home    = iv;
+        else if (_stricmp(key, "async_home")     == 0) next.async_home     = iv;
         else if (_stricmp(key, "half_home")      == 0) next.half_home      = iv;
         else if (_stricmp(key, "passthrough")    == 0) next.passthrough    = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
@@ -646,15 +653,17 @@ static bool CfgReload()
 
     const bool rebuild = next.hdr != g_cfg.hdr || next.depth_inverted != g_cfg.depth_inverted ||
                          next.flags != g_cfg.flags || next.rebuild != g_cfg.rebuild ||
-                         next.preset != g_cfg.preset || next.buffer_home != g_cfg.buffer_home;
+                         next.preset != g_cfg.preset || next.buffer_home != g_cfg.buffer_home ||
+                         next.async_home != g_cfg.async_home;
     const bool changed = rebuild || memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
     if (!changed) return false;
     g_cfg = next;
     Log("[feed] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d warmup_rebuild=%d "
-        "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% gpu_timeout_ms=%d buffer_home=%d mv_scale=%.3f,%.3f",
+        "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% gpu_timeout_ms=%d buffer_home=%d async_home=%d mv_scale=%.3f,%.3f",
         g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
         g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay,
-        g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+        g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
+        g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     return rebuild;
 }
 
@@ -670,10 +679,11 @@ static void CfgSave()
     fprintf(f,
         "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
             "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\ngpu_timeout_ms=%d\n"
-            "buffer_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+            "buffer_home=%d\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
-            g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
 }
 
@@ -848,6 +858,8 @@ struct Feed
     VkBuffer               vk_home_buf;
     VkDeviceMemory         vk_home_mem;
     UINT                   home_pitch;       // bytes per row in the buffer (256-aligned)
+    UINT64                 home_slice;       // async_home: bytes per slot; the buffer holds two,
+                                             // D3D12 writes n&1 while Vulkan reads (n-1)&1. 0 = off
     ID3D12Resource        *in_buf12[SLOT_COUNT];    // buffer_home, input direction: one shared linear
     HANDLE                 in_buf_handle[SLOT_COUNT];  // buffer per input slot (OUTPUT unused) -- the
     VkBuffer               vk_in_buf[SLOT_COUNT];      // image imports proved stale for D3D12 reads of
@@ -1595,6 +1607,7 @@ static void ReleaseFrameResources()
     if (g.home_buf_handle != nullptr) { CloseHandle(g.home_buf_handle); g.home_buf_handle = nullptr; }
     SafeRelease(g.home_buf12);
     g.home_pitch = 0;
+    g.home_slice = 0;
     for (int i = 0; i < SLOT_COUNT; ++i)
     {
         if (g.in_buf_handle[i] != nullptr) { CloseHandle(g.in_buf_handle[i]); g.in_buf_handle[i] = nullptr; }
@@ -2588,7 +2601,14 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     if (g_cfg.buffer_home != 0 && home_bpp != 0 && SameTexelLayout(g.output_fmt, bb_fmt))
     {
         g.home_pitch = (w * home_bpp + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
-        const UINT64 home_size = static_cast<UINT64>(g.home_pitch) * h;
+        // async_home double-slots the buffer: the evaluate writes one slot while the copy
+        // home reads the other, so the two never alias and no wait on THIS frame is needed.
+        // The slot stride keeps D3D12's placed-footprint alignment.
+        const UINT64 one_slot = static_cast<UINT64>(g.home_pitch) * h;
+        g.home_slice = g_cfg.async_home != 0
+            ? ((one_slot + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~static_cast<UINT64>(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1))
+            : 0;
+        const UINT64 home_size = g.home_slice != 0 ? g.home_slice * 2 : one_slot;
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC   rd = {};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = home_size;
@@ -2609,7 +2629,9 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
             g.home_pitch = 0;
         }
         else
-            Log("[feed] buffer_home: output goes home through a shared linear buffer (%ux%u, pitch %u)", w, h, g.home_pitch);
+            Log("[feed] buffer_home: output goes home through a shared linear buffer (%ux%u, pitch %u)%s",
+                w, h, g.home_pitch,
+                g.home_slice != 0 ? " -- async_home: double-slotted, copy home carries frame n-1" : "");
     }
 
     // Input direction of the same workaround: one shared linear buffer per input slot.
@@ -3787,7 +3809,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                         D3D12_TEXTURE_COPY_LOCATION dst = {};
                         dst.pResource = g.home_buf12;
                         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                        dst.PlacedFootprint.Offset = 0;
+                        dst.PlacedFootprint.Offset = g.home_slice != 0 ? g.home_slice * (n & 1) : 0;
                         dst.PlacedFootprint.Footprint = { g.output_fmt, g.width, g.height, 1, g.home_pitch };
                         g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
                         Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3816,7 +3838,14 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             // The copy home lands on the fresh immediate list, which executes on the
             // game's queue after the wait below -- GPU-ordered, no CPU stall.
             Breadcrumb("waiting for the result (Vulkan)");
-            const bool wait_ok = g.rs_queue->wait(g.rs_fence_out, n);
+            // async_home: wait for the PREVIOUS frame's evaluate, not this one. The game's
+            // present path then never carries a cross-API stall of unbounded length -- which
+            // is what an external frame pacer (Smooth Motion) cannot absorb, and is a cost
+            // worth removing regardless. Frame 1 has no predecessor: skip the copy home.
+            const bool async_home = g.home_slice != 0;
+            const UINT64 wait_n   = async_home ? (n > 1 ? n - 1 : 0) : n;
+            const bool   home_ok  = !async_home || n > 1;
+            const bool wait_ok = wait_n != 0 ? g.rs_queue->wait(g.rs_fence_out, wait_n) : true;
             // Sync probe: does the cross-API fence machinery actually connect? The two
             // D3D12 completed values are what the D3D12 device has retired; the two
             // Vulkan values are what the IMPORTED timeline semaphores read from this
@@ -3824,13 +3853,15 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             // and nothing orders the copy home against the evaluate. sig/wait are
             // ReShade's own return values -- 0 means it refused the imported semaphore.
             if ((n % 60) == 1)
-                Log("[feed] sync probe: n=%llu sig=%d wait=%d | d12 in=%llu out=%llu | vk in=%llu out=%llu",
-                    static_cast<unsigned long long>(n), sig_ok ? 1 : 0, wait_ok ? 1 : 0,
+                Log("[feed] sync probe: n=%llu (waited out=%llu) sig=%d wait=%d | d12 in=%llu out=%llu | vk in=%llu out=%llu",
+                    static_cast<unsigned long long>(n), static_cast<unsigned long long>(wait_n),
+                    sig_ok ? 1 : 0, wait_ok ? 1 : 0,
                     static_cast<unsigned long long>(g.fence12_in  != nullptr ? g.fence12_in->GetCompletedValue()  : 0),
                     static_cast<unsigned long long>(g.fence12_out != nullptr ? g.fence12_out->GetCompletedValue() : 0),
                     static_cast<unsigned long long>(FeedVkTimelineValue(&g.vk, g.vk_sem_in)),
                     static_cast<unsigned long long>(FeedVkTimelineValue(&g.vk, g.vk_sem_out)));
             cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());  // fresh buffer after the flush
+            done = done && home_ok;   // async_home frame 1: nothing to carry home yet
             // Take the images back from the D3D12 device: acquire from
             // VK_QUEUE_FAMILY_EXTERNAL, making the evaluate's output writes visible to
             // the copy home. This submit waits on the out-fence, so the acquire is
@@ -3856,8 +3887,12 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 // only for the layouts a raw copy genuinely cannot express.
                 const UINT wh = g_cfg.half_home != 0 ? w / 2 : w;   // half_home: leave the right half raw
                 if (g.vk_home_buf != VK_NULL_HANDLE)
+                {
+                    // async_home reads the slot the evaluate is NOT writing this frame.
+                    const VkDeviceSize slot = async_home ? g.home_slice * ((n - 1) & 1) : 0;
                     FeedVkCopyBufferToImage(&g.vk, cb, g.vk_home_buf, bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                            wh, h, g.home_pitch / HomeTexelBytes(g.output_fmt));
+                                            wh, h, g.home_pitch / HomeTexelBytes(g.output_fmt), slot);
+                }
                 else if (SameTexelLayout(g.output_fmt, g.bb_fmt))
                     FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
                                     bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, wh, h);
@@ -3878,6 +3913,8 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 g.consecutive_fails = 0;
                 if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
                     Log("[feed] frame %llu delivered (%ux%u, reset=%d, Vulkan transport)", fn, g.width, g.height, reset);
+                // Feeds the pacer detector (presents vs. frames fed) and reports periodically.
+                FeedVkPresentTick(fn, 600);
 
                 if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
                 {

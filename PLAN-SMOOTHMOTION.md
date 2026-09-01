@@ -13,6 +13,24 @@
 > Smooth Motion exposes (Luma's unchecked `GetBuffer(GetCurrentBackBufferIndex())`, fix offered
 > upstream; and RenoDX v4.6's `NRStyle=2`, which the feeder now warns about).
 >
+> **Update (2026-09-01, later still): the Vulkan data point (#10) is in, and it reproduces.**
+> **DOOM 2016, 64-bit Vulkan, Smooth Motion ON** — a proven-working row with it off — shows the
+> display holding very old frames far past any single-frame lag, while the feeder reports frames
+> evaluated and delivered at a normal rate throughout. So the serialization work in steps 3–5 is
+> **not sufficient** for Vulkan: the feeder-side race is fixed, but something downstream of our
+> copy-home is holding/re-presenting frames. Detroit: Become Human (Demo) shows the identical
+> symptom *without* Smooth Motion knowingly enabled — see [`PLAN-DETROIT.md`](PLAN-DETROIT.md)
+> for eight tests that rule out the transport, the format, HDR, NR and DLSS itself.
+>
+> **`DetectSmoothMotion()` cannot see Smooth Motion on Vulkan at all.** It checks for
+> `NvPresent64.dll`, the DXGI/D3D implementation; on Vulkan NVIDIA does it inside the ICD's own
+> swapchain, and there is no NVIDIA implicit layer either (verified against
+> `HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers`). So the warning never fires for the exact users
+> who need it, and an absent warning must not be read as "Smooth Motion is off" — it was, during
+> the Detroit investigation, which cost real time. The durable fix is behavioural: count
+> `vkQueuePresentKHR` against frames fed and warn when presents outnumber them, which detects any
+> external pacer regardless of vendor or API.
+>
 > Two things landed that the plan did not call for, both found while implementing:
 > - A `CRITICAL_SECTION` is *recursive*, so a lock alone cannot stop a re-entrant Present on the
 >   same thread — it would walk straight into a half-built frame. Hence the busy flag beside it.

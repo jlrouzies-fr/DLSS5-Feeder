@@ -335,10 +335,11 @@ static bool FeedVkImportBuffer(FeedVk *vk, HANDLE d3d12_res_handle, VkDeviceSize
 
 // Copy the imported buffer (tightly rowed at row_texels) into the game's backbuffer.
 static void FeedVkCopyBufferToImage(FeedVk *vk, VkCommandBuffer cb, VkBuffer src, VkImage dst,
-                                    VkImageLayout dst_layout, UINT w, UINT h, UINT row_texels)
+                                    VkImageLayout dst_layout, UINT w, UINT h, UINT row_texels,
+                                    VkDeviceSize src_offset = 0)
 {
     VkBufferImageCopy c = {};
-    c.bufferOffset      = 0;
+    c.bufferOffset      = src_offset;
     c.bufferRowLength   = row_texels;   // in TEXELS, not bytes
     c.bufferImageHeight = h;
     c.imageSubresource  = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
