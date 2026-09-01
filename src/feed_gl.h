@@ -206,8 +206,7 @@ struct FeedGl
     char missing[256];      // the first extension/entry point that was absent
     char renderer[128];     // GL_RENDERER, so a wrong-GPU hybrid laptop is obvious
     char version[64];       // GL_VERSION
-    char diag[448];         // how the extension query itself behaved (see FeedGlLoad)
-    bool probe_rescued;     // the string denied the interop and a live probe overrode it
+    char diag[512];         // how the extension query behaved (see FeedGlSurveyExtensions)
 
     bool ok;
 };
@@ -216,71 +215,111 @@ struct FeedGl
 // Loading
 // ---------------------------------------------------------------------------
 
-// Is `name` listed in the current context's extension string? Reads it both the
-// modern way (glGetStringi, core profiles) and the legacy way (glGetString, which
-// compatibility contexts still answer), because NVIDIA hands even ancient games a
-// 4.6 compatibility context and either form may be the one that answers.
-static bool FeedGlHasExtension(FeedGl *gl, const char *name)
+// Swallow and report whatever is sitting in the error queue. Returns the first
+// error found (0 = clean) so a caller can log one line instead of a loop. Bounded,
+// because a context that reports an error forever must not hang the game in here.
+// Defined ahead of the loader so load-time code shares the one drain, and free of an
+// `ok` guard for the same reason: every other caller already checked `ok` itself.
+static GLenum FeedGlDrainErrors(FeedGl *gl)
 {
-    if (gl->GetStringi != nullptr && gl->GetIntegerv != nullptr)
+    GLenum first = GL_NO_ERROR;
+    for (int i = 0; i < 32; ++i)
     {
-        GLint count = 0;
+        const GLenum e = gl->GetError();
+        if (e == GL_NO_ERROR) break;
+        if (first == GL_NO_ERROR) first = e;
+    }
+    return first;
+}
+
+// Read the context's advertised extension set ONCE, both ways, and answer the only
+// question the loader asks of it: which of `names` are listed. `found` receives one
+// flag per name.
+//
+// Both enumerations are read and unioned, never short-circuited. NVIDIA hands even
+// ancient games a 4.6 compatibility context, so either form may be the one that
+// answers; and when ReShade is installed for OpenGL it IS the local opengl32.dll, and
+// a proxy that answers one form need not answer the other. Letting whichever form
+// spoke first be authoritative turns a half-answer into "this GPU cannot do interop",
+// which disables the feed outright.
+//
+// gl->diag records how each enumeration itself behaved, because a bare
+// "GL_EXT_memory_object missing" cannot tell a GPU that lacks the interop apart from a
+// query that answered nothing -- and on hardware that plainly has it, the second is
+// what happens. `listed` is how many of `names` each form carried, counted in this
+// same pass, so it is the matcher's own verdict rather than a second guess at it.
+static void FeedGlSurveyExtensions(FeedGl *gl, const char *const *names, int n, bool *found)
+{
+    for (int k = 0; k < n; ++k) found[k] = false;
+
+    // The game and ReShade share this context: an error left behind by either would
+    // otherwise be reported as ours and read as evidence about a query that succeeded.
+    FeedGlDrainErrors(gl);
+
+    GLint count = 0;
+    GLenum err_i = GL_NO_ERROR;
+    int listed_i = 0;
+    if (gl->GetStringi != nullptr)
+    {
         gl->GetIntegerv(GL_NUM_EXTENSIONS, &count);
-        if (gl->GetError != nullptr) (void)gl->GetError();   // GL_INVALID_ENUM pre-3.0
+        err_i = FeedGlDrainErrors(gl);                  // GL_INVALID_ENUM pre-3.0
         for (GLint i = 0; i < count; ++i)
         {
             const GLubyte *e = gl->GetStringi(GL_EXTENSIONS, static_cast<GLuint>(i));
-            if (e != nullptr && strcmp(reinterpret_cast<const char *>(e), name) == 0) return true;
+            if (e == nullptr) continue;
+            for (int k = 0; k < n; ++k)
+                if (!found[k] && strcmp(reinterpret_cast<const char *>(e), names[k]) == 0)
+                { found[k] = true; ++listed_i; }
         }
     }
-    // The legacy form, consulted even when the modern one answered with a non-empty
-    // list -- it is not a fallback for an empty enumeration alone. When ReShade is
-    // installed for OpenGL it IS the local opengl32.dll, and a proxy that answers one
-    // of the two enumerations need not answer the other. Letting whichever form spoke
-    // first be authoritative turns a half-answer into "this GPU cannot do interop",
-    // which disables the feed outright.
-    if (gl->GetString == nullptr) return false;
+
     const GLubyte *all = gl->GetString(GL_EXTENSIONS);
-    if (gl->GetError != nullptr) (void)gl->GetError();       // GL_INVALID_ENUM in a core profile
-    if (all == nullptr) return false;
-    const char *s = reinterpret_cast<const char *>(all);
-    const size_t n = strlen(name);
-    for (const char *p = strstr(s, name); p != nullptr; p = strstr(p + 1, name))
-        if ((p == s || p[-1] == ' ') && (p[n] == ' ' || p[n] == '\0')) return true;
-    return false;
+    const GLenum err_s = FeedGlDrainErrors(gl);         // GL_INVALID_ENUM in a core profile
+    const char *const s = reinterpret_cast<const char *>(all);
+    int listed_s = 0;
+    if (s != nullptr)
+        for (int k = 0; k < n; ++k)
+        {
+            const size_t len = strlen(names[k]);
+            for (const char *p = strstr(s, names[k]); p != nullptr; p = strstr(p + 1, names[k]))
+                if ((p == s || p[-1] == ' ') && (p[len] == ' ' || p[len] == '\0'))
+                { found[k] = true; ++listed_s; break; }
+        }
+
+    sprintf_s(gl->diag,
+              "glGetStringi=%s GL_NUM_EXTENSIONS=%d err=0x%04X listed=%d/%d | "
+              "glGetString(GL_EXTENSIONS)=%s len=%u err=0x%04X listed=%d/%d",
+              gl->GetStringi != nullptr ? "resolved" : "NULL", static_cast<int>(count),
+              static_cast<unsigned>(err_i), listed_i, n,
+              s != nullptr ? "ok" : "NULL",
+              s != nullptr ? static_cast<unsigned>(strlen(s)) : 0u,
+              static_cast<unsigned>(err_s), listed_s, n);
 }
 
-// Does this context actually do external-object interop, whatever the extension
-// string claims? NVIDIA's per-application profiles cap the string they report to old
-// engines -- id Tech 3 and its descendants copy glGetString(GL_EXTENSIONS) into a
-// fixed 4 KB buffer, so the driver truncates the advertised set for those executables
-// and GL_EXT_memory_object falls off the end. The capability is untouched; only the
+// Does this context actually do external-object interop, whatever the extension string
+// claims? NVIDIA's per-application profiles cap the string reported to old engines --
+// id Tech 3 and its descendants copy glGetString(GL_EXTENSIONS) into a fixed 4 KB
+// buffer, so the driver truncates the advertised set for those executables and
+// GL_EXT_memory_object falls off the end. The capability is untouched; only the
 // advertisement is. Asking the driver to hand back a live memory object and a live
-// semaphore settles it, and settles the stub worry with it: a stub cannot produce a
-// non-zero object name and leave GL_NO_ERROR behind.
+// semaphore settles it -- and settles the stub worry with it, which is why a resolved
+// entry point was never the gate on its own: a stub cannot produce a non-zero object
+// name and leave GL_NO_ERROR behind.
 static bool FeedGlProbeInterop(FeedGl *gl)
 {
-    const auto CreateMem = reinterpret_cast<PFN_glCreateMemoryObjectsEXT_>(gl->wglGetProcAddress("glCreateMemoryObjectsEXT"));
-    const auto DeleteMem = reinterpret_cast<PFN_glDeleteMemoryObjectsEXT_>(gl->wglGetProcAddress("glDeleteMemoryObjectsEXT"));
-    const auto GenSem    = reinterpret_cast<PFN_glGenSemaphoresEXT_>(gl->wglGetProcAddress("glGenSemaphoresEXT"));
-    const auto DelSem    = reinterpret_cast<PFN_glDeleteSemaphoresEXT_>(gl->wglGetProcAddress("glDeleteSemaphoresEXT"));
-    if (CreateMem == nullptr || DeleteMem == nullptr || GenSem == nullptr || DelSem == nullptr) return false;
-
-    // Start from a clean error state, and never trust the driver to drain (a context
-    // that reports an error forever must not hang the game in here).
-    for (int i = 0; i < 32 && gl->GetError() != GL_NO_ERROR; ++i) {}
+    FeedGlDrainErrors(gl);
 
     GLuint mem = 0;
-    CreateMem(1, &mem);
-    const bool mem_ok = mem != 0 && gl->GetError() == GL_NO_ERROR;
-    if (mem != 0) DeleteMem(1, &mem);
+    gl->CreateMemoryObjectsEXT(1, &mem);
+    const bool mem_ok = FeedGlDrainErrors(gl) == GL_NO_ERROR && mem != 0;
+    if (mem != 0) gl->DeleteMemoryObjectsEXT(1, &mem);
 
     GLuint sem = 0;
-    GenSem(1, &sem);
-    const bool sem_ok = sem != 0 && gl->GetError() == GL_NO_ERROR;
-    if (sem != 0) DelSem(1, &sem);
+    gl->GenSemaphoresEXT(1, &sem);
+    const bool sem_ok = FeedGlDrainErrors(gl) == GL_NO_ERROR && sem != 0;
+    if (sem != 0) gl->DeleteSemaphoresEXT(1, &sem);
 
-    for (int i = 0; i < 32 && gl->GetError() != GL_NO_ERROR; ++i) {}
+    FeedGlDrainErrors(gl);
     return mem_ok && sem_ok;
 }
 
@@ -328,77 +367,34 @@ static bool FeedGlLoad(FeedGl *gl)
     if (const GLubyte *r = gl->GetString(GL_RENDERER)) strncpy_s(gl->renderer, reinterpret_cast<const char *>(r), _TRUNCATE);
     if (const GLubyte *v = gl->GetString(GL_VERSION))  strncpy_s(gl->version,  reinterpret_cast<const char *>(v), _TRUNCATE);
 
-    // Record how each enumeration behaves before anything is looked up in it. A bare
-    // "GL_EXT_memory_object missing" cannot tell a GPU that lacks the interop apart
-    // from a query that answered nothing -- and on hardware that plainly has it, the
-    // second is what happened. mem_obj counts entries containing "memory_object" in
-    // each form, so "the driver lists it and our matcher missed it" reads differently
-    // from "the driver never listed it".
-    {
-        GLint count = 0;
-        GLenum err_i = 0;
-        int hits_i = 0;
-        // Drain first: the game and ReShade share this context, so an error left
-        // behind by either would otherwise be reported as ours and read as evidence
-        // about a query that in fact succeeded.
-        for (int i = 0; i < 32 && gl->GetError() != GL_NO_ERROR; ++i) {}
-        if (gl->GetStringi != nullptr)
-        {
-            gl->GetIntegerv(GL_NUM_EXTENSIONS, &count);
-            err_i = gl->GetError();
-            for (GLint i = 0; i < count; ++i)
-            {
-                const GLubyte *e = gl->GetStringi(GL_EXTENSIONS, static_cast<GLuint>(i));
-                if (e != nullptr && strstr(reinterpret_cast<const char *>(e), "memory_object") != nullptr) ++hits_i;
-            }
-        }
-        const GLubyte *all = gl->GetString(GL_EXTENSIONS);
-        const GLenum err_s = gl->GetError();
-        int hits_s = 0;
-        if (all != nullptr)
-            for (const char *p = strstr(reinterpret_cast<const char *>(all), "memory_object");
-                 p != nullptr; p = strstr(p + 1, "memory_object")) ++hits_s;
-        sprintf_s(gl->diag,
-                  "glGetStringi=%s GL_NUM_EXTENSIONS=%d err=0x%04X mem_obj=%d | "
-                  "glGetString(GL_EXTENSIONS)=%s len=%u err=0x%04X mem_obj=%d",
-                  gl->GetStringi != nullptr ? "resolved" : "NULL", static_cast<int>(count),
-                  static_cast<unsigned>(err_i), hits_i,
-                  all != nullptr ? "ok" : "NULL",
-                  all != nullptr ? static_cast<unsigned>(strlen(reinterpret_cast<const char *>(all))) : 0u,
-                  static_cast<unsigned>(err_s), hits_s);
-    }
-
     // The gate. Failing it means this frame is not being rendered on an NVIDIA GPU
     // (wrong GPU on a hybrid laptop, or non-NVIDIA hardware) -- DLSS could not run
     // there anyway, so the caller disables the feed rather than falling back.
-    static const char *const kNeeded[] = {
+    enum { kMemObj, kMemObjWin32, kSem, kSemWin32, kCopyImageArb, kCopyImageExt, kExtCount };
+    static const char *const kExt[kExtCount] = {
         "GL_EXT_memory_object", "GL_EXT_memory_object_win32",
         "GL_EXT_semaphore",     "GL_EXT_semaphore_win32",
+        "GL_ARB_copy_image",    "GL_EXT_copy_image",
     };
-    const char *unadvertised = nullptr;
-    for (const char *ext : kNeeded)
-        if (!FeedGlHasExtension(gl, ext)) { unadvertised = ext; break; }
+    bool have[kExtCount];
+    FeedGlSurveyExtensions(gl, kExt, kExtCount, have);
 
-    // An unadvertised extension is a question, not a verdict: on a capped extension
-    // string the interop is there and works. Only a probe that also fails is absence.
-    if (unadvertised != nullptr)
-    {
-        if (!FeedGlProbeInterop(gl)) { strcpy_s(gl->missing, unadvertised); return false; }
-        gl->probe_rescued = true;
-        char note[192];
-        sprintf_s(note, " | %s unadvertised, live probe PASSED (capped extension string)", unadvertised);
-        strcat_s(gl->diag, note);
-    }
+    const char *unadvertised = nullptr;
+    for (int k = kMemObj; k <= kSemWin32; ++k)
+        if (!have[k]) { unadvertised = kExt[k]; break; }
 
     // glCopyImageSubData is core since 4.3; on anything older it needs an extension.
     // ReShade's own OpenGL minimum is 4.3, so this is belt and braces.
     if (atoi(gl->version) < 4 || (atoi(gl->version) == 4 && (strlen(gl->version) < 3 || gl->version[2] < '3')))
-        if (!FeedGlHasExtension(gl, "GL_ARB_copy_image") && !FeedGlHasExtension(gl, "GL_EXT_copy_image"))
+        if (!have[kCopyImageArb] && !have[kCopyImageExt])
         { strcpy_s(gl->missing, "GL_ARB_copy_image (and the context is below OpenGL 4.3)"); return false; }
 
+    // An entry point that will not resolve while the extension was also unadvertised is
+    // the extension genuinely being absent -- report it as such, so the wrong-GPU case
+    // reads the same whether the driver hands back stubs or nothing at all.
     #define FEED_GL_EXT(member, name) \
         gl->member = reinterpret_cast<PFN_gl##member##_>(gl->wglGetProcAddress(name)); \
-        if (gl->member == nullptr) { strcpy_s(gl->missing, name); return false; }
+        if (gl->member == nullptr) { strcpy_s(gl->missing, unadvertised != nullptr ? unadvertised : name); return false; }
     FEED_GL_EXT(GenFramebuffers,        "glGenFramebuffers")
     FEED_GL_EXT(DeleteFramebuffers,     "glDeleteFramebuffers")
     FEED_GL_EXT(BindFramebuffer,        "glBindFramebuffer")
@@ -426,27 +422,24 @@ static bool FeedGlLoad(FeedGl *gl)
     FEED_GL_EXT(ImportSemaphoreWin32HandleEXT,"glImportSemaphoreWin32HandleEXT")
     #undef FEED_GL_EXT
 
+    // An unadvertised extension is a question, not a verdict: under a capped extension
+    // string the interop is there and works. Only a probe that also fails is absence.
+    // Asked here, after resolution, so the probe calls the same table the transport
+    // will -- there is no second copy of the entry points to keep in step.
+    if (unadvertised != nullptr)
+    {
+        if (!FeedGlProbeInterop(gl)) { strcpy_s(gl->missing, unadvertised); return false; }
+        char note[128];
+        sprintf_s(note, " | %s unadvertised, live probe PASSED (capped extension string)", unadvertised);
+        strcat_s(gl->diag, note);
+    }
+
     // Optional: the DSA form spares us a bind/restore during the import.
     gl->TextureStorageMem2DEXT =
         reinterpret_cast<PFN_glTextureStorageMem2DEXT_>(gl->wglGetProcAddress("glTextureStorageMem2DEXT"));
 
     gl->ok = true;
     return true;
-}
-
-// Swallow and report whatever is sitting in the error queue. Returns the first
-// error found (0 = clean) so a caller can log one line instead of a loop.
-static GLenum FeedGlDrainErrors(FeedGl *gl)
-{
-    if (!gl->ok) return 0;
-    GLenum first = 0;
-    for (int i = 0; i < 32; ++i)
-    {
-        const GLenum e = gl->GetError();
-        if (e == GL_NO_ERROR) break;
-        if (first == 0) first = e;
-    }
-    return first;
 }
 
 // ---------------------------------------------------------------------------

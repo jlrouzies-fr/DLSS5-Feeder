@@ -2156,12 +2156,7 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
     g.gl_ctx = g.gl.wglGetCurrentContext();
     Log("[feed] OpenGL: renderer=\"%s\" version=\"%s\" context=%p thread=%lu (interop extensions present)",
         g.gl.renderer, g.gl.version, (void *)g.gl_ctx, GetCurrentThreadId());
-    // The driver hid the extensions from this executable (an NVIDIA per-application
-    // cap on the extension string, applied to old engines) and the live probe found
-    // them anyway. Worth a line: it is the difference between a driver quirk and a
-    // GPU that genuinely cannot do interop.
-    if (g.gl.probe_rescued)
-        Log("[feed] extension query: %s", g.gl.diag);
+    Log("[feed] extension query: %s", g.gl.diag);
 
     // Private D3D12 device, loaded so ReShade hooks it -- that hook is what lets the
     // DLSS 5 add-on see the device. Proven under dxgi.dll and Vulkan-layer loading;

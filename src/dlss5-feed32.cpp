@@ -1692,12 +1692,7 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
         g.gl_ctx = g.gl.wglGetCurrentContext();
         Log("[feed32] OpenGL: renderer=\"%s\" version=\"%s\" context=%p thread=%lu (interop extensions present)",
             g.gl.renderer, g.gl.version, (void *)g.gl_ctx, GetCurrentThreadId());
-        // The driver hid the extensions from this executable (an NVIDIA per-application
-        // cap on the extension string, applied to old engines) and the live probe found
-        // them anyway. Worth a line: it is the difference between a driver quirk and a
-        // GPU that genuinely cannot do interop.
-        if (g.gl.probe_rescued)
-            Log("[feed32] extension query: %s", g.gl.diag);
+        Log("[feed32] extension query: %s", g.gl.diag);
     }
     // GL names live in the share group of the context current at import: a context
     // change strands every one of them, so start over on the new one.
