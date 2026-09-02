@@ -7,3 +7,9 @@ D3D12 Work Resolution allows the neural rendering workload to run at a lower int
 D3D12 Sharpness adds a dedicated RCAS sharpening pass after the expand-back stage, allowing the player to control the final image sharpness independently.
 
 The goal is to provide players with an additional option for D3D12 games that do not already offer DLSS, while keeping the implementation separate and modular.
+
+## Community Fork
+
+This fork adds D3D12 Work Resolution and D3D12 Sharpness support for D3D12 games that do not natively support DLSS.
+
+For the original installation and setup instructions, see the [upstream DLSS5-Feeder README](https://github.com/jlrouzies-fr/DLSS5-Feeder).
