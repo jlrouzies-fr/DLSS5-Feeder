@@ -42,7 +42,7 @@ add-on rather than two, and there is nothing for this project to add.
 | **DirectX 9**, and you want the best handling of motion | **DLSS5-Feeder** |
 
 renodx-dlss is not on GitHub. It comes from the RenoDX Discord, `#DLSS5` channel:
-<https://discord.com/channels/1408098019194310818/1542647972695904317>
+<https://discord.com/invite/renodx>
 
 <details>
 <summary>Why DLSS5-Feeder is still the only option for those three</summary>
@@ -62,7 +62,7 @@ DLSS5-Feeder does not sharpen anything by itself. It builds the DLSS request you
 makes; a **second add-on** does the actual neural rendering. You install **exactly one** of them.
 
 **Recommended: Deep Fried Chicken**, by Alexander, from its Discord:
-<https://discord.com/channels/1543931653976498207/1543936250657120366> — take **1.4.8 or newer**.
+<https://discord.gg/g2v2XGqvR> — take **1.4.8 or newer**.
 
 Copy its three files next to your game's `.exe` (or into `host64\` for a 32-bit game):
 `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll` and `deep-fried-chicken.cfg`.
@@ -78,7 +78,7 @@ supply `nvngx_dlssnr.dll` and `nvngx_dlss.dll` yourself, as always.
 <summary>Using Krish's RenoDX add-on instead (the older option, still fully supported)</summary>
 
 `renodx-dlss5.addon64`, the `#DLSS5` build, from the RenoDX Discord, `#DLSS5` channel:
-<https://discord.com/channels/1408098019194310818/1542647972695904317>. It is what every release
+<https://discord.com/invite/renodx>. It is what every release
 up to now was developed against.
 
 The feeder fingerprints whichever build it finds and adapts, so any recent one works — take the
@@ -324,7 +324,7 @@ powershell -ExecutionPolicy Bypass -File .\Verify-DLSS5Feeder.ps1 -GamePath "C:\
    its `Shaders\` folder (the `lumenite_*.fx` files and `include\`) into `reshade-shaders\Shaders\`,
    and `Textures\lumenite_bluenoise256.png` into `reshade-shaders\Textures\`.
    *(Other providers: see [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider).)*
-4. Get the neural consumer — **[Deep Fried Chicken](https://discord.com/channels/1543931653976498207/1543936250657120366)**
+4. Get the neural consumer — **[Deep Fried Chicken](https://discord.gg/g2v2XGqvR)**
    (see [Before you install](#2-you-need-one-neural-add-on-installed-next-to-this-one)) — and put its three files next to the game `.exe`:
    `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll` and `deep-fried-chicken.cfg`.
    Add **`nvngx_dlssnr.dll`** (from the RenoDX Discord — Chicken does not bundle it) and a
@@ -348,60 +348,79 @@ and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`. The 
 
 ### Deep Fried Chicken: first run
 
-**Deep Fried Chicken** (by Alexander) is a multi-pass DLSS 5 renderer that attaches to the feature-1
-DLSS calls this feeder makes. From 1.4.0 it negotiates with DLSS5-Feeder instead of colliding with it
-(the ABI is in `src/feed_dfc.h`; the story behind it is in `FEEDBACK-DFC.md`). This feeder marks every
-Create and Evaluate for it automatically — there is nothing to configure on our side.
+**Deep Fried Chicken** (by Alexander) is the add-on that does the neural rendering on top of what
+this project feeds it. There is nothing to set up on our side — the two recognise each other
+automatically.
 
-- **The shipped `deep-fried-chicken.cfg` is already the recommended first-run configuration:**
-  `arm=1`, one pass (`layers=1`), Texture Boost off, Clean Fry off, 100% neural work scale. Leave
-  it alone for the first launch. `arm=0` is a restart-only hard disarm; the live `enabled=0`
-  switch only drains neural work, it does not disarm anything.
-- **Expect one extra restart on the first armed run.** From 1.4.4 Chicken appends itself to
-  `[ADDON] LoadFromDllMain` in the sibling `ReShade.ini`, backs the original file up beside it,
-  and asks you to restart once more. On 1.4.0 that entry had to be added by hand.
-- **Exactly one neural consumer.** No `renodx-dlss5.addon64`, no `renodx-dlss.addon64`, no
-  `alexs-toolkit.addon64` — with any of them loaded Chicken stays inert for the whole process.
-  Never add `dlss5-dx11-bridge.addon64` either: that bridge is for D3D11 games that already have
-  their own DLSS. Disable NVIDIA Smooth Motion and OptiScaler while testing.
-- **Start with one pass.** It can run up to 30, which is a stress mode, not a setting to open on.
-  Its work scale is a continuous 10–150% slider (`neural_work_percent`); 1.4.4 replaced the older
-  Full/Half selector with it, and old `neural_work_divisor` configs migrate.
-- **Use 1.4.8 or newer if you see a regular stutter.** Up to 1.4.7 Chicken rescanned every module
-  in the process every 300 presented frames looking for a late-loaded NGX host. In a host with a
-  large module list that scan is expensive enough to cost a frame, on a fixed cadence — about
-  every 5 s at 60 fps — which reads as a periodic hitch and poor 1% lows while average frame rate
-  stays flat. 1.4.8 replaced the polling with an OS loader callback; its log then says
-  `smart discovery settled: periodic full-module fallback disabled`.
-- The feeder's `warmup_rebuild` frame count is not used while Chicken is present. Instead the feeder watches
-  Chicken's exported interception state and re-creates the feature once, the moment it reads `ARMED` — Chicken
-  arms its NGX detours several seconds after it claims ownership, and it never adopts a create it did not see.
-  The log says `warm-up: re-creating the feature once (Deep Fried Chicken armed its NGX detours after our
-  first create)` when this happens; it is expected, not a fault.
-- Chicken forwards **Frame Generation** (NGX feature 11) and **Ray Reconstruction** (feature 13)
-  untouched and adopts neither. Its author does not claim Frame Generation works — a live test
-  gave a black screen — and does not claim 32-bit Vulkan.
-- For a **32-bit game** the three Chicken files go into `host64\` next to `dlss5-feed-host64.exe`,
-  **not** beside the 32-bit game `.exe` — a 32-bit process cannot load a 64-bit add-on.
+Four things to know:
 
-The overlay's **Status** section and `dlss5-feed.log` (`host64\dlss5-feed-host.log` for 32-bit) show
-Chicken's version, its interop ABI and its feature-1 interception state (`ARMED` is what you want; `DISARMED`,
-`CONFLICT` or `FAILED` mean it will not run its passes, and why). For a report send that log together with
-`deep-fried-chicken.log` and `ReShade.log` from the same run.
+1. **Don't edit its settings file.** The `deep-fried-chicken.cfg` it ships with is already the
+   right starting point: on, one pass, extras off.
+2. **It will ask you to restart once more.** On its first run it adds itself to ReShade's startup
+   list and wants one more restart. That is normal, and only happens once.
+3. **Start with one pass.** It can do up to 30. That is a stress test, not a starting point.
+4. **Nothing else neural in the folder.** No RenoDX add-on, no Alex's Toolkit, no DX11 bridge. With
+   any of those present, Chicken quietly does nothing at all.
 
-**Verification status.** Confirmed working on this machine on 2026-09-02:
+For a **32-bit game**, its three files go in the `host64\` folder, next to `dlss5-feed-host64.exe` —
+not beside the game itself. A 32-bit game cannot load them.
 
-- **DOOM (2016), 64-bit Vulkan, 3840x2160, in-process** — Chicken ARMED, 1200+ neural frames, zero failures.
-- **Fable Anniversary, 32-bit D3D9 via dgVoodoo2, 3578x2013, through the x64 helper** — Chicken armed 6 s
-  after the first create, the feeder re-created once on its `ARMED` state, and Chicken adopted that
-  create and rendered for the rest of the session.
-- **A 64-bit D3D11 host, in-process, 3840x2160 HDR10** — marker accepted (`feeder_marker=1
-  legacy_exact=0`), neural frames throughout. This one is a capture/streaming application rather than
-  a game, so it also exercised a swapchain that changes size and format live.
+**Is it working?** The overlay's **Status** section and `dlss5-feed.log` both show Chicken's version
+and its state. **`ARMED` is what you want.** `DISARMED`, `CONFLICT` or `FAILED` mean it is not
+running its passes, and the log says which and why.
+
+<details>
+<summary>Version notes, and one log line that looks alarming but isn't</summary>
+
+**Take 1.4.8 or newer.** Up to 1.4.7 Chicken rescanned every module in the process every 300
+presented frames, looking for a graphics component that might have loaded late. In an application
+with a lot of DLLs loaded that scan costs a frame each time it runs, on a fixed cadence of roughly
+five seconds at 60 fps. The result is a periodic hitch and poor 1% lows while the average frame
+rate stays flat. 1.4.8 replaced the polling with a callback from the operating system, and its log
+then says `smart discovery settled: periodic full-module fallback disabled`. If you are stuck on an
+older build, the feeder's `stall_log_ms` setting will confirm whether this is what you are seeing.
+
+**`warm-up: re-creating the feature once` is expected.** Chicken arms its hooks a few seconds after
+it loads, and it never picks up work that started before it was ready. So the feeder watches for it
+to report `ARMED` and rebuilds once at that moment. Without that rebuild you would get plain DLSS
+and an idle Chicken. The feeder's own `warmup_rebuild` frame count is not used while Chicken is
+present.
+
+**Frame Generation and Ray Reconstruction** pass straight through untouched; Chicken adopts
+neither. Its author does not claim Frame Generation works — a live test gave a black screen — and
+does not claim 32-bit Vulkan.
+
+`arm=0` in its config is a full off switch that needs a restart. The live `enabled=0` only stops the
+neural work, leaving its hooks in place — worth knowing if you are trying to rule Chicken out of a
+problem, because only `arm=0` truly takes it out of the picture.
+
+The interop is ABI 1 in 1.4.0-alpha, 1.4.4-alpha and 1.4.8-alpha alike (`FEEDER-INTEROP-v1.md` is
+byte-identical across all three). The protocol is in `src/feed_dfc.h`; the request that produced it
+is in `FEEDBACK-DFC.md`.
+
+</details>
+
+<details>
+<summary>Where it has been confirmed working</summary>
+
+Confirmed on this machine on 2026-09-02:
+
+- **DOOM (2016)**, 64-bit Vulkan, 3840x2160, in-process — ARMED, 1200+ neural frames, zero failures.
+- **Fable Anniversary**, 32-bit D3D9 via dgVoodoo2, 3578x2013, through the x64 helper — Chicken
+  armed 6 s after the first create, the feeder rebuilt once on its `ARMED` state, and Chicken
+  rendered for the rest of the session.
+- **A 64-bit D3D11 host**, in-process, 3840x2160 HDR10 — marker accepted (`feeder_marker=1
+  legacy_exact=0`), neural frames throughout. This one is a capture/streaming application rather
+  than a game, so it also exercised a swapchain that changes size and format live.
 
 D3D12, OpenGL and 32-bit Vulkan are source-contract compatible per its author but **not
-game-validated**. The interop is ABI 1 in 1.4.0-alpha, 1.4.4-alpha and 1.4.8-alpha alike —
-`FEEDER-INTEROP-v1.md` is byte-identical across all three.
+game-validated**.
+
+</details>
+
+**Reporting a problem?** Send `dlss5-feed.log`, `deep-fried-chicken.log` and `ReShade.log` from the
+same run (plus `host64\dlss5-feed-host.log` for a 32-bit game), and the output of the
+[install checker](#install-read-first).
 
 ### Alternative: the RenoDX add-on
 
