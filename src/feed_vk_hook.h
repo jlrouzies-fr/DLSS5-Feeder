@@ -82,6 +82,13 @@ static bool                  g_vk_pacer_warned;
 // (Plain long long: single writer, and a torn read only misprints one log line.)
 static volatile LONG64       g_vk_feed_frames;
 
+// Presents already counted when the FIRST frame was fed. Everything between the hook
+// going in and the feed starting -- menus, the shader compile, loading screens -- is
+// the game presenting on its own, and counting it as surplus accused the driver of
+// pacing frames it never touched (The Surge 2, 2026-09-02: "1.57x" at frame 121,
+// decaying to 1.01x as the honest 1:1 ratio outgrew the ~68-present head start).
+static volatile LONG64       g_vk_presents_base;
+
 static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookQueuePresent(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
 {
     const LONG64 presents = InterlockedIncrement64(&g_vk_presents);
@@ -90,17 +97,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookQueuePresent(VkQueue queue, cons
 
     // The pacer signature. Only meaningful once the feed has run for a while, and
     // only said once: a real pacer keeps the ratio up for the whole session.
-    const LONG64 fed = g_vk_feed_frames;
-    if (!g_vk_pacer_warned && fed > 120 && presents > fed + fed / 4)
+    const LONG64 fed   = g_vk_feed_frames;
+    const LONG64 since = presents - g_vk_presents_base;
+    if (!g_vk_pacer_warned && fed > 120 && since > fed + fed / 4)
     {
         g_vk_pacer_warned = true;
         Log("[feed] an external frame pacer is presenting this swapchain: %lld presents against %lld frames fed "
-            "(%.2fx). NVIDIA Smooth Motion does exactly this, and on Vulkan it lives inside the driver, so no "
-            "module check can see it. This combination is NOT verified and is the subject of issues #1 and #10 "
-            "-- if the image holds old frames or corrupts, turn Smooth Motion off for THIS API only in NVIDIA "
-            "Profile Inspector: \"Smooth Motion - Enabled APIs\" (0xB0CC0875), clear bit 4 for Vulkan.",
-            static_cast<long long>(presents), static_cast<long long>(fed),
-            fed > 0 ? static_cast<double>(presents) / static_cast<double>(fed) : 0.0);
+            "since the first fed frame (%.2fx). NVIDIA Smooth Motion does exactly this, and on Vulkan it lives "
+            "inside the driver, so no module check can see it. This combination is NOT verified and is the "
+            "subject of issues #1 and #10 -- if the image holds old frames or corrupts, turn Smooth Motion off "
+            "for THIS API only in NVIDIA Profile Inspector: \"Smooth Motion - Enabled APIs\" (0xB0CC0875), "
+            "clear bit 4 for Vulkan.",
+            static_cast<long long>(since), static_cast<long long>(fed),
+            fed > 0 ? static_cast<double>(since) / static_cast<double>(fed) : 0.0);
     }
     return g_vk_present_orig(queue, pPresentInfo);
 }
@@ -109,12 +118,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookQueuePresent(VkQueue queue, cons
 static void FeedVkPresentTick(unsigned long long fed_frames, int every)
 {
     g_vk_feed_frames = static_cast<LONG64>(fed_frames);
+    // The first frame the feed ever delivered starts the comparison: presents before it
+    // belong to the game alone.
+    if (fed_frames == 1) g_vk_presents_base = g_vk_presents;
     if (g_vk_present_orig == nullptr || every <= 0 || (fed_frames % static_cast<unsigned long long>(every)) != 0)
         return;
-    const LONG64 presents = g_vk_presents;
-    Log("[feed] present probe: %lld presents / %llu frames fed (%.2fx), last swapchain image index %u",
-        static_cast<long long>(presents), fed_frames,
-        fed_frames > 0 ? static_cast<double>(presents) / static_cast<double>(fed_frames) : 0.0,
+    const LONG64 since = g_vk_presents - g_vk_presents_base;
+    Log("[feed] present probe: %lld presents / %llu frames fed since the first fed frame (%.2fx), "
+        "last swapchain image index %u",
+        static_cast<long long>(since), fed_frames,
+        fed_frames > 0 ? static_cast<double>(since) / static_cast<double>(fed_frames) : 0.0,
         g_vk_last_image);
 }
 

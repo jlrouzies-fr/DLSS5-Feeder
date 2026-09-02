@@ -127,32 +127,64 @@ static const char *volatile g_where = "starting up";
 static void Breadcrumb(const char *what) { g_where = what; }
 
 // A minidump next to the log, so a crash report can be read in a debugger instead of
-// guessed at from the breadcrumb. dbghelp is loaded on demand -- it is not a dependency
-// until the moment the process is already dying. Kept small (no full memory): the stack,
-// the module list and the memory the registers point at are what a crash needs.
+// guessed at from the breadcrumb. Kept small (no full memory): the stack, the module
+// list and the memory the registers point at are what a crash needs.
+//
+// dbghelp is resolved EARLY (FeedResolveDbghelp, from an effect-runtime init) rather
+// than inside the filter: ReShade refuses a LoadLibrary made from a thread it considers
+// deadlock-prone and logs "Ignoring LoadLibrary('dbghelp.dll') call to avoid possible
+// deadlock" -- which is exactly what happened to the one crash worth having a dump of
+// (The Surge 2, 2026-09-02: eight threads faulted in nvoglv64 and not one dump survived).
 typedef BOOL (WINAPI *PFN_MiniDumpWriteDump_)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+static PFN_MiniDumpWriteDump_ g_write_dump;
+
+// Called from an event where a LoadLibrary is safe (never from DllMain, never from the
+// exception filter). Cheap and idempotent.
+static void FeedResolveDbghelp()
+{
+    if (g_write_dump != nullptr) return;
+    if (HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll"))
+        g_write_dump = reinterpret_cast<PFN_MiniDumpWriteDump_>(GetProcAddress(dbghelp, "MiniDumpWriteDump"));
+}
+
 static void WriteCrashDump(EXCEPTION_POINTERS *ep)
 {
     char path[MAX_PATH];
     strcpy_s(path, g_log_path);
     if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "dlss5-feed-crash.dmp");
-    HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
-    auto write = dbghelp ? reinterpret_cast<PFN_MiniDumpWriteDump_>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+    // Last resort only: if the early resolve never ran, try anyway -- ReShade may refuse it.
+    PFN_MiniDumpWriteDump_ write = g_write_dump;
+    if (write == nullptr)
+    {
+        if (HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll"))
+            write = reinterpret_cast<PFN_MiniDumpWriteDump_>(GetProcAddress(dbghelp, "MiniDumpWriteDump"));
+    }
     if (write == nullptr) { Log("[feed] no dbghelp.dll; no crash dump written"); return; }
-    HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // FILE_SHARE_READ: a second thread faulting at the same moment should be able to read
+    // this file rather than fail with a sharing violation (error 32).
+    HANDLE f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) { Log("[feed] could not create %s (error %lu)", path, GetLastError()); return; }
     struct { DWORD tid; EXCEPTION_POINTERS *ep; BOOL client; } info = { GetCurrentThreadId(), ep, FALSE };
     // MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithDataSegs | MiniDumpWithHandleData
     const int type = 0x0040 | 0x0001 | 0x0004;
-    const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), f, type, ep != nullptr ? &info : nullptr, nullptr, nullptr);
+    const BOOL  ok  = write(GetCurrentProcess(), GetCurrentProcessId(), f, type, ep != nullptr ? &info : nullptr, nullptr, nullptr);
+    const DWORD err = ok ? 0 : GetLastError();   // before CloseHandle, which overwrites it
     CloseHandle(f);
-    Log(ok ? "[feed] crash dump written: %s -- attach it to the issue with this log"
-           : "[feed] crash dump FAILED (%s, error %lu)", path, GetLastError());
+    if (ok) Log("[feed] crash dump written: %s -- attach it to the issue with this log", path);
+    else    Log("[feed] crash dump FAILED (%s, error %lu)", path, err);
 }
 
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
+static volatile LONG g_crash_once;
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
+    // One thread records, every other one goes straight on to the game's handler. A GPU
+    // fault takes out every thread inside the driver at once (The Surge 2: eight of them),
+    // and eight threads racing for the same log lines and the same dump file produced
+    // seven sharing violations and no dump at all.
+    if (InterlockedCompareExchange(&g_crash_once, 1, 0) != 0)
+        return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+
     const void *addr = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
     const DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
     wchar_t owner[MAX_PATH] = L"unknown";
@@ -161,7 +193,8 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            static_cast<LPCWSTR>(addr), &mod) && mod != nullptr)
         GetModuleFileNameW(mod, owner, MAX_PATH);
-    Log("### CRASH RECORDED ###  exception 0x%08X at %p in %ls; this add-on was last doing: %s%s", code, addr,
+    Log("### CRASH RECORDED ###  exception 0x%08X at %p in %ls; this add-on was last doing: %s%s "
+        "(later faults in this process are not recorded)", code, addr,
         owner, g_where, mod == g_self ? " (inside this add-on)" : "");
     WriteCrashDump(ep);
     return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
@@ -973,7 +1006,11 @@ static bool CfgReload()
     const bool rebuild = next.hdr != g_cfg.hdr || next.depth_inverted != g_cfg.depth_inverted ||
                          next.flags != g_cfg.flags || next.rebuild != g_cfg.rebuild ||
                          next.preset != g_cfg.preset || next.buffer_home != g_cfg.buffer_home ||
-                         next.async_home != g_cfg.async_home;
+                         next.async_home != g_cfg.async_home ||
+                         // mode decides whether a feature exists at all: 1 (transport) creates
+                         // none, so a hand edit from 1 to 2 without a rebuild left the frame
+                         // path evaluating against a null feature until that failure rebuilt it.
+                         next.mode != g_cfg.mode;
     const bool changed = rebuild || memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
     if (!changed) return false;
     g_cfg = next;
@@ -987,13 +1024,62 @@ static bool CfgReload()
     return rebuild;
 }
 
-// Writes every current value to dlss5-feed.cfg, overwriting it -- used by the ReShade
-// overlay page so a change made there survives the next CfgReload() (which otherwise
-// would read the old value straight back off disk 60 frames later).
+// The keys CfgSave() writes out. CfgReload() understands more than these -- the parse-only
+// diagnostics (half_home, passthrough, jitter_sign, jitter_phases) have no widget and no
+// line here -- so anything NOT in this list has to be carried over from the old file.
+static const char *const kCfgSavedKeys[] = {
+    "enabled", "mode", "hdr", "depth_inverted", "flags", "reset_every", "warmup_rebuild",
+    "rebuild", "log_frames", "create_delay", "preset", "work_resolution", "work_upscale",
+    "work_sharpness", "gpu_timeout_ms", "buffer_home", "async_home", "sync_home",
+    "mv_scale_x", "mv_scale_y", "stall_log_ms",
+};
+
+static bool CfgKeyIsSaved(const char *key)
+{
+    for (const char *k : kCfgSavedKeys)
+        if (_stricmp(k, key) == 0) return true;
+    return false;
+}
+
+// Writes every current value to dlss5-feed.cfg -- used by the ReShade overlay page so a
+// change made there survives the next CfgReload() (which otherwise would read the old value
+// straight back off disk 60 frames later).
+//
+// It used to truncate the file and write only the keys it knows, which silently deleted
+// every hand-set key it does not: jitter_sign above all, which the README asks people to
+// try, and which one click anywhere on the overlay page was enough to lose. So read the
+// file first and copy through everything that is not ours -- unknown keys, comments, blank
+// lines, and keys a newer build might add.
 static void CfgSave()
 {
     char path[MAX_PATH];
     CfgPath(path);
+
+    std::string carried;
+    FILE *r = nullptr;
+    if (fopen_s(&r, path, "r") == 0 && r != nullptr)
+    {
+        char line[256];
+        while (fgets(line, sizeof(line), r) != nullptr)
+        {
+            char key[64] = {};
+            const char *eq = strchr(line, '=');
+            bool ours = false;
+            if (eq != nullptr && sscanf_s(line, "%63[^=]", key, static_cast<unsigned>(sizeof(key))) == 1)
+            {
+                size_t n = strlen(key);                                  // "  mode " -> "mode"
+                while (n > 0 && (key[n - 1] == ' ' || key[n - 1] == '\t')) key[--n] = '\0';
+                const char *k = key;
+                while (*k == ' ' || *k == '\t') ++k;
+                ours = CfgKeyIsSaved(k);
+            }
+            if (ours) continue;   // rewritten below from g_cfg
+            carried += line;
+            if (carried.back() != '\n') carried += '\n';   // a file whose last line had no newline
+        }
+        fclose(r);
+    }
+
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f,
@@ -1005,6 +1091,7 @@ static void CfgSave()
             g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
             g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms);
+    if (!carried.empty()) fputs(carried.c_str(), f);
     fclose(f);
 }
 
@@ -1067,6 +1154,25 @@ static char g_mv_problem[640] = "";
 static bool ProviderCompileError(const char *file, char *out, size_t out_size)
 {
     out[0] = '\0';
+
+    // ResolveHandles() calls this on every runtime (re)creation, and a game behind a proxy
+    // swapchain can recreate runtimes dozens of times a second (Smooth Motion; Space
+    // Engineers bursts). Reading and line-splitting half a megabyte of log on the render
+    // thread that often is pure waste -- ReShade only writes a compile result when it
+    // actually recompiles an effect, so looking a few times a second notices one just as
+    // surely. The answer is a single bit that feeds the status line, nothing time-critical.
+    static char      cached_file[128];
+    static char      cached_msg[512];
+    static bool      cached_failed;
+    static bool      cached_valid;
+    static ULONGLONG cached_at;
+    const ULONGLONG now = GetTickCount64();
+    if (cached_valid && now - cached_at < 250 && strcmp(cached_file, file) == 0)
+    {
+        strncpy_s(out, out_size, cached_msg, _TRUNCATE);
+        return cached_failed;
+    }
+
     char path[MAX_PATH];
     GetModuleFileNameA(g_self, path, MAX_PATH);
     if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "ReShade.log");
@@ -1102,6 +1208,12 @@ static bool ProviderCompileError(const char *file, char *out, size_t out_size)
             strncpy_s(out, out_size, msg.c_str(), _TRUNCATE);
         }
     }
+
+    strncpy_s(cached_file, sizeof(cached_file), file, _TRUNCATE);
+    strncpy_s(cached_msg,  sizeof(cached_msg),  out,  _TRUNCATE);
+    cached_failed = failed;
+    cached_at     = now;
+    cached_valid  = true;
     return failed;
 }
 
@@ -1752,6 +1864,13 @@ static float HalfToFloat(uint16_t h)
     return f;
 }
 
+// The mean vector length of the last MV probe. The depth probe reads it to tell a game
+// with a genuinely flat view (a menu, a loading screen -- nothing is wrong) apart from
+// one where the scene is moving and the depth guide is still flat, which means ReShade's
+// Generic Depth is bound to the wrong buffer (The Surge 2, 2026-09-02: three minutes of
+// gameplay at 0.249981 while the vectors showed up to 37 px of motion).
+static double g_mv_probe_mean_px;
+
 static void MvProbeAnalyse()
 {
     void *p = nullptr;
@@ -1775,6 +1894,7 @@ static void MvProbeAnalyse()
     const D3D12_RANGE none = { 0, 0 };
     g_mv_probe_buf->Unmap(0, &none);
     const int total = static_cast<int>(kMvProbeSize * kMvProbeSize);
+    g_mv_probe_mean_px = sum / total;   // read by DepthProbeAnalyse, which runs next on this frame
     _snprintf_s(g_mv_probe, sizeof(g_mv_probe), _TRUNCATE,
                  "MV probe (centre 64x64, frame %llu): mean |mv| %.3f px, max %.2f px, %d%% non-zero%s",
                  static_cast<unsigned long long>(g_guide_probe_capture_frame), sum / total, maxlen, nonzero * 100 / total,
@@ -1814,12 +1934,18 @@ static void DepthProbeAnalyse()
     const double mean = finite > 0 ? sum / finite : 0.0;
     const double variance = finite > 0 ? (std::max)(0.0, sum2 / finite - mean * mean) : 0.0;
     const bool flat = finite == 0 || max_depth - min_depth < 1e-6;
+    // Flat depth on a still image says nothing. Flat depth while the vectors show the
+    // scene moving is a bound-to-the-wrong-buffer diagnosis, so say that instead.
+    const bool flat_moving = flat && g_mv_probe_mean_px > 1.0;
     _snprintf_s(g_depth_probe, sizeof(g_depth_probe), _TRUNCATE,
                 "Depth probe (4x 32x32, frame %llu): min %.6g, max %.6g, mean %.6g, variance %.3g, %d%% finite%s",
                 static_cast<unsigned long long>(g_guide_probe_capture_frame),
                 finite > 0 ? min_depth : 0.0, finite > 0 ? max_depth : 0.0, mean, variance,
                 finite * 100 / total,
-                flat ? "  <-- sampled depth is flat; inspect the depth debug view / Generic Depth settings" : "");
+                flat_moving ? "  <-- depth is FLAT while the scene moves: ReShade's Generic Depth is on the wrong "
+                              "buffer (Add-ons tab -> Generic Depth). DLSS and the neural pass get no depth until "
+                              "that is fixed"
+                     : flat ? "  <-- sampled depth is flat; inspect the depth debug view / Generic Depth settings" : "");
     Log("[feed] %s", g_depth_probe);
 }
 
@@ -2652,6 +2778,8 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
 
 typedef HRESULT (WINAPI *PFN_D3D12CreateDevice_)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
 
+static void ShutdownSession();   // defined below; every InitSession* unwinds through it
+
 static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
 {
     Breadcrumb("opening the D3D12 session");
@@ -2773,6 +2901,13 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
 
 fail:
     if (adapter != nullptr) adapter->Release();
+    // Everything this function got as far as creating is still live: the private D3D12
+    // device, the NGX init on it, the parameter block, the queue/list/fences, and the
+    // multithread-protection flag flipped on the game's context. Releasing only the adapter
+    // leaked all of it, and the overlay's Re-enable calls straight back in here -- a second
+    // device and a second NVSDK_NGX_D3D12_Init on top of the first. The other three
+    // InitSession* variants have always cleaned up this way.
+    ShutdownSession();
     FeedDisable("the D3D12/NGX session failed to start");
     return false;
 }
@@ -3977,6 +4112,16 @@ static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *d
     return tex;  // caller releases
 }
 
+// Mode 1 (transport) builds the shared textures and no feature at all, and reports itself
+// ready; mode 2 needs a feature. Switching 1 -> 2 therefore leaves a "ready" build whose
+// feature is null, and the evaluate would be handed that null handle -- straight into the
+// DLSS 5 add-on's detour. Every frame path folds this into its needs_build test so the
+// answer is a rebuild rather than a caught failure.
+static bool FeatureMissingForMode()
+{
+    return g_cfg.mode >= 2 && g.feature == nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // Per frame, D3D12 same-device: ReShade's own command list carries every barrier
 // and copy (so its state tracking stays right); our list carries only the NGX
@@ -4057,11 +4202,19 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
     // Same hook-arming grace as the D3D11 path: never call into NGX while the DLSS 5
     // add-on may still be patching its vtable (that has crashed the process at EXEC 0x0),
     // and it re-patches after every runtime recreation.
-    const bool needs_build12 = !g.frame_ready || w != g.width || h != g.height || cd.Format != g.bb_fmt;
+    const bool needs_build12 = !g.frame_ready || w != g.width || h != g.height || cd.Format != g.bb_fmt ||
+                               FeatureMissingForMode();
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
-    if (g.frame_ready && needs_build12) g.create_grace = 0;
+    //
+    // Clearing frame_ready in the same breath is what makes this a ONE-TIME re-arm. While it
+    // stayed set, this line reset the counter on EVERY frame before the gate below could
+    // increment it: ++create_grace never got past 1, the build never ran, and the log said
+    // "holding the feature (re)build" forever. It bites wherever nothing else clears
+    // frame_ready -- above all same-device D3D12, where a runtime teardown deliberately keeps
+    // the feature and the textures, so a resize killed the feed for the rest of the session.
+    if (g.frame_ready && needs_build12) { g.create_grace = 0; g.frame_ready = false; }
     // A classic (single hook pass) DLSS 5 add-on engine needs far longer than the default
     // 60 frames on the game's own device: Starfield lost the device with 60 and survived
     // with 600 (issue #16). Lazy (v4.5+) engines re-scan per present and keep the default.
@@ -4314,11 +4467,13 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     if (!g.session_ready) ok = InitSessionVk(rt);
 
     const DXGI_FORMAT bbf = static_cast<DXGI_FORMAT>(cd.texture.format);
-    const bool needs_build_vk = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt;
+    const bool needs_build_vk = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt ||
+                                FeatureMissingForMode();
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
-    if (g.frame_ready && needs_build_vk) g.create_grace = 0;
+    // frame_ready goes with it: a one-time re-arm, not a per-frame reset (see FeedFrame12).
+    if (g.frame_ready && needs_build_vk) { g.create_grace = 0; g.frame_ready = false; }
     if (ok && needs_build_vk && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
@@ -4883,11 +5038,13 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
 
     const DXGI_FORMAT bbf = have_bb_desc ? static_cast<DXGI_FORMAT>(cd.texture.format)
                                          : DXGI_FORMAT_R8G8B8A8_UNORM;   // default FB: assume 8-bit; the blit converts anyway
-    const bool needs_build_gl = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt;
+    const bool needs_build_gl = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt ||
+                                FeatureMissingForMode();
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
-    if (g.frame_ready && needs_build_gl) g.create_grace = 0;
+    // frame_ready goes with it: a one-time re-arm, not a per-frame reset (see FeedFrame12).
+    if (g.frame_ready && needs_build_gl) { g.create_grace = 0; g.frame_ready = false; }
     if (ok && needs_build_gl && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
@@ -5158,11 +5315,13 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     const bool want_sr = sr_wanted && (work_w != cd.Width || work_h != cd.Height);
     const bool needs_build11 = !g.frame_ready || work_w != g.width || work_h != g.height ||
                                cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height ||
-                               cd.Format != g.bb_fmt || want_sr != g.sr_requested;
+                               cd.Format != g.bb_fmt || want_sr != g.sr_requested ||
+                               FeatureMissingForMode();
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
-    if (g.frame_ready && needs_build11) g.create_grace = 0;
+    // frame_ready goes with it: a one-time re-arm, not a per-frame reset (see FeedFrame12).
+    if (g.frame_ready && needs_build11) { g.create_grace = 0; g.frame_ready = false; }
     if (ok && needs_build11 && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
@@ -5437,7 +5596,12 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
 
     char v[16] = {};
     g.depth_reversed = true;  // ReShade.fxh's own default when the definition is absent
-    if (rt->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", v))
+    // Per-effect scope first, exactly like the provider lookup above: setting the definition
+    // on DLSS5_Feed.fx alone is a normal way to fix one shader, and reading only the global
+    // left the shader linearising depth one way while DLSS was told the other -- silent
+    // ghosting on every disocclusion, with nothing in the log to suggest why.
+    if (rt->get_preprocessor_definition_for_effect(kEffectFile, "RESHADE_DEPTH_INPUT_IS_REVERSED", v) ||
+        rt->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", v))
         g.depth_reversed = atoi(v) != 0;
 
     g.handles_ok = g.technique.handle != 0 && g.mv_var.handle != 0 && g.depth_var.handle != 0;
@@ -5537,6 +5701,10 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
     DetectSmoothMotion();
     // Not in DllMain: this LoadLibrary()s, which under the loader lock can deadlock.
     DetectStaleD3DCompiler();
+    // Same reason, plus a second one: resolving dbghelp HERE is what makes a crash dump
+    // possible at all, because ReShade refuses the LoadLibrary the exception filter would
+    // otherwise have to make ("Ignoring LoadLibrary('dbghelp.dll') to avoid possible deadlock").
+    FeedResolveDbghelp();
     // Either way the add-on may be re-patching its NGX hooks right now: hold any upcoming
     // feature create for a fresh grace period.
     g.create_grace = 0;
@@ -5665,6 +5833,12 @@ static void HelpMarker(const char *desc)
 static void DrawOverlay(reshade::api::effect_runtime *rt)
 {
     bool dirty = false;
+    // Settings that only take effect when the DLSS feature is created. Saving them is not
+    // enough: CfgReload() diffs the FILE against g_cfg, and the overlay writes straight into
+    // g_cfg before saving, so by the time the reload runs there is nothing left to notice and
+    // the change sat there doing nothing until the next resize. Clearing frame_ready is what
+    // actually asks the frame path for a rebuild.
+    bool rebuild = false;
     bool enabled = g_cfg.enabled != 0;
     if (ImGui::Checkbox("Enabled", &enabled)) { g_cfg.enabled = enabled ? 1 : 0; dirty = true; }
 
@@ -5720,6 +5894,12 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     {
         g.disabled = false;
         g.consecutive_fails = 0;
+        // Both of these latch the feed off on their own. create_fail_count is only cleared by a
+        // SUCCESSFUL create, so after the three failures that disabled the feed it still reads 3
+        // and the very next create disables it again -- the button did nothing. Give the retry a
+        // full grace period too, since whatever the add-on downstream was doing has moved on.
+        g.create_fail_count = 0;
+        g.create_grace = 0;
         g_disable_why[0] = '\0';
         Log("[feed] re-enabled from the overlay");
     }
@@ -5727,7 +5907,7 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     ImGui::Separator();
     ImGui::TextUnformatted("DLSS contract");
     static const char *kModes[] = { "Inert", "Transport test (no NGX)", "Full DLSS path" };
-    if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) dirty = true;
+    if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) { dirty = true; rebuild = true; }
     const bool adjustable_work_resolution = rt != nullptr &&
         rt->get_device()->get_api() == reshade::api::device_api::d3d11;
     if (adjustable_work_resolution)
@@ -5774,8 +5954,8 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     }
     static const char *kTri[] = { "Auto", "Force off", "Force on" };
     int hdr_idx = g_cfg.hdr + 1, di_idx = g_cfg.depth_inverted + 1;
-    if (ImGui::Combo("HDR", &hdr_idx, kTri, 3)) { g_cfg.hdr = hdr_idx - 1; dirty = true; }
-    if (ImGui::Combo("Depth inverted", &di_idx, kTri, 3)) { g_cfg.depth_inverted = di_idx - 1; dirty = true; }
+    if (ImGui::Combo("HDR", &hdr_idx, kTri, 3)) { g_cfg.hdr = hdr_idx - 1; dirty = true; rebuild = true; }
+    if (ImGui::Combo("Depth inverted", &di_idx, kTri, 3)) { g_cfg.depth_inverted = di_idx - 1; dirty = true; rebuild = true; }
     bool reset_every = g_cfg.reset_every != 0;
     if (ImGui::Checkbox("Reset every frame (diagnostic)", &reset_every)) { g_cfg.reset_every = reset_every ? 1 : 0; dirty = true; }
 
@@ -5785,7 +5965,7 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     static const int   kPresetValues[] = { 0, 5, 6, 10, 11 };
     int preset_idx = 0;
     for (int i = 0; i < 5; ++i) if (kPresetValues[i] == g_cfg.preset) preset_idx = i;
-    if (ImGui::Combo("Preset", &preset_idx, kPresetNames, 5)) { g_cfg.preset = kPresetValues[preset_idx]; dirty = true; }
+    if (ImGui::Combo("Preset", &preset_idx, kPresetNames, 5)) { g_cfg.preset = kPresetValues[preset_idx]; dirty = true; rebuild = true; }
     ImGui::TextWrapped("Presets differ in how hard DLSS clamps history against the current frame. "
                        "If motion warps around transparents (dust, smoke, flames), try E or F.");
 
@@ -5819,12 +5999,17 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                           "the classic DLSS 5 add-on latching STANDBY on its first create. "
                                           "Skipped automatically on v45+ (not shown as adjustable there).");
         }
-        if (ImGui::InputInt("Raw create flags (-1 = auto)", &g_cfg.flags)) dirty = true;
+        if (ImGui::InputInt("Raw create flags (-1 = auto)", &g_cfg.flags)) { dirty = true; rebuild = true; }
         if (ImGui::SliderInt("Log first N frames", &g_cfg.log_frames, 0, 20)) dirty = true;
-        if (ImGui::Button("Force one rebuild")) { ++g_cfg.rebuild; dirty = true; }
+        if (ImGui::Button("Force one rebuild")) { ++g_cfg.rebuild; dirty = true; rebuild = true; }
     }
 
     if (dirty) CfgSave();
+    if (rebuild)
+    {
+        Log("[feed] overlay: rebuilding the feature to apply a creation-time setting");
+        g.frame_ready = false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5881,6 +6066,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        // First, before anything else can fault: CrashFilter lives in code that is about to
+        // be unmapped. ReShade reloads add-ons per Vulkan instance (see feed_vk_hook.h), so
+        // leaving it installed means a later crash jumps into freed memory and the game's own
+        // handler never sees the real fault.
+        SetUnhandledExceptionFilter(g_prev_filter);
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
@@ -5893,6 +6083,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         ShutdownSession();
         reshade::unregister_addon(module);
         Log("shut down cleanly.");
+        // Last, after the final Log: these are re-initialised on every attach, and ReShade
+        // attaches this add-on again per Vulkan instance, so not deleting them leaks one pair
+        // per load cycle. Nothing may log or feed past this point.
+        DeleteCriticalSection(&g_feed_cs);
+        DeleteCriticalSection(&g_log_cs);
     }
     return TRUE;
 }
