@@ -46,3 +46,8 @@ layer/x86/*.pdb
 # and must never be pushed (e.g. sdr-guard, a standalone ReShade add-on for a
 # capture app). See local/sdr-guard/README.txt.
 /local/
+
+# Deep Fried Chicken's release archives (external/deepfried/): its licence forbids rehosting the
+# binaries, so only the author's interop docs and checksums are tracked. See README credits.
+external/deepfried/**/*.dll
+external/deepfried/**/*.cfg

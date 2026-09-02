@@ -1,3 +1,25 @@
+![DLSS5 Feeder](dlss5-feeder-logo-dark.png)
+
+[![AI-DECLARATION: copilot](https://img.shields.io/badge/䷼%20AI--DECLARATION-copilot-fee2e2?labelColor=fee2e2)](AI-DECLARATION.md)
+
+## Description
+
+**DLSS 5 neural rendering in games that ship without any DLSS — D3D11, D3D12, Vulkan, OpenGL, 32-bit, even DirectX 9.**
+
+DLSS 5's neural-rendering add-on only works by hooking a game's own DLSS calls. A game that has no
+DLSS never makes those calls, so the add-on sits idle. **DLSS5-Feeder makes the calls itself.** It
+builds a complete DLSS DLAA "contract" out of what ReShade already has — the frame being processed,
+the depth buffer, and estimated optical-flow motion vectors — runs a genuine DLSS evaluate, lets the
+DLSS 5 neural-rendering add-on hook into that evaluate, and copies the neural result back into the
+frame. All inside ReShade's effect chain.
+
+```
+game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-Feeder:
+                                                    depth + MV     DLSS DLAA + DLSS 5 neural rendering
+                                                                   ↓
+                                    neural output written back over the frame → later effects → present
+```
+
 > # 🔄 This project is being partially superseded
 >
 > ShortFuse's **renodx-dlss** add-on now handles **D3D9, D3D11, and D3D12 presentation natively**
@@ -20,19 +42,34 @@
 
 > ## ⚠️ Which DLSS 5 add-on to install next to this one
 >
-> Every install below needs the separate neural-rendering add-on this project detours. Use
-> **Krish's `renodx-dlss5.addon64`** — the `#DLSS5` build, from the RenoDX Discord, `#DLSS5`
-> channel: <https://discord.com/channels/1408098019194310818/1542647972695904317>
+> Every install below needs a separate **neural consumer** — the add-on that hooks the DLSS
+> calls this feeder manufactures and does the actual neural rendering. Two are supported, and
+> you install **exactly one** of them.
 >
-> **Not ShortFuse's `renodx-dlss` add-on.** That is a different add-on: it builds the DLSS
-> contract itself (see the banner above), so it does not need — and conflicts with — this
-> feeder. One or the other, never both.
+> ### Recommended: Deep Fried Chicken
 >
-> **Add-on generations.** The feeder fingerprints the build it finds next to it and adapts,
-> so any recent one works; take the newest in the channel. It writes `EnableHooks=2`,
+> **Deep Fried Chicken** (by Alexander), distributed as its own archive through Discord:
+> <https://discord.com/channels/1543931653976498207/1543936250657120366>. Current version
+> **1.4.4-alpha**; the feeder interop was introduced in **1.4.0**.
+>
+> Three files go next to the 64-bit game `.exe` (or into `host64\` for a 32-bit game):
+> `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll` and `deep-fried-chicken.cfg`.
+> It does **not** bundle NVIDIA's DLLs — you still supply `nvngx_dlssnr.dll` and
+> `nvngx_dlss.dll`, exactly as before. Its shipped `.cfg` is already the recommended
+> first-run configuration, so there is nothing to edit.
+>
+> ### Alternative: Krish's `renodx-dlss5.addon64`
+>
+> The `#DLSS5` build, from the RenoDX Discord, `#DLSS5` channel:
+> <https://discord.com/channels/1408098019194310818/1542647972695904317>. Still fully
+> supported by this feeder — it is what every release up to now was developed against.
+>
+> **Add-on generations.** The feeder fingerprints the RenoDX build it finds next to it and
+> adapts, so any recent one works; take the newest in the channel. It writes `EnableHooks=2`,
 > `NeuralUplift=1` and `NREnableUpscaling=0` when they are unset, and in the `host64` helper
 > unbinds the global hotkeys so a gameplay keypress cannot silently toggle NR in a background
-> process. Every guard is keyed to a marker only the build that needs it carries.
+> process. Every guard is keyed to a marker only the build that needs it carries. **None of
+> this applies to Deep Fried Chicken**, which has its own config file and its own overlay tab.
 >
 > | Build | Marker | What the feeder does about it |
 > | --- | --- | --- |
@@ -44,6 +81,17 @@
 > **Verification status:** no game row has verified a v4.6 or v4.7 run end-to-end yet. The
 > compatibility work is static — marker detection, key defaults, panel mirroring — and both
 > generations were checked against the shipped binaries.
+>
+> ### Exactly one neural consumer
+>
+> Never install both. Chicken stays inert for the whole process if `renodx-dlss5.addon64` (or
+> `renodx-dlss.addon64`) is loaded alongside it, and says so in red in its own tab; the feeder
+> reports the collision in its log and overlay too. If you have `alexs-toolkit.addon64` (a third
+> NGX interposer) installed, remove that as well when using Chicken.
+>
+> **Not ShortFuse's `renodx-dlss` add-on.** That is a different add-on again: it builds the DLSS
+> contract itself (see the banner above), so it does not need — and conflicts with — this
+> feeder. One or the other, never both.
 
 > ## ⚠️ NVIDIA Smooth Motion and Optiscaler
 >
@@ -111,28 +159,13 @@
 > | Smooth Motion - Enable | `0xB0D384C0` | `0` / `1`, per application |
 > | Smooth Motion - Debug Bars | `0xB01B8B02` | draws coloured bars on generated frames — use it to check whether bad frames *are* the generated ones |
 
-# DLSS5-Feeder
-
-**DLSS 5 neural rendering in games that ship without any DLSS — D3D11, D3D12, Vulkan, OpenGL, 32-bit, even DirectX 9.**
-
-DLSS 5's neural-rendering add-on only works by hooking a game's own DLSS calls. A game that has no
-DLSS never makes those calls, so the add-on sits idle. **DLSS5-Feeder makes the calls itself.** It
-builds a complete DLSS DLAA "contract" out of what ReShade already has — the frame being processed,
-the depth buffer, and estimated optical-flow motion vectors — runs a genuine DLSS evaluate, lets the
-DLSS 5 neural-rendering add-on hook into that evaluate, and copies the neural result back into the
-frame. All inside ReShade's effect chain.
-
-```
-game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-Feeder:
-                                                    depth + MV     DLSS DLAA + DLSS 5 neural rendering
-                                                                   ↓
-                                    neural output written back over the frame → later effects → present
-```
-
 ## Contents
 
 - [Status](#status)
+- [Install: read first](#install-read-first) — the installation verifier script
 - [Install for a 64-bit game](#install-for-a-64-bit-game)
+  - [Deep Fried Chicken: first run](#deep-fried-chicken-first-run)
+  - [Alternative: the RenoDX add-on](#alternative-the-renodx-add-on)
 - [Install for a 32-bit game](#install-for-a-32-bit-game-beta)
 - [Install for a DirectX 9 game](#install-for-a-directx-9-game-beta)
 - [Install for a Vulkan game](#install-for-a-vulkan-game)
@@ -151,6 +184,7 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 - [Limitations and roadmap](#limitations-and-roadmap)
 - [Credits](#credits)
 - [License](#license)
+- [AI declaration](AI-DECLARATION.md) — what was written by AI, and what wasn't
 
 ## Status
 
@@ -212,6 +246,27 @@ in fast motion, softness on thin moving geometry), and the HUD is processed alon
 > also used as render target`). ReShade still lists it as an enabled technique, so nothing looked
 > wrong — but it wrote nothing. This release detects that and says so in the overlay and the log.
 
+## Install: read first
+
+There is now a new script available to help you verify if everything is installed properly.
+
+1. Copy `Verify-DLSS5Feeder.ps1` (from `tools\`) next to your game executable — for a 32-bit game,
+   next to the game `.exe`, not into `host64\`; it looks in there itself.
+2. Right-click `Verify-DLSS5Feeder.ps1` ▸ **Run with PowerShell**.
+3. Read the output: every line is `[ OK ]`, `[WARN]` or `[FAIL]`, and the summary at the end lists the
+   fix for each failure.
+
+The script is read-only — it never changes a file. If Windows refuses to run it ("running scripts is
+disabled on this system"), run it from a PowerShell prompt instead, which needs no policy change:
+
+```
+powershell -ExecutionPolicy Bypass -File .\Verify-DLSS5Feeder.ps1 -GamePath "C:\path\to\game"
+```
+
+`-GamePath` also lets you check a game without copying the script next to it.
+
+![Verification script](Verify-DLSS5Feeder.png)
+
 ## Install for a 64-bit game
 
 1. Run **ReShade's installer** (https://reshade.me), point it at your game's `.exe`, choose
@@ -227,13 +282,18 @@ in fast motion, softness on thin moving geometry), and the HUD is processed alon
    its `Shaders\` folder (the `lumenite_*.fx` files and `include\`) into `reshade-shaders\Shaders\`,
    and `Textures\lumenite_bluenoise256.png` into `reshade-shaders\Textures\`.
    *(Other providers: see [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider).)*
-4. Get **`renodx-dlss5.addon64`** (Krish's `#DLSS5` build — see the warning above) and
-   **`nvngx_dlssnr.dll`** from the RenoDX Discord. Put both next to the game `.exe`, plus a **`nvngx_dlss.dll`** (from any DLSS
-   game, or [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper)).
+4. Get the neural consumer — **[Deep Fried Chicken](https://discord.com/channels/1543931653976498207/1543936250657120366)**
+   (see the warning above) — and put its three files next to the game `.exe`:
+   `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll` and `deep-fried-chicken.cfg`.
+   Add **`nvngx_dlssnr.dll`** (from the RenoDX Discord — Chicken does not bundle it) and a
+   **`nvngx_dlss.dll`** (from any DLSS game, or
+   [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper)) in the same folder.
+   *(Using the RenoDX add-on instead? See [Alternative: the RenoDX add-on](#alternative-the-renodx-add-on).)*
 5. Press **Home** for the ReShade overlay, select `DLSS5_Feed.fx`, set **`DLSS5_MV_PROVIDER` = `3`**
    in its Preprocessor definitions, and reload effects.
 6. In-game: enable **"LUMENITE: Kernel 2.0"**, then **DLSS 5 Feed** below it, then turn on neural
-   rendering in the **DLSS 5 Neural Rendering** panel. Turn the game's MSAA/SSAA **off**.
+   rendering in the consumer's own panel — the **Deep Fried Chicken** tab, or the **DLSS 5 Neural
+   Rendering** panel if you took the RenoDX route. Turn the game's MSAA/SSAA **off**.
 
 Check `dlss5-feed.log` (next to the game `.exe`) for `feature ready … DLAA`, `frame N delivered`,
 and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`. The overlay's
@@ -243,6 +303,66 @@ and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`. The 
 > **Do I need the DLSS 5 DX11 *bridge*?** **No.** DLSS5-Feeder does the bridge's job for games that
 > have no DLSS. The bridge — **https://github.com/NIGos/dlss5-dx11-bridge/releases** — is only for
 > DX11 games that *already* have their own DLSS; don't run both for the same game.
+
+### Deep Fried Chicken: first run
+
+**Deep Fried Chicken** (by Alexander) is a multi-pass DLSS 5 renderer that attaches to the feature-1
+DLSS calls this feeder makes. From 1.4.0 it negotiates with DLSS5-Feeder instead of colliding with it
+(the ABI is in `src/feed_dfc.h`; the story behind it is in `FEEDBACK-DFC.md`). This feeder marks every
+Create and Evaluate for it automatically — there is nothing to configure on our side.
+
+- **The shipped `deep-fried-chicken.cfg` is already the recommended first-run configuration:**
+  `arm=1`, one pass (`layers=1`), Texture Boost off, Clean Fry off, 100% neural work scale. Leave
+  it alone for the first launch. `arm=0` is a restart-only hard disarm; the live `enabled=0`
+  switch only drains neural work, it does not disarm anything.
+- **Expect one extra restart on the first armed run.** From 1.4.4 Chicken appends itself to
+  `[ADDON] LoadFromDllMain` in the sibling `ReShade.ini`, backs the original file up beside it,
+  and asks you to restart once more. On 1.4.0 that entry had to be added by hand.
+- **Exactly one neural consumer.** No `renodx-dlss5.addon64`, no `renodx-dlss.addon64`, no
+  `alexs-toolkit.addon64` — with any of them loaded Chicken stays inert for the whole process.
+  Never add `dlss5-dx11-bridge.addon64` either: that bridge is for D3D11 games that already have
+  their own DLSS. Disable NVIDIA Smooth Motion and OptiScaler while testing.
+- **Start with one pass.** It can run up to 30, which is a stress mode, not a setting to open on.
+  Its work scale is a continuous 10–150% slider (`neural_work_percent`); 1.4.4 replaced the older
+  Full/Half selector with it, and old `neural_work_divisor` configs migrate.
+- The feeder's `warmup_rebuild` frame count is not used while Chicken is present. Instead the feeder watches
+  Chicken's exported interception state and re-creates the feature once, the moment it reads `ARMED` — Chicken
+  arms its NGX detours several seconds after it claims ownership, and it never adopts a create it did not see.
+  The log says `warm-up: re-creating the feature once (Deep Fried Chicken armed its NGX detours after our
+  first create)` when this happens; it is expected, not a fault.
+- Chicken forwards **Frame Generation** (NGX feature 11) and **Ray Reconstruction** (feature 13)
+  untouched and adopts neither. Its author does not claim Frame Generation works — a live test
+  gave a black screen — and does not claim 32-bit Vulkan.
+- For a **32-bit game** the three Chicken files go into `host64\` next to `dlss5-feed-host64.exe`,
+  **not** beside the 32-bit game `.exe` — a 32-bit process cannot load a 64-bit add-on.
+
+The overlay's **Status** section and `dlss5-feed.log` (`host64\dlss5-feed-host.log` for 32-bit) show
+Chicken's version, its interop ABI and its feature-1 interception state (`ARMED` is what you want; `DISARMED`,
+`CONFLICT` or `FAILED` mean it will not run its passes, and why). For a report send that log together with
+`deep-fried-chicken.log` and `ReShade.log` from the same run.
+
+**Verification status.** Confirmed working on this machine on 2026-09-02 with **DOOM (2016),
+Vulkan, 3840x2160, in-process**: Chicken ARMED, 1200+ neural frames, zero failures. The 32-bit
+x64 helper path is confirmed in-game too — **Fable Anniversary, D3D9 via dgVoodoo2, 3578x2013**:
+Chicken armed 6 s after the first create, the feeder re-created once on its `ARMED` state, and
+Chicken adopted that create and rendered for the rest of the session. Everything else — 64-bit
+D3D11, D3D12, OpenGL, 32-bit Vulkan — is source-contract compatible per its author but **not
+game-validated**. The interop is ABI 1 in both 1.4.0-alpha and 1.4.4-alpha.
+
+### Alternative: the RenoDX add-on
+
+To use **Krish's `renodx-dlss5.addon64`** (the `#DLSS5` build — see the warning near the top of this
+README for where to get it and which generations exist) instead of Deep Fried Chicken:
+
+- In step 4, put `renodx-dlss5.addon64` next to the game `.exe` in place of the three Chicken files.
+  `nvngx_dlssnr.dll` and `nvngx_dlss.dll` are needed either way. For a 32-bit game it goes into
+  `host64\`, again for the same reason Chicken does.
+- Its neural rendering is turned on in ReShade's **DLSS 5 Neural Rendering** panel, and on 32-bit
+  games mirrored onto our own overlay page — see [Configuration](#configuration).
+- The feeder writes `EnableHooks=2`, `NeuralUplift=1` and `NREnableUpscaling=0` when they are unset,
+  and unbinds the helper's global hotkeys. Both are RenoDX-specific and do nothing on the Chicken path.
+- `warmup_rebuild` matters here: older builds latch STANDBY on their first create, and the warm-up
+  re-create is what clears it.
 
 ## Install for a 32-bit game (beta)
 
@@ -254,8 +374,11 @@ exists as 64-bit code.
    **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)**. Put
    `dlss5-feed.addon32` next to the game `.exe`, `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`,
    and `dlss5-feed-host64.exe` into a new `host64\` folder next to the game `.exe`.
-3. Put a 64-bit ReShade `dxgi.dll`, `renodx-dlss5.addon64` (Krish's `#DLSS5` build — see the warning above),
-   `nvngx_dlssnr.dll` and `nvngx_dlss.dll` into `host64\`. (Get the x64 `dxgi.dll` by running the
+3. Put a 64-bit ReShade `dxgi.dll`, the neural consumer, `nvngx_dlssnr.dll` and `nvngx_dlss.dll`
+   into `host64\` — **not** beside the 32-bit game `.exe`, which cannot load 64-bit code. The
+   consumer is Deep Fried Chicken's three files (`deep-fried-chicken.addon64`,
+   `deep-fried-chicken-nvngx.dll`, `deep-fried-chicken.cfg`), or `renodx-dlss5.addon64` if you took
+   [the RenoDX route](#alternative-the-renodx-add-on). (Get the x64 `dxgi.dll` by running the
    ReShade installer once against any 64-bit game.)
 4. Install a motion-vector provider into the game's `reshade-shaders\`, same as steps 3 and 5 of the
    [64-bit instructions](#install-for-a-64-bit-game).
@@ -264,7 +387,8 @@ exists as 64-bit code.
 
 The first fed frame also spawns `host64\dlss5-feed-host64.exe`, which opens a window titled
 **"32-bit DLSS 5 Feeder"** — the add-on and the game never share a ReShade instance, so this is
-where the DLSS 5 add-on's *own* full panel lives, for anything not covered by our overlay page.
+where the neural consumer's *own* full panel lives — the **Deep Fried Chicken** tab, or the RenoDX
+add-on's panel — for anything not covered by our overlay page.
 Press Home in that window to open it:
 
 <img width="1880" height="1058" alt="image" src="https://github.com/user-attachments/assets/57abd732-94d2-401c-a524-6536006f3c86" />
@@ -409,9 +533,9 @@ the pixel is flagged in a `DLSS5_Mask` texture the add-on passes to DLSS as its
   full-screen depth pass while leaving the depth values sent to DLSS unchanged.
 * `dlss5-feed.addon64` registers with the ReShade add-on API. After the `DLSS5_Feed` technique
   renders, it takes the backbuffer + those textures and runs `NGX_D3D12_EVALUATE_DLSS` in DLAA
-  mode (render size = output size, no jitter). The DLSS 5 neural-rendering add-on
-  (`renodx-dlss5.addon64`) detours that D3D12 evaluate and inserts its neural pass — it cannot tell
-  the contract is synthetic.
+  mode (render size = output size, no jitter). The neural consumer
+  (`deep-fried-chicken.addon64`, or `renodx-dlss5.addon64`) detours that D3D12 evaluate and inserts
+  its neural pass — it cannot tell the contract is synthetic.
 * On a **64-bit D3D11 game** the optional **Work resolution** slider can run the private
   DLAA + Neural Rendering contract at 50–100% of each backbuffer axis. Color is resampled
   linearly; depth, motion vectors and the trust mask use point sampling; motion-vector
@@ -560,7 +684,7 @@ memory objects are import-only and a GL process cannot export one. Both directio
 | --- | --- |
 | D3D11, D3D12, Vulkan or OpenGL game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan works out of the box at both bitnesses (the add-on adds the interop extensions itself; a small bundled layer is the fallback — [64-bit](#install-for-a-vulkan-game), [32-bit/DXVK](#32-bit-vulkan-dxvk)); OpenGL needs nothing extra at all, but the game must be rendering on the NVIDIA GPU (see [Install for an OpenGL game](#install-for-an-opengl-game)). D3D10 is not supported. |
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
-| DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | **Krish's `#DLSS5` build**, from its own author — not ShortFuse's `renodx-dlss`, which is a different add-on that replaces this project rather than working with it (see the warning near the top). Not included here. |
+| A neural consumer + `nvngx_dlssnr.dll` | **Deep Fried Chicken** (recommended — `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll`, `deep-fried-chicken.cfg`, from its Discord), or **Krish's `renodx-dlss5.addon64`** `#DLSS5` build as the alternative. Exactly one of them. Not ShortFuse's `renodx-dlss`, which is a different add-on that replaces this project rather than working with it (see the warning near the top). Neither is included here, and neither bundles `nvngx_dlssnr.dll`. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
 | A motion vector provider | one of five, selected with the `DLSS5_MV_PROVIDER` definition — **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) Kernel is recommended** (`=3`); also iMMERSE Launchpad, VORT, LumeniteFX QuantMotion, or anything writing `texMotionVectors` (qUINT, `dh_uber_motion`). **Not DRME — it does not compile on ReShade 6.8.** See [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider). Install it yourself — nothing third-party is bundled, and our shader includes no third-party files. |
 | `dlss5-feed.addon64` (or `.addon32` + `host64\`) + `DLSS5_Feed.fx` | this project. |
@@ -569,11 +693,12 @@ memory objects are import-only and a GL process cannot export one. Both directio
 
 The easiest way to change any of this is **ReShade's overlay → Add-ons tab → DLSS 5 Feed**: every
 setting below is a live control there (checkboxes, sliders, combos), reading from and saving straight
-to `dlss5-feed.cfg`. On 32-bit games the same page also shows the **DLSS 5 host's** neural-rendering
-settings (neural uplift, NR intensity/style/local structure/local tone/auto mask/UI correction) with
-an **Apply** button — since those live in a separate process, Apply writes them into
-`host64\ReShade.ini` and restarts the helper (~2 s without DLSS; the game keeps rendering, the feed
-reconnects automatically).
+to `dlss5-feed.cfg`. On 32-bit games **running the RenoDX add-on**, the same page also mirrors that
+add-on's neural-rendering settings from the host process (neural uplift, NR intensity/style/local
+structure/local tone/auto mask/UI correction) with an **Apply** button — since those live in a
+separate process, Apply writes them into `host64\ReShade.ini` and restarts the helper (~2 s without
+DLSS; the game keeps rendering, the feed reconnects automatically). Deep Fried Chicken is not
+mirrored: its settings live in its own tab in the helper's window and in `deep-fried-chicken.cfg`.
 
 `dlss5-feed.cfg` itself is created automatically next to the add-on and re-read while the game runs,
 if you prefer editing the file directly:
@@ -587,10 +712,10 @@ if you prefer editing the file directly:
 | `depth_inverted` | -1 | -1 follow `RESHADE_DEPTH_INPUT_IS_REVERSED`, 0/1 force. |
 | `flags` | -1 | raw `DLSS.Feature.Create.Flags` override. |
 | `reset_every` | 0 | 1 = NGX Reset every frame (no temporal history; diagnostic). |
-| `warmup_rebuild` | 180 | re-create the feature once after N delivered frames (works around the DLSS 5 add-on latching STANDBY on its first create; skipped automatically on newer "v45+" add-on builds). |
+| `warmup_rebuild` | 180 | **RenoDX path only.** Re-create the feature once after N delivered frames, working around older RenoDX builds latching STANDBY on their first create. Skipped automatically on "v45+" builds. **Not used as a frame count while Deep Fried Chicken is present** — there the one re-create is triggered by Chicken's own `ARMED` state instead (it arms its NGX detours seconds after claiming, and never adopts a create it did not see). |
 | `rebuild` | 0 | change the number to re-create the feature once, by hand. |
 | `log_frames` | 3 | first N frames logged in detail. |
-| `create_delay` | 60 | frames to hold a feature (re)build after a runtime (re)init — the DLSS 5 add-on arms its NGX hooks asynchronously, and calling in too early can crash. 0 disables. |
+| `create_delay` | 60 | frames to hold a feature (re)build after a runtime (re)init — the neural consumer arms its NGX hooks asynchronously, and calling in too early can crash. 0 disables. |
 | `preset` | 0 | DLSS render-preset hint: `0` default, `5`/`6` = legacy CNN presets E/F (clamp history harder — try these if motion warps around transparents like dust or flames), `10`/`11` = transformer presets J/K. |
 | `gpu_timeout_ms` | 2000 | how long a frame waits for the GPU to retire a command allocator before that frame is abandoned. Three abandoned frames in a row stop the feed. Raise it on a heavily contended GPU; clamped to 100–60000. |
 | `mv_scale_x/y` | 1.0 | extra motion-vector multiplier. |
@@ -626,7 +751,8 @@ Preprocessor definitions on the shader (overlay → *Preprocessor definitions* �
 | `dlss5-feed.log` | next to the game exe: resolved effect handles, the session, the contract (`feature ready: WxH DLAA, flags=…`), `frame N delivered`, timing and guide probes every 600 frames, crash breadcrumbs. |
 | `ReShade.log` | which graphics API ReShade attached to, shader compile errors. |
 | `host64\dlss5-feed-host.log` | 32-bit games: the helper's own session and per-frame state. |
-| `host64\ReShade.log` | 32-bit games: the DLSS 5 add-on's messages (`feature 18 created`, `inline feature 18 evaluation succeeded`). |
+| `host64\ReShade.log` | 32-bit games: the neural consumer's messages (`feature 18 created`, `inline feature 18 evaluation succeeded`). |
+| `deep-fried-chicken.log` | next to the Chicken add-on: its own arming, contract and per-pass state. Quote it with `dlss5-feed.log` on any Chicken report. |
 
 Common cases:
 
@@ -679,8 +805,13 @@ Common cases:
 * **32-bit game: "the host64\ folder is from a different release"** — the add-on and the helper
   speak a versioned protocol (v2 added the OpenGL client kind, v3 the Vulkan one). Reinstall both
   halves from the same release rather than mixing them.
-* **DLSS 5 panel stuck in STANDBY** — the add-on missed the first create; the built-in warm-up
-  re-creates the feature a few seconds in, which normally clears it.
+* **DLSS 5 panel stuck in STANDBY** (RenoDX add-on) — it missed the first create; the built-in
+  warm-up re-creates the feature a few seconds in, which normally clears it.
+* **Deep Fried Chicken's tab says `DISARMED`, `CONFLICT` or `FAILED`** — `DISARMED` is `arm=0` in
+  `deep-fried-chicken.cfg` (restart-only), or the first launch before its `LoadFromDllMain` entry
+  took effect; `CONFLICT` means a second neural consumer (`renodx-dlss5.addon64`,
+  `renodx-dlss.addon64`, `alexs-toolkit.addon64`) is loaded — remove it and fully restart.
+  `dlss5-feed.log` prints the same state.
 * **Neural rendering stops mid-session, no crash** — the overlay's **Status** section now names the
   reason next to `Session: disabled`, and **Re-enable** restarts it. If the log says `the GPU did
   not retire allocator slot N within 2000 ms`, the GPU is not keeping up rather than broken: raise
@@ -733,7 +864,10 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
   trust mask reduces it; nothing available to a post-process feed removes it.
 * Exclusive-fullscreen swapchain churn can make some games reload effects repeatedly; windowed is
   smoother.
-* Depends on a closed-source, community-distributed DLSS 5 add-on and the NGX runtime; both can change.
+* Depends on a closed-source, community-distributed neural consumer and the NGX runtime; both can
+  change. Deep Fried Chicken is game-validated here only on 64-bit Vulkan in-process and through
+  the 32-bit x64 helper — its other backends are source-contract compatible per its author, and it
+  claims neither Frame Generation nor 32-bit Vulkan.
 * The **32-bit and D3D9 paths are beta** — see [`PLAN-32BIT.md`](PLAN-32BIT.md) for the full design
   and known risks. Cross-process adds a small amount of scheduling jitter versus the in-process
   64-bit path (not measured as a problem so far).
@@ -753,7 +887,9 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
   [AlucardDH's dh-reshade-shaders](https://github.com/AlucardDH/dh-reshade-shaders) for the
   provider-switch pattern. **No provider's files are bundled or included by this project's shader**
   — install them from their own repositories, under their own licenses.
-* **DLSS 5 neural rendering:** the RenoDX community's `renodx-dlss5` add-on.
+* **DLSS 5 neural rendering:** **Deep Fried Chicken** by Alexander — the recommended consumer, and
+  the author who built the ABI-1 interop this feeder negotiates over (`FEEDER-INTEROP-v1.md`) — and
+  the RenoDX community's `renodx-dlss5` add-on, the alternative. Neither is bundled here.
 * **ReShade** add-on API by Patrick Mours.
 * **dgVoodoo2** by Dege — the D3D9 translation layer that makes the DirectX 9 path possible.
 * **D3D12 stability findings** independently confirmed by the

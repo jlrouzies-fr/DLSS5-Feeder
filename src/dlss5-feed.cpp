@@ -55,8 +55,9 @@
 #include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
+#include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
 
-#define FEED_VERSION "0.10.0-beta.3"
+#define FEED_VERSION "0.11.0-beta.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -445,6 +446,127 @@ static void DetectToolkitAddon()
              "put the v4.55-era renodx-dlss5.addon64 next to this add-on; to keep v4.6/v4.7, remove "
              "alexs-toolkit.addon64 so nothing claims a cascade that is not running.",
              g_toolkit_ver, g_renodx_gen[0] != '\0' ? g_renodx_gen : g_renodx_ver);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deep Fried Chicken (deep-fried-chicken.addon64) -- an alternative neural consumer.
+// Like the DLSS 5 add-on it detours the NGX feature-1 entry points and runs its own
+// neural passes on whatever contract it finds there; unlike it, 1.4.0+ negotiates
+// with a feeder instead of fighting it (see feed_dfc.h and FEEDBACK-DFC.md):
+//
+//  - it exports DFC_FeederInteropAbi / DFC_Feature1InterceptionState so we can tell
+//    whether it is armed for feature-1 work in this process;
+//  - it treats dlss5-feed.addon64 and dlss5-feed-host64.exe as compatible transports
+//    (exempt from its loader-import patching; GetProcAddress keeps the genuine target);
+//  - it adopts every synthetic Create we mark with the four DFC.Feeder.* parameters,
+//    never releases our feature-1 handle, and reuses bounded slots across our
+//    resolution / history / device rebuilds, so no warm-up re-create is needed.
+//
+// It replaces the RenoDX neural provider rather than stacking on it: with both files
+// present it stays inert for the whole process and asks the user to remove Reno. We
+// keep feeding either way -- the genuine NGX DLAA call is always forwarded -- and only
+// report, the same way we report Alex's Toolkit. Chicken's exports can only be read
+// once ReShade has loaded it, which is later than this add-on's DllMain, so the file is
+// scanned here and the exports are polled from the first feature build onwards.
+// ---------------------------------------------------------------------------
+
+static char  g_chicken_ver[64]     = "not found";
+static char  g_chicken_status[192] = "not present";
+static bool  g_chicken_present     = false;   // the add-on file sits next to this one
+static bool  g_chicken_abi         = false;   // ABI-1 exports found on the loaded module
+static bool  g_chicken_loaded      = false;   // GetModuleHandle sees it
+static LONG  g_chicken_state       = DFC_STATE_UNKNOWN;   // last observed export value
+// True when the live feature was created while Chicken was not yet ARMED. Chicken arms its
+// NGX detours several seconds after claiming ownership, and a Create it did not see is never
+// adopted at Evaluate -- so WarmupRebuildDue() re-creates once when the state flips to ARMED.
+static bool  g_chicken_created_unarmed = false;
+
+// 'warmup_rebuild' is the configured value (g_cfg is declared further down).
+static void DetectChickenAddon(int warmup_rebuild)
+{
+    char dir[MAX_PATH];
+    GetModuleFileNameA(g_self, dir, MAX_PATH);
+    char *slash = strrchr(dir, '\\');
+    if (slash == nullptr) return;
+    slash[1] = '\0';
+
+    g_chicken_present = DfcScanFile(dir, g_chicken_ver, sizeof(g_chicken_ver));
+    if (!g_chicken_present)
+    {
+        Log("[feed] Deep Fried Chicken: not present");
+        return;
+    }
+    _snprintf_s(g_chicken_status, sizeof(g_chicken_status), _TRUNCATE,
+                "Deep Fried Chicken %s: present; waiting for ReShade to load it", g_chicken_ver);
+    Log("[feed] Deep Fried Chicken %s: present next to this add-on -- it is the neural consumer of the synthetic "
+        "DLAA contract; the DFC.Feeder.* interop marker (ABI 1, HostMode=0) is published on every Create and "
+        "Evaluate, and if the first create lands before Chicken has armed its NGX detours the feature is "
+        "re-created once when it does", g_chicken_ver);
+
+    if (g_renodx_present)
+        Warn("Deep Fried Chicken %s and renodx-dlss5.addon64 are BOTH next to this add-on. Chicken replaces "
+             "the RenoDX neural provider and stays inert for the whole process while both are loaded, so "
+             "neural rendering will come from RenoDX or from nothing. Keep dlss5-feed.addon64, remove "
+             "renodx-dlss5.addon64 (Chicken's own guidance) or remove deep-fried-chicken.addon64, then "
+             "fully restart the game.", g_chicken_ver);
+    if (warmup_rebuild > 0)
+        Log("[feed] warmup_rebuild=%d (a frame count) is not used while Deep Fried Chicken is present: the one "
+            "re-create is driven by its ARMED state instead", warmup_rebuild);
+}
+
+// Polled before each feature build: reads the ABI exports once Chicken is loaded and
+// reports the first sighting and every state change. Cheap (two GetProcAddress), and
+// bounded: nothing is logged again while nothing changes.
+static void ChickenPoll()
+{
+    if (!g_chicken_present) return;
+    unsigned int abi = 0;
+    LONG state = DFC_STATE_UNKNOWN;
+    bool loaded = false;
+    const bool have = DfcReadExports(&abi, &state, &loaded);
+    if (loaded != g_chicken_loaded)
+    {
+        g_chicken_loaded = loaded;
+        if (!have && loaded)
+        {
+            _snprintf_s(g_chicken_status, sizeof(g_chicken_status), _TRUNCATE,
+                        "Deep Fried Chicken %s: loaded, but pre-1.4.0 (no interop ABI) -- legacy exact-identity fallback only",
+                        g_chicken_ver);
+            Log("[feed] %s", g_chicken_status);
+        }
+    }
+    if (!have) return;
+    if (!g_chicken_abi)
+    {
+        g_chicken_abi = true;
+        Log("[feed] Deep Fried Chicken %s: interop ABI %u (this add-on speaks ABI %u), feature-1 interception state %ld (%s)",
+            g_chicken_ver, abi, DFC_CONTRACT_VERSION, state, DfcStateName(state));
+        if (abi != DFC_CONTRACT_VERSION)
+            Warn("Deep Fried Chicken %s publishes interop ABI %u, this add-on publishes ABI %u -- Chicken will "
+                 "reject the marker and skip its passes (the DLAA contract itself is unaffected). Update whichever "
+                 "side is older.", g_chicken_ver, abi, DFC_CONTRACT_VERSION);
+    }
+    if (state == g_chicken_state) return;
+    g_chicken_state = state;
+    if (DfcStateAvailable(state))
+    {
+        _snprintf_s(g_chicken_status, sizeof(g_chicken_status), _TRUNCATE,
+                    "Deep Fried Chicken %s: %s -- consuming the synthetic contract (interop ABI %u)",
+                    g_chicken_ver, DfcStateName(state), abi);
+        Log("[feed] %s", g_chicken_status);
+    }
+    else
+    {
+        _snprintf_s(g_chicken_status, sizeof(g_chicken_status), _TRUNCATE,
+                    "Deep Fried Chicken %s: %s -- NOT consuming; no neural passes this run", g_chicken_ver, DfcStateName(state));
+        Warn("Deep Fried Chicken %s reports feature-1 interception state %s: it will not run its passes on this "
+             "process. %s The feed keeps running (plain DLAA output). See deep-fried-chicken.log.",
+             g_chicken_ver, DfcStateName(state),
+             state == DFC_STATE_DISARMED ? "Its cfg has arm=0 (a restart-only hard disarm), or it has not armed yet."
+           : state == DFC_STATE_CONFLICT ? "Another feature-1 consumer already owns this process (RenoDX or a second Chicken?)."
+           : state == DFC_STATE_FAILED   ? "It could not create its ownership marker or arm its resolver hook."
+                                         : "Unknown state value; a newer Chicken ABI than this add-on knows.");
     }
 }
 
@@ -1313,16 +1435,65 @@ static void DrainGpu()
 // snippet), especially across a resolution or device change. SEH keeps that from taking the game
 // down -- it becomes a graceful disable instead. These wrappers hold no C++ objects, so __try is
 // legal here under /EHsc (same approach as the dlss5-dx11-bridge).
+//
+// Both wrappers first stamp the Deep Fried Chicken interop marker on the parameter
+// object (feed_dfc.h): Chicken requires the complete tuple immediately before Create
+// AND before every Evaluate, bound to the same handle. Every backend funnels through
+// these two wrappers, so this is the one place it has to happen. The keys are ordinary
+// application parameters to the driver and to the RenoDX add-on, so they are set
+// unconditionally.
+static void PublishDfcInterop()
+{
+    if (g.params == nullptr) return;
+    g.params->Set(DFC_KEY_CONTRACT_VERSION, DFC_CONTRACT_VERSION);
+    g.params->Set(DFC_KEY_PROVIDER_ID,      DFC_PROVIDER_ID_DL5F);
+    g.params->Set(DFC_KEY_HOST_MODE,        DFC_HOST_MODE_IN_PROCESS);
+    g.params->Set(DFC_KEY_EVALUATE_CADENCE, DFC_EVALUATE_CADENCE);
+}
+
 static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
 {
     *code = 0;
+    ChickenPoll();
+    g_chicken_created_unarmed = g_chicken_present && g_chicken_state != DFC_STATE_ARMED;
+    PublishDfcInterop();
     __try { return NGX_D3D12_CREATE_DLSS_EXT(g.list, 1, 1, &g.feature, g.params, cp); }
     __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+}
+
+// Whether the one warm-up re-create should happen on delivered frame 'n'. Three regimes:
+//  - classic RenoDX: it misses the very first create (STANDBY latch) when its hooks armed a
+//    moment too late, so re-create at the configured frame count;
+//  - v45+ RenoDX: rescans every present and adopts lazily -- never;
+//  - Deep Fried Chicken: it arms its NGX detours seconds after claiming ownership and never
+//    adopts a create it did not see, so if the feature was created before it read ARMED,
+//    poll its exported state every frame and re-create the moment it does (900 frames as
+//    a backstop, in case the state never flips -- then the log names the reason).
+static bool WarmupRebuildDue(UINT64 n)
+{
+    if (g.warmup_done) return false;
+    if (g_chicken_present)
+    {
+        if (!g_chicken_created_unarmed) return false;   // Chicken saw the create
+        ChickenPoll();
+        if (g_chicken_state == DFC_STATE_ARMED) return true;
+        if (n >= 900)
+        {
+            Warn("Deep Fried Chicken is still not ARMED 900 frames after the feature was created (state %s); "
+                 "re-creating once anyway. If neural rendering stays off, deep-fried-chicken.log names why.",
+                 DfcStateName(g_chicken_state));
+            return true;
+        }
+        return false;
+    }
+    if (g_renodx_lazy) return false;
+    return g_cfg.warmup_rebuild > 0 && n >= static_cast<UINT64>(g_cfg.warmup_rebuild);
 }
 
 static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, DWORD *code)
 {
     *code = 0;
+    PublishDfcInterop();
     __try { return NGX_D3D12_EVALUATE_DLSS_EXT(g.list, g.feature, g.params, ep); }
     __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
 }
@@ -3625,7 +3796,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                     // in LOTR: hooks +215 ms), which latches it in STANDBY. One warm-up re-create
                     // fixes that -- and it is safe now: it goes through RecreateFeatureOnly, which
                     // keeps the old feature if the new create fails or crashes.
-                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                    if (WarmupRebuildDue(n))
                     {
                         g.warmup_done = true;
                         g.frame_ready = false;
@@ -4075,8 +4246,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                         Log("[feed] frame %llu delivered (%ux%u, reset=%d, Vulkan transport, 1 submit)",
                             fn, g.width, g.height, reset);
                     FeedVkPresentTick(fn, 120);
-                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy &&
-                        fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                    if (WarmupRebuildDue(fn))
                     {
                         g.warmup_done = true;
                         g.frame_ready = false;
@@ -4181,7 +4351,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 // Feeds the pacer detector (presents vs. frames fed) and reports periodically.
                 FeedVkPresentTick(fn, 120);
 
-                if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                if (WarmupRebuildDue(fn))
                 {
                     g.warmup_done = true;
                     g.frame_ready = false;
@@ -4451,7 +4621,7 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
                 if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
                     Log("[feed] frame %llu delivered (%ux%u, reset=%d, OpenGL transport)", fn, g.width, g.height, reset);
 
-                if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                if (WarmupRebuildDue(fn))
                 {
                     g.warmup_done = true;
                     g.frame_ready = false;
@@ -4691,7 +4861,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
 
                     // The DLSS 5 add-on sometimes latches STANDBY/FAILED on the very first create and only
                     // recovers on a fresh one; re-create once after the pipeline has settled.
-                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                    if (WarmupRebuildDue(n))
                     {
                         g.warmup_done = true;
                         g.frame_ready = false;
@@ -4981,6 +5151,18 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                            g_toolkit_ver, g_toolkit_passes, g_toolkit_passes);
     else if (strcmp(g_toolkit_ver, "not found") != 0)
         ImGui::Text("Alex's Toolkit %s: present, cascade off (single pass)", g_toolkit_ver);
+    if (g_chicken_present)
+    {
+        const bool bad = g_chicken_abi && !DfcStateAvailable(g_chicken_state);
+        if (bad || g_renodx_present)
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "%s", g_chicken_status);
+        else
+            ImGui::TextUnformatted(g_chicken_status);
+        if (g_renodx_present)
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
+                               "renodx-dlss5.addon64 is ALSO present -- Chicken stays inert while both are loaded.\n"
+                               "Keep dlss5-feed.addon64, remove one neural provider, then fully restart.");
+    }
     if (g_d3dcompiler_stale)
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
                            "d3dcompiler_47.dll is too old for Shader Model 5.1 -- NEURAL RENDERING IS DOING NOTHING.\n"
@@ -5067,7 +5249,7 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         if (ImGui::SliderInt("Create delay (frames)", &g_cfg.create_delay, 0, 300)) dirty = true;
         ImGui::SameLine(); HelpMarker("Frames to hold a feature (re)build after a runtime (re)init -- "
                                        "the DLSS 5 add-on arms its NGX hooks asynchronously.");
-        if (!g_renodx_lazy)
+        if (!g_renodx_lazy && !g_chicken_present)
         {
             if (ImGui::SliderInt("Warm-up rebuild (frames)", &g_cfg.warmup_rebuild, 0, 600)) dirty = true;
             ImGui::SameLine(); HelpMarker("Re-creates the feature once after N delivered frames -- works around "
@@ -5120,6 +5302,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         CfgReload();
         DetectRenodxAddon();
         DetectToolkitAddon();
+        DetectChickenAddon(g_cfg.warmup_rebuild);   // after DetectRenodxAddon: it needs g_renodx_present
         // Usually too early to see it (the driver injects it around swapchain creation);
         // OnInitEffectRuntime re-checks. Worth one look here for the case where ReShade
         // itself was loaded late.

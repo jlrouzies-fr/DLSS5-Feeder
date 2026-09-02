@@ -29,12 +29,14 @@
 #include <cstring>
 #include <cstdlib>
 #include <vector>
+#include <string>
 
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
 #include "../src/feed_ipc.h"
 #include "../src/feed_fmt.h"
+#include "../src/feed_dfc.h"   // Deep Fried Chicken interop ABI 1 (producer side, HostMode=1 here)
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -42,6 +44,94 @@
 
 static char g_log_path[MAX_PATH];
 static bool g_show_window = false;   // visible host window = the user's door to the DLSS 5 panel
+// Client area of the host window and its swapchain. Twice the original 960x540 -- the
+// neural consumer's whole tuning panel lives in this window, and at 4K a 960x540 overlay
+// was unreadable -- capped to the primary work area (16:9 kept). Set once in InitDisguise;
+// the banner and the swapchain both size themselves from it.
+static int  g_win_w = 1920;
+static int  g_win_h = 1080;
+
+// ReShade's overlay toggle key in the host's ReShade.ini ([INPUT] KeyOverlay, Home by
+// default) -- pressed once for the user a few frames after the window is up, so the
+// neural consumer's panel is already open when they look at this window. Posted through
+// the message queue, which is where ReShade's WH_GETMESSAGE input hook reads keys.
+static UINT g_overlay_key = VK_HOME;
+static int  g_pump_count  = 0;
+
+static void Log(const char *fmt, ...);
+
+// Fit the 1920x1080 default into the primary monitor's work area (90% of it, 16:9 kept).
+// Runs before PrepareHostOverlay, which sizes the overlay layout from the result.
+static void FitWindowToWorkArea()
+{
+    RECT wa = {};
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0))
+    {
+        const int max_w = (wa.right - wa.left) * 9 / 10, max_h = (wa.bottom - wa.top) * 9 / 10;
+        if (g_win_w > max_w) { g_win_w = max_w; g_win_h = max_w * 9 / 16; }
+        if (g_win_h > max_h) { g_win_h = max_h; g_win_w = max_h * 16 / 9; }
+    }
+    if (g_win_w < 960) { g_win_w = 960; g_win_h = 540; }
+    g_win_w &= ~1; g_win_h &= ~1;
+}
+
+// Once ReShade's overlay is docked, its tabs (Home / Add-ons -- where the neural
+// consumer's panel is) sit in a 335 px column with the effect editor beside it. In this
+// window nobody edits shaders, so the tab column gets almost the whole width.
+static void PrepareHostOverlay()
+{
+    FitWindowToWorkArea();
+    char dir[MAX_PATH], ini[MAX_PATH];
+    GetModuleFileNameA(nullptr, dir, MAX_PATH);
+    if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
+    sprintf_s(ini, "%sReShade.ini", dir);
+
+    char buf[64] = {};
+    GetPrivateProfileStringA("INPUT", "KeyOverlay", "36", buf, sizeof(buf), ini);
+    const int k = atoi(buf);   // "36,0,0,0" -> 36; modifiers are ignored, ReShade's default has none
+    if (k > 0 && k < 256) g_overlay_key = static_cast<UINT>(k);
+
+    // Only the stock ReShade split (335 | 623 for a 960-wide window) is rewritten; a
+    // layout the user dragged into shape is left exactly as ReShade saved it.
+    char dock[4096] = {};
+    GetPrivateProfileStringA("OVERLAY", "Docking", "", dock, sizeof(dock), ini);
+    const int tabs_w = g_win_w - 96;
+    if (dock[0] == '\0')
+    {
+        char v[4096];
+        sprintf_s(v, "[Docking][Data],DockSpace   ID=0xB0DF600F Window=0xCC18005E Pos=8,,8 Size=%d,,%d Split=X,  "
+                     "DockNode  ID=0x00000001 Parent=0xB0DF600F SizeRef=%d,,%d Selected=0xCBCD3A85,  "
+                     "DockNode  ID=0x00000002 Parent=0xB0DF600F SizeRef=96,,%d CentralNode=1",
+                  g_win_w - 16, g_win_h - 16, tabs_w, g_win_h, g_win_h);
+        WritePrivateProfileStringA("OVERLAY", "Docking", v, ini);
+        sprintf_s(v, "[Window][###home],Pos=8,,8,Size=%d,,%d,Collapsed=0,DockId=0x00000001,,0,"
+                     "[Window][###addons],Pos=8,,8,Size=%d,,%d,Collapsed=0,DockId=0x00000001,,1,"
+                     "[Window][###settings],Pos=8,,8,Size=%d,,%d,Collapsed=0,DockId=0x00000001,,2,"
+                     "[Window][###statistics],Pos=8,,8,Size=%d,,%d,Collapsed=0,DockId=0x00000001,,3,"
+                     "[Window][###log],Pos=8,,8,Size=%d,,%d,Collapsed=0,DockId=0x00000001,,4,"
+                     "[Window][###about],Pos=8,,8,Size=%d,,%d,Collapsed=0,DockId=0x00000001,,5,"
+                     "[Window][###editor],Collapsed=0,DockId=0x00000002,"
+                     "[Window][Viewport],Pos=0,,0,Size=%d,,%d,Collapsed=0",
+                  tabs_w, g_win_h - 16, tabs_w, g_win_h - 16, tabs_w, g_win_h - 16, tabs_w, g_win_h - 16,
+                  tabs_w, g_win_h - 16, tabs_w, g_win_h - 16, g_win_w, g_win_h);
+        WritePrivateProfileStringA("OVERLAY", "Window", v, ini);
+        Log("[host] ReShade.ini: wrote an overlay layout with the tab column %d px wide", tabs_w);
+    }
+    else if (strstr(dock, "SizeRef=335,,540") != nullptr && strstr(dock, "SizeRef=623,,540") != nullptr)
+    {
+        std::string d(dock);
+        char a[64], b[64];
+        sprintf_s(a, "SizeRef=%d,,%d", tabs_w, g_win_h);
+        sprintf_s(b, "SizeRef=96,,%d", g_win_h);
+        d.replace(d.find("SizeRef=335,,540"), 16, a);
+        d.replace(d.find("SizeRef=623,,540"), 16, b);
+        WritePrivateProfileStringA("OVERLAY", "Docking", d.c_str(), ini);
+        Log("[host] ReShade.ini: widened the overlay's tab column from the stock 335 px to %d px", tabs_w);
+    }
+    else
+        Log("[host] ReShade.ini: overlay layout is user-arranged; leaving it alone");
+}
+static bool g_renodx_present = false;   // renodx-dlss5.addon64 sits next to this exe
 static bool g_renodx_lazy = false;   // DLSS 5 add-on is v45+ (per-present rescan, lazy adoption)
 static bool g_renodx_v46  = false;   // DLSS 5 add-on is v4.6+ (global hotkeys, upscaling latch)
 static bool g_renodx_v47  = false;   // DLSS 5 add-on is v4.7+ (reversible colour bridge, workset pool)
@@ -113,6 +203,7 @@ static void DetectRenodxAddon()
 
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) { Log("[host] renodx-dlss5.addon64 not found next to the host"); return; }
+    g_renodx_present = true;
     const DWORD size = GetFileSize(f, nullptr);
     DWORD got = 0;
     char *buf = (size > 0 && size < 8u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
@@ -321,6 +412,82 @@ static void DetectToolkitAddon()
             "cascade, or remove alexs-toolkit.addon64 from this folder.", ver);
 }
 
+// Deep Fried Chicken next to this exe -- the alternative neural consumer (mirrors the
+// section in src/dlss5-feed.cpp; keep the two in step). A 32-bit game cannot load the
+// x64 Chicken, so for the companion path it lives HERE, in host64, beside ReShade x64
+// and the NVIDIA DLLs, and consumes the contract this host publishes on its private
+// D3D12 device. The x86 game-side add-on does not negotiate with it at all; this host
+// publishes the ABI-1 marker with HostMode=1 (see feed_dfc.h).
+static char g_chicken_ver[64]  = "not found";
+static bool g_chicken_present  = false;
+static bool g_chicken_abi      = false;
+static bool g_chicken_loaded   = false;
+static LONG g_chicken_state    = DFC_STATE_UNKNOWN;
+// True when the live feature was created while Chicken was not yet ARMED. Chicken arms
+// its NGX detours several seconds after it claims ownership (6.4 s in Fable Anniversary),
+// and a Create it did not see is never adopted at Evaluate -- the feed then runs plain
+// DLAA for the whole session with Chicken silently idle. Serve() re-creates once when the
+// state flips to ARMED (see the warm-up block there).
+static bool g_chicken_created_unarmed = false;
+
+static void DetectChickenAddon()
+{
+    char dir[MAX_PATH];
+    GetModuleFileNameA(nullptr, dir, MAX_PATH);
+    if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
+    g_chicken_present = DfcScanFile(dir, g_chicken_ver, sizeof(g_chicken_ver));
+    if (!g_chicken_present) { Log("[host] Deep Fried Chicken: not present next to the host"); return; }
+    Log("[host] Deep Fried Chicken %s: present next to the host -- it is the neural consumer of the synthetic DLAA "
+        "contract; the DFC.Feeder.* interop marker (ABI 1, HostMode=1) is published on every Create and Evaluate, "
+        "and if the first create lands before Chicken has armed its NGX detours the feature is re-created once "
+        "when it does", g_chicken_ver);
+    if (g_renodx_present)
+        Log("[host] WARNING: Deep Fried Chicken %s and renodx-dlss5.addon64 are BOTH next to this host. Chicken "
+            "replaces the RenoDX neural provider and stays inert while both are loaded. Keep dlss5-feed-host64.exe, "
+            "remove one of the two neural providers from host64, then restart the game.", g_chicken_ver);
+}
+
+// Polled before each feature build: reads the ABI exports once ReShade (in this process)
+// has loaded Chicken and reports the first sighting and every state change.
+static void ChickenPoll()
+{
+    if (!g_chicken_present) return;
+    unsigned int abi = 0;
+    LONG state = DFC_STATE_UNKNOWN;
+    bool loaded = false;
+    const bool have = DfcReadExports(&abi, &state, &loaded);
+    if (loaded != g_chicken_loaded)
+    {
+        g_chicken_loaded = loaded;
+        if (!have && loaded)
+            Log("[host] Deep Fried Chicken %s: loaded, but pre-1.4.0 (no interop ABI) -- legacy exact-identity "
+                "fallback only", g_chicken_ver);
+    }
+    if (!have) return;
+    if (!g_chicken_abi)
+    {
+        g_chicken_abi = true;
+        Log("[host] Deep Fried Chicken %s: interop ABI %u (this host speaks ABI %u), feature-1 interception state %ld (%s)",
+            g_chicken_ver, abi, DFC_CONTRACT_VERSION, state, DfcStateName(state));
+        if (abi != DFC_CONTRACT_VERSION)
+            Log("[host] WARNING: Deep Fried Chicken %s publishes interop ABI %u, this host publishes ABI %u -- Chicken "
+                "will reject the marker and skip its passes (the DLAA contract itself is unaffected).",
+                g_chicken_ver, abi, DFC_CONTRACT_VERSION);
+    }
+    if (state == g_chicken_state) return;
+    g_chicken_state = state;
+    if (DfcStateAvailable(state))
+        Log("[host] Deep Fried Chicken %s: %s -- consuming the synthetic contract", g_chicken_ver, DfcStateName(state));
+    else
+        Log("[host] WARNING: Deep Fried Chicken %s reports feature-1 interception state %s -- it will not run its "
+            "passes in this host. %s The host keeps serving plain DLAA. See host64\\deep-fried-chicken.log.",
+            g_chicken_ver, DfcStateName(state),
+            state == DFC_STATE_DISARMED ? "Its cfg has arm=0 (a restart-only hard disarm), or it has not armed yet."
+          : state == DFC_STATE_CONFLICT ? "Another feature-1 consumer already owns this process (RenoDX or a second Chicken?)."
+          : state == DFC_STATE_FAILED   ? "It could not create its ownership marker or arm its resolver hook."
+                                        : "Unknown state value; a newer Chicken ABI than this host knows.");
+}
+
 static void Log(const char *fmt, ...)
 {
     char line[2048];
@@ -451,9 +618,24 @@ static void AbortCommands()   // never execute a list NGX crashed in
         h.list->Close();
 }
 
+// Deep Fried Chicken interop marker (feed_dfc.h): the complete tuple must be on the
+// parameter object immediately before Create AND before every Evaluate. Ordinary
+// application parameters to the driver and to RenoDX, so it is set unconditionally.
+static void PublishDfcInterop()
+{
+    if (h.params == nullptr) return;
+    h.params->Set(DFC_KEY_CONTRACT_VERSION, DFC_CONTRACT_VERSION);
+    h.params->Set(DFC_KEY_PROVIDER_ID,      DFC_PROVIDER_ID_DL5F);
+    h.params->Set(DFC_KEY_HOST_MODE,        DFC_HOST_MODE_COMPANION);
+    h.params->Set(DFC_KEY_EVALUATE_CADENCE, DFC_EVALUATE_CADENCE);
+}
+
 static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
 {
     *code = 0;
+    ChickenPoll();
+    g_chicken_created_unarmed = g_chicken_present && g_chicken_state != DFC_STATE_ARMED;
+    PublishDfcInterop();
     __try { return NGX_D3D12_CREATE_DLSS_EXT(h.list, 1, 1, &h.feature, h.params, cp); }
     __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
 }
@@ -461,6 +643,7 @@ static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *
 static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, DWORD *code)
 {
     *code = 0;
+    PublishDfcInterop();
     __try { return NGX_D3D12_EVALUATE_DLSS_EXT(h.list, h.feature, h.params, ep); }
     __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
 }
@@ -498,7 +681,9 @@ static bool WaitFenceValue(ID3D12Fence *f, UINT64 v, DWORD ms);
 
 static void InitBanner()
 {
-    const int W = 960, H = 540;
+    const int   W = g_win_w, H = g_win_h;
+    const float s = static_cast<float>(W) / 960.0f;   // the layout below was drawn for 960x540
+    const auto  S = [s](int v) { return static_cast<int>(v * s + 0.5f); };
 
     // 1. Render the text with GDI into a 32-bit DIB.
     BITMAPINFO bi = {};
@@ -520,20 +705,20 @@ static void InitBanner()
     DeleteObject(bg);
     SetBkMode(dc, TRANSPARENT);
 
-    HFONT fnt_big   = CreateFontW(64, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0,
+    HFONT fnt_big   = CreateFontW(S(64), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0,
                                   CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    HFONT fnt_small = CreateFontW(26, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0,
+    HFONT fnt_small = CreateFontW(S(26), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0,
                                   CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     HGDIOBJ old_font = SelectObject(dc, fnt_big);
     SetTextColor(dc, RGB(118, 185, 0));
-    RECT r1 = { 0, 150, W, 240 };
+    RECT r1 = { 0, S(150), W, S(240) };
     DrawTextW(dc, L"32-bit DLSS 5 Feeder", -1, &r1, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     SelectObject(dc, fnt_small);
     SetTextColor(dc, RGB(200, 200, 205));
-    RECT r2 = { 0, 260, W, 300 };
+    RECT r2 = { 0, S(260), W, S(300) };
     DrawTextW(dc, L"DLSS 5 neural rendering runs here for your 32-bit game.", -1, &r2,
               DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-    RECT r3 = { 0, 305, W, 345 };
+    RECT r3 = { 0, S(305), W, S(345) };
     DrawTextW(dc, L"Press  Home  in this window to tune it  \x2022  closing only hides the window", -1, &r3,
               DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     SelectObject(dc, old_font);
@@ -640,6 +825,22 @@ static void PumpPresent(bool force = false)
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     if (h.swap == nullptr) return;
 
+    // Open ReShade's overlay for the user once the window is up: key down on one pump, key
+    // up three pumps later, so ReShade sees a held key across a frame boundary (down and
+    // up inside the same frame reads as never pressed). Only when the window is visible.
+    if (g_show_window && h.hwnd != nullptr)
+    {
+        ++g_pump_count;
+        const UINT scan = MapVirtualKeyW(g_overlay_key, MAPVK_VK_TO_VSC);
+        if (g_pump_count == 90)
+            PostMessageW(h.hwnd, WM_KEYDOWN, g_overlay_key, 1 | (scan << 16));
+        else if (g_pump_count == 93)
+        {
+            PostMessageW(h.hwnd, WM_KEYUP, g_overlay_key, 1 | (scan << 16) | (1u << 30) | (1u << 31));
+            Log("[host] opened ReShade's overlay (key %u) so the neural consumer's panel is in view", g_overlay_key);
+        }
+    }
+
     static ULONGLONG last = 0;
     const ULONGLONG now = GetTickCount64();
     if (!force && now - last < 33) return;
@@ -699,10 +900,17 @@ static bool InitDisguise()
     wc.hInstance     = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"dlss5feedhost";
     RegisterClassW(&wc);
+
+    // g_win_w/h were fitted to the work area in PrepareHostOverlay; size the OUTER window so
+    // the client area -- and the swapchain -- is exactly that.
+    RECT frame = { 0, 0, g_win_w, g_win_h };
+    AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
     h.hwnd = CreateWindowExW(0, wc.lpszClassName,
                              L"DLSS 5 Feed host - press Home HERE to tune DLSS 5 neural rendering",
-                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 960, 540,
+                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                             frame.right - frame.left, frame.bottom - frame.top,
                              nullptr, nullptr, wc.hInstance, nullptr);
+    Log("[host] window: %dx%d client (2x the original 960x540, capped to the work area)", g_win_w, g_win_h);
     if (h.hwnd == nullptr) { Log("[host] window creation failed"); return false; }
     if (g_show_window) ShowWindow(h.hwnd, SW_SHOWNOACTIVATE);   // never steal the game's focus
 
@@ -720,8 +928,8 @@ static bool InitDisguise()
     if (FAILED(hr)) { Log("[host] CreateDXGIFactory1 failed 0x%08X", hr); return false; }
 
     DXGI_SWAP_CHAIN_DESC1 sd = {};
-    sd.Width            = 960;
-    sd.Height           = 540;
+    sd.Width            = static_cast<UINT>(g_win_w);
+    sd.Height           = static_cast<UINT>(g_win_h);
     sd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -1115,7 +1323,7 @@ static int Serve(DWORD game_pid)
     // not race that (a 15 ms miss latched STANDBY in Blacklist), so hold it briefly.
     UINT64 hold_until = GetTickCount64() + 800;
     UINT64 evaluated  = 0;
-    bool   warm_done  = g_renodx_lazy;   // v45+ adopts missed creates on its own
+    bool   warm_done  = g_renodx_lazy;   // v45+ adopts missed creates on its own; Chicken: see the build below
     int    build_fails = 0;
 
     // The tag read stays pended across pump ticks: a plain blocking ReadFile starves
@@ -1253,7 +1461,9 @@ static int Serve(DWORD game_pid)
             }
 
             evaluated = 0;
-            warm_done = transport_only || g_renodx_lazy;   // no warm-up without NGX / with v45+
+            // No warm-up without NGX, with v45+, or when Chicken already had its detours ARMED
+            // at this create (then it saw it). Otherwise the block below waits for ARMED.
+            warm_done = transport_only || g_renodx_lazy || (g_chicken_present && !g_chicken_created_unarmed);
 
             FeedBuildAck back = {};
             back.ok         = ok ? 1 : 0;
@@ -1303,12 +1513,31 @@ static int Serve(DWORD game_pid)
             if (done)
             {
                 h.queue->Signal(h.fence_out, fm.n);
-                // One warm-up re-create per build: the DLSS 5 add-on misses the very first
-                // create (STANDBY latch) when its hooks armed a moment too late.
-                if (!warm_done && ++evaluated >= 180)
+                // One warm-up re-create per build. RenoDX: it misses the very first create
+                // (STANDBY latch) when its hooks armed a moment too late, so re-create at a
+                // fixed frame count. Chicken: it arms its detours seconds after claiming, and
+                // never adopts a create it did not see -- so poll its exported state every
+                // frame and re-create the moment it reads ARMED (900 frames as a backstop).
+                bool warm_fire = false;
+                const char *warm_why = "the DLSS 5 add-on misses the very first create";
+                if (!warm_done)
+                {
+                    ++evaluated;
+                    if (g_chicken_present)
+                    {
+                        ChickenPoll();
+                        if (g_chicken_state == DFC_STATE_ARMED)
+                        { warm_fire = true; warm_why = "Deep Fried Chicken armed its NGX detours after our first create"; }
+                        else if (evaluated >= 900)
+                        { warm_fire = true; warm_why = "Deep Fried Chicken still not ARMED after 900 frames -- re-creating anyway; "
+                                                       "if it stays idle, see host64\\deep-fried-chicken.log"; }
+                    }
+                    else warm_fire = evaluated >= 180;
+                }
+                if (warm_fire)
                 {
                     warm_done = true;
-                    Log("[host] warm-up: re-creating the feature once");
+                    Log("[host] warm-up: re-creating the feature once (%s)", warm_why);
                     WaitFenceValue(h.fence, h.fence_value, 2000);
                     NVSDK_NGX_Handle *old = h.feature;
                     h.feature = nullptr;
@@ -1379,7 +1608,9 @@ int main(int argc, char **argv)
 
     DetectRenodxAddon();   // must run BEFORE ReShade loads, so an EnableHooks write is read
     DetectToolkitAddon();
+    DetectChickenAddon();   // after DetectRenodxAddon: it needs g_renodx_present
     DetectStaleD3DCompiler();
+    PrepareHostOverlay();   // edits ReShade.ini, so also BEFORE ReShade loads (InitDisguise)
 
     if (!InitDisguise()) return 1;
     if (!InitNgx()) { Log("[host] NGX unavailable"); return 1; }

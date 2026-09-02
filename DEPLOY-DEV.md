@@ -214,7 +214,7 @@ compile fine, `dlss5-feed.log` reports frames delivered, and neural rendering do
 **Fix: delete or rename the game-folder copy.** For the 32-bit split path the copy that matters
 is the one next to `host64\dlss5-feed-host64.exe`, because renodx lives in the host process.
 
-Since 0.10.0-beta.3 both the add-on and the host probe this at startup with a live `cs_5_1`
+Since 0.11.0-beta.1 both the add-on and the host probe this at startup with a live `cs_5_1`
 compile and say so in the log (and the add-on shows a red overlay line). The check is a compile,
 not a path test — a game-folder copy may equally be a *newer* one, which is fine (`G:\Games\Dusk`
 has a `10.0.26100` copy and is unaffected). One-liner to audit a folder:
@@ -316,6 +316,9 @@ pass-through for the whole run — the cascade did nothing that session.
 `Alex's Toolkit 0.9.0-beta: 2-pass DLSS 5 cascade active -- roughly 2x the temporal
 history`, and the ReShade overlay shows the same line.
 
+**Do not combine it with Deep Fried Chicken** (section 9) — that is a third interposer on the
+same NGX module, and Chicken's own test doc asks for it to be removed.
+
 **Expect a temporal cost.** Every stage keeps its own history, so the cascade multiplies
 the effective history length. Motion vectors are *not* the problem — they stay
 dimensionally valid for every stage — but because ours are screen-space estimates that
@@ -324,3 +327,103 @@ and a slow settle after a hard camera cut. If a cutscene transition looks like t
 briefly stopped working and then recovered, that is the cascade's history re-converging,
 not a failure: check `alexs-toolkit.log` for `fallback=` staying at 0 to confirm. Set
 `two_pass=0` if the trade isn't worth it for that game.
+
+## 9. Deep Fried Chicken instead of the RenoDX add-on
+
+Deep Fried Chicken (Alexander, 1.4.0-alpha+) is an *alternative neural consumer* — it does
+renodx-dlss5's job, attaching to the feature-1 calls this feeder makes. From 1.4.0 it
+negotiates rather than collides: `src/feed_dfc.h` publishes the four `DFC.Feeder.*` marker
+parameters on every Create and Evaluate, and reads back Chicken's two ABI exports. The
+producer contract is `external/deepfried/FEEDER-INTEROP-v1.md`; the request that produced
+it is `FEEDBACK-DFC.md`.
+
+Deploy exactly as sections 3-6, with these differences:
+
+```
+deep-fried-chicken.addon64        # instead of renodx-dlss5.addon64
+deep-fried-chicken-nvngx.dll      # its private NGX bridge (3 KB, not a copy of NVIDIA's)
+deep-fried-chicken.cfg            # ships with arm=1, one pass, Texture Boost off = the
+                                  # recommended first-test config; no edits needed
+nvngx_dlssnr.dll, nvngx_dlss.dll  # still required, same as always
+```
+
+**Exactly one neural provider.** Retire `renodx-dlss5.addon64` **and**
+`alexs-toolkit.addon64` (section 8) — Chicken stays inert for the whole process if a Reno
+provider is loaded, and the toolkit is a third interposer on the same module. Also never add
+`dlss5-dx11-bridge.addon64`. The feeder warns about the Reno collision in its log and in red
+in the overlay. `warmup_rebuild` is not used as a frame count while Chicken is present: the
+feeder polls Chicken's exported `DFC_Feature1InterceptionState` every frame and re-creates the
+feature once when it flips to `ARMED`.
+
+**Why that re-create is load-bearing (learned the hard way, Fable Anniversary, 2026-09-02):**
+Chicken logs `standalone provider armed: ownership acquired; interop_state=CLAIMING` within a
+few hundred ms of loading, but its actual NGX detours land seconds later
+(`smart native-NGX Detours commit installed`, 6.4 s later in that run). A feature created in
+between is *never* adopted — Chicken's docs say "continuously adopts later creates", and it
+does, but only creates it *sees*; there is no adoption at Evaluate. The first build of this
+integration switched the warm-up re-create off when Chicken was present (its docs call the
+re-create unnecessary), so the one create landed at +1.9 s, Chicken armed at +6.4 s, and the
+game ran 5,400 frames of plain DLAA with Chicken idle (`active pairs=0`) while every feeder
+log line looked healthy. The `--test` rig never caught it because that mode hard-codes a
+second create at frame 180. The tell in `deep-fried-chicken.log` is a `Detours commit` line
+with **no** `standalone native DLSS create #1` after it.
+
+For the 32-bit path, the three Chicken files go in `host64\`, not beside the x86 exe.
+
+### Verifying without a game
+
+`host\dlss5-feed-host64.exe --test --hide` is the fastest real check: it loads ReShade, makes
+a D3D12 device, and runs 300 evaluates on a 640x360 synthetic contract, so Chicken loads and
+runs as a genuine add-on. Build a scratch folder holding the host exe, a 64-bit ReShade
+`dxgi.dll` (`deploy/reshade-dxgi/dxgi_x64.dll`), the three Chicken files, both `nvngx_*.dll`,
+and a minimal `ReShade.ini` (`[GENERAL] EffectSearchPaths=.\`), then run it there.
+
+What a good run looks like — `dlss5-feed-host.log` / `dlss5-feed.log`:
+
+```
+Deep Fried Chicken 1.4.0-alpha: interop ABI 1 (this host speaks ABI 1), ... state 1 (CLAIMING)
+Deep Fried Chicken 1.4.0-alpha: ARMED -- consuming the synthetic contract
+--test finished: 300/300 evaluates succeeded
+```
+
+and `deep-fried-chicken.log`:
+
+```
+compatibility transport detected: dlss5-feed-host64.exe; x86-to-x64 host mode is allowed
+standalone provider armed: ownership acquired; interop_state=CLAIMING
+standalone native DLSS create #1: ... feeder_marker=1 legacy_exact=0
+standalone feature 18 created: ... game=640x360->640x360 neural=640x360->640x360
+```
+
+**`feeder_marker=1 legacy_exact=0` is the line that matters** — it means Chicken accepted the
+negotiated ABI-1 tuple and did *not* fall back to recognising us by filename. `feeder_marker=0`
+means our marker never arrived; `legacy_exact=1` means it matched us the old way, so the
+marker is wrong or missing.
+
+Known and expected: `DLSS5-Feeder trust mask not published` (the host has never published the
+bias-current-colour mask — their docs say so too), and `standalone early load is not
+configured`, which is harmless for the feeder path because we create the first feature well
+after ReShade starts.
+
+### Status
+
+All verified on 2026-09-02, against Chicken **1.4.0-alpha and 1.4.4-alpha** (same ABI 1;
+`FEEDER-INTEROP-v1.md` is byte-identical between them, and the state enum is unchanged):
+
+| Path | Where | Evidence |
+| --- | --- | --- |
+| In-process (`HostMode=0`) | DOOM (2016), Vulkan, 3840x2160 | ARMED, `feeder_marker=1 legacy_exact=0`, 1200+ neural frames, 0 failures, one clean fenced feature-18 release/recreate |
+| Host (`HostMode=1`) | Fable Anniversary in-game (32-bit D3D9 via dgVoodoo2, 3578x2013), plus the `--test` rig | ARMED 6 s after the first create, feeder re-created on the ARMED flip, `feeder_marker=1 legacy_exact=0`, neural frames for the rest of the session |
+
+The 64-bit path publishes the bias-current-colour trust mask and Chicken accepts it
+(`trust mask accepted`); the 32-bit host does not publish one, which matches the author's
+docs. Chicken's own docs still claim only *source-contract* compatibility for the remaining
+backends, and explicitly do not claim Frame Generation (a live test there gave a black
+screen) or 32-bit Vulkan.
+
+**1.4.4 differences that matter to a deploy:** the Full/Half work-scale selector became a
+continuous 10-150% slider (`neural_work_percent` replaces `neural_work_divisor`, old configs
+migrate), and early load is now automatic — on its first armed run Chicken appends itself to
+`[ADDON] LoadFromDllMain` in the sibling `ReShade.ini`, backs the original up beside it, and
+asks for one more full restart. Expect that extra restart on the first launch after installing
+it, and expect a `ReShade.ini.deep-fried-chicken-backup-*` file to appear next to it.

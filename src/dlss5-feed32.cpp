@@ -47,8 +47,9 @@
 #include "feed_gl.h"   // raw-OpenGL interop, the same header the 64-bit add-on uses
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
+#include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 
-#define FEED_VERSION "0.10.0-beta.3"
+#define FEED_VERSION "0.11.0-beta.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -771,6 +772,63 @@ static bool PipeRead(void *buf, DWORD len)
 {
     DWORD got = 0;
     return g.pipe != nullptr && ReadFile(g.pipe, buf, len, &got, nullptr) && got == len;
+}
+
+// ---------------------------------------------------------------------------
+// Deep Fried Chicken in host64\ -- the neural consumer on the split path, when it is
+// installed there instead of renodx-dlss5.addon64. The x86 side never negotiates with it
+// (the host does, see feed_dfc.h); this add-on only needs to know it is there so the
+// overlay stops mirroring RenoDX's [RenoDX.DLSS5] keys, which Chicken does not read, and
+// points the user at the host window instead. A few of Chicken's own top-level keys are
+// shown read-only from host64\deep-fried-chicken.cfg (plain key=value, no INI section).
+// ---------------------------------------------------------------------------
+static bool   g_chicken_host        = false;
+static char   g_chicken_host_ver[64] = "not found";
+static char   g_chicken_cfg_path[MAX_PATH];
+static UINT64 g_chicken_cfg_read_at = 0;
+static int    g_chicken_arm = -1, g_chicken_enabled = -1, g_chicken_layers = -1, g_chicken_work_percent = -1;
+
+static void DetectChickenHost()
+{
+    char dir[MAX_PATH];
+    GetModuleFileNameA(g_self, dir, MAX_PATH);
+    if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
+    char h64[MAX_PATH];
+    sprintf_s(h64, "%shost64\\", dir);
+    g_chicken_host = DfcScanFile(h64, g_chicken_host_ver, sizeof(g_chicken_host_ver));
+    sprintf_s(g_chicken_cfg_path, "%sdeep-fried-chicken.cfg", h64);
+    if (!g_chicken_host) { Log("[feed32] Deep Fried Chicken: not present in host64\\"); return; }
+    Log("[feed32] Deep Fried Chicken %s: present in host64\\ -- it is the neural consumer; the host negotiates "
+        "with it (ABI 1, HostMode=1) and its full panel lives in the host window (Home key there)", g_chicken_host_ver);
+
+    char stray[MAX_PATH];
+    sprintf_s(stray, "%s" DFC_ADDON_FILENAME, dir);
+    if (GetFileAttributesA(stray) != INVALID_FILE_ATTRIBUTES)
+        Warn("deep-fried-chicken.addon64 is next to the 32-bit game exe, where a 32-bit process cannot load it. "
+             "It belongs in host64\\ (it is already there too). Remove the copy next to the game.");
+}
+
+// Re-read the four headline keys at most every 2 s while the overlay is open.
+static void ChickenCfgRefresh()
+{
+    const UINT64 now = GetTickCount64();
+    if (now - g_chicken_cfg_read_at < 2000) return;
+    g_chicken_cfg_read_at = now;
+    FILE *f = nullptr;
+    if (fopen_s(&f, g_chicken_cfg_path, "rb") != 0 || f == nullptr) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f) != nullptr)
+    {
+        char *eq = strchr(line, '=');
+        if (eq == nullptr) continue;
+        *eq = '\0';
+        const int v = atoi(eq + 1);
+        if      (_stricmp(line, "arm") == 0)                 g_chicken_arm = v;
+        else if (_stricmp(line, "enabled") == 0)             g_chicken_enabled = v;
+        else if (_stricmp(line, "layers") == 0)              g_chicken_layers = v;
+        else if (_stricmp(line, "neural_work_percent") == 0) g_chicken_work_percent = v;
+    }
+    fclose(f);
 }
 
 static bool EnsureHost()
@@ -2668,6 +2726,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Text("Render API: %s", g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : "Direct3D 11");
     ImGui::Text("Handoff: %s", g_cfg.async_home ? "pipelined (+1 frame)" : "same frame");
     ImGui::Text("Host process: %s", HostAlive() ? "running" : "not running");
+    if (g_chicken_host)
+        ImGui::Text("Neural consumer: Deep Fried Chicken %s (in host64\\)", g_chicken_host_ver);
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
     ImGui::TextWrapped("Motion vectors: %s", g_mv_status);
     if (g_mv_problem[0])
@@ -2746,6 +2806,34 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     {
         if (ImGui::InputInt("Raw create flags (-1 = auto)", &g_cfg.flags)) dirty = true;
         if (ImGui::SliderInt("Log first N frames", &g_cfg.log_frames, 0, 20)) dirty = true;
+    }
+
+    if (g_chicken_host)
+    {
+        // Chicken does not read [RenoDX.DLSS5]; mirroring that panel here would be a lie.
+        ImGui::Separator();
+        ImGui::TextUnformatted("Deep Fried Chicken settings (on the host)");
+        ImGui::TextWrapped("Deep Fried Chicken has far more options than fit on this page -- up to 30 neural "
+                           "passes, each with its own preset, style and four strengths, plus colour, HDR and "
+                           "work-scale controls -- so only the feeder's own DLSS settings above are shown here. "
+                           "For Chicken's, tick \"Show the DLSS 5 host window\" above, then press Home in that "
+                           "window and open its Deep Fried Chicken tab.");
+        ChickenCfgRefresh();
+        if (g_chicken_arm >= 0)
+        {
+            ImGui::Text("Current (host64\\deep-fried-chicken.cfg): arm=%d  enabled=%d  passes=%d  work scale=%d%%",
+                        g_chicken_arm, g_chicken_enabled, g_chicken_layers, g_chicken_work_percent);
+            if (g_chicken_arm == 0)
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f),
+                                   "arm=0 is a hard disarm: Chicken installs no hooks and does nothing until it is set "
+                                   "to 1 and the host is restarted.");
+            else if (g_chicken_enabled == 0)
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "enabled=0: neural passes are switched off live.");
+        }
+        else
+            ImGui::TextDisabled("(host64\\deep-fried-chicken.cfg not readable yet)");
+        if (dirty) CfgSave();
+        return;
     }
 
     ImGui::Separator();
@@ -2857,6 +2945,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         }
         CfgWriteDefault();
         CfgReload();
+        DetectChickenHost();
 
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
