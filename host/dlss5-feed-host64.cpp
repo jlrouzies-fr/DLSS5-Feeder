@@ -637,6 +637,24 @@ static void CloseListGuarded()
     __try { h.list->Close(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// A removed D3D12 device never comes back: every later OpenSharedHandle fails with
+// DXGI_ERROR_DEVICE_REMOVED, every create stalls, and the window (a swapchain on that
+// device) stops answering. The add-on already respawns a host that exits, so the right
+// answer is to say why and leave. Seen on a work-resolution change with Deep Fried
+// Chicken (Fable Anniversary, 2026-09-02): DEVICE_HUNG, then ten dead rebuilds.
+static bool g_device_removed = false;
+static bool DeviceRemoved(const char *where)
+{
+    if (h.dev == nullptr) return false;
+    const HRESULT reason = h.dev->GetDeviceRemovedReason();
+    if (SUCCEEDED(reason)) return false;
+    if (!g_device_removed)
+        Log("[host] the D3D12 device was removed (0x%08X%s) during %s; exiting so the game can respawn a fresh host",
+            reason, reason == DXGI_ERROR_DEVICE_HUNG ? " DEVICE_HUNG" : reason == DXGI_ERROR_DEVICE_RESET ? " DEVICE_RESET" : "", where);
+    g_device_removed = true;
+    return true;
+}
+
 static void AbortCommands()   // never execute a list NGX crashed in
 {
     if (h.list == nullptr) return;
@@ -1458,7 +1476,14 @@ static int Serve(DWORD game_pid)
             Log("[host] build: %ux%u color=%u output=%u hdr=%d inverted=%d", b.width, b.height,
                 b.color_fmt, b.output_fmt, b.hdr, b.depth_inverted);
 
-            // Tear down the old set.
+            // Tear down the old set -- after the GPU is done with it. The last evaluate may
+            // still be in flight, and a neural consumer (Deep Fried Chicken) keeps a graph
+            // alive on the feature until its own fence; releasing the feature and the
+            // textures under that work hung the GPU on a work-resolution change (Fable
+            // Anniversary, 2026-09-02: the next create never completed, DEVICE_HUNG). The
+            // warm-up re-create below has always drained first; this path now does too.
+            if (h.feature != nullptr && !WaitFenceValue(h.fence, h.fence_value, 2000))
+                Log("[host] rebuild: the previous feature's GPU work did not retire within 2 s");
             SafeReleaseFeature(h.feature);
             h.feature = nullptr;
             for (int i = 0; i < FEED_SLOTS; ++i)
@@ -1591,6 +1616,7 @@ static int Serve(DWORD game_pid)
             back.output_fmt = static_cast<uint32_t>(out_fmt);
             for (int i = 0; i < FEED_SLOTS; ++i) { back.tex[i] = game_tex[i]; back.tex_size[i] = tex_size[i]; }
             WriteFull(pipe, &back, sizeof(back));
+            if (!ok && DeviceRemoved("a rebuild")) break;   // the ack went out; retrying here is pointless
         }
         else if (tag == 'F')
         {
@@ -1666,7 +1692,10 @@ static int Serve(DWORD game_pid)
                 }
             }
             else
+            {
                 h.fence_out->Signal(fm.n);     // CPU-signal so the game never hangs on us
+                if (DeviceRemoved("an evaluate")) break;
+            }
 
             if (fm.n <= 3 || (fm.n % 1800) == 0)
                 Log("[host] frame %llu evaluated", (unsigned long long)fm.n);
@@ -1687,10 +1716,10 @@ static int Serve(DWORD game_pid)
     // own queue, then release every wait the game could possibly hold.
     if (pending) { CancelIo(pipe); DWORD got = 0; GetOverlappedResult(pipe, &ov_tag, &got, TRUE); }
     CloseHandle(ev_tag);
-    WaitFenceValue(h.fence, h.fence_value, 2000);
+    if (!g_device_removed) WaitFenceValue(h.fence, h.fence_value, 2000);   // nothing to wait for on a dead device
     if (h.fence_out != nullptr) h.fence_out->Signal(UINT64_MAX);
-    Log("[host] pending game fence waits released; exiting");
-    return 0;
+    Log("[host] pending game fence waits released; exiting%s", g_device_removed ? " (device removed)" : "");
+    return g_device_removed ? 3 : 0;
 }
 
 // ---------------------------------------------------------------------------

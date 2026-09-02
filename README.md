@@ -959,6 +959,14 @@ Common cases:
   it to the panel (NVIDIA Control Panel → Adjust desktop size and position → GPU scaling); the
   feeder then works 1:1 at that size. See `PLAN-PROXY-SWAPCHAIN.md` for what doing that
   in-process would take.
+* **32-bit game: changing the work resolution froze the PC for a few seconds, then DLSS never
+  came back and the helper window stopped responding** — the helper's log shows `feature create
+  did not complete`, its `ReShade.log` shows `DXGI_ERROR_DEVICE_HUNG`, and every later rebuild
+  fails with `OpenSharedHandle … 0x887A0005`. Before 0.12.0 the helper released the old feature
+  and textures without waiting for the GPU, which a neural consumer that keeps a graph alive on
+  the feature (Deep Fried Chicken) turned into a GPU hang, and a helper whose D3D12 device was
+  removed retried against it forever. From 0.12.0 the rebuild drains the GPU first, and a helper
+  whose device was removed says so, exits, and is respawned by the add-on on the next frame.
 * **32-bit game: `tex 1 CreateTexture2D failed 0x80070057`, `failure: shared build` forever** —
   the game's D3D11 device is feature level 10.x and cannot bind the UAV the DLSS output needs.
   From 0.11.0-beta.2 the helper creates the shared set instead (the log says `the host will
