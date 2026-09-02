@@ -966,7 +966,7 @@ under `external/reshade/include` (BSD-3-Clause, Patrick Mours), as is **MinHook*
 | `build-addon32.bat` | `build\dlss5-feed.addon32` | Vulkan headers |
 | `host\build-host.bat` | `host\dlss5-feed-host64.exe` | NGX SDK |
 | `layer\build-layer.bat` | `layer\VkLayer_feed_vk.dll` and `layer\x86\VkLayer_feed_vk32.dll` (fallback for Vulkan games where the add-on's own `vkCreateDevice` hook cannot add the interop extensions; the 32-bit pair keeps its own subdirectory because the Vulkan loader tries every manifest on `VK_LAYER_PATH`) | Vulkan headers |
-| `spike\build-spike.bat` | the standalone proofs used during development: the 32↔64-bit shared-resource pair, plus `spike-gl64.exe` / `spike-gl32.exe` and `spike-vkhost64.exe` / `spike-vkclient32.exe`, which round-trip a texture and a fence between D3D12 and OpenGL / Vulkan, in-process and cross-process. They need an NVIDIA GPU to *run*, none to compile. | — |
+| `spike\build-spike.bat` | the standalone proofs used during development: the 32↔64-bit shared-resource pair, plus `spike-gl64.exe` / `spike-gl32.exe` and `spike-vkhost64.exe` / `spike-vkclient32.exe`, which round-trip a texture and a fence between D3D12 and OpenGL / Vulkan, in-process and cross-process, and `spike-proxy-swapchain.exe`, the `IDXGISwapChain` wrapper contract behind `PLAN-PROXY-SWAPCHAIN.md` (a 960×540 "game" presented at window size through FSR 1). They need an NVIDIA GPU to *run*, none to compile. | — |
 
 NGX links against the Release CRT, so the builds use `/MD`.
 
