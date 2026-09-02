@@ -44,6 +44,12 @@
 
 static char g_log_path[MAX_PATH];
 static bool g_show_window = false;   // visible host window = the user's door to the DLSS 5 panel
+// --behind: the window is shown (DWM needs a shown, non-minimized source to render the
+// live thumbnail the 32-bit add-on casts into the game window, dlss5-feed32's "cast")
+// but as a tool window -- no taskbar button, never activated -- parked at the bottom of
+// the Z-order. The game's add-on positions it under the game window and forwards the
+// user's clicks to it. Banner and auto-Home run as for a visible window.
+static bool g_behind = false;
 // Client area of the host window and its swapchain. Twice the original 960x540 -- the
 // neural consumer's whole tuning panel lives in this window, and at 4K a 960x540 overlay
 // was unreadable -- capped to the primary work area (16:9 kept). Set once in InitDisguise;
@@ -129,7 +135,33 @@ static void PrepareHostOverlay()
         Log("[host] ReShade.ini: widened the overlay's tab column from the stock 335 px to %d px", tabs_w);
     }
     else
+    {
+        // A layout this host wrote for an earlier window size (its signature: the second
+        // node is our 96 px editor strip) is brought to the current size; the tab column
+        // then fills the window again instead of the smaller window it was sized for. A
+        // layout whose split the user changed is left exactly as ReShade saved it.
+        std::string d(dock);
+        const size_t n1 = d.find("SizeRef="), n2 = n1 == std::string::npos ? n1 : d.find("SizeRef=96,,", n1 + 8);
+        int w1 = 0, h1 = 0, h2 = 0;
+        if (n1 != std::string::npos && n2 != std::string::npos &&
+            sscanf_s(d.c_str() + n1, "SizeRef=%d,,%d", &w1, &h1) == 2 && sscanf_s(d.c_str() + n2, "SizeRef=96,,%d", &h2) == 1 &&
+            (w1 != tabs_w || h1 != g_win_h || h2 != g_win_h))
+        {
+            char a[64], b[64];
+            sprintf_s(a, "SizeRef=%d,,%d", tabs_w, g_win_h);
+            sprintf_s(b, "SizeRef=96,,%d", g_win_h);
+            const size_t e1 = d.find(' ', n1), e2 = d.find(' ', n2);
+            if (e2 != std::string::npos && e1 != std::string::npos)
+            {
+                d.replace(n2, e2 - n2, b);   // the later one first so n1 stays valid
+                d.replace(n1, e1 - n1, a);
+                WritePrivateProfileStringA("OVERLAY", "Docking", d.c_str(), ini);
+                Log("[host] ReShade.ini: overlay layout was sized for a %dx%d window; resized to %dx%d", w1 + 96, h1, g_win_w, g_win_h);
+                return;
+            }
+        }
         Log("[host] ReShade.ini: overlay layout is user-arranged; leaving it alone");
+    }
 }
 static bool g_renodx_present = false;   // renodx-dlss5.addon64 sits next to this exe
 static bool g_renodx_lazy = false;   // DLSS 5 add-on is v45+ (per-present rescan, lazy adoption)
@@ -586,6 +618,16 @@ struct Host
     DXGI_FORMAT     color_fmt, output_fmt;
 
     HANDLE          latency_wait;  // the disguise swapchain's frame-latency waitable object
+
+    // v7: the panel texture -- the GAME's D3D11 texture (this driver refuses the other
+    // direction), opened here, into which the frame this window just presented is copied
+    // after every Present, ReShade x64's overlay (the neural consumer's tuning panel)
+    // included. The game draws it where DWM cannot paint a thumbnail (exclusive
+    // fullscreen), unfenced: a UI layer, tearing is the worst case.
+    ID3D12Resource *panel;
+    bool            panel_host_owned;   // GL / Vulkan client: created here (they cannot export one)
+    HANDLE          panel_local;        // ... and its handle, duplicated into the game on every build
+    uint64_t        panel_size;
 };
 
 static Host h;
@@ -725,6 +767,13 @@ static ID3D12CommandAllocator     *g_pump_alloc;
 static ID3D12GraphicsCommandList  *g_pump_list;
 static ID3D12Fence                *g_pump_fence;
 static UINT64                      g_pump_val;
+// A second allocator/list pair for the panel copy after Present: the banner pair is still
+// in flight on the GPU at that point, and neither copy may wait for the other.
+static ID3D12CommandAllocator     *g_panel_alloc;
+static ID3D12GraphicsCommandList  *g_panel_list;
+static ID3D12Fence                *g_panel_fence;
+static UINT64                      g_panel_val;
+static bool                        g_panel_ready;   // the pair above exists: a panel can be served
 
 static bool BeginCommands();
 static UINT64 EndCommands();
@@ -857,6 +906,50 @@ static void InitBanner()
     h.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g_pump_fence));
     h.swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_swap3));
     Log("[host] banner ready");
+
+    // 4. The panel copy's own submission pair (v7); the texture itself is the game's.
+    h.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                  reinterpret_cast<void **>(&g_panel_alloc));
+    if (g_panel_alloc != nullptr)
+        h.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_panel_alloc, nullptr,
+                                 __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g_panel_list));
+    if (g_panel_list != nullptr) g_panel_list->Close();
+    h.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g_panel_fence));
+    g_panel_ready = g_panel_list != nullptr && g_panel_fence != nullptr;
+    if (g_panel_ready)
+        Log("[host] panel copy ready: a D3D11 game may hand over a %dx%d texture to receive every presented frame", W, H);
+    else
+        Log("[host] panel copy unavailable; the game can only cast this window through the compositor");
+}
+
+// After Present: copy the buffer that was just presented -- banner plus whatever ReShade
+// drew on it inside its Present hook -- into the shared panel texture. FLIP_SEQUENTIAL
+// keeps that buffer's contents intact until it is handed back to us.
+static void CopyPanel()
+{
+    if (h.panel == nullptr || g_panel_list == nullptr || g_swap3 == nullptr) return;
+    if (g_panel_fence->GetCompletedValue() < g_panel_val) return;   // the last copy is still running
+    const UINT presented = (g_swap3->GetCurrentBackBufferIndex() + 1) % 2;
+    ID3D12Resource *bb = nullptr;
+    if (FAILED(g_swap3->GetBuffer(presented, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&bb))) || bb == nullptr)
+        return;
+    if (SUCCEEDED(g_panel_alloc->Reset()) && SUCCEEDED(g_panel_list->Reset(g_panel_alloc, nullptr)))
+    {
+        D3D12_RESOURCE_BARRIER b[2] = {};
+        for (auto &x : b) { x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
+        b[0].Transition.pResource = bb;      b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT; b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b[1].Transition.pResource = h.panel; b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;  b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        g_panel_list->ResourceBarrier(2, b);
+        g_panel_list->CopyResource(h.panel, bb);
+        std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
+        std::swap(b[1].Transition.StateBefore, b[1].Transition.StateAfter);
+        g_panel_list->ResourceBarrier(2, b);
+        g_panel_list->Close();
+        ID3D12CommandList *lists[] = { g_panel_list };
+        h.pump_queue->ExecuteCommandLists(1, lists);
+        h.pump_queue->Signal(g_panel_fence, ++g_panel_val);
+    }
+    bb->Release();
 }
 
 typedef HRESULT (WINAPI *PFN_D3D12CreateDevice_)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
@@ -947,6 +1040,8 @@ static void PumpPresent(bool force = false)
         if (++busy == 1 || (busy % 1800) == 0)
             Log("[host] present skipped: DXGI was still drawing (%u so far)", busy);
     }
+    else if (SUCCEEDED(hr))
+        CopyPanel();
 }
 
 static bool InitDisguise()
@@ -974,12 +1069,13 @@ static bool InitDisguise()
     // the client area -- and the swapchain -- is exactly that.
     RECT frame = { 0, 0, g_win_w, g_win_h };
     AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
-    h.hwnd = CreateWindowExW(0, wc.lpszClassName,
+    h.hwnd = CreateWindowExW(g_behind ? (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) : 0, wc.lpszClassName,
                              L"DLSS 5 Feed host - press Home HERE to tune DLSS 5 neural rendering",
                              WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                              frame.right - frame.left, frame.bottom - frame.top,
                              nullptr, nullptr, wc.hInstance, nullptr);
-    Log("[host] window: %dx%d client (2x the original 960x540, capped to the work area)", g_win_w, g_win_h);
+    Log("[host] window: %dx%d client (2x the original 960x540, capped to the work area)%s", g_win_w, g_win_h,
+        g_behind ? ", behind the game (tool window, no taskbar button)" : "");
     if (h.hwnd == nullptr) { Log("[host] window creation failed"); return false; }
     if (g_show_window) ShowWindow(h.hwnd, SW_SHOWNOACTIVATE);   // never steal the game's focus
 
@@ -1003,7 +1099,9 @@ static bool InitDisguise()
     sd.SampleDesc.Count = 1;
     sd.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount      = 2;
-    sd.SwapEffect       = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    // SEQUENTIAL, not DISCARD: the buffer just presented must keep its contents so
+    // CopyPanel can lift ReShade's overlay off it afterwards (the v7 panel texture).
+    sd.SwapEffect       = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     // Waitable, latency 1: Present on this chain must never block. It is called once per
     // evaluate, and the game's next frame waits on fence_out behind that evaluate -- so
     // a Present that DWM holds until the next vblank (the window is occluded by a
@@ -1417,6 +1515,7 @@ static int Serve(DWORD game_pid)
     // Nothing else may be read -- FeedBuild and FeedBuildAck changed size between
     // versions, so a mismatched pair would desync the pipe on the very next message.
     FeedHelloAck ack = { FEED_IPC_MAGIC, FEED_IPC_VERSION };
+    if (g_panel_ready) { ack.panel_width = static_cast<uint32_t>(g_win_w); ack.panel_height = static_cast<uint32_t>(g_win_h); }
     WriteFull(pipe, &ack, sizeof(ack));
     if (hello.version != FEED_IPC_VERSION)
     {
@@ -1541,7 +1640,7 @@ static int Serve(DWORD game_pid)
             if (h.out_scratch != nullptr) { h.out_scratch->Release(); h.out_scratch = nullptr; }
 
             bool ok = true;
-            uint64_t game_tex[FEED_SLOTS] = {}, tex_size[FEED_SLOTS] = {};
+            uint64_t game_tex[FEED_SLOTS] = {}, tex_size[FEED_SLOTS] = {}, game_panel = 0;
             // A D3D11 client whose device refused the shared set asks for the GL/Vulkan
             // route per build (v5, issue #33); one that cannot bind UAVs at all gets an
             // Output without one, and NGX writes a private scratch that is copied over.
@@ -1589,6 +1688,22 @@ static int Serve(DWORD game_pid)
                     CloseHandle(local);   // the duplicate stands on its own; the resource keeps the memory
                     game_tex[i] = reinterpret_cast<uint64_t>(remote);
                 }
+                // v7: the panel texture for a client that cannot export one -- created once
+                // per session, a fresh duplicate of its handle on every build. Never fatal.
+                if (ok && g_panel_ready)
+                {
+                    if (h.panel == nullptr)
+                    {
+                        h.panel = MakeSharedTexHost(static_cast<UINT>(g_win_w), static_cast<UINT>(g_win_h), DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                    false, &h.panel_local, &h.panel_size, false);
+                        h.panel_host_owned = h.panel != nullptr;
+                        if (h.panel != nullptr) Log("[host] panel texture created for the game (%dx%d): every presented frame is copied into it", g_win_w, g_win_h);
+                    }
+                    HANDLE remote = nullptr;
+                    if (h.panel != nullptr && h.panel_local != nullptr &&
+                        DuplicateHandle(GetCurrentProcess(), h.panel_local, hgame, &remote, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                        game_panel = reinterpret_cast<uint64_t>(remote);
+                }
                 if (ok)
                     Log("[host] created and handed over %d shared textures (%ux%u, color %s, output %s)",
                         FEED_SLOTS, b.width, b.height, FeedFmtName(static_cast<DXGI_FORMAT>(b.color_fmt)),
@@ -1628,6 +1743,35 @@ static int Serve(DWORD game_pid)
                                                          reinterpret_cast<void **>(&h.tex[i]));
                     CloseHandle(local);
                     if (FAILED(hr)) { Log("[host] OpenSharedHandle(tex %d) failed 0x%08X", i, hr); ok = false; }
+                }
+            }
+
+            // v7: a D3D11 game's panel texture, opened the same way. Never fatal for the build.
+            if (h.panel != nullptr && !h.panel_host_owned) { h.panel->Release(); h.panel = nullptr; }
+            if (b.panel_tex != 0 && g_panel_ready && !h.panel_host_owned)
+            {
+                HANDLE local = nullptr;
+                if (!DuplicateHandle(hgame, reinterpret_cast<HANDLE>(static_cast<uintptr_t>(b.panel_tex)),
+                                     GetCurrentProcess(), &local, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                    Log("[host] DuplicateHandle(panel) failed %lu; no in-game panel texture", GetLastError());
+                else
+                {
+                    const HRESULT hr = h.dev->OpenSharedHandle(local, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&h.panel));
+                    CloseHandle(local);
+                    if (FAILED(hr)) { Log("[host] OpenSharedHandle(panel) failed 0x%08X; no in-game panel texture", hr); h.panel = nullptr; }
+                    else
+                    {
+                        const D3D12_RESOURCE_DESC pd = h.panel->GetDesc();
+                        if (pd.Width != static_cast<UINT64>(g_win_w) || pd.Height != static_cast<UINT>(g_win_h) ||
+                            pd.Format != DXGI_FORMAT_R8G8B8A8_UNORM)
+                        {
+                            Log("[host] the game's panel texture is %ux%u fmt=%u, not %dx%d RGBA8; ignoring it",
+                                static_cast<unsigned>(pd.Width), pd.Height, pd.Format, g_win_w, g_win_h);
+                            h.panel->Release(); h.panel = nullptr;
+                        }
+                        else
+                            Log("[host] panel texture opened: every presented frame is copied into it");
+                    }
                 }
             }
 
@@ -1681,6 +1825,8 @@ static int Serve(DWORD game_pid)
             back.fence_out  = reinterpret_cast<uint64_t>(game_out);
             back.output_fmt = static_cast<uint32_t>(out_fmt);
             for (int i = 0; i < FEED_SLOTS; ++i) { back.tex[i] = game_tex[i]; back.tex_size[i] = tex_size[i]; }
+            back.panel_tex  = game_panel;
+            back.panel_size = game_panel != 0 ? h.panel_size : 0;
             WriteFull(pipe, &back, sizeof(back));
             if (!ok && DeviceRemoved("a rebuild")) break;   // the ack went out; retrying here is pointless
         }
@@ -1788,6 +1934,33 @@ static int Serve(DWORD game_pid)
     return g_device_removed ? 3 : 0;
 }
 
+// ReShade x64 writes its ini -- the overlay layout the user arranged, the neural
+// consumer's own settings -- when its effect runtime is destroyed, which happens when the
+// swapchain's last reference goes. It never does so for a process that simply exits
+// around a live swapchain (its log then says "Add-ons are still loaded!"), which is why
+// the host's layout was forgotten on every restart. So take the disguise down properly.
+static void ShutdownDisguise()
+{
+    if (h.swap == nullptr) return;
+    if (!g_device_removed)
+    {
+        if (g_pump_fence  != nullptr) WaitFenceValue(g_pump_fence,  g_pump_val,  500);
+        if (g_panel_fence != nullptr) WaitFenceValue(g_panel_fence, g_panel_val, 500);
+    }
+    auto rel = [](IUnknown *&p) { if (p != nullptr) { p->Release(); p = nullptr; } };
+    rel(reinterpret_cast<IUnknown *&>(g_panel_list));  rel(reinterpret_cast<IUnknown *&>(g_panel_alloc));
+    rel(reinterpret_cast<IUnknown *&>(g_panel_fence)); rel(reinterpret_cast<IUnknown *&>(g_pump_list));
+    rel(reinterpret_cast<IUnknown *&>(g_pump_alloc));  rel(reinterpret_cast<IUnknown *&>(g_pump_fence));
+    rel(reinterpret_cast<IUnknown *&>(g_banner));      rel(reinterpret_cast<IUnknown *&>(h.panel));
+    rel(reinterpret_cast<IUnknown *&>(g_swap3));
+    rel(reinterpret_cast<IUnknown *&>(h.swap));   // ReShade's runtime goes with it, and saves
+    MSG msg;
+    for (int i = 0; i < 20; ++i)
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    if (h.hwnd != nullptr) { DestroyWindow(h.hwnd); h.hwnd = nullptr; }
+    Log("[host] disguise released (ReShade saves its ini here)");
+}
+
 // ---------------------------------------------------------------------------
 
 // Same shape as the add-ons' filter: the crash goes in the log with the faulting
@@ -1843,20 +2016,22 @@ int main(int argc, char **argv)
     // helper, and process exit restores the resolution anyway.
     timeBeginPeriod(1);
 
-    bool  test = false, hide = false;
+    bool  test = false, hide = false, behind = false;
     DWORD pid = 0;
     for (int i = 1; i < argc; ++i)
     {
         if      (strcmp(argv[i], "--test") == 0) test = true;
         else if (strcmp(argv[i], "--hide") == 0) hide = true;
+        else if (strcmp(argv[i], "--behind") == 0) behind = true;
         else pid = static_cast<DWORD>(strtoul(argv[i], nullptr, 10));
     }
     if (!test && pid == 0)
     {
-        Log("usage: dlss5-feed-host64 --test | dlss5-feed-host64 <game pid> [--hide]");
+        Log("usage: dlss5-feed-host64 --test | dlss5-feed-host64 <game pid> [--hide | --behind]");
         return 1;
     }
     g_show_window = !test && !hide;   // the visible window carries the DLSS 5 add-on's tuning panel
+    g_behind      = g_show_window && behind;
 
     DetectRenodxAddon();   // must run BEFORE ReShade loads, so an EnableHooks write is read
     DetectToolkitAddon();
@@ -1867,5 +2042,15 @@ int main(int argc, char **argv)
     if (!InitDisguise()) return 1;
     if (!InitNgx()) { Log("[host] NGX unavailable"); return 1; }
 
-    return test ? RunTest() : Serve(pid);
+    const int rc = test ? RunTest() : Serve(pid);
+    ShutdownDisguise();
+    // Everything that had to happen has happened: ReShade wrote its ini when its runtime
+    // went with the swapchain above. What is left is ReShade's own DLL teardown (unhooking
+    // every module it patched), which has been seen to hang after the window was gone --
+    // WormsXHD, 2026-09-02: "disguise released" logged, the process still alive a minute
+    // later, and the game, stuck in its own exit-time crash loop, never came to kill it.
+    // A helper that outlives its game is worse than skipped unhooking at exit.
+    Log("[host] exit %d", rc);
+    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(rc));
+    return rc;
 }

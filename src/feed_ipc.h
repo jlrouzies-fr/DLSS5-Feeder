@@ -52,6 +52,16 @@
 // sub-pixel shift it applied to the downsample grid on every frame. The host answers
 // with FeedBuildAck::flags -- FEED_ACK_SR_UNAVAILABLE when no DLSS quality preset covers
 // the ratio, so the game rebuilds as plain DLAA -- and the preset it picked.
+// Version 7 added the panel texture: a shared copy of the host's own presented frame (its
+// ReShade overlay = the neural consumer's tuning panel), so the game can draw that panel
+// itself where the desktop compositor cannot (exclusive fullscreen). FeedHelloAck::panel_*
+// says how big the host's frame is; a D3D11 client creates a texture of that size on its
+// own device -- the direction this driver accepts, a D3D12-created one comes back
+// E_INVALIDARG from OpenSharedResource1 -- and sends its handle in FeedBuild::panel_tex.
+// GL and Vulkan clients cannot export a texture the host could open, so for them the host
+// creates the panel and hands it over in FeedBuildAck::panel_tex, like their four slots.
+// The host copies its back buffer into it after every Present; the game samples it,
+// unfenced, as a UI layer.
 //
 // Both sides refuse a version they do not understand rather than misparsing it: the
 // struct sizes differ between versions, so a mismatched pair would desync the pipe.
@@ -60,7 +70,7 @@
 #include <cstdint>
 
 #define FEED_IPC_MAGIC   0x35534C44u  // 'DLS5'
-#define FEED_IPC_VERSION 6u
+#define FEED_IPC_VERSION 7u
 
 // FeedBuild::client_flags (v5+)
 #define FEED_BUILD_HOST_CREATES  1u   // tex[] are zero: the host creates the shared set and answers with handles
@@ -106,6 +116,8 @@ struct FeedHelloAck     // host -> game, once
 {
     uint32_t magic;
     uint32_t version;
+    uint32_t panel_width, panel_height;   // v7+: the host's frame size (R8G8B8A8_UNORM), for the panel
+                                          // texture a D3D11 client creates; 0 = the host has no panel
 };
 
 struct FeedBuild        // game -> host, on every resolution/format change
@@ -125,6 +137,9 @@ struct FeedBuild        // game -> host, on every resolution/format change
     uint32_t target_width, target_height;   // v6+: 0 = DLAA (target == width/height). Otherwise the Output
                                             // slot is THIS size and the feature is DLSS Super Resolution
                                             // (work_upscale=2); Color/Depth/MV stay at width/height.
+    uint64_t panel_tex;          // v7+: D3D11 clients: NT-handle VALUE (game process) of the panel texture the
+                                 // game created at FeedHelloAck::panel_* size; 0 = none. The host opens it and
+                                 // copies its presented frame into it after every Present.
 };
 
 struct FeedBuildAck     // host -> game
@@ -143,6 +158,10 @@ struct FeedBuildAck     // host -> game
                                  // the output falls back to R8G8B8A8. Echoed for D3D11 clients too.
     uint32_t flags;              // v6+: FEED_ACK_*
     uint32_t sr_quality;         // v6+: NVSDK_NGX_PerfQuality_Value of an SR feature (FEED_ACK_SR_ACTIVE)
+    uint64_t panel_tex;          // v7+: host-creating clients (GL / Vulkan) only: handle value valid in the GAME
+                                 // process of the HOST-created panel texture (they cannot export one for the
+                                 // host to open); 0 = none. RGBA8, FeedHelloAck::panel_* in size.
+    uint64_t panel_size;         // v7+: its GetResourceAllocationInfo size, for the GL import
 };
 
 struct FeedFrameMsg     // game -> host, per frame

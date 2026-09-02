@@ -440,30 +440,40 @@ the list of build generations:
 
 ## Install for a 32-bit game (beta)
 
-32-bit games need one extra piece: a 64-bit helper that does the actual DLSS work, since NGX only
-exists as 64-bit code.
+NGX only exists as 64-bit code, so a 32-bit game gets a 64-bit helper process that does the DLSS
+work. Two folders to fill:
 
-1. Run ReShade's installer, point it at your game's `.exe` — it detects **32-bit** automatically.
-2. Download **`dlss5-feed.addon32`**, **`DLSS5_Feed.fx`** and **`dlss5-feed-host64.exe`** from the
-   **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)**. Put
-   `dlss5-feed.addon32` next to the game `.exe`, `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`,
-   and `dlss5-feed-host64.exe` into a new `host64\` folder next to the game `.exe`.
-3. Put a 64-bit ReShade `dxgi.dll`, the neural consumer, `nvngx_dlssnr.dll` and `nvngx_dlss.dll`
-   into `host64\` — **not** beside the 32-bit game `.exe`, which cannot load 64-bit code. The
-   consumer is Deep Fried Chicken's three files (`deep-fried-chicken.addon64`,
-   `deep-fried-chicken-nvngx.dll`, `deep-fried-chicken.cfg`), or `renodx-dlss5.addon64` if you took
-   [the RenoDX route](#alternative-the-renodx-add-on). (Get the x64 `dxgi.dll` by running the
-   ReShade installer once against any 64-bit game.)
-4. Install a motion-vector provider into the game's `reshade-shaders\`, same as steps 3 and 5 of the
-   [64-bit instructions](#install-for-a-64-bit-game).
-5. Turn it on in-game as above. Day-to-day DLSS 5 settings live in **ReShade's overlay → Add-ons tab
-   → DLSS 5 Feed** — see [Configuration](#configuration).
+**Next to the game `.exe`** (32-bit side)
+- ReShade, installed with its installer (it detects 32-bit itself; tick "Enable loading of add-ons").
+- `dlss5-feed.addon32` from the [latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest).
+- `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`, plus a motion-vector provider (steps 3 and 5 of the
+  [64-bit instructions](#install-for-a-64-bit-game)).
 
-The first fed frame also spawns `host64\dlss5-feed-host64.exe`, which opens a window titled
-**"32-bit DLSS 5 Feeder"** — the add-on and the game never share a ReShade instance, so this is
-where the neural consumer's *own* full panel lives — the **Deep Fried Chicken** tab, or the RenoDX
-add-on's panel — for anything not covered by our overlay page.
-Press Home in that window to open it:
+**In a new `host64\` folder next to the game `.exe`** (64-bit side, nothing here can go beside the game)
+- `dlss5-feed-host64.exe` from the same release.
+- A 64-bit ReShade `dxgi.dll` (run the ReShade installer once against any 64-bit game and take it from there).
+- The neural consumer: Deep Fried Chicken's three files (`deep-fried-chicken.addon64`,
+  `deep-fried-chicken-nvngx.dll`, `deep-fried-chicken.cfg`), or `renodx-dlss5.addon64`
+  ([the RenoDX route](#alternative-the-renodx-add-on)).
+- `nvngx_dlssnr.dll` and `nvngx_dlss.dll`.
+
+**Then, in-game**
+- Turn it on as for a 64-bit game. The first fed frame starts the helper by itself.
+- Day-to-day settings: ReShade overlay → Add-ons → **DLSS 5 Feed** (see [Configuration](#configuration)).
+- The neural consumer's own panel lives in the helper, not in the game's ReShade. No alt-tab needed:
+  press **Show the DLSS 5 panel in-game** on that page, or bind a key with **Set key**, and it is drawn
+  at the top right of the game window with your clicks forwarded to it. Changes apply live.
+  - That button uses the desktop compositor: windowed or borderless games only.
+  - **Show as texture** draws it through the game's own ReShade instead and also works in exclusive
+    fullscreen; it appears once the feed has built.
+  - While the panel is up the mouse and keyboard belong to it. Escape away from it hides it, Alt+F4
+    hides it and closes the game, and the X in its corner always closes it. **Panel size** scales it.
+- `host_window=1` in `dlss5-feed.cfg` gives the helper a visible window of its own instead (Home opens
+  the panel there).
+
+![32-bit-overlay-ingame](Ingame-32bit-overlay.png)
+
+The helper's own window, with `host_window=1`:
 
 <img width="1880" height="1058" alt="image" src="https://github.com/user-attachments/assets/57abd732-94d2-401c-a524-6536006f3c86" />
 
@@ -660,7 +670,11 @@ NGX and the DLSS 5 add-on only exist as x64 code, and a 32-bit process cannot lo
   it: a window with a minimal D3D12 swap chain lets its own bundled ReShade (`host64\dxgi.dll`)
   attach and the add-on arm its hooks, exactly as in a real D3D12 title. The 32-bit `dlss5-feed.cfg`
   add-on writes settings changes made in the *game's* own overlay straight into that window's
-  ReShade.ini and restarts it to apply them.
+  ReShade.ini and restarts it to apply them. For live changes it instead *casts* that window into
+  the game: a DWM live thumbnail of the host window is registered on the game window (no pixel
+  transport, no protocol change), and while the cursor is over it the game's mouse and keys —
+  read through ReShade's add-on API and blocked from the game — are posted to the host window as
+  ordinary `WM_*` messages, which is where the host's ReShade reads its input.
 * If the host process dies, the pipe breaks, the add-on notices and disables itself — the game keeps
   rendering normally.
 * Verified end to end with a deliberate split-screen test (`mode=1`): the host copies only the left
@@ -815,7 +829,10 @@ if you prefer editing the file directly:
 | `mv_scale_x/y` | 1.0 | extra motion-vector multiplier. |
 | `stall_log_ms` | 50 | **Diagnostic.** Log a breakdown for any frame whose present-to-present interval exceeds this, in ms (0 = off). Each `STALL frame` line splits the interval into the time inside the NGX evaluate call — which is where the neural consumer's own work runs — the rest of this add-on's work, and everything outside it, then names which of the three dominated. The `600 frames:` summary also carries the worst frame and a stall count. Use it to tell "the feed is slow" apart from "the neural consumer is slow" apart from "neither, something else in the process stalled". |
 | `async_home` | 1 | **32-bit games only.** 1 = pipelined handoff: each frame carries the DLSS output of the frame *before* it, so the game never waits for the helper process inside a frame — this is what lifts the ~35 fps ceiling of the original same-frame contract (issue #15). Costs one frame of latency on the DLSS output, which the temporal history hides. 0 = the original same-frame behaviour. Also on the overlay as "Pipelined handoff". |
-| `host_window` | 1 | **32-bit games only.** 1 shows the helper's window; 0 hides it (its own settings are now on the overlay page above, so you rarely need it). |
+| `host_window` | 0 | **32-bit games only.** 0 keeps the helper's window behind the game, off the taskbar, and lets the overlay's "Show the DLSS 5 panel in-game" button cast its tuning panel into the game window; 1 gives the helper its own visible window instead (press Home there). Read when the helper is started. |
+| `cast_key` | 0 | **32-bit games only.** Virtual-key code that shows/hides the cast DLSS 5 panel in-game; 0 = none. Set it from the overlay page with "Set key" rather than by hand. |
+| `cast_scale` | 100 | **32-bit games only.** Size of the cast panel, 25..300 % of the largest size that fits the game window (above 100 % it may run past the window's edges). Also on the overlay as "Panel size". |
+| `cast_mode` | 0 | **32-bit games only.** How the cast panel is drawn: 0 = a desktop-compositor thumbnail of the helper's window (windowed / borderless games, any API); 1 = a shared copy of the helper's frame drawn by the game's ReShade or blitted onto its backbuffer (works in exclusive fullscreen; D3D11, OpenGL and Vulkan). The two overlay buttons set it. |
 
 In `DLSS5_Feed.fx`'s own UI (settings that only make sense per-shader, not per-session):
 
