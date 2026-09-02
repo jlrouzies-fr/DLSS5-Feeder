@@ -106,30 +106,62 @@ static void Breadcrumb(const char *what) { g_where = what; }
 
 // The 64-bit add-on has recorded crashes with a breadcrumb since 0.8; this side only
 // set the breadcrumb and never read it, so a 32-bit crash left nothing in the log past
-// the last ordinary line. Same filter here, plus a minidump next to the log (dbghelp
-// loaded on demand -- the process is already dying when it is needed).
+// the last ordinary line. Same filter here, plus a minidump next to the log.
+//
+// dbghelp is resolved EARLY (FeedResolveDbghelp, from an effect-runtime init) rather
+// than inside the filter: ReShade refuses a LoadLibrary made from a thread it considers
+// deadlock-prone and logs "Ignoring LoadLibrary('dbghelp.dll') call to avoid possible
+// deadlock", which is how the one crash worth a dump ended up with none.
 typedef BOOL (WINAPI *PFN_MiniDumpWriteDump_)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+static PFN_MiniDumpWriteDump_ g_write_dump;
+
+// Called from an event where a LoadLibrary is safe (never from DllMain, never from the
+// exception filter). Cheap and idempotent.
+static void FeedResolveDbghelp()
+{
+    if (g_write_dump != nullptr) return;
+    if (HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll"))
+        g_write_dump = reinterpret_cast<PFN_MiniDumpWriteDump_>(GetProcAddress(dbghelp, "MiniDumpWriteDump"));
+}
+
 static void WriteCrashDump(EXCEPTION_POINTERS *ep)
 {
     char path[MAX_PATH];
     strcpy_s(path, g_log_path);
     if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "dlss5-feed-crash.dmp");
-    HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
-    auto write = dbghelp ? reinterpret_cast<PFN_MiniDumpWriteDump_>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+    // Last resort only: if the early resolve never ran, try anyway -- ReShade may refuse it.
+    PFN_MiniDumpWriteDump_ write = g_write_dump;
+    if (write == nullptr)
+    {
+        if (HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll"))
+            write = reinterpret_cast<PFN_MiniDumpWriteDump_>(GetProcAddress(dbghelp, "MiniDumpWriteDump"));
+    }
     if (write == nullptr) { Log("[feed32] no dbghelp.dll; no crash dump written"); return; }
-    HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // FILE_SHARE_READ: a second thread faulting at the same moment should be able to read
+    // this file rather than fail with a sharing violation (error 32).
+    HANDLE f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) { Log("[feed32] could not create %s (error %lu)", path, GetLastError()); return; }
     struct { DWORD tid; EXCEPTION_POINTERS *ep; BOOL client; } info = { GetCurrentThreadId(), ep, FALSE };
     const int type = 0x0040 | 0x0001 | 0x0004;   // IndirectlyReferencedMemory | DataSegs | HandleData
-    const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), f, type, ep != nullptr ? &info : nullptr, nullptr, nullptr);
+    const BOOL  ok  = write(GetCurrentProcess(), GetCurrentProcessId(), f, type, ep != nullptr ? &info : nullptr, nullptr, nullptr);
+    const DWORD err = ok ? 0 : GetLastError();   // before CloseHandle, which overwrites it
     CloseHandle(f);
-    Log(ok ? "[feed32] crash dump written: %s -- attach it to the issue with this log"
-           : "[feed32] crash dump FAILED (%s, error %lu)", path, GetLastError());
+    if (ok) Log("[feed32] crash dump written: %s -- attach it to the issue with this log", path);
+    else    Log("[feed32] crash dump FAILED (%s, error %lu)", path, err);
 }
 
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
+static volatile LONG g_crash_once;
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
+    // One record per process, and only one thread may make it. Two ways this is reached
+    // more than once: a game whose own handler resumes the faulting instruction comes
+    // back every few hundred ms (WormsXHD at exit, 31 times), and a GPU fault takes out
+    // every thread inside the driver at once (The Surge 2, eight of them -- they raced
+    // for the same dump file and seven got a sharing violation).
+    if (InterlockedCompareExchange(&g_crash_once, 1, 0) != 0)
+        return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+
     const void *addr = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
     const DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
     wchar_t owner[MAX_PATH] = L"unknown";
@@ -138,13 +170,10 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            static_cast<LPCWSTR>(addr), &mod) && mod != nullptr)
         GetModuleFileNameW(mod, owner, MAX_PATH);
-    Log("### CRASH RECORDED ###  exception 0x%08X at %p in %ls; this add-on was last doing: %s%s", code, addr,
+    Log("### CRASH RECORDED ###  exception 0x%08X at %p in %ls; this add-on was last doing: %s%s "
+        "(later faults in this process are not recorded)", code, addr,
         owner, g_where, mod == g_self ? " (inside this add-on)" : "");
-    // One dump per process: a game whose own handler resumes the faulting instruction
-    // comes back here every few hundred ms (WormsXHD at exit, 31 times), and rewriting
-    // the dump each time is what would keep it busy.
-    static int crashes = 0;
-    if (++crashes == 1) WriteCrashDump(ep);
+    WriteCrashDump(ep);
     return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -350,13 +379,55 @@ static void CfgWriteDefault()
     fclose(f);
 }
 
-// Writes every current value, overwriting the file -- used by the overlay page so an
-// edit made there survives the next CfgReload() instead of being read back off the
-// stale on-disk copy 60 frames later.
+// The keys CfgSave() writes. Anything else in the file is carried over untouched: comments,
+// and any key a different build of this add-on understands. (The 64-bit side lost hand-set
+// diagnostics this way -- see its CfgSave.)
+static const char *const kCfgSavedKeys[] = {
+    "enabled", "mode", "hdr", "depth_inverted", "flags", "reset_every", "log_frames",
+    "host_window", "work_resolution", "work_upscale", "work_sharpness", "async_home",
+    "mv_scale_x", "mv_scale_y", "cast_key", "cast_scale", "cast_mode",
+};
+
+static bool CfgKeyIsSaved(const char *key)
+{
+    for (const char *k : kCfgSavedKeys)
+        if (_stricmp(k, key) == 0) return true;
+    return false;
+}
+
+// Writes every current value -- used by the overlay page so an edit made there survives the
+// next CfgReload() instead of being read back off the stale on-disk copy 60 frames later.
+// Everything the file holds that is not one of ours is preserved rather than truncated away.
 static void CfgSave()
 {
     char path[MAX_PATH];
     CfgPath(path);
+
+    std::string carried;
+    FILE *r = nullptr;
+    if (fopen_s(&r, path, "r") == 0 && r != nullptr)
+    {
+        char line[256];
+        while (fgets(line, sizeof(line), r) != nullptr)
+        {
+            char key[64] = {};
+            const char *eq = strchr(line, '=');
+            bool ours = false;
+            if (eq != nullptr && sscanf_s(line, "%63[^=]", key, static_cast<unsigned>(sizeof(key))) == 1)
+            {
+                size_t n = strlen(key);
+                while (n > 0 && (key[n - 1] == ' ' || key[n - 1] == '\t')) key[--n] = '\0';
+                const char *k = key;
+                while (*k == ' ' || *k == '\t') ++k;
+                ours = CfgKeyIsSaved(k);
+            }
+            if (ours) continue;   // rewritten below from g_cfg
+            carried += line;
+            if (carried.back() != '\n') carried += '\n';
+        }
+        fclose(r);
+    }
+
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
@@ -364,6 +435,7 @@ static void CfgSave()
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale, g_cfg.cast_mode);
+    if (!carried.empty()) fputs(carried.c_str(), f);
     fclose(f);
 }
 
@@ -801,6 +873,7 @@ static void HostDrain()
 
 static void CastHostLost();       // below: drop the thumbnail of a window that is going away
 static void CastReleasePanel();   // below: and our view of its panel texture
+static void CastFlushInput();     // below: release any key/button the host still thinks is held
 
 static void HostClose()
 {
@@ -953,6 +1026,16 @@ static RECT CastCloseRect()
 static bool       g_cast_shown;           // something is on screen this frame (thumbnail or texture)
 static char       g_cast_status[160] = "hidden";
 
+// What this add-on has told the host is currently held down. Key and button messages are
+// only forwarded while the cursor is over the panel, so a key released after the cursor
+// left it -- or while the panel was being hidden by the toggle key, Escape, the close
+// button or a host restart -- never got its WM_KEYUP, and ReShade x64's ImGui went on
+// believing it was down: every later click became a Ctrl+click, text fields repeated,
+// Shift stuck. CastFlushInput() releases whatever is still marked here.
+static bool       g_cast_key_down[256];
+static UINT       g_cast_btn_down;        // bit i = kCastButtons[i] is down in the host
+static int16_t    g_cast_wheel_pending;   // wheel notches seen in reshade_overlay, consumed by CastInput
+
 static HWND CastFindHostWindow()
 {
     if (g.hproc == nullptr) return nullptr;
@@ -968,6 +1051,10 @@ static HWND CastFindHostWindow()
 
 static void CastRelease()   // the thumbnail only; the host window stays known
 {
+    // Before the panel goes away: hand the host a key-up for everything it still thinks is
+    // held. This is the path every hide takes -- toggle key, Escape, Alt+F4, the close
+    // button, a lost host, DLL detach -- so it is the one place that has to do it.
+    CastFlushInput();
     if (g_cast_thumb != nullptr) { DwmUnregisterThumbnail(g_cast_thumb); g_cast_thumb = nullptr; }
     g_cast_dest     = nullptr;
     g_cast_rect     = {};
@@ -1038,8 +1125,12 @@ static uint64_t CastMakePanel()
 // Vulkan objects are dropped in ReleaseShared with the four slots, so this runs per build.
 static void CastImportPanelGl(const FeedBuildAck &ack)
 {
-    if (ack.panel_tex == 0 || g.panel_w == 0 || g.gl_panel_tex != 0) return;
+    if (ack.panel_tex == 0) return;
     HANDLE hnd = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex));
+    // The host duplicates a FRESH handle into this process on every build. When we are not
+    // importing it -- the panel is already there, or the hello ack named no size -- it still
+    // has to be closed here, or every rebuild leaks one.
+    if (g.panel_w == 0 || g.gl_panel_tex != 0) { CloseHandle(hnd); return; }
     if (!FeedGlImportImage(&g.gl, hnd, ack.panel_size, static_cast<GLsizei>(g.panel_w), static_cast<GLsizei>(g.panel_h),
                            GL_RGBA8, &g.gl_panel_tex, &g.gl_panel_memobj))
         Log("[feed32] cast: panel import FAILED (GL error 0x%04X); texture mode unavailable", FeedGlDrainErrors(&g.gl));
@@ -1050,14 +1141,47 @@ static void CastImportPanelGl(const FeedBuildAck &ack)
 
 static void CastImportPanelVk(const FeedBuildAck &ack)
 {
-    if (ack.panel_tex == 0 || g.panel_w == 0 || g.vk_panel != VK_NULL_HANDLE) return;
+    if (ack.panel_tex == 0) return;
     HANDLE hnd = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex));
+    if (g.panel_w == 0 || g.vk_panel != VK_NULL_HANDLE) { CloseHandle(hnd); return; }   // see CastImportPanelGl
     if (!FeedVkImportImage(&g.vk, hnd, g.panel_w, g.panel_h, VK_FORMAT_R8G8B8A8_UNORM, false, &g.vk_panel, &g.vk_panel_mem))
         Log("[feed32] cast: panel import FAILED (Vulkan external-memory import); texture mode unavailable");
     else
         Log("[feed32] cast: host panel texture imported (Vulkan, %ux%u)", g.panel_w, g.panel_h);
     g.vk_panel_init = false;
     CloseHandle(hnd);
+}
+
+// A D3D11 client whose own device refused the shared set (feature level 10.x, issue #33)
+// gets a host-created panel as well: the host takes the same branch as a GL/Vulkan client
+// and never looks at FeedBuild::panel_tex, so a panel made on this side would be a texture
+// nobody ever writes -- texture cast showed a frozen frame, and the handle the host
+// duplicated in was dropped on the floor once per build. Open the host's instead.
+static void CastAdoptHostPanel11(ID3D11Device1 *dev1, const FeedBuildAck &ack)
+{
+    if (ack.panel_tex == 0) return;
+    HANDLE hnd = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex));
+    if (dev1 == nullptr || g.panel_w == 0) { CloseHandle(hnd); return; }
+
+    const UINT pw = g.panel_w, ph = g.panel_h;   // CastReleasePanel clears these; the size has not changed
+    CastReleasePanel();
+    g.panel_w = pw; g.panel_h = ph;
+
+    ID3D11Texture2D *tex = nullptr;
+    HRESULT hr = dev1->OpenSharedResource1(hnd, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&tex));
+    if (SUCCEEDED(hr)) hr = g.dev->CreateShaderResourceView(tex, nullptr, &g.panel_srv);
+    if (FAILED(hr))
+    {
+        Log("[feed32] cast: could not open the host's panel texture 0x%08X; texture mode unavailable", hr);
+        SafeRelease(g.panel_srv);
+        if (tex != nullptr) tex->Release();
+        CloseHandle(hnd);
+        g.panel_w = g.panel_h = 0;   // do not retry every build
+        return;
+    }
+    g.panel_tex    = tex;
+    g.panel_handle = hnd;   // CastReleasePanel closes it
+    Log("[feed32] cast: host panel texture opened (%ux%u, host-created set)", g.panel_w, g.panel_h);
 }
 
 static bool CastPanelAvailable()
@@ -1146,10 +1270,38 @@ static void CastKeyName(int vk, char *out, size_t n)
 
 static void CastPostKey(UINT msg, UINT vk, bool up)
 {
+    if (g_cast_hwnd == nullptr) return;
     const UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
     LPARAM lp = 1 | (static_cast<LPARAM>(scan) << 16);
     if (up) lp |= (1 << 30) | (1u << 31);
     PostMessageW(g_cast_hwnd, msg, vk, lp);
+}
+
+// ReShade's mouse button order: 0 left, 1 middle, 2 right.
+static const struct { uint32_t idx; UINT down, up; } kCastButtons[] = {
+    { 0, WM_LBUTTONDOWN, WM_LBUTTONUP },
+    { 1, WM_MBUTTONDOWN, WM_MBUTTONUP },
+    { 2, WM_RBUTTONDOWN, WM_RBUTTONUP },
+};
+
+// Release everything the host still believes is held. Called when the cursor leaves the
+// panel and whenever the panel is taken down, so no key or button can stay stuck in ReShade
+// x64's ImGui after this side stops forwarding.
+static void CastFlushInput()
+{
+    int keys = 0, buttons = 0;
+    for (UINT vk = 0; vk < 256; ++vk)
+        if (g_cast_key_down[vk]) { g_cast_key_down[vk] = false; ++keys; CastPostKey(WM_KEYUP, vk, true); }
+    if (g_cast_btn_down != 0 && g_cast_hwnd != nullptr)
+    {
+        const LPARAM at = MAKELPARAM(g_cast_last.x >= 0 ? g_cast_last.x : 0,
+                                     g_cast_last.y >= 0 ? g_cast_last.y : 0);
+        for (const auto &b : kCastButtons)
+            if (g_cast_btn_down & (1u << b.idx)) { ++buttons; PostMessageW(g_cast_hwnd, b.up, 0, at); }
+    }
+    g_cast_btn_down = 0;
+    if ((keys != 0 || buttons != 0) && g_cfg.log_frames > 0)
+        Log("[feed32] cast: released %d key(s) and %d button(s) still held in the host", keys, buttons);
 }
 
 // Finds the host window, registers the thumbnail on the game window and lays the panel
@@ -1297,6 +1449,8 @@ static void CastInput(reshade::api::effect_runtime *rt)
     uint32_t cx = 0, cy = 0;
     int16_t  wheel = 0;
     rt->get_mouse_cursor_position(&cx, &cy, &wheel);   // the wheel comes in notches
+    if (wheel == 0) wheel = g_cast_wheel_pending;      // OnOverlay's earlier read, if this one came up empty
+    g_cast_wheel_pending = 0;
     const POINT p = { static_cast<LONG>(cx), static_cast<LONG>(cy) };
     g_cast_cursor = p;
     const bool inside = PtInRect(&g_cast_rect, p) != FALSE;
@@ -1315,12 +1469,16 @@ static void CastInput(reshade::api::effect_runtime *rt)
         }
         g_cast_hover = false;
         g_cast_last  = { -1, -1 };
+        CastFlushInput();
         return;
     }
     if (!inside && !g_cast_captured)
     {
+        // Leaving the panel stops the forwarding, so anything still held has to be released
+        // now -- otherwise its key-up happens out there and the host never hears it.
         g_cast_hover = false;
         g_cast_last  = { -1, -1 };
+        CastFlushInput();
         return;
     }
 
@@ -1338,22 +1496,43 @@ static void CastInput(reshade::api::effect_runtime *rt)
     g_cast_hover = true;
 
     // Press and release land on different frames by construction -- what ImGui needs
-    // to see a click. ReShade's button indices are 0 left, 1 middle, 2 right.
-    static const struct { uint32_t idx; UINT down, up; } kButtons[] =
+    // to see a click.
+    for (const auto &b : kCastButtons)
     {
-        { 0, WM_LBUTTONDOWN, WM_LBUTTONUP }, { 1, WM_MBUTTONDOWN, WM_MBUTTONUP }, { 2, WM_RBUTTONDOWN, WM_RBUTTONUP },
-    };
-    for (const auto &b : kButtons)
-    {
-        if (rt->is_mouse_button_pressed(b.idx))  { PostMessageW(g_cast_hwnd, b.down, mk, at); g_cast_captured = true; }
-        if (rt->is_mouse_button_released(b.idx)) PostMessageW(g_cast_hwnd, b.up, mk, at);
+        if (rt->is_mouse_button_pressed(b.idx))
+        {
+            PostMessageW(g_cast_hwnd, b.down, mk, at);
+            g_cast_captured = true;
+            g_cast_btn_down |= 1u << b.idx;
+        }
+        if (rt->is_mouse_button_released(b.idx))
+        {
+            PostMessageW(g_cast_hwnd, b.up, mk, at);
+            g_cast_btn_down &= ~(1u << b.idx);
+        }
     }
 
     if (wheel != 0)
     {
-        POINT sp = {};
-        GetCursorPos(&sp);
-        PostMessageW(g_cast_hwnd, WM_MOUSEWHEEL, MAKEWPARAM(mk, wheel * WHEEL_DELTA), MAKELPARAM(sp.x, sp.y));
+        // WM_MOUSEWHEEL carries the cursor in SCREEN coordinates, and ReShade x64 turns the
+        // position in the message into its ImGui mouse position. Sending the real cursor's
+        // screen position put that somewhere over the game instead of over the panel, so the
+        // scroll landed on whatever ImGui window happened to be under a point the user was
+        // not pointing at -- usually none, which is why nothing scrolled. Send the panel
+        // position mapped into the host's own screen space, and a move first so ImGui has
+        // the hover before the wheel arrives.
+        POINT s = { hx, hy };
+        ClientToScreen(g_cast_hwnd, &s);
+        PostMessageW(g_cast_hwnd, WM_MOUSEMOVE, mk, at);
+        g_cast_last = { hx, hy };
+        // One message per notch: ImGui accumulates them, and some builds clamp a single
+        // oversized delta to one line.
+        const int notches = wheel > 0 ? wheel : -wheel;
+        const int step    = wheel > 0 ? WHEEL_DELTA : -WHEEL_DELTA;
+        for (int i = 0; i < notches && i < 16; ++i)
+            PostMessageW(g_cast_hwnd, WM_MOUSEWHEEL, MAKEWPARAM(mk, step), MAKELPARAM(s.x, s.y));
+        if (g_cfg.log_frames > 0)
+            Log("[feed32] cast: wheel %d notch(es) -> host client %d,%d (screen %ld,%ld)", wheel, hx, hy, s.x, s.y);
     }
 
     // Keys, so Ctrl+click text entry, typing a value and the host's own overlay key work.
@@ -1366,6 +1545,7 @@ static void CastInput(reshade::api::effect_runtime *rt)
         if (rt->is_key_pressed(vk))
         {
             CastPostKey(WM_KEYDOWN, vk, false);
+            g_cast_key_down[vk] = true;   // so CastFlushInput can release it if the cursor leaves
             if (have_ks && !ctrl)
             {
                 wchar_t chars[4] = {};
@@ -1374,7 +1554,7 @@ static void CastInput(reshade::api::effect_runtime *rt)
                     if (chars[i] >= 32) PostMessageW(g_cast_hwnd, WM_CHAR, chars[i], 1);
             }
         }
-        if (rt->is_key_released(vk)) CastPostKey(WM_KEYUP, vk, true);
+        if (rt->is_key_released(vk)) { CastPostKey(WM_KEYUP, vk, true); g_cast_key_down[vk] = false; }
     }
 }
 
@@ -1444,6 +1624,16 @@ static void OnPresent(reshade::api::effect_runtime *rt)
 static void OnOverlay(reshade::api::effect_runtime *rt)
 {
     if (rt != g.runtime) return;
+    // ReShade's wheel delta is a per-frame value. This callback runs inside its GUI draw,
+    // earlier in the frame than reshade_present where CastInput reads it, so take it here
+    // too: if the delta has already been cleared by then, this is the copy that survives.
+    // CastInput prefers its own read and only falls back to this one.
+    {
+        uint32_t wx = 0, wy = 0;
+        int16_t  w  = 0;
+        rt->get_mouse_cursor_position(&wx, &wy, &w);
+        if (w != 0) g_cast_wheel_pending = w;
+    }
     if (!g_cast_shown)
     {
         if (g_cast_hid_cursor) { ImGui::GetIO().MouseDrawCursor = true; g_cast_hid_cursor = false; }
@@ -2113,35 +2303,54 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     else
         for (int i = 0; i < FEED_SLOTS; ++i)
             b.tex[i] = reinterpret_cast<uintptr_t>(g.tex_handle[i]);
-    b.panel_tex = CastMakePanel();   // v7: the in-game panel's texture (0 when the host has none)
+    // v7: the in-game panel's texture (0 when the host has none). Not when the host creates
+    // the set -- it then makes the panel too and ignores this field, so making one here would
+    // only burn a texture nobody writes; CastAdoptHostPanel11 opens the host's from the ack.
+    b.panel_tex = g.host_creates ? 0 : CastMakePanel();
 
     Breadcrumb("asking the host to build");
     BYTE tag = 'B';
     FeedBuildAck ack = {};
     if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
     { HostLost("build exchange failed"); return false; }
+
+    // Take ownership of every handle the host duplicated in, BEFORE any early return can drop
+    // it. The host fills ack.tex[] whenever it created the textures, whether or not the
+    // feature create that follows succeeded -- so a build that fails here used to leak four
+    // handles, plus the panel's, every attempt. ReleaseShared() closes g.tex_handle[], and
+    // BuildShared starts with a ReleaseShared(), so a retry is covered. (The GL and Vulkan
+    // builds have always done this; the D3D11 host-creates path never did.)
+    if (g.host_creates)
+        for (int i = 0; i < FEED_SLOTS; ++i)
+            g.tex_handle[i] = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.tex[i]));
+
     if (!ack.ok && (ack.flags & FEED_ACK_SR_UNAVAILABLE) != 0)
     {
         // The host found no DLSS preset for this ratio: build again as DLAA + FSR 1, once.
         Log("[feed32] work_upscale=2: no DLSS preset covers %ux%u -> %ux%u; staying on DLAA + FSR 1 for this size", w, h, backbuffer_w, backbuffer_h);
         g.sr_unavailable = true;
+        if (ack.panel_tex != 0) CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex)));
         return BuildShared(w, h, backbuffer_w, backbuffer_h, bb_fmt);
     }
     if (!ack.ok)
     {
         Log("[feed32] host build failed (ngx 0x%08X)", ack.ngx_result);
+        if (ack.panel_tex != 0) CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex)));
         return false;
     }
 
     if (g.host_creates)
     {
-        // The handles are already duplicated into this process; ReleaseShared closes them.
+        // The handles were taken above; ReleaseShared closes them.
         ID3D11Device1 *dev1 = nullptr;
         if (FAILED(g.dev->QueryInterface(__uuidof(ID3D11Device1), reinterpret_cast<void **>(&dev1))) || dev1 == nullptr)
-        { FeedDisable("ID3D11Device1 unavailable, so the host-created textures cannot be opened (Windows 8+ D3D11.1 runtime required)"); return false; }
+        {
+            if (ack.panel_tex != 0) CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex)));
+            FeedDisable("ID3D11Device1 unavailable, so the host-created textures cannot be opened (Windows 8+ D3D11.1 runtime required)");
+            return false;
+        }
         for (int i = 0; i < FEED_SLOTS; ++i)
         {
-            g.tex_handle[i] = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.tex[i]));
             const HRESULT hr = g.tex_handle[i] != nullptr
                 ? dev1->OpenSharedResource1(g.tex_handle[i], __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&g.tex[i]))
                 : E_HANDLE;
@@ -2149,12 +2358,14 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
             {
                 Log("[feed32] OpenSharedResource1(tex %d) failed 0x%08X -- this device cannot open the host's textures either",
                     i, hr);
+                if (ack.panel_tex != 0) CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex)));
                 dev1->Release();
                 ReleaseShared();
                 FeedDisable("the shared textures cannot be created on the game's device or opened from the host's");
                 return false;
             }
         }
+        CastAdoptHostPanel11(dev1, ack);   // the host made the panel too; ours would never be written
         dev1->Release();
         if (ack.output_fmt != 0 && static_cast<DXGI_FORMAT>(ack.output_fmt) != g.output_fmt)
         {
@@ -3097,6 +3308,14 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         Log("[feed32] the game recreated its Vulkan device; rebuilding on the new one");
         g.fence_wait_queued = false;
         for (int i = 0; i < FEED_SLOTS; ++i) { g.vk_img[i] = VK_NULL_HANDLE; g.vk_mem[i] = VK_NULL_HANDLE; }
+        // The cast's panel image is an import of the old device too, and it has to be dropped
+        // HERE: `g.vk = {}` below clears the entry points, and ReleaseShared's panel cleanup
+        // is gated on g.vk.ok, so it would be skipped. Leaving them set meant the next build
+        // saw a panel already imported (early return, new handle leaked) and CastVkDrawPanel
+        // blitted a VkImage belonging to a destroyed device.
+        g.vk_panel     = VK_NULL_HANDLE;
+        g.vk_panel_mem = VK_NULL_HANDLE;
+        g.vk_panel_init = false;
         g.vk = {};
         g.vk_sem_in = g.vk_sem_out = VK_NULL_HANDLE;
         g.rs_fence_in = g.rs_fence_out = {};
@@ -3579,7 +3798,9 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
 
     char v[16] = {};
     g.depth_reversed = true;
-    if (rt->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", v))
+    // Per-effect scope first, like the provider lookup: see the 64-bit add-on's note.
+    if (rt->get_preprocessor_definition_for_effect(kEffectFile, "RESHADE_DEPTH_INPUT_IS_REVERSED", v) ||
+        rt->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", v))
         g.depth_reversed = atoi(v) != 0;
 
     g.handles_ok = g.technique.handle != 0 && g.mv_var.handle != 0 && g.depth_var.handle != 0;
@@ -3627,6 +3848,9 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
     g.runtime = rt;
     ResolveHandles(rt);
     DetectSmoothMotion();   // a present interposer can arrive after this add-on did
+    // Not in DllMain (LoadLibrary under the loader lock) and not in the exception filter
+    // (ReShade refuses a LoadLibrary from there): this is what makes a dump possible.
+    FeedResolveDbghelp();
     static int inits = 0;
     if (++inits <= 8) Log("[feed32] effect runtime %p initialised", (void *)rt);
 }
@@ -3755,6 +3979,16 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g.consecutive_fails = 0;
         g_retry_at = 0;
         g_disable_why[0] = '\0';
+        // HostClose() keeps g.built on the D3D11 path (the game owns those textures, so a
+        // replacement host can re-open them). But if the host is what died, "built" with no
+        // host means the frame path skips the rebuild and then trips over the dead host on
+        // the very next frame -- disabled again, and only "Restart the host" ever recovered.
+        // A build is cheap here; the host it needs gets spawned by EnsureHost as usual.
+        if (!HostAlive() && g.built)
+        {
+            g.built = false;
+            Log("[feed32] re-enable: the host is gone, so the shared set is rebuilt from scratch");
+        }
         Log("[feed32] re-enabled from the overlay");
     }
 
@@ -4074,6 +4308,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        // First, before anything else can fault: CrashFilter lives in code that is about to
+        // be unmapped. ReShade reloads add-ons per Vulkan instance (see feed_vk_hook.h), so
+        // leaving it installed means a later crash jumps into freed memory and the game's own
+        // handler never sees the real fault.
+        SetUnhandledExceptionFilter(g_prev_filter);
         CastRelease();
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_present>(OnPresent);
@@ -4090,6 +4329,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         HostClose();
         reshade::unregister_addon(module);
         Log("shut down cleanly.");
+        // Last, after the final Log: these are re-initialised on every attach, and ReShade
+        // attaches this add-on again per Vulkan instance, so not deleting them leaks one pair
+        // per load cycle. Nothing may log or feed past this point.
+        DeleteCriticalSection(&g_feed_cs);
+        DeleteCriticalSection(&g_log_cs);
     }
     return TRUE;
 }
