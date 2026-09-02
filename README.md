@@ -65,7 +65,10 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 > supported by this feeder — it is what every release up to now was developed against.
 >
 > **Add-on generations.** The feeder fingerprints the RenoDX build it finds next to it and
-> adapts, so any recent one works; take the newest in the channel. It writes `EnableHooks=2`,
+> adapts, so any recent one works; take the newest in the channel. Any `renodx-dlss5*.addon64`
+> name is recognised (`renodx-dlss5-4.7.addon64` included — before 0.11.0-beta.2 only the exact
+> name was, and a versioned file was logged as "not found" and treated as the classic engine;
+> keep just one copy, ReShade loads them all). It writes `EnableHooks=2`,
 > `NeuralUplift=1` and `NREnableUpscaling=0` when they are unset, and in the `host64` helper
 > unbinds the global hotkeys so a gameplay keypress cannot silently toggle NR in a background
 > process. Every guard is keyed to a marker only the build that needs it carries. **None of
@@ -104,11 +107,17 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 > at the end of this section so you keep Smooth Motion for your D3D11/D3D12 games — you only
 > need to give it up for Vulkan ones.
 >
-> **In a D3D11/D3D12 game** it may well be fine. Since 0.8.0 the feeder is thread-safe against
-> Smooth Motion's extra `Present` calls, and Metro 2033 Redux ran with it active (2026-09-01):
-> session open, frames delivered at the normal cost, nothing raced. Full visual sign-off is still
-> pending, so if you see corruption there, say so on
-> [#1](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/1).
+> **In a D3D11/D3D12 game** it should work from 0.11.0-beta.2 on. Smooth Motion adds its own
+> D3D11 device and an invisible proxy swapchain (`InvisibleWindowClassNvPresent`), and ReShade
+> creates an effect runtime on **each** — `ReShade.ini` for one, `ReShade2.ini` for the other.
+> Until beta.2 the feeder fed whichever runtime initialised last, which under Smooth Motion was
+> routinely the one *without* your preset: the log looked healthy and nothing was neural
+> (issue [#1](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/1), Ghost Recon Breakpoint and
+> AC Syndicate). It now tracks every runtime and feeds the one that actually renders
+> `DLSS5_Feed`; `dlss5-feed.log` lists each runtime with its device and window class, and says
+> which one is bound. Since 0.8.0 it is also thread-safe against Smooth Motion's extra `Present`
+> calls. If the picture still shows no effect with Smooth Motion on, post the log after a minute
+> of play (not the first seconds) on #1, and say whether your *other* ReShade effects are visible.
 >
 > ### Why it can't work on Vulkan
 >
@@ -200,6 +209,9 @@ Proven working in seven games covering every supported path:
 | **Fable Anniversary** | 32-bit **D3D9** via dgVoodoo2 | 1440p, 60 fps |
 | **DOOM (2016)** | 64-bit **Vulkan** | 4K, D3D12 evaluate via cross-API interop |
 | **Worms Ultimate Mayhem** | 32-bit **OpenGL** | 4K, GL↔D3D12 interop + cross-process host, 0.13 ms/frame |
+| **Guild Wars Reforged** | 32-bit **Vulkan** via DXVK | User-reported (#32): 3440x1440, 55 fps on an RTX 4070 (350+ without) |
+| **World of Warcraft 3.3.5a** | 32-bit **Vulkan** via DXVK | User-reported (#15): 4K on an RTX 5080/5090; the working `dxvk.conf` is in the DXVK section |
+| **Star Wars: KOTOR** | 32-bit **OpenGL** | User-reported (#31): RTX 2060, fixed in 0.9.0 (capped `GL_EXTENSIONS` string) |
 
 In each, the DLSS 5 add-on reports `feature 18 created … inline feature 18 evaluation succeeded`,
 driven entirely by ReShade depth + estimated motion vectors.
@@ -452,6 +464,16 @@ Almost every 32-bit game that reaches Vulkan does it through
 
 DLSS runs at the game's native resolution here, so the **Work resolution** slider is fixed at 100%.
 
+A working configuration from issue #15 (World of Warcraft 3.3.5a, DXVK 3.0.2, ReShade 6.8 x86 as
+a global Vulkan layer, Guild Wars Reforged likewise): the default `dxvk.conf` is fine; the only
+setting that mattered was `dxvk.allowFse = False`. Expect roughly half the frame rate — DLAA at
+native size plus the 32→64-bit hop — and, from 0.11.0-beta.2, no more plateaus at exactly 30 fps
+(the helper's own `Present` used to block on the compositor while the game waited behind it; it
+no longer waits). If frame times still step between two fixed values, run once with `mode=1`
+(transport only, no DLSS) and once with `async_home=0` and post both `dlss5-feed.log`s; the
+`present probe` line now also counts presents against frames fed here, which tells an external
+frame pacer apart from a slow helper.
+
 If `dlss5-feed.log` says the interop entry points are missing, use the 32-bit fallback layer:
 
 ```
@@ -560,6 +582,11 @@ NGX and the DLSS 5 add-on only exist as x64 code, and a 32-bit process cannot lo
 
 * It creates the four Color/Output/Depth/MV textures as **cross-process shared** D3D11 resources
   (`D3D11_RESOURCE_MISC_SHARED_NTHANDLE`) on the game's own device, plus two shared fences.
+  If the game's device refuses (a feature-level 10.x device cannot bind the UAV the DLSS output
+  needs — NFS Most Wanted 2012, issue #33), it switches to the route the GL and Vulkan clients
+  use: the host creates the set on D3D12 and hands the handles in, keeps the output's UAV on its
+  own side and copies the result into a plain shared texture. The log says so
+  (`the host will create the shared set instead`).
 * It spawns `dlss5-feed-host64.exe` and hands it the texture/fence handles over a named pipe
   (`DuplicateHandle` across the process boundary — the same WDDM sharing the driver already uses,
   just one hop further).
@@ -707,7 +734,7 @@ if you prefer editing the file directly:
 | --- | --- | --- |
 | `enabled` | 1 | 0 disables everything. |
 | `mode` | 2 | 0 inert · 1 transport test (no NGX; on 32-bit it copies only the left half, so a split screen proves the round trip) · 2 full DLSS path. |
-| `work_resolution` | 100 | **64-bit D3D11 only.** 50–100% of each backbuffer axis for the private DLAA + Neural Rendering work textures. The Add-ons overlay slider applies once 400 ms after dragging stops. Other paths remain at 100%. |
+| `work_resolution` | 100 | **64-bit D3D11 only.** 50–100% of each backbuffer axis for the private DLAA + Neural Rendering work textures. The Add-ons overlay slider applies once 400 ms after dragging stops. Other paths remain at 100%. A cost knob, not DLSS upscaling — below 100% the image is downsampled, processed, and expanded back (see the troubleshooting FAQ). |
 | `hdr` | -1 | -1 auto (FP16 / R11G11B10 backbuffer = HDR), 0 force SDR, 1 force HDR. |
 | `depth_inverted` | -1 | -1 follow `RESHADE_DEPTH_INPUT_IS_REVERSED`, 0/1 force. |
 | `flags` | -1 | raw `DLSS.Feature.Create.Flags` override. |
@@ -821,6 +848,30 @@ Common cases:
   thread: `frame fed from thread N, not the usual M` means `Present` is arriving off-thread, and
   `re-entrant frame … dropped` means it arrived twice at once. Both lines are worth quoting on an
   issue. Turn Smooth Motion off for this game's API only, with Profile Inspector.
+* **Smooth Motion on, everything reports healthy, nothing looks neural** — two ReShade runtimes
+  (`effect runtime … initialised (device …, window class '…'; 2 runtimes in this process)`), and
+  before 0.11.0-beta.2 the feeder could be bound to the wrong one. Update; the log then shows
+  `binding to effect runtime …: it is the one rendering DLSS5_Feed`.
+* **Can I use DLSS Quality / Balanced / Performance instead of DLAA?** No — not as a setting, and
+  not as a future one either. Real DLSS upscaling needs the game to render *smaller* than the
+  screen and jitter its camera, then hands DLSS that small frame; the feeder only ever sees the
+  finished, screen-sized frame ReShade has, so it publishes a 1:1 DLAA contract by construction.
+  `work_resolution` (64-bit D3D11) is a **cost** knob: the frame is downsampled, DLAA + neural
+  rendering run on the smaller image, and the result is expanded back — that is why 50–66% looks
+  blurry rather than like DLSS Quality. Leave the DLSS 5 add-on's `NREnableUpscaling` at 0: with a
+  1:1 contract it cannot engage, and on v4.6 it parks neural rendering for the run. For games that
+  ship DLSS already, use the game's own DLSS (or OptiScaler) instead of this feeder.
+* **32-bit game: `tex 1 CreateTexture2D failed 0x80070057`, `failure: shared build` forever** —
+  the game's D3D11 device is feature level 10.x and cannot bind the UAV the DLSS output needs.
+  From 0.11.0-beta.2 the helper creates the shared set instead (the log says `the host will
+  create the shared set instead`); on older builds there is no workaround (`mode=1` uses the same
+  texture).
+* **The game crashed** — `dlss5-feed.log` (or `dlss5-feed-host.log`) ends with
+  `### CRASH RECORDED ###`, naming the exception, the module it faulted in and what the feeder was
+  doing at the time, and from 0.11.0-beta.2 a `dlss5-feed-crash.dmp` is written next to it. Post
+  the log and the `.dmp` on the issue; the last ordinary line before the crash line (the session
+  opens in fixed steps — adapter, D3D12 device, NGX init, multithread protection, session open)
+  pins the step.
 
 ## Building
 
@@ -854,7 +905,8 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
 * **DLAA contract, optional reduced work extent on 64-bit D3D11** — render resolution still
   equals DLAA output resolution, but the private work extent can be 50–100% of the native
   backbuffer and is spatially expanded afterward. D3D12, Vulkan, OpenGL and 32-bit paths remain at
-  100%. This is not jittered DLSS Super Resolution.
+  100%. This is not jittered DLSS Super Resolution, and a Quality/Balanced/Performance mode cannot
+  be added: see the FAQ entry in [Logs and troubleshooting](#logs-and-troubleshooting).
 * Estimated motion vectors → temporal artifacts in fast motion; the UI is processed with the scene
   (a UI mask / pre-UI colour capture is future work).
 * **Geometry vectors are experimental and off.** The camera-model fit is derived from the provider's

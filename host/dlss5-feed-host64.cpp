@@ -193,16 +193,43 @@ static void RenodxFindBanner(const char *buf, DWORD size, char *out, size_t out_
     }
 }
 
+// Versioned copies ("renodx-dlss5-4.7.addon64") are what the channel actually ships;
+// ReShade loads any *.addon64, so an exact-name check reported a working add-on as
+// missing and then treated it as the classic engine. Match the prefix instead.
+static bool FindRenodxAddon(const char *dir, char *out, size_t out_size)
+{
+    char pattern[MAX_PATH];
+    sprintf_s(pattern, "%srenodx-dlss5*.addon64", dir);
+    WIN32_FIND_DATAA fd = {};
+    HANDLE find = FindFirstFileA(pattern, &fd);
+    if (find == INVALID_HANDLE_VALUE) return false;
+    int matches = 0;
+    char first[MAX_PATH] = "";
+    do
+    {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (++matches == 1) strcpy_s(first, fd.cFileName);
+        else Log("[host] %s is ALSO in host64\\ -- ReShade loads every *.addon64, so two copies of the add-on will "
+                 "both hook NGX; keep one", fd.cFileName);
+    } while (FindNextFileA(find, &fd));
+    FindClose(find);
+    if (matches == 0) return false;
+    strcpy_s(out, out_size, first);
+    return true;
+}
+
 static void DetectRenodxAddon()
 {
-    char dir[MAX_PATH], path[MAX_PATH], ini[MAX_PATH];
+    char dir[MAX_PATH], path[MAX_PATH], ini[MAX_PATH], name[MAX_PATH];
     GetModuleFileNameA(nullptr, dir, MAX_PATH);
     if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
-    sprintf_s(path, "%srenodx-dlss5.addon64", dir);
     sprintf_s(ini, "%sReShade.ini", dir);
+    if (!FindRenodxAddon(dir, name, sizeof(name))) { Log("[host] renodx-dlss5*.addon64 not found next to the host"); return; }
+    sprintf_s(path, "%s%s", dir, name);
 
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (f == INVALID_HANDLE_VALUE) { Log("[host] renodx-dlss5.addon64 not found next to the host"); return; }
+    if (f == INVALID_HANDLE_VALUE) { Log("[host] %s is here but could not be opened (error %lu)", name, GetLastError()); return; }
+    Log("[host] DLSS 5 add-on file: %s", name);
     g_renodx_present = true;
     const DWORD size = GetFileSize(f, nullptr);
     DWORD got = 0;
@@ -551,8 +578,11 @@ struct Host
     NVSDK_NGX_Handle    *feature;
 
     ID3D12Resource *tex[FEED_SLOTS];
+    ID3D12Resource *out_scratch;   // FEED_BUILD_OUTPUT_NO_UAV: NGX writes here; copied into the shared Output
     UINT            width, height;
     DXGI_FORMAT     color_fmt, output_fmt;
+
+    HANDLE          latency_wait;  // the disguise swapchain's frame-latency waitable object
 };
 
 static Host h;
@@ -846,6 +876,18 @@ static void PumpPresent(bool force = false)
     if (!force && now - last < 33) return;
     last = now;
 
+    // No free back buffer yet: skip this present rather than wait for DWM (see the
+    // swapchain creation for why). The DLSS 5 add-on keys per-frame state to Present, so
+    // a skipped present makes two evaluates share a frame on its side -- counted here so
+    // a log can show how often, and never more than DWM's own rhythm forces.
+    if (h.latency_wait != nullptr && WaitForSingleObject(h.latency_wait, 0) != WAIT_OBJECT_0)
+    {
+        static unsigned skipped = 0;
+        if (++skipped == 1 || (skipped % 1800) == 0)
+            Log("[host] present skipped: DWM still holds the back buffer (%u so far; the game is never made to wait for it)", skipped);
+        return;
+    }
+
     // Paint the banner into the backbuffer (ReShade's overlay composites on top at Present).
     if (g_banner != nullptr && g_pump_list != nullptr && g_swap3 != nullptr)
     {
@@ -877,7 +919,13 @@ static void PumpPresent(bool force = false)
             bb->Release();
         }
     }
-    h.swap->Present(0, 0);
+    const HRESULT hr = h.swap->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+    {
+        static unsigned busy = 0;
+        if (++busy == 1 || (busy % 1800) == 0)
+            Log("[host] present skipped: DXGI was still drawing (%u so far)", busy);
+    }
 }
 
 static bool InitDisguise()
@@ -935,7 +983,26 @@ static bool InitDisguise()
     sd.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount      = 2;
     sd.SwapEffect       = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    // Waitable, latency 1: Present on this chain must never block. It is called once per
+    // evaluate, and the game's next frame waits on fence_out behind that evaluate -- so
+    // a Present that DWM holds until the next vblank (the window is occluded by a
+    // fullscreen game, or the present queue is full) paced the GAME at the compositor's
+    // rhythm: the rigid 33.5 ms / 30 fps plateaus of issue #15 on 32-bit DXVK, with the
+    // feed's own CPU cost at 0.1 ms. PumpPresent checks the waitable object and skips
+    // the Present when a buffer is not free, and asks DXGI not to wait either way.
+    sd.Flags            = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     hr = factory->CreateSwapChainForHwnd(h.pump_queue, h.hwnd, &sd, nullptr, nullptr, &h.swap);
+    if (SUCCEEDED(hr))
+    {
+        IDXGISwapChain2 *swap2 = nullptr;
+        if (SUCCEEDED(h.swap->QueryInterface(__uuidof(IDXGISwapChain2), reinterpret_cast<void **>(&swap2))) && swap2 != nullptr)
+        {
+            swap2->SetMaximumFrameLatency(1);
+            h.latency_wait = swap2->GetFrameLatencyWaitableObject();
+            swap2->Release();
+        }
+        if (h.latency_wait == nullptr) Log("[host] no frame-latency waitable object; Present may block on DWM");
+    }
     // By default DXGI watches this window and may act on window/foreground changes -- which,
     // for a helper spawned behind a fullscreen game, can pull the game out of focus. We only
     // ever use this swapchain to keep ReShade pumping, so tell DXGI to keep its hands off.
@@ -1064,6 +1131,22 @@ static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resour
     DWORD ecode = 0;
     NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
     if (ecode != 0) { AbortCommands(); Log("[host] evaluate raised 0x%08X (caught; nothing submitted)", ecode); return false; }
+    if (NVSDK_NGX_SUCCEED(re) && output == h.out_scratch && h.out_scratch != nullptr)
+    {
+        // The game's device cannot open a UAV texture: NGX wrote the private scratch,
+        // and the shared Output (no UAV flag) receives a copy on the same list. The
+        // scratch was promoted to UNORDERED_ACCESS by the evaluate; the shared target is
+        // promoted to COPY_DEST implicitly (SIMULTANEOUS_ACCESS), and both decay to
+        // COMMON when this submission completes.
+        D3D12_RESOURCE_BARRIER bar = {};
+        bar.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bar.Transition.pResource   = h.out_scratch;
+        bar.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        h.list->ResourceBarrier(1, &bar);
+        h.list->CopyResource(h.tex[FEED_OUTPUT], h.out_scratch);
+    }
     EndCommands();
     if (NVSDK_NGX_FAILED(re)) { Log("[host] evaluate failed 0x%08X (%s)", re, NgxResultName(re)); return false; }
     return true;
@@ -1119,7 +1202,7 @@ static DXGI_FORMAT ResolveOutputFormatHost(DXGI_FORMAT want)
 // process can open. This is also a better resource than the D3D11 route's: it is born
 // with exactly the flags NGX wants, with none of MakeSharedPair's UAV-flag uncertainty.
 static ID3D12Resource *MakeSharedTexHost(UINT w, UINT h_, DXGI_FORMAT fmt, bool uav,
-                                         HANDLE *out_handle, uint64_t *out_size)
+                                         HANDLE *out_handle, uint64_t *out_size, bool render_target = false)
 {
     *out_handle = nullptr;
     *out_size   = 0;
@@ -1135,8 +1218,11 @@ static ID3D12Resource *MakeSharedTexHost(UINT w, UINT h_, DXGI_FORMAT fmt, bool 
     rd.Format           = fmt;
     rd.SampleDesc.Count = 1;
     rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    // ALLOW_RENDER_TARGET is what a D3D11 opener needs for its work-resolution resample
+    // RTVs (D3D11 derives its bind flags from these); GL/Vulkan importers do not care.
     rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
-                          (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
+                          (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE) |
+                          (render_target ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource *t = nullptr;
     HRESULT hr = h.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
                                                 nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&t));
@@ -1377,16 +1463,26 @@ static int Serve(DWORD game_pid)
             h.feature = nullptr;
             for (int i = 0; i < FEED_SLOTS; ++i)
                 if (h.tex[i] != nullptr) { h.tex[i]->Release(); h.tex[i] = nullptr; }
+            if (h.out_scratch != nullptr) { h.out_scratch->Release(); h.out_scratch = nullptr; }
 
             bool ok = true;
             uint64_t game_tex[FEED_SLOTS] = {}, tex_size[FEED_SLOTS] = {};
+            // A D3D11 client whose device refused the shared set asks for the GL/Vulkan
+            // route per build (v5, issue #33); one that cannot bind UAVs at all gets an
+            // Output without one, and NGX writes a private scratch that is copied over.
+            const bool host_creates_b = host_creates || (b.client_flags & FEED_BUILD_HOST_CREATES) != 0;
+            const bool no_uav         = host_creates_b && (b.client_flags & FEED_BUILD_OUTPUT_NO_UAV) != 0;
+            const bool d3d11_opener   = host_creates_b && !host_creates;
+            if (d3d11_opener)
+                Log("[host] the game's D3D11 device could not create the shared set; creating it here%s",
+                    no_uav ? " with the DLSS output's UAV kept on this side" : "");
             // The Output format is the host's call whenever the host creates the
             // textures -- only this process has the D3D12 device that can be asked
             // about typed UAV stores. In transport mode there is no UAV at all and
             // the copy is Color -> Output on this side, so the two must stay equal.
             DXGI_FORMAT out_fmt = static_cast<DXGI_FORMAT>(b.output_fmt);
-            if (host_creates && b.transport == 0) out_fmt = ResolveOutputFormatHost(out_fmt);
-            if (host_creates)
+            if (host_creates_b && b.transport == 0) out_fmt = ResolveOutputFormatHost(out_fmt);
+            if (host_creates_b)
             {
                 // OpenGL / Vulkan client: WE create, and duplicate the handles into the
                 // game, which imports them (PLAN-OPENGL §5 design A; PLAN-VULKAN32 §2).
@@ -1396,7 +1492,8 @@ static int Serve(DWORD game_pid)
                 for (int i = 0; i < FEED_SLOTS && ok; ++i)
                 {
                     HANDLE local = nullptr;
-                    h.tex[i] = MakeSharedTexHost(b.width, b.height, fmt[i], i == FEED_OUTPUT, &local, &tex_size[i]);
+                    h.tex[i] = MakeSharedTexHost(b.width, b.height, fmt[i], i == FEED_OUTPUT && !no_uav, &local, &tex_size[i],
+                                                 d3d11_opener && i != FEED_OUTPUT);
                     if (h.tex[i] == nullptr) { ok = false; break; }
                     HANDLE remote = nullptr;
                     if (!DuplicateHandle(GetCurrentProcess(), local, hgame, &remote, 0, FALSE, DUPLICATE_SAME_ACCESS))
@@ -1408,6 +1505,27 @@ static int Serve(DWORD game_pid)
                     Log("[host] created and handed over %d shared textures (%ux%u, color %s, output %s)",
                         FEED_SLOTS, b.width, b.height, FeedFmtName(static_cast<DXGI_FORMAT>(b.color_fmt)),
                         FeedFmtName(out_fmt));
+                if (ok && no_uav && b.transport == 0)
+                {
+                    // Private, UAV-capable, same format: NGX evaluates into this and Evaluate()
+                    // copies it into the shared Output the game can open. SIMULTANEOUS_ACCESS so
+                    // its state decays to COMMON after every submission, like the shared set.
+                    D3D12_HEAP_PROPERTIES hp = {};
+                    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                    D3D12_RESOURCE_DESC rd = {};
+                    rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                    rd.Width            = b.width;
+                    rd.Height           = b.height;
+                    rd.DepthOrArraySize = 1;
+                    rd.MipLevels        = 1;
+                    rd.Format           = out_fmt;
+                    rd.SampleDesc.Count = 1;
+                    rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+                    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+                    const HRESULT hr = h.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                                      nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&h.out_scratch));
+                    if (FAILED(hr)) { Log("[host] output scratch texture failed 0x%08X", hr); ok = false; }
+                }
             }
             else
             {
@@ -1507,7 +1625,8 @@ static int Serve(DWORD game_pid)
                 }
             }
             else
-                done = Evaluate(h.tex[FEED_COLOR], h.tex[FEED_OUTPUT], h.tex[FEED_DEPTH], h.tex[FEED_MV],
+                done = Evaluate(h.tex[FEED_COLOR], h.out_scratch != nullptr ? h.out_scratch : h.tex[FEED_OUTPUT],
+                                h.tex[FEED_DEPTH], h.tex[FEED_MV],
                                 h.width, h.height, fm.reset ? 1 : 0, mvsx, mvsy);
 
             if (done)
@@ -1576,12 +1695,50 @@ static int Serve(DWORD game_pid)
 
 // ---------------------------------------------------------------------------
 
+// Same shape as the add-ons' filter: the crash goes in the log with the faulting
+// module, and a minidump lands next to it (dbghelp loaded on demand).
+typedef BOOL (WINAPI *PFN_MiniDumpWriteDump_)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
+{
+    const void *addr = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+    const DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+    wchar_t owner[MAX_PATH] = L"unknown";
+    HMODULE mod = nullptr;
+    if (addr != nullptr &&
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(addr), &mod) && mod != nullptr)
+        GetModuleFileNameW(mod, owner, MAX_PATH);
+    Log("### CRASH RECORDED ###  exception 0x%08X at %p in %ls%s", code, addr, owner,
+        mod == GetModuleHandleW(nullptr) ? " (inside this host)" : "");
+
+    char path[MAX_PATH];
+    strcpy_s(path, g_log_path);
+    if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "dlss5-feed-host-crash.dmp");
+    HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
+    auto write = dbghelp ? reinterpret_cast<PFN_MiniDumpWriteDump_>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+    HANDLE f = write != nullptr ? CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr)
+                                : INVALID_HANDLE_VALUE;
+    if (f != INVALID_HANDLE_VALUE)
+    {
+        struct { DWORD tid; EXCEPTION_POINTERS *ep; BOOL client; } info = { GetCurrentThreadId(), ep, FALSE };
+        const int type = 0x0040 | 0x0001 | 0x0004;   // IndirectlyReferencedMemory | DataSegs | HandleData
+        const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), f, type, ep != nullptr ? &info : nullptr, nullptr, nullptr);
+        CloseHandle(f);
+        Log(ok ? "[host] crash dump written: %s -- attach it to the issue with this log"
+               : "[host] crash dump FAILED (%s, error %lu)", path, GetLastError());
+    }
+    else
+        Log("[host] no crash dump written (dbghelp %s, error %lu)", write ? "present" : "missing", GetLastError());
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int main(int argc, char **argv)
 {
     GetModuleFileNameA(nullptr, g_log_path, MAX_PATH);
     if (char *s = strrchr(g_log_path, '\\'))
         strcpy_s(s + 1, MAX_PATH - (s + 1 - g_log_path), "dlss5-feed-host.log");
     { FILE *f = nullptr; if (fopen_s(&f, g_log_path, "w") == 0 && f) fclose(f); }
+    SetUnhandledExceptionFilter(&CrashFilter);
 
     Log("dlss5-feed-host64 (built %s %s)", __DATE__, __TIME__);
 

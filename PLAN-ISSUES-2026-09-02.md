@@ -177,3 +177,54 @@ line naming the actual file found. Same change for the host (`host/dlss5-feed-ho
 - E: inject a deliberate fault behind a debug key and confirm the `.dmp` lands next to the log.
 - Then stamp/tag `v0.10.0-beta.3`, publish the release, and post the approved replies with
   `gh issue comment`.
+
+
+# Reply drafts — post after 0.11.0-beta.2 is released (each references it)
+
+## #1 (Smooth Motion) — reply, keep open
+
+@cptmacp — I owe you a correction: your setup is not incomplete, and your A/B logs are what found the bug.
+
+Both ReShade logs show what Smooth Motion does on D3D11: NvPresent64 creates a **second D3D11 device and an invisible proxy swapchain** (`RegisterClassExA "InvisibleWindowClassNvPresent"`, then `CreateSwapChain` on a different `pDevice`), and ReShade creates an effect runtime on each — `ReShade.ini` for one, `ReShade2.ini` for the other. The feeder had one global "current runtime" and bound to whichever initialised **last**; under Smooth Motion that was routinely the runtime *without* your preset, so it resolved `DLSS5_Feed.fx technique MISSING` there and then ignored every render of the technique on the other runtime. Healthy-looking log, no neural pass — exactly what @Colada-K described, and their log has the same two-runtime shape.
+
+**0.11.0-beta.2** tracks every runtime and feeds the one that actually renders `DLSS5_Feed`. The log now lists each runtime with its device and window class (the proxy is called out by name) and prints `binding to effect runtime …: it is the one rendering DLSS5_Feed` when it switches.
+
+Two more things from your logs:
+- Your add-on file is `renodx-dlss5-4.7.addon64`; the feeder only matched the exact name `renodx-dlss5.addon64`, so it logged "not found" and ran as if a classic engine were installed. beta.2 matches `renodx-dlss5*.addon64`. Until then, renaming the file also fixes it.
+- With Smooth Motion off, your run works but `MV probe … 0% non-zero` on every probe: Lumenite Kernel is enabled but producing no vectors, so DLSS is running without motion (static-sharp, smears when moving). That's separate from Smooth Motion — check the Kernel technique sits above DLSS 5 Feed and compiled cleanly in ReShade.log.
+
+Could both of you retest on beta.2 and post `dlss5-feed.log` **after a minute of gameplay** (both attached logs stop at the effect compile, before a frame was fed)? And one question that settles what NvPresent scans out: with Smooth Motion on, are your *other* ReShade effects visible?
+
+(Aside: for 64-bit D3D11 games ShortFuse's renodx-dlss handles presentation natively and needs no feeder — see the banner at the top of the README — if you want a second data point.)
+
+## #15 (32-bit DXVK) — reply
+
+@FIocker — thank you, that is the first end-to-end 32-bit DXVK configuration on record; it is now in the README's DXVK section, and WoW 3.3.5a has a status row.
+
+@skoriandlp-arch — your numbers pointed at the right place. The feeder's `feed CPU` figure only counts CPU time inside the ReShade callback; a GPU-side wait on the helper's fence is invisible to it, which is how 0.09 ms/frame and a rigid 33.5 ms plateau coexist. The helper presented its own (occluded) window **once per evaluate with a blocking `Present`**, and with `async_home` the game's next frame waits on that evaluate's fence — so whenever DWM held the helper's back buffer to the next vblank, the game inherited the wait and settled at two vblanks. **0.11.0-beta.2** makes that present non-blocking (waitable swapchain, latency 1, `DO_NOT_WAIT`; a skipped present is counted in `dlss5-feed-host.log`), and the 32-bit add-on now also feeds the `present probe` counter so an external pacer shows up as presents ≫ frames fed.
+
+If the plateaus survive beta.2, two runs would isolate the remainder: `mode=1` (transport only, no DLSS evaluate) and `async_home=0`, each with `dlss5-feed.log` + `dlss5-feed-host.log`.
+
+## #32 (Guild Wars Reforged) — reply, then close
+
+Thanks — added as a working 32-bit DXVK row in the README. 350+ → 55 fps is the DLAA-at-native cost plus the 32→64-bit hop at 3440x1440; 0.11.0-beta.2 removes one known stall in that hop (the helper's present could block the game, #15), so a quick before/after `dlss5-feed.log` on beta.2 would be welcome, but there is nothing further to fix here. Closing as a working configuration.
+
+## #33 (NFS MW 2012) — reply
+
+`tex 1` is the DLSS **output** — the only one of the four shared textures created with a UAV bind. Slot 0 (Color, identical desc minus the UAV) succeeded, so the device is refusing the UAV itself: that is a **feature-level 10.x D3D11 device**, which cannot bind UAVs (Frostbite 2 creates one). `mode=1` cannot help — it uses the same texture — and the old code retried the same desc forever.
+
+**0.11.0-beta.2** falls back to the route the OpenGL/Vulkan clients use: the 64-bit helper creates the shared set, keeps the output's UAV on its own side and copies the result into a plain shared texture the game opens. The log will say `the game's D3D11 device (feature level 10_x) refused the shared Output texture; the host will create the shared set instead`. Please retest and attach `dlss5-feed.log`, `dlss5-feed-host.log` and `ReShade.log`.
+
+## #34 (Upscaling?) — reply, close as answered
+
+Not possible, and not as a future setting either — the feeder is DLAA-only by construction. Real DLSS upscaling needs the game to render *smaller* than the screen and jitter its camera, then hands DLSS that small frame plus motion vectors. This feeder only ever sees the finished, screen-sized frame ReShade has, so it publishes a 1:1 DLAA contract (input = output size, no jitter). `work_resolution` is a **cost** knob: the frame is downsampled, DLAA + neural rendering run on the smaller image, and the result is expanded back — which is why 50–66% looks blurry rather than like DLSS Quality. Leave the DLSS 5 add-on's `NREnableUpscaling` at 0: with a 1:1 contract it cannot engage, and on v4.6 it parks neural rendering for the run.
+
+For games that ship DLSS already, use the game's own DLSS (or OptiScaler) rather than this feeder; the ~50% cost in a game like BioShock Remastered (@haldi4803) is the neural pass at native resolution and is expected. Written up in the README's troubleshooting FAQ. Closing as answered.
+
+## #35 (MGSV Ground Zeroes) — reply
+
+Thanks for the unusually thorough isolation — it points at one place. The feeder opens its session the moment ReShade renders the `DLSS5_Feed` technique (not when the passes do anything): D3D12 device, NGX init, then multithread protection on the game's immediate context — all before `create_delay`, all under `mode=1` (only `mode=0` is inert), and none of it involves the RenoDX add-on. Renaming the technique is the one change that skips that path entirely, which is exactly what you saw.
+
+Please attach `dlss5-feed.log` and `ReShade.log`: the feeder's log ends with a `### CRASH RECORDED ###` line naming the exception, the module it faulted in, and the step it was on (`opening the D3D12 session` / `initialising NGX on D3D12` / after `D3D11 multithread protection enabled`). **0.11.0-beta.2** additionally catches a fault inside NGX init and turns it into a clean disable, and writes a `dlss5-feed-crash.dmp` next to the log for anything else — please retest on it and include the `.dmp` if one appears.
+
+(Aside: MGSV GZ is 64-bit D3D11, which ShortFuse's renodx-dlss now handles without a feeder — README banner — if you want to compare.)

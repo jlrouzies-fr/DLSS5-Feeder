@@ -57,7 +57,7 @@
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
 #include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
 
-#define FEED_VERSION "0.11.0-beta.1"
+#define FEED_VERSION "0.11.0-beta.2"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -125,6 +125,30 @@ static void Warn(const char *fmt, ...)
 static const char *volatile g_where = "starting up";
 static void Breadcrumb(const char *what) { g_where = what; }
 
+// A minidump next to the log, so a crash report can be read in a debugger instead of
+// guessed at from the breadcrumb. dbghelp is loaded on demand -- it is not a dependency
+// until the moment the process is already dying. Kept small (no full memory): the stack,
+// the module list and the memory the registers point at are what a crash needs.
+typedef BOOL (WINAPI *PFN_MiniDumpWriteDump_)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+static void WriteCrashDump(EXCEPTION_POINTERS *ep)
+{
+    char path[MAX_PATH];
+    strcpy_s(path, g_log_path);
+    if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "dlss5-feed-crash.dmp");
+    HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
+    auto write = dbghelp ? reinterpret_cast<PFN_MiniDumpWriteDump_>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+    if (write == nullptr) { Log("[feed] no dbghelp.dll; no crash dump written"); return; }
+    HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) { Log("[feed] could not create %s (error %lu)", path, GetLastError()); return; }
+    struct { DWORD tid; EXCEPTION_POINTERS *ep; BOOL client; } info = { GetCurrentThreadId(), ep, FALSE };
+    // MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithDataSegs | MiniDumpWithHandleData
+    const int type = 0x0040 | 0x0001 | 0x0004;
+    const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), f, type, ep != nullptr ? &info : nullptr, nullptr, nullptr);
+    CloseHandle(f);
+    Log(ok ? "[feed] crash dump written: %s -- attach it to the issue with this log"
+           : "[feed] crash dump FAILED (%s, error %lu)", path, GetLastError());
+}
+
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
@@ -138,6 +162,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
         GetModuleFileNameW(mod, owner, MAX_PATH);
     Log("### CRASH RECORDED ###  exception 0x%08X at %p in %ls; this add-on was last doing: %s%s", code, addr,
         owner, g_where, mod == g_self ? " (inside this add-on)" : "");
+    WriteCrashDump(ep);
     return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -230,17 +255,50 @@ static void RenodxDefault(const char *key, const char *value, const char *why)
         Log("[feed] %s=%s (user-set; leaving it alone)", key, v);
 }
 
+static char g_renodx_file[MAX_PATH] = "renodx-dlss5.addon64";   // the file actually found
+
+// The add-on is distributed under versioned names too ("renodx-dlss5-4.7.addon64"), and
+// ReShade loads any *.addon64 -- so a user with the versioned file has a working add-on
+// that this feeder used to report as "not found", and then treated as the classic engine
+// (warm-up re-create on, no EnableHooks default, no lazy-engine grace). Match the prefix.
+static bool FindRenodxAddon(const char *dir, char *out, size_t out_size)
+{
+    char pattern[MAX_PATH];
+    sprintf_s(pattern, "%srenodx-dlss5*.addon64", dir);
+    WIN32_FIND_DATAA fd = {};
+    HANDLE find = FindFirstFileA(pattern, &fd);
+    if (find == INVALID_HANDLE_VALUE) return false;
+    int matches = 0;
+    char first[MAX_PATH] = "";
+    do
+    {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (++matches == 1) strcpy_s(first, fd.cFileName);
+        else Log("[feed] DLSS 5 add-on: %s is ALSO here -- ReShade loads every *.addon64, so two copies of the add-on "
+                 "will both hook NGX; keep one", fd.cFileName);
+    } while (FindNextFileA(find, &fd));
+    FindClose(find);
+    if (matches == 0) return false;
+    strcpy_s(out, out_size, first);
+    return true;
+}
+
 static void DetectRenodxAddon()
 {
     char path[MAX_PATH];
     GetModuleFileNameA(g_self, path, MAX_PATH);
-    if (char *s = strrchr(path, '\\'))
-        strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "renodx-dlss5.addon64");
+    if (char *s = strrchr(path, '\\')) *(s + 1) = '\0';
+    if (!FindRenodxAddon(path, g_renodx_file, sizeof(g_renodx_file)))
+    {
+        Log("[feed] DLSS 5 add-on: renodx-dlss5*.addon64 not found next to this add-on");
+        return;
+    }
+    strcat_s(path, g_renodx_file);
 
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE)
     {
-        Log("[feed] DLSS 5 add-on: renodx-dlss5.addon64 not found next to this add-on");
+        Log("[feed] DLSS 5 add-on: %s is here but could not be opened (error %lu)", g_renodx_file, GetLastError());
         return;
     }
     g_renodx_present = true;
@@ -273,7 +331,7 @@ static void DetectRenodxAddon()
         free(vdata);
     }
 
-    Log("[feed] DLSS 5 add-on: renodx-dlss5.addon64 %s%s (file version %s) -- %s engine",
+    Log("[feed] DLSS 5 add-on: %s %s%s (file version %s) -- %s engine", g_renodx_file,
         g_renodx_gen[0] != '\0' ? "" : "v", g_renodx_gen[0] != '\0' ? g_renodx_gen : g_renodx_ver, g_renodx_ver,
         g_renodx_v47  ? "v4.7+ (per-present rescan, lazy adoption, reversible colour bridge, fenced workset pool)"
       : g_renodx_v46  ? "v4.6+ (per-present rescan, lazy adoption, global hotkeys, upscaling latch)"
@@ -1451,6 +1509,25 @@ static void PublishDfcInterop()
     g.params->Set(DFC_KEY_EVALUATE_CADENCE, DFC_EVALUATE_CADENCE);
 }
 
+// NGX init is the first NGX call of the session, made on the game's render thread the
+// moment DLSS5_Feed renders. It walks the driver's NGX modules and whatever else has
+// hooked them; a fault there used to take the game down with nothing in the log but
+// the crash filter's breadcrumb (issue #35, MGSV Ground Zeroes). Caught here it becomes
+// a disable with the exception code named.
+static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *dev, DWORD *code)
+{
+    *code = 0;
+    __try
+    {
+        NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, dev, nullptr, NVSDK_NGX_Version_API);
+        if (NVSDK_NGX_FAILED(r))
+            r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+                                                    "1.0", data_path, dev, nullptr, NVSDK_NGX_Version_API);
+        return r;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NVSDK_NGX_Result_Fail; }
+}
+
 static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
 {
     *code = 0;
@@ -2096,11 +2173,10 @@ static bool ReinitNgx()
     GetModuleFileNameW(g_self, data_path, MAX_PATH);
     if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
-    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-    if (NVSDK_NGX_FAILED(r))
-        r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                                                "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-    Log("[feed] NGX re-init -> 0x%08X (%s)", r, NgxResultName(r));
+    DWORD ngx_code = 0;
+    NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
+    if (ngx_code != 0) Log("[feed] NGX re-init raised exception 0x%08X (caught)", ngx_code);
+    else               Log("[feed] NGX re-init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r)) return false;
     g.ngx_inited = true;
 
@@ -2381,14 +2457,15 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
         Breadcrumb("initialising NGX on D3D12");
-        NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-        Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
-        if (NVSDK_NGX_FAILED(r))
+        DWORD ngx_code = 0;
+        NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
+        if (ngx_code != 0)
         {
-            r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                                                    "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-            Log("[feed] NVSDK_NGX_D3D12_Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
+            Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
+                "process faulted during init; the feed stays off for this run", ngx_code);
+            goto fail;
         }
+        Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
         if (NVSDK_NGX_FAILED(r)) { Log("[feed] NGX would not initialise on this device/driver"); goto fail; }
         g.ngx_inited = true;
 
@@ -2565,14 +2642,13 @@ static bool InitSession12(reshade::api::effect_runtime *rt)
     if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
     Breadcrumb("initialising NGX on the game's device");
-    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-    Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
-    if (NVSDK_NGX_FAILED(r))
-    {
-        r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                                                "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-        Log("[feed] NVSDK_NGX_D3D12_Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
-    }
+    DWORD ngx_code = 0;
+    NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
+    if (ngx_code != 0)
+        Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
+            "process faulted during init; the feed stays off for this run", ngx_code);
+    else
+        Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))
     {
         ShutdownSession();
@@ -2750,14 +2826,13 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
     if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
     Breadcrumb("initialising NGX (Vulkan transport)");
-    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-    Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
-    if (NVSDK_NGX_FAILED(r))
-    {
-        r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                                                "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-        Log("[feed] NVSDK_NGX_D3D12_Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
-    }
+    DWORD ngx_code = 0;
+    NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
+    if (ngx_code != 0)
+        Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
+            "process faulted during init; the feed stays off for this run", ngx_code);
+    else
+        Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))
     {
         ShutdownSession();
@@ -3129,14 +3204,13 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
     if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
     Breadcrumb("initialising NGX (OpenGL transport)");
-    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-    Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
-    if (NVSDK_NGX_FAILED(r))
-    {
-        r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                                                "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-        Log("[feed] NVSDK_NGX_D3D12_Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
-    }
+    DWORD ngx_code = 0;
+    NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
+    if (ngx_code != 0)
+        Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
+            "process faulted during init; the feed stays off for this run", ngx_code);
+    else
+        Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))
     {
         ShutdownSession();
@@ -4914,6 +4988,67 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
 // ReShade events
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Which effect runtime is ours? A process normally has one. NVIDIA Smooth Motion
+// (NvPresent64.dll) adds a second D3D11 device with an invisible proxy swapchain
+// ("InvisibleWindowClassNvPresent"), and ReShade dutifully creates a runtime on each --
+// the first gets ReShade.ini (the user's preset), the second ReShade2.ini. The old rule
+// here was "the last runtime to initialise is the one we feed", which under Smooth
+// Motion bound this add-on to whichever runtime came second, resolved DLSS5_Feed.fx as
+// MISSING there, and then ignored every render of the technique on the other runtime:
+// a healthy-looking log, no neural rendering at all (issue #1, Ghost Recon Breakpoint
+// and AC Syndicate). The rule now is "the runtime that RENDERS DLSS5_Feed is ours":
+// every runtime is tracked, technique handles are resolved per runtime, and
+// OnRenderTechnique adopts the runtime whose DLSS5_Feed pass is actually being drawn.
+// ---------------------------------------------------------------------------
+struct RuntimeSlot
+{
+    reshade::api::effect_runtime  *rt;
+    reshade::api::effect_technique technique;   // this runtime's DLSS5_Feed, or 0
+    void                          *dev;         // native device, for the log
+    char                           wclass[48];  // window class of the swapchain's HWND
+    bool                           proxy;       // Smooth Motion's invisible proxy swapchain
+};
+static RuntimeSlot g_runtimes[6];
+static int         g_runtime_count;
+static ULONGLONG   g_bound_last_render;   // GetTickCount64 of the bound runtime's last DLSS5_Feed render
+
+static RuntimeSlot *FindRuntime(reshade::api::effect_runtime *rt)
+{
+    for (int i = 0; i < g_runtime_count; ++i)
+        if (g_runtimes[i].rt == rt) return &g_runtimes[i];
+    return nullptr;
+}
+
+static RuntimeSlot *TrackRuntime(reshade::api::effect_runtime *rt)
+{
+    RuntimeSlot *s = FindRuntime(rt);
+    if (s == nullptr)
+    {
+        if (g_runtime_count == static_cast<int>(sizeof(g_runtimes) / sizeof(g_runtimes[0])))
+            --g_runtime_count;   // overflow: recycle the last slot rather than lose track
+        s = &g_runtimes[g_runtime_count++];
+        *s = {};
+        s->rt = rt;
+        // Identity, for the log: the game's swapchain and Smooth Motion's proxy are only
+        // distinguishable by their window class and device.
+        reshade::api::device *dev = rt->get_device();
+        s->dev = dev != nullptr ? reinterpret_cast<void *>(dev->get_native()) : nullptr;
+        HWND hwnd = static_cast<HWND>(rt->get_hwnd());
+        if (hwnd != nullptr && !GetClassNameA(hwnd, s->wclass, sizeof(s->wclass))) s->wclass[0] = '\0';
+        if (hwnd == nullptr) strcpy_s(s->wclass, "(no window)");
+        s->proxy = strstr(s->wclass, "NvPresent") != nullptr;
+    }
+    s->technique = rt->find_technique(kEffectFile, kTechnique);
+    return s;
+}
+
+static void UntrackRuntime(reshade::api::effect_runtime *rt)
+{
+    for (int i = 0; i < g_runtime_count; ++i)
+        if (g_runtimes[i].rt == rt) { g_runtimes[i] = g_runtimes[--g_runtime_count]; return; }
+}
+
 static void ResolveHandles(reshade::api::effect_runtime *rt)
 {
     g.technique = rt->find_technique(kEffectFile, kTechnique);
@@ -4962,8 +5097,10 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
                           (g.launchpad.handle ? 16 : 0) | (g.depth_reversed ? 32 : 0) | (provider_on ? 64 : 0) |
                           (mode << 7) | (other.handle ? 1024 : 0) | ((other_mode & 7) << 11) | (provider_broken ? 16384 : 0);
     static int last_signature = -1;
-    if (signature == last_signature) return;
+    static reshade::api::effect_runtime *last_rt = nullptr;
+    if (signature == last_signature && rt == last_rt) return;
     last_signature = signature;
+    last_rt = rt;
 
     _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> %s (%s)",
                 mode, kMvModeName[mode], provider,
@@ -5012,28 +5149,48 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
 
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
-    g.runtime = rt;
-    ResolveHandles(rt);
+    RuntimeSlot *slot = TrackRuntime(rt);
+    static int inits = 0;
+    if (++inits <= 8)
+        Log("[feed] effect runtime %p initialised (device %p, window class '%s'%s; %d runtime%s in this process)",
+            (void *)rt, slot->dev, slot->wclass,
+            slot->proxy ? " -- NVIDIA Smooth Motion's proxy swapchain, not the game's" : "",
+            g_runtime_count, g_runtime_count == 1 ? "" : "s");
+    else if (inits == 9) Log("[feed] (further runtime init/destroy messages suppressed)");
+
+    // Bind: the first runtime, or a re-init of the bound one. Another runtime only takes
+    // over when the bound one has no DLSS5_Feed and this one does; otherwise it is
+    // tracked, and OnRenderTechnique adopts it the moment it renders the technique.
+    const bool rebind = g.runtime == nullptr || rt == g.runtime ||
+                        (g.technique.handle == 0 && slot->technique.handle != 0);
+    if (rebind)
+    {
+        if (g.runtime != nullptr && rt != g.runtime)
+            Log("[feed] effect runtime %p takes over from %p: it has DLSS5_Feed.fx, the bound one did not", (void *)rt, (void *)g.runtime);
+        g.runtime = rt;
+        ResolveHandles(rt);
+        // A recreated runtime means the DLSS 5 add-on has re-armed its hooks on our private
+        // device: give it a fresh feature (a cheap feature-only re-create -- the textures stay).
+        // On the same-device D3D12 path its hooks live on the game's device and survive; the
+        // feature must NOT be touched (re-creating a live one is where the add-on crashes).
+        if (g.session_ready && g.dev12_owned) g.frame_ready = false;
+    }
+    else if (inits <= 8)
+        Log("[feed] effect runtime %p not bound (%p stays bound%s); it takes over if it renders DLSS5_Feed",
+            (void *)rt, (void *)g.runtime, slot->technique.handle ? ", both have DLSS5_Feed.fx" : "");
     // The driver injects NvPresent64.dll around swapchain creation, which can be after
     // this add-on attached -- so this is the re-check DllMain's first look cannot be.
     DetectSmoothMotion();
     // Not in DllMain: this LoadLibrary()s, which under the loader lock can deadlock.
     DetectStaleD3DCompiler();
-    // A recreated runtime means the DLSS 5 add-on has re-armed its hooks on our private
-    // device: give it a fresh feature (a cheap feature-only re-create -- the textures stay).
-    // On the same-device D3D12 path its hooks live on the game's device and survive; the
-    // feature must NOT be touched (re-creating a live one is where the add-on crashes).
-    if (g.session_ready && g.dev12_owned) g.frame_ready = false;
     // Either way the add-on may be re-patching its NGX hooks right now: hold any upcoming
     // feature create for a fresh grace period.
     g.create_grace = 0;
-    static int inits = 0;
-    if (++inits <= 8) Log("[feed] effect runtime %p initialised", (void *)rt);
-    else if (inits == 9) Log("[feed] (further runtime init/destroy messages suppressed)");
 }
 
 static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 {
+    UntrackRuntime(rt);
     if (rt != g.runtime) return;
     static int destroys = 0;
     if (++destroys <= 8) Log("[feed] effect runtime %p destroyed", (void *)rt);
@@ -5055,8 +5212,11 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 
 static void OnReloadedEffects(reshade::api::effect_runtime *rt)
 {
-    if (rt == g.runtime || g.runtime == nullptr)
+    RuntimeSlot *slot = TrackRuntime(rt);
+    if (rt == g.runtime || g.runtime == nullptr || (g.technique.handle == 0 && slot->technique.handle != 0))
     {
+        if (g.runtime != nullptr && rt != g.runtime)
+            Log("[feed] effect runtime %p takes over from %p: its reload produced DLSS5_Feed.fx, the bound one has none", (void *)rt, (void *)g.runtime);
         g.runtime = rt;
         ResolveHandles(rt);
         // A reload recompiles the MV provider, which writes zero vectors until its own
@@ -5070,7 +5230,33 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
                               reshade::api::command_list *cl, reshade::api::resource_view rtv,
                               reshade::api::resource_view /*rtv_srgb*/)
 {
-    if (rt != g.runtime || g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    if (rt != g.runtime)
+    {
+        // Another runtime is rendering DLSS5_Feed. Adopt it -- unless the bound runtime
+        // rendered the technique within the last second, in which case both are drawing
+        // it (the same preset on the game's swapchain and Smooth Motion's proxy) and
+        // flip-flopping between two devices every frame would rebuild the session each
+        // time. The bound one keeps it then; the other is dropped, and says so once.
+        const RuntimeSlot *slot = FindRuntime(rt);
+        if (slot == nullptr || slot->technique.handle == 0 || technique.handle != slot->technique.handle) return;
+        const ULONGLONG now = GetTickCount64();
+        if (g.technique.handle != 0 && now - g_bound_last_render < 1000)
+        {
+            static int both = 0;
+            if (++both <= 3)
+                Log("[feed] effect runtime %p (window class '%s') also renders DLSS5_Feed; feeding %p only%s",
+                    (void *)rt, slot->wclass, (void *)g.runtime, both == 3 ? " (further notices suppressed)" : "");
+            return;
+        }
+        Log("[feed] binding to effect runtime %p (device %p, window class '%s'): it is the one rendering DLSS5_Feed; %p was bound",
+            (void *)rt, slot->dev, slot->wclass, (void *)g.runtime);
+        g.runtime = rt;
+        ResolveHandles(rt);
+        g.need_reset = true;
+        g.create_grace = 0;
+    }
+    if (g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    g_bound_last_render = GetTickCount64();
     FeedFrame(rt, cl, rtv);
 }
 
@@ -5171,9 +5357,11 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                            "Delete or rename %s, then restart the game.", g_d3dcompiler_path);
     if (g_smooth_motion)
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
-                           "NVIDIA Smooth Motion is active (NvPresent64.dll) -- unverified with this add-on. "
+                           "NVIDIA Smooth Motion is active (NvPresent64.dll). It adds a proxy swapchain, so ReShade runs "
+                           "%d effect runtimes here; this add-on feeds the one rendering DLSS5_Feed (%p). "
                            "If the image corrupts or flickers, disable it for this game's API only: "
-                           "Profile Inspector, \"Smooth Motion - Enabled APIs\" (1=DX12, 2=DX11, 4=Vulkan).");
+                           "Profile Inspector, \"Smooth Motion - Enabled APIs\" (1=DX12, 2=DX11, 4=Vulkan).",
+                           g_runtime_count, (void *)g.runtime);
     if (g.disabled && ImGui::Button("Re-enable"))
     {
         g.disabled = false;

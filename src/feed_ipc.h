@@ -41,6 +41,11 @@
 // VkImage and to decide copy-vs-blit for the way home. Version 4 added
 // FeedHello::self_process so the host no longer OpenProcess()es the game, which a
 // protective DACL on the game process denies (error 5 -- the vanilla-WoW report).
+// Version 5 added FeedBuild::client_flags: a D3D11 client whose device refuses the
+// shared textures (a feature-level 10.x game, NFS Most Wanted 2012 / issue #33: it
+// cannot bind a UAV, and the DLSS output needs one) asks the host to create the set
+// instead, exactly as GL/Vulkan clients always have, and to keep the UAV on its own
+// side (the host evaluates into a private scratch and copies into the shared Output).
 //
 // Both sides refuse a version they do not understand rather than misparsing it: the
 // struct sizes differ between versions, so a mismatched pair would desync the pipe.
@@ -49,7 +54,11 @@
 #include <cstdint>
 
 #define FEED_IPC_MAGIC   0x35534C44u  // 'DLS5'
-#define FEED_IPC_VERSION 4u
+#define FEED_IPC_VERSION 5u
+
+// FeedBuild::client_flags (v5+)
+#define FEED_BUILD_HOST_CREATES  1u   // tex[] are zero: the host creates the shared set and answers with handles
+#define FEED_BUILD_OUTPUT_NO_UAV 2u   // the game's device cannot bind UAVs: share the Output without one
 #define FEED_PIPE_FMT    "\\\\.\\pipe\\dlss5-feed.%lu"   // %lu = game PID
 
 // The bytes a version-1 client sends as its hello: magic, version, pid.
@@ -101,6 +110,7 @@ struct FeedBuild        // game -> host, on every resolution/format change
     uint64_t tex[FEED_SLOTS];    // D3D11 clients: NT-handle VALUES in the game process (host
                                  // duplicates them out). GL/Vulkan clients: all zero -- the host
                                  // creates, and answers with its own handles.
+    uint32_t client_flags;       // v5+: FEED_BUILD_* -- a D3D11 client can opt into host-created textures
 };
 
 struct FeedBuildAck     // host -> game

@@ -49,7 +49,7 @@
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 
-#define FEED_VERSION "0.11.0-beta.1"
+#define FEED_VERSION "0.11.0-beta.2"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -101,6 +101,46 @@ static void Warn(const char *fmt, ...)
 
 static const char *volatile g_where = "starting up";
 static void Breadcrumb(const char *what) { g_where = what; }
+
+// The 64-bit add-on has recorded crashes with a breadcrumb since 0.8; this side only
+// set the breadcrumb and never read it, so a 32-bit crash left nothing in the log past
+// the last ordinary line. Same filter here, plus a minidump next to the log (dbghelp
+// loaded on demand -- the process is already dying when it is needed).
+typedef BOOL (WINAPI *PFN_MiniDumpWriteDump_)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+static void WriteCrashDump(EXCEPTION_POINTERS *ep)
+{
+    char path[MAX_PATH];
+    strcpy_s(path, g_log_path);
+    if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "dlss5-feed-crash.dmp");
+    HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
+    auto write = dbghelp ? reinterpret_cast<PFN_MiniDumpWriteDump_>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+    if (write == nullptr) { Log("[feed32] no dbghelp.dll; no crash dump written"); return; }
+    HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) { Log("[feed32] could not create %s (error %lu)", path, GetLastError()); return; }
+    struct { DWORD tid; EXCEPTION_POINTERS *ep; BOOL client; } info = { GetCurrentThreadId(), ep, FALSE };
+    const int type = 0x0040 | 0x0001 | 0x0004;   // IndirectlyReferencedMemory | DataSegs | HandleData
+    const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), f, type, ep != nullptr ? &info : nullptr, nullptr, nullptr);
+    CloseHandle(f);
+    Log(ok ? "[feed32] crash dump written: %s -- attach it to the issue with this log"
+           : "[feed32] crash dump FAILED (%s, error %lu)", path, GetLastError());
+}
+
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
+{
+    const void *addr = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+    const DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+    wchar_t owner[MAX_PATH] = L"unknown";
+    HMODULE mod = nullptr;
+    if (addr != nullptr &&
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(addr), &mod) && mod != nullptr)
+        GetModuleFileNameW(mod, owner, MAX_PATH);
+    Log("### CRASH RECORDED ###  exception 0x%08X at %p in %ls; this add-on was last doing: %s%s", code, addr,
+        owner, g_where, mod == g_self ? " (inside this add-on)" : "");
+    WriteCrashDump(ep);
+    return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+}
 
 // ---------------------------------------------------------------------------
 // NVIDIA Smooth Motion, and the serialization it forces -- the 64-bit add-on's
@@ -440,9 +480,11 @@ struct Feed32
     HANDLE hproc;
     HANDLE pipe;
 
-    // shared textures (created HERE, opened by the host)
+    // shared textures (created HERE, opened by the host -- unless host_creates)
     ID3D11Texture2D *tex[FEED_SLOTS];
     HANDLE           tex_handle[FEED_SLOTS];
+    bool             host_creates;  // D3D11 client: the game's device refused the shared set once; the host creates it now
+    bool             no_uav;        // ... and cannot bind UAVs at all (feature level 10.x): the Output is shared without one
     ID3D11ShaderResourceView *output_srv;
     ID3D11RenderTargetView   *input_rtv[FEED_SLOTS];  // work-resolution resample targets
     ID3D11Texture2D          *color_stage;            // native-size copy of the frame (the only SRV-able source)
@@ -1250,11 +1292,95 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     const bool hdr      = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
 
-    if (!MakeShared(FEED_COLOR, w, h, g.color_fmt, false, true) ||
-        !MakeShared(FEED_OUTPUT, w, h, g.output_fmt, true, false) ||
-        !MakeShared(FEED_DEPTH, w, h, DXGI_FORMAT_R32_FLOAT, false, true) ||
-        !MakeShared(FEED_MV, w, h, DXGI_FORMAT_R16G16_FLOAT, false, true))
-    { ReleaseShared(); return false; }
+    if (!g.host_creates)
+    {
+        int failed = -1;
+        if      (!MakeShared(FEED_COLOR,  w, h, g.color_fmt,              false, true))  failed = FEED_COLOR;
+        else if (!MakeShared(FEED_OUTPUT, w, h, g.output_fmt,             true,  false)) failed = FEED_OUTPUT;
+        else if (!MakeShared(FEED_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,    false, true))  failed = FEED_DEPTH;
+        else if (!MakeShared(FEED_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false, true))  failed = FEED_MV;
+        if (failed >= 0)
+        {
+            // The game's device will not create what the host needs to open. Seen on a
+            // feature-level 10.x device (NFS Most Wanted 2012, issue #33): Color went
+            // through and Output -- the one slot with a UAV bind -- came back E_INVALIDARG,
+            // because UAVs are a feature-level 11 feature. Retrying the same desc every
+            // 30 s forever was the old behaviour. Instead, switch to the route the GL and
+            // Vulkan clients always use: the host creates the set on D3D12 and hands the
+            // handles in; this side opens them (OpenSharedResource1 needs no bind flags
+            // of its own), and where UAVs are the problem the host keeps the Output's UAV
+            // on its side and copies into a plain shared texture.
+            static const char *const slot_name[FEED_SLOTS] = { "Color", "Output", "Depth", "MV" };
+            const D3D_FEATURE_LEVEL fl = g.dev->GetFeatureLevel();
+            ReleaseShared();
+            g.host_creates = true;
+            g.no_uav       = failed == FEED_OUTPUT || fl < D3D_FEATURE_LEVEL_11_0;
+            Log("[feed32] the game's D3D11 device (feature level %d_%d) refused the shared %s texture; the host will "
+                "create the shared set instead%s",
+                (fl >> 12) & 0xF, (fl >> 8) & 0xF, slot_name[failed],
+                g.no_uav ? ", keeping the DLSS output's UAV on its own side (this device cannot bind one)" : "");
+        }
+    }
+
+    if (!EnsureHost()) return false;
+
+    FeedBuild b = {};
+    b.width          = w;
+    b.height         = h;
+    b.color_fmt      = g.color_fmt;
+    b.output_fmt     = g.output_fmt;
+    b.hdr            = hdr ? 1 : 0;
+    b.depth_inverted = inverted ? 1 : 0;
+    b.flags_override = g_cfg.flags;
+    b.transport      = g_cfg.mode == 1 ? 1 : 0;
+    b.mv_scale_x     = g_cfg.mv_scale_x;
+    b.mv_scale_y     = g_cfg.mv_scale_y;
+    if (g.host_creates)
+        b.client_flags = FEED_BUILD_HOST_CREATES | (g.no_uav ? FEED_BUILD_OUTPUT_NO_UAV : 0);
+    else
+        for (int i = 0; i < FEED_SLOTS; ++i)
+            b.tex[i] = reinterpret_cast<uintptr_t>(g.tex_handle[i]);
+
+    Breadcrumb("asking the host to build");
+    BYTE tag = 'B';
+    FeedBuildAck ack = {};
+    if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
+    { HostLost("build exchange failed"); return false; }
+    if (!ack.ok)
+    {
+        Log("[feed32] host build failed (ngx 0x%08X)", ack.ngx_result);
+        return false;
+    }
+
+    if (g.host_creates)
+    {
+        // The handles are already duplicated into this process; ReleaseShared closes them.
+        ID3D11Device1 *dev1 = nullptr;
+        if (FAILED(g.dev->QueryInterface(__uuidof(ID3D11Device1), reinterpret_cast<void **>(&dev1))) || dev1 == nullptr)
+        { FeedDisable("ID3D11Device1 unavailable, so the host-created textures cannot be opened (Windows 8+ D3D11.1 runtime required)"); return false; }
+        for (int i = 0; i < FEED_SLOTS; ++i)
+        {
+            g.tex_handle[i] = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.tex[i]));
+            const HRESULT hr = g.tex_handle[i] != nullptr
+                ? dev1->OpenSharedResource1(g.tex_handle[i], __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&g.tex[i]))
+                : E_HANDLE;
+            if (FAILED(hr))
+            {
+                Log("[feed32] OpenSharedResource1(tex %d) failed 0x%08X -- this device cannot open the host's textures either",
+                    i, hr);
+                dev1->Release();
+                ReleaseShared();
+                FeedDisable("the shared textures cannot be created on the game's device or opened from the host's");
+                return false;
+            }
+        }
+        dev1->Release();
+        if (ack.output_fmt != 0 && static_cast<DXGI_FORMAT>(ack.output_fmt) != g.output_fmt)
+        {
+            Log("[feed32] host created the Output as fmt=%u (asked for %u)", ack.output_fmt, g.output_fmt);
+            g.output_fmt = static_cast<DXGI_FORMAT>(ack.output_fmt);
+        }
+    }
 
     D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
     sv.Format              = g.output_fmt;
@@ -1303,33 +1429,6 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         Log("[feed32] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
     }
 
-    if (!EnsureHost()) return false;
-
-    FeedBuild b = {};
-    b.width          = w;
-    b.height         = h;
-    b.color_fmt      = g.color_fmt;
-    b.output_fmt     = g.output_fmt;
-    b.hdr            = hdr ? 1 : 0;
-    b.depth_inverted = inverted ? 1 : 0;
-    b.flags_override = g_cfg.flags;
-    b.transport      = g_cfg.mode == 1 ? 1 : 0;
-    b.mv_scale_x     = g_cfg.mv_scale_x;
-    b.mv_scale_y     = g_cfg.mv_scale_y;
-    for (int i = 0; i < FEED_SLOTS; ++i)
-        b.tex[i] = reinterpret_cast<uintptr_t>(g.tex_handle[i]);
-
-    Breadcrumb("asking the host to build");
-    BYTE tag = 'B';
-    FeedBuildAck ack = {};
-    if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
-    { HostLost("build exchange failed"); return false; }
-    if (!ack.ok)
-    {
-        Log("[feed32] host build failed (ngx 0x%08X)", ack.ngx_result);
-        return false;
-    }
-
     if (g.fence_in == nullptr || g.fence_out == nullptr)
     {
         ID3D11Device5 *dev5 = nullptr;
@@ -1346,6 +1445,8 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     Log("[feed32] shared set ready: %ux%u (%d%% of %ux%u) color fmt=%u output fmt=%u (host ngx 0x%08X, %s)",
         w, h, g_cfg.work_resolution, backbuffer_w, backbuffer_h,
         g.color_fmt, g.output_fmt, ack.ngx_result, g_cfg.mode == 1 ? "transport" : "DLSS");
+    if (g.host_creates)
+        Log("[feed32] the shared set is host-created and opened here%s", g.no_uav ? "; the DLSS output is copied into it host-side" : "");
     g.built      = true;
     g.need_reset = true;
     g.out_valid  = false;   // a fresh Output slot holds nothing worth carrying home
@@ -2245,6 +2346,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             const UINT64 n = ++g.frame_n;
             const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
             g.need_reset = false;
+            // Presents-vs-frames probe (feed_vk_hook.h): the 64-bit add-on has published its
+            // frame count to it since 0.9.0; this side never did, so a DXVK user could not
+            // tell an external pacer from a slow host (issue #15).
+            FeedVkPresentTick(n, 120);
 
             // async_home: carry home what the host produced for the frame we waited on
             // above. It has to be recorded HERE -- after the input copies, because the
@@ -2937,6 +3042,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         { FILE *f = nullptr; if (fopen_s(&f, g_log_path, "w") == 0 && f) fclose(f); }
 
         if (!reshade::register_addon(module)) return FALSE;
+        g_prev_filter = SetUnhandledExceptionFilter(&CrashFilter);
         Log("dlss5-feed32 %s (built %s %s) attached.", FEED_VERSION, __DATE__, __TIME__);
         {
             wchar_t exe[MAX_PATH] = {};
