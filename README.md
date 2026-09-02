@@ -49,7 +49,7 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 > ### Recommended: Deep Fried Chicken
 >
 > **Deep Fried Chicken** (by Alexander), distributed as its own archive through Discord:
-> <https://discord.com/channels/1543931653976498207/1543936250657120366>. Current version
+> <https://discord.gg/g2v2XGqvR>. Current version
 > **1.4.4-alpha**; the feeder interop was introduced in **1.4.0**.
 >
 > Three files go next to the 64-bit game `.exe` (or into `host64\` for a 32-bit game):
@@ -282,7 +282,7 @@ powershell -ExecutionPolicy Bypass -File .\Verify-DLSS5Feeder.ps1 -GamePath "C:\
    its `Shaders\` folder (the `lumenite_*.fx` files and `include\`) into `reshade-shaders\Shaders\`,
    and `Textures\lumenite_bluenoise256.png` into `reshade-shaders\Textures\`.
    *(Other providers: see [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider).)*
-4. Get the neural consumer — **[Deep Fried Chicken](https://discord.com/channels/1543931653976498207/1543936250657120366)**
+4. Get the neural consumer — (invite: <https://discord.gg/g2v2XGqvR>) **[Deep Fried Chicken](https://discord.com/channels/1543931653976498207/1543936250657120366)**
    (see the warning above) — and put its three files next to the game `.exe`:
    `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll` and `deep-fried-chicken.cfg`.
    Add **`nvngx_dlssnr.dll`** (from the RenoDX Discord — Chicken does not bundle it) and a
