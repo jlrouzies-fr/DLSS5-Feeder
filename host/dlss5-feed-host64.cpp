@@ -638,6 +638,16 @@ static Host h;
 
 static bool BeginCommands()
 {
+    // AbortCommands releases the list and tries to make a new one; if that create failed --
+    // which is most likely exactly when things are already going wrong, a removed device --
+    // there is no list to reset and the h.list->Reset() below would fault. Fail the frame
+    // instead: the caller CPU-signals fence_out, so the game never waits on us for it.
+    if (h.list == nullptr)
+    {
+        static bool said = false;
+        if (!said) { said = true; Log("[host] no command list (a previous NGX fault could not be recovered from)"); }
+        return false;
+    }
     const int slot = h.frame_slot;
     const UINT64 retire = h.alloc_fence[slot];
     if (retire != 0 && h.fence->GetCompletedValue() < retire)
@@ -1565,9 +1575,18 @@ static int Serve(DWORD game_pid)
         FAILED(h.dev->CreateSharedHandle(h.fence_out, nullptr, GENERIC_ALL, nullptr, &hout)))
     { Log("[host] shared fence creation failed"); return 1; }
 
+    // These two are the whole synchronisation contract. Ignoring the result meant a failure
+    // (a process handle without PROCESS_DUP_HANDLE, say) still sent the game an ack saying
+    // ok=1 with two null fence handles, and it went looking for the fault everywhere except
+    // here. Fail the session instead; the add-on respawns a host.
     HANDLE game_in = nullptr, game_out = nullptr;
-    DuplicateHandle(GetCurrentProcess(), hin, hgame, &game_in, 0, FALSE, DUPLICATE_SAME_ACCESS);
-    DuplicateHandle(GetCurrentProcess(), hout, hgame, &game_out, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    if (!DuplicateHandle(GetCurrentProcess(), hin, hgame, &game_in, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
+        !DuplicateHandle(GetCurrentProcess(), hout, hgame, &game_out, 0, FALSE, DUPLICATE_SAME_ACCESS))
+    {
+        Log("[host] could not duplicate the shared fences into the game (error %lu); nothing could be "
+            "synchronised, so this host exits", GetLastError());
+        return 1;
+    }
 
     int flags_active = 0;
     bool transport_only = false;
@@ -1631,8 +1650,14 @@ static int Serve(DWORD game_pid)
             // textures under that work hung the GPU on a work-resolution change (Fable
             // Anniversary, 2026-09-02: the next create never completed, DEVICE_HUNG). The
             // warm-up re-create below has always drained first; this path now does too.
-            if (h.feature != nullptr && !WaitFenceValue(h.fence, h.fence_value, 2000))
-                Log("[host] rebuild: the previous feature's GPU work did not retire within 2 s");
+            //
+            // Unconditionally, not just when a feature exists: in transport mode there is no
+            // feature but the last frame's CopyTextureRegion out of h.tex[] can still be in
+            // flight, and the release below would pull the source out from under it. The wait
+            // returns at once on an idle queue, so it costs nothing when there is nothing to
+            // wait for.
+            if (!WaitFenceValue(h.fence, h.fence_value, 2000))
+                Log("[host] rebuild: the previous frame's GPU work did not retire within 2 s");
             SafeReleaseFeature(h.feature);
             h.feature = nullptr;
             for (int i = 0; i < FEED_SLOTS; ++i)
@@ -1742,11 +1767,40 @@ static int Serve(DWORD game_pid)
                     HRESULT hr = h.dev->OpenSharedHandle(local, __uuidof(ID3D12Resource),
                                                          reinterpret_cast<void **>(&h.tex[i]));
                     CloseHandle(local);
-                    if (FAILED(hr)) { Log("[host] OpenSharedHandle(tex %d) failed 0x%08X", i, hr); ok = false; }
+                    if (FAILED(hr)) { Log("[host] OpenSharedHandle(tex %d) failed 0x%08X", i, hr); ok = false; continue; }
+
+                    // Check what actually arrived against what the message claims. Everything
+                    // downstream -- the NGX create, InRenderSubrectDimensions, the transport
+                    // copy box -- trusts b.width/height/formats, so a texture that does not
+                    // match them is a device-removed or a corrupt frame several steps later,
+                    // with nothing pointing back here. The panel has always been checked this
+                    // way; the four slots that matter were not.
+                    const D3D12_RESOURCE_DESC td = h.tex[i]->GetDesc();
+                    const UINT want_w = (i == FEED_OUTPUT) ? out_w : b.width;
+                    const UINT want_h = (i == FEED_OUTPUT) ? out_h : b.height;
+                    const DXGI_FORMAT want_fmt =
+                        i == FEED_COLOR  ? static_cast<DXGI_FORMAT>(b.color_fmt) :
+                        i == FEED_OUTPUT ? out_fmt :
+                        i == FEED_DEPTH  ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R16G16_FLOAT;
+                    const bool needs_uav = (i == FEED_OUTPUT) && !no_uav && b.transport == 0;
+                    if (td.Width != static_cast<UINT64>(want_w) || td.Height != want_h || td.Format != want_fmt ||
+                        (needs_uav && (td.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0))
+                    {
+                        Log("[host] the game's %s texture is %ux%u fmt=%u flags=0x%X, not %ux%u fmt=%u%s -- refusing the build",
+                            i == FEED_COLOR ? "Color" : i == FEED_OUTPUT ? "Output" : i == FEED_DEPTH ? "Depth" : "MV",
+                            static_cast<unsigned>(td.Width), td.Height, td.Format, td.Flags,
+                            want_w, want_h, want_fmt, needs_uav ? " with a UAV" : "");
+                        ok = false;
+                    }
                 }
             }
 
             // v7: a D3D11 game's panel texture, opened the same way. Never fatal for the build.
+            // CopyPanel runs on pump_queue and tracks its own fence, which the drain at the top
+            // of this rebuild does not cover -- so wait for it here or the release below can
+            // pull the destination out from under a copy that is still running.
+            if (h.panel != nullptr && !h.panel_host_owned && g_panel_fence != nullptr)
+                WaitFenceValue(g_panel_fence, g_panel_val, 500);
             if (h.panel != nullptr && !h.panel_host_owned) { h.panel->Release(); h.panel = nullptr; }
             if (b.panel_tex != 0 && g_panel_ready && !h.panel_host_owned)
             {
@@ -2039,10 +2093,17 @@ int main(int argc, char **argv)
     DetectStaleD3DCompiler();
     PrepareHostOverlay();   // edits ReShade.ini, so also BEFORE ReShade loads (InitDisguise)
 
-    if (!InitDisguise()) return 1;
-    if (!InitNgx()) { Log("[host] NGX unavailable"); return 1; }
+    // Both failures used to `return 1` straight out, skipping the tail below -- and a failed
+    // NGX init is exactly the case where ReShade is already loaded and its teardown is the
+    // thing that hangs. Everything leaves through one door now.
+    int rc = 1;
+    if (!InitDisguise())
+        Log("[host] the disguise swapchain could not be created");
+    else if (!InitNgx())
+        Log("[host] NGX unavailable");
+    else
+        rc = test ? RunTest() : Serve(pid);
 
-    const int rc = test ? RunTest() : Serve(pid);
     ShutdownDisguise();
     // Everything that had to happen has happened: ReShade wrote its ini when its runtime
     // went with the swapchain above. What is left is ReShade's own DLL teardown (unhooking
