@@ -3139,17 +3139,17 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
         const bool fsr_available = g.blit_vs == nullptr || g.fsr_ok;   // unknown until the shaders compile
         if (!fsr_available) ImGui::BeginDisabled();
-        static const char *kUpscale[] = { "Bilinear stretch", "FSR 1 (EASU + RCAS)", "DLSS reconstruction (experimental)" };
-        if (ImGui::Combo("Expand-back", &g_cfg.work_upscale, kUpscale, 3)) dirty = true;
-        ImGui::SameLine(); HelpMarker("How the work-size result gets back to native size. FSR 1: AMD's spatial upscaler "
-                                      "plus RCAS sharpening, much crisper than the stretch at 50-75%. DLSS reconstruction: "
-                                      "the frame is downsampled with a different sub-pixel shift every frame and the "
-                                      "helper's DLSS Super Resolution rebuilds the native size from that history -- "
-                                      "near-native when still, but it leans on the estimated motion vectors far more "
-                                      "than DLAA does, so expect smear in motion. Neither is DLSS Quality: nothing here "
-                                      "can exceed the native frame the game already rendered. At 100% only the "
-                                      "sharpening runs.");
-        if (g_cfg.work_upscale != 0)
+        // work_upscale=2 (DLSS reconstruction on synthetic jitter) is deliberately NOT on the
+        // overlay: measured on Fable Anniversary it costs as much as 100% -- DLSS SR scales
+        // with the output size and the neural consumer runs on the resolved native output --
+        // and the image shimmers. It stays reachable from the cfg as the experiment it is.
+        bool fsr = g_cfg.work_upscale != 0;
+        if (ImGui::Checkbox("FSR 1 expand-back (EASU + RCAS)", &fsr)) { g_cfg.work_upscale = fsr ? 1 : 0; dirty = true; }
+        ImGui::SameLine(); HelpMarker("Replaces the bilinear stretch of the work-size output with AMD FSR 1 spatial "
+                                      "upscaling and RCAS sharpening: much crisper than the stretch at 50-75%. A better "
+                                      "filter for the cost knob above, not DLSS Quality: the result can never exceed "
+                                      "the native frame. At 100% only the sharpening runs.");
+        if (fsr)
         {
             ImGui::SliderFloat("Sharpness", &g_cfg.work_sharpness, 0.0f, 1.0f, "%.2f");
             if (ImGui::IsItemDeactivatedAfterEdit()) dirty = true;
@@ -3160,15 +3160,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             ImGui::TextDisabled("FSR 1 shaders failed to compile (see the log); the spatial expand-back stays bilinear.");
         }
         if (g_cfg.work_upscale == 2 && g.backbuffer_width != 0)
-        {
-            if (g.sr_active)
-                ImGui::TextDisabled("DLSS %s: %ux%u -> %ux%u, %u jitter phases", SrQualityName(g.sr_quality),
-                                    g.width, g.height, g.output_width, g.output_height, g.jitter_phases);
-            else if (g.sr_unavailable)
-                ImGui::TextDisabled("No DLSS preset covers this ratio; using DLAA + FSR 1 instead.");
-            else if (g_cfg.work_resolution >= 100)
-                ImGui::TextDisabled("Nothing to reconstruct at 100%%; lower the work resolution.");
-        }
+            ImGui::TextDisabled("work_upscale=2 (cfg only): %s", g.sr_active ? "DLSS reconstruction active -- costs as much as 100%" :
+                                g.sr_unavailable ? "no DLSS preset covers this ratio; DLAA + FSR 1" : "DLAA + FSR 1");
     }
 
     static const char *kTri[] = { "Auto", "Force off", "Force on" };
