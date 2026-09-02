@@ -830,20 +830,28 @@ struct HostLink
     HANDLE        proc;         //   render thread, on success AND on failure (so HostClose
     uint32_t      panel_w;      //   disposes of a half-made link the usual way)
     uint32_t      panel_h;
+    HMODULE       mod_ref;      // a reference on THIS module, held for the worker's lifetime
     bool          fatal;        // true = FeedDisable(why), false = HostLost(why)
     char          why[192];
     DWORD         ms;           // how long the job took, for the log
 };
 static HostLink g_link;
 
-// How long the render thread is willing to wait for the host at each step. The first two
-// are the worker's, so the game never feels them; the last one is on the frame path, where
-// 21 bytes into a 1 KB pipe buffer only ever blocks if the host has stopped reading.
+// How long we are willing to wait for the host at each step. The first two are the worker's,
+// so the game never feels them. The last one IS on the frame path: 21 bytes into a 1 KB pipe
+// buffer can only block if the host has stopped reading it, but a busy host can be a little
+// late, and running out of patience there ends the session (HostLost). So: generous enough
+// that reaching it really does mean the host is not coming back, short enough that the worst
+// case is a survivable hitch rather than the indefinite freeze this replaced.
 static const DWORD kPipeHelloMs = 15000;
 static const DWORD kPipeBuildMs = 60000;
-static const DWORD kPipeFrameMs = 250;
+static const DWORD kPipeFrameMs = 2000;
 
-static void HostLinkStop();   // below: abort and join the worker, from HostClose
+static bool HostLinkStop();   // below: abort and join the worker, from HostClose
+static bool g_detaching;      // DLL_PROCESS_DETACH: the loader lock is held, so never join
+
+static bool HostRequestPending();   // below: an overlay button is waiting to be acted on
+static void HostConsumeRequest();   // below: act on it, on the render thread, inside the lock
 
 // A build is in flight (waiting for the host to connect, or for its answer). The frame path
 // skips feeding while this is set WITHOUT counting a failure: the exponential backoff in
@@ -928,7 +936,9 @@ static void CastFlushInput();     // below: release any key/button the host stil
 
 static void HostClose()
 {
-    HostLinkStop();   // first: nothing else here may run beside a worker still using the pipe
+    // First: nothing else here may run beside a worker still using the pipe. When it says
+    // false an orphan survived, and g.pipe is the handle a JOB_BUILD worker holds.
+    const bool worker_done = HostLinkStop();
     g_build_pending = false;   // whatever was in flight went with the link
     CastHostLost();
     CastReleasePanel();
@@ -938,15 +948,25 @@ static void HostClose()
     g.sent_n    = 0;
     g.wait_n    = 0;
     g.out_valid = false;
-    if (g.pipe != nullptr)  { CloseHandle(g.pipe); g.pipe = nullptr; }
     if (g.hproc != nullptr)
     {
-        // 4 s: the host now releases its swapchain on the way out so ReShade x64 can save
-        // its ini (the overlay layout), and ReShade's own unhook takes about a second.
+        // Ending the host first is what unblocks an orphan worker parked on the pipe, and it
+        // is always safe: no worker ever touches g.hproc. 4 s, because the host releases its
+        // swapchain on the way out so ReShade x64 can save its ini (the overlay layout), and
+        // ReShade's own unhook takes about a second.
         if (WaitForSingleObject(g.hproc, 4000) != WAIT_OBJECT_0)
             TerminateProcess(g.hproc, 0);      // it did not exit on the pipe break
         CloseHandle(g.hproc);
         g.hproc = nullptr;
+    }
+    if (g.pipe != nullptr)
+    {
+        // Closing it under a live worker would let the value be reused and the orphan's next
+        // write land in an unrelated handle. Leaking one pipe handle is the cheaper mistake;
+        // the host it named is gone by now, so the orphan's I/O fails and it exits.
+        if (worker_done) CloseHandle(g.pipe);
+        else Log("[feed32] leaking the pipe handle: a host worker may still be using it");
+        g.pipe = nullptr;
     }
     // The fences belong to the host that just went away; a new host creates new ones.
     // Releasing them on EVERY close (not just the apply path) is what makes a respawn
@@ -1668,6 +1688,15 @@ static bool OnOpenOverlay(reshade::api::effect_runtime *rt, bool open, reshade::
 
 static void OnPresent(reshade::api::effect_runtime *rt)
 {
+    // The host buttons are drained HERE, not in FeedFrame. FeedFrame only runs when the
+    // DLSS5_Feed technique renders, so with the effect missing or disabled, effects toggled
+    // off, or mode=0, "Start the DLSS 5 host" would have done nothing at all -- and that is
+    // exactly the state a user presses it in. This callback runs every frame regardless.
+    if (rt == g.runtime && HostRequestPending() && FeedEnter())
+    {
+        HostConsumeRequest();   // inside the lock: it tears down what a frame uses
+        FeedLeave();
+    }
     CastTick(rt);
 }
 
@@ -1973,6 +2002,12 @@ static DWORD WINAPI HostWorker(void *)
     g_link.ms = static_cast<DWORD>(GetTickCount64() - t0);
     // Last write: everything above must be visible to the render thread before it sees this.
     InterlockedExchange(&g_link.state, ok ? LINK_DONE : LINK_FAILED);
+    // And the last act: drop the module reference taken in HostLinkStart. This is what makes
+    // it safe for DLL_PROCESS_DETACH to walk away without joining -- the module cannot be
+    // unmapped while this thread is still in it, and FreeLibraryAndExitThread is the one call
+    // that releases the reference and exits atomically. Nothing in this DLL runs after it.
+    const HMODULE ref = g_link.mod_ref;
+    if (ref != nullptr) FreeLibraryAndExitThread(ref, 0);
     return 0;
 }
 
@@ -1992,11 +2027,17 @@ static bool HostLinkStart(int job)
     g_link.ms      = 0;
     g_link.pipe    = nullptr;
     g_link.proc    = nullptr;
+    // Pin this module for as long as the worker runs in it (see HostWorker's tail).
+    g_link.mod_ref = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                       reinterpret_cast<LPCWSTR>(&HostWorker), &g_link.mod_ref);
     InterlockedExchange(&g_link.state, LINK_RUNNING);
     g_link.thread = CreateThread(nullptr, 0, HostWorker, nullptr, 0, nullptr);
     if (g_link.thread == nullptr)
     {
+        if (g_link.mod_ref != nullptr) { FreeLibrary(g_link.mod_ref); g_link.mod_ref = nullptr; }
         InterlockedExchange(&g_link.state, LINK_IDLE);
+        g_build_pending = false;
         Log("[feed32] could not start the host worker thread (%lu)", GetLastError());
         return false;
     }
@@ -2011,40 +2052,56 @@ static void HostLinkJoin()
     g_link.thread = nullptr;
 }
 
-static void HostLinkStop()
+// Returns true when the worker is definitely finished, so everything it could have been
+// touching is safe to close. False means an orphan is still running and the CALLER must leak
+// the pipe rather than close it -- see HostClose.
+static bool HostLinkStop()
 {
-    if (g_link.thread == nullptr) { InterlockedExchange(&g_link.state, LINK_IDLE); return; }
+    if (g_link.thread == nullptr) { InterlockedExchange(&g_link.state, LINK_IDLE); return true; }
     InterlockedExchange(&g_link.abort, 1);
     if (g_link.abort_event != nullptr) SetEvent(g_link.abort_event);
     // Wakes a transfer that is parked on the pipe; the worker's own OVERLAPPED wait then
     // returns and it unwinds. Cancel on both handles, since a connect uses its own.
     if (g.pipe != nullptr)      CancelIoEx(g.pipe, nullptr);
     if (g_link.pipe != nullptr) CancelIoEx(g_link.pipe, nullptr);
-    // Every wait the worker can be in is bounded and wakes on the abort event or the cancel,
-    // so this should return almost at once. If it somehow does not, the one thing that must
-    // NOT happen is closing handles it is still using, or starting a second worker over the
-    // same state: leave the orphan and everything it owns strictly alone. g_link.thread stays
-    // set, so HostLinkStart refuses from here on and the feed stays down until the game is
-    // restarted -- unpleasant, and still much better than a handle reused under it.
+
+    // NEVER wait from DLL_PROCESS_DETACH. A thread cannot finish exiting while another holds
+    // the loader lock, so a join there blocks for the whole timeout and then unmaps this
+    // module out from under a thread still executing it -- and ReShade unloads and reloads
+    // this add-on per Vulkan instance, so that is a real path, not a theoretical one. The
+    // worker holds its own reference to the module and drops it as its last act
+    // (FreeLibraryAndExitThread), so walking away here is safe.
+    if (g_detaching)
+    {
+        Log("[feed32] detaching with the host worker still running; it holds a reference to this "
+            "module and will unload it when it finishes");
+        return false;
+    }
+    // Otherwise every wait it can be in is bounded and wakes on the abort or the cancel, so
+    // this should return almost at once. If it somehow does not, the one thing that must not
+    // happen is a handle closed or reused under it: leave the orphan and everything it holds
+    // strictly alone. g_link.thread stays set, so HostLinkStart refuses from here on.
     if (WaitForSingleObject(g_link.thread, 5000) != WAIT_OBJECT_0)
     {
-        Log("[feed32] the host worker did not stop within 5 s; abandoning it (no further host "
-            "connections this session -- restart the game)");
-        return;
+        Log("[feed32] the host worker did not stop within 5 s; abandoning it and everything it holds");
+        return false;
     }
     CloseHandle(g_link.thread);
     g_link.thread = nullptr;
-    // It is finished, so anything it had half-opened is ours to dispose of now.
+    // It is finished, so anything it half-opened is ours. Break the pipe first and give the
+    // host the same few seconds HostClose does: a host that has just connected still has a
+    // ReShade ini to save, and killing it outright loses the overlay layout.
     if (g_link.pipe != nullptr) { CloseHandle(g_link.pipe); g_link.pipe = nullptr; }
     if (g_link.proc != nullptr)
     {
-        TerminateProcess(g_link.proc, 0);
+        if (WaitForSingleObject(g_link.proc, 4000) != WAIT_OBJECT_0) TerminateProcess(g_link.proc, 0);
         CloseHandle(g_link.proc);
         g_link.proc = nullptr;
     }
     InterlockedExchange(&g_link.state, LINK_IDLE);
     InterlockedExchange(&g_link.abort, 0);
     if (g_link.abort_event != nullptr) ResetEvent(g_link.abort_event);
+    return true;
 }
 
 // True when the pipe is up and the host is alive. Otherwise it starts (or keeps waiting on)
@@ -2332,7 +2389,9 @@ static void HostApplySettings()
     Warn("DLSS 5 settings applied -- the replacement host starts in the background");
 }
 
-// Called from FeedFrame, on the render thread and inside the feed lock.
+static bool HostRequestPending() { return g_host_request != HOST_REQ_NONE; }
+
+// Called from OnPresent, on the render thread and inside the feed lock.
 static void HostConsumeRequest()
 {
     const LONG req = InterlockedExchange(&g_host_request, HOST_REQ_NONE);
@@ -2551,7 +2610,7 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     // Transport test copies Color->Output host-side with CopyResource: same format then.
     g.output_fmt = g_cfg.mode == 1 ? g.color_fmt : OutputFormatFor(g.color_fmt);
     if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
-    { FeedDisable("unsupported backbuffer format"); return false; }
+    { g_build_pending = false; FeedDisable("unsupported backbuffer format"); return false; }
     const bool hdr      = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
 
@@ -4110,16 +4169,12 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
 // caller per frame. See the Smooth Motion note next to FeedEnter.
 static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
-    if (!g_cfg.enabled || g_cfg.mode == 0) return;
-    // A pending overlay request has to get through even with the feed disabled -- that is
-    // precisely when the user reaches for "Start the DLSS 5 host".
-    const bool request = g_host_request != HOST_REQ_NONE;
-    if (g.disabled && !request) return;
+    // Overlay host requests are drained in OnPresent, which runs whether or not this does.
+    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
 
     if (!FeedEnter()) return;   // logs the dropped call, with its thread id
     FeedThreadTrace();
-    if (request) HostConsumeRequest();   // inside the lock: it tears down what a frame uses
-    if (!g.disabled) FeedFrameDispatch(rt, cl, rtv);
+    FeedFrameDispatch(rt, cl, rtv);
     FeedLeave();
 }
 
@@ -4684,6 +4739,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // leaving it installed means a later crash jumps into freed memory and the game's own
         // handler never sees the real fault.
         SetUnhandledExceptionFilter(g_prev_filter);
+        // We are under the loader lock: HostLinkStop must not try to join the worker here.
+        g_detaching = true;
         CastRelease();
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_present>(OnPresent);
