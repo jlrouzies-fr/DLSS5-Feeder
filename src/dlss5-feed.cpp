@@ -822,9 +822,12 @@ struct Cfg
     int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer)
     int   work_resolution; // 64-bit D3D11 only: 50..100 percent of each backbuffer axis
     int   work_upscale;    // how the work-size output is expanded back over the backbuffer:
-                           // 0 = bilinear stretch, 1 = AMD FSR 1 (EASU + RCAS). A better
-                           // filter for the cost knob above, not super resolution (issue #34)
-    float work_sharpness;  // RCAS strength for work_upscale=1, 0 (off) .. 1 (sharpest)
+                           // 0 = bilinear stretch, 1 = AMD FSR 1 (EASU + RCAS), 2 = DLSS
+                           // Super Resolution fed with synthetic jitter (experimental: the
+                           // downsample grid is shifted sub-pixel each frame and DLSS
+                           // reconstructs the native size itself). Better filters for the
+                           // cost knob above, never more than the native frame (issue #34)
+    float work_sharpness;  // RCAS strength for work_upscale 1 and 2, 0 (off) .. 1 (sharpest)
     int   gpu_timeout_ms;  // how long BeginCommands waits for the GPU to retire an allocator slot
     int   buffer_home;     // Vulkan transport: 1 = route the output home through a shared linear
                            // BUFFER instead of the shared image (dodges a one-directional
@@ -856,9 +859,14 @@ struct Cfg
                            // everything outside it -- which is what separates "the feed is slow"
                            // from "the neural consumer's detour is slow" from "neither, the
                            // stall is elsewhere in the process".
+    int   jitter_sign;     // diagnostic for work_upscale=2: +1 or -1, the sign handed to DLSS
+                           // for the grid shift. The wrong one converges to a crawl instead
+                           // of a stable image on a static scene. Parse-only, not written back.
+    int   jitter_phases;   // diagnostic for work_upscale=2: Halton sequence length, 0 = auto
+                           // (8 * (native/work)^2, NVIDIA's guidance). Parse-only.
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 0, 0.3f, 2000, 1, 0, 0, 0, 0, 1.0f, 1.0f, 50 };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 0, 0.3f, 2000, 1, 0, 0, 0, 0, 1.0f, 1.0f, 50, 1, 0 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -947,12 +955,16 @@ static bool CfgReload()
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
         else if (_stricmp(key, "stall_log_ms")   == 0) next.stall_log_ms   = iv;
+        else if (_stricmp(key, "jitter_sign")    == 0) next.jitter_sign    = iv;
+        else if (_stricmp(key, "jitter_phases")  == 0) next.jitter_phases  = iv;
     }
     fclose(f);
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
-    if (next.work_upscale < 0 || next.work_upscale > 1) next.work_upscale = g_cfg.work_upscale;
+    if (next.work_upscale < 0 || next.work_upscale > 2) next.work_upscale = g_cfg.work_upscale;
     if (next.work_sharpness < 0.0f || next.work_sharpness > 1.0f) next.work_sharpness = g_cfg.work_sharpness;
+    if (next.jitter_sign != 1 && next.jitter_sign != -1) next.jitter_sign = g_cfg.jitter_sign;
+    if (next.jitter_phases < 0 || next.jitter_phases > 128) next.jitter_phases = g_cfg.jitter_phases;
     // 0 would mean "give up instantly"; an unbounded wait would hang the game on a
     // genuinely dead GPU. Clamp to something a contended machine can still live with.
     if (next.gpu_timeout_ms < 100 || next.gpu_timeout_ms > 60000) next.gpu_timeout_ms = g_cfg.gpu_timeout_ms;
@@ -1207,8 +1219,19 @@ struct Feed
     ID3D11Texture2D          *easu_tex;        // work_upscale=1: native-size EASU result, RCAS reads it
     ID3D11RenderTargetView   *easu_rtv;
     ID3D11ShaderResourceView *easu_srv;
-    UINT        width, height;
+    UINT        width, height;                  // the work size: what DLSS renders from
+    UINT        output_width, output_height;    // the Output texture: == work size (DLAA), or native (work_upscale=2)
     UINT        backbuffer_width, backbuffer_height;
+
+    // work_upscale=2: DLSS Super Resolution on synthetic jitter (64-bit D3D11 only)
+    bool        sr_requested;      // what the current build was asked for (rebuild when the cfg disagrees)
+    bool        sr_active;         // the build actually got an SR feature (NGX had a preset covering the ratio)
+    int         sr_quality;        // NVSDK_NGX_PerfQuality_Value in use
+    const char *sr_quality_name;
+    const char *sr_quality_hint;   // the NGX render-preset hint key for that quality
+    UINT        jitter_index;      // position in the Halton sequence, restarts on every DLSS reset
+    UINT        jitter_phases;     // sequence length for this build
+    float       jitter_x, jitter_y;   // this frame's grid shift, in work pixels
     DXGI_FORMAT color_fmt, output_fmt;      // shared texture formats
     DXGI_FORMAT bb_fmt;                     // the backbuffer's format, to notice swaps
     bool        hdr;
@@ -1250,6 +1273,21 @@ static Feed g;
 // ---------------------------------------------------------------------------
 
 template <typename T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
+
+// Halton(2,3) low-discrepancy sequence, centred on the pixel: each value in [-0.5, 0.5).
+// Index 0 (and every wrap) is the unshifted sample, which is what a history reset starts from.
+static void HaltonJitter(UINT index, UINT phases, float *x, float *y)
+{
+    if (phases == 0) phases = 8;
+    const UINT k = index % phases;
+    if (k == 0) { *x = 0.0f; *y = 0.0f; return; }
+    float fx = 0.0f, inv = 0.5f;
+    for (UINT n = k; n != 0; n /= 2) { fx += inv * static_cast<float>(n % 2); inv *= 0.5f; }
+    float fy = 0.0f; inv = 1.0f / 3.0f;
+    for (UINT n = k; n != 0; n /= 3) { fy += inv * static_cast<float>(n % 3); inv /= 3.0f; }
+    *x = fx - 0.5f;
+    *y = fy - 0.5f;
+}
 
 static UINT ScaledExtent(UINT native_extent, int percent)
 {
@@ -2058,6 +2096,8 @@ static void ReleaseFrameResources()
     g.vk_layout_init = false;
     g.vk_released    = false;
     SafeRelease(g.output_srv);
+    g.sr_active = false;              // a fresh build decides again
+    g.output_width = g.output_height = 0;
     SafeRelease(g.color_stage_srv);
     SafeRelease(g.color_stage);
     SafeRelease(g.easu_srv);
@@ -2163,17 +2203,20 @@ static bool MakeBlitShaders()
         "Texture2D<float> src_mask : register(t3);\n"
         "SamplerState linear_smp : register(s0);\n"
         "SamplerState point_smp : register(s1);\n"
-        "cbuffer ResampleConstants : register(b0) { float2 mv_scale; float2 _pad; };\n"
+        // jitter_uv: work_upscale=2 shifts the whole sampling grid by a sub-pixel amount
+        // each frame (the synthetic jitter DLSS reconstructs from); zero otherwise. All four
+        // guides move together so depth/vectors/mask stay aligned with the colour sample.
+        "cbuffer ResampleConstants : register(b0) { float2 mv_scale; float2 jitter_uv; };\n"
         "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
         "VSOut vs(uint id : SV_VertexID) { VSOut o; float2 uv = float2((id << 1) & 2, id & 2);\n"
         "  o.uv = uv; o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
         "float4 ps(VSOut i) : SV_Target { return float4(src_color.Sample(linear_smp, i.uv).rgb, 1.0); }\n"
         "struct ResampleOut { float4 color : SV_Target0; float2 mv : SV_Target1; float depth : SV_Target2; float mask : SV_Target3; };\n"
-        "ResampleOut ps_resample(VSOut i) { ResampleOut o;\n"
-        "  o.color = src_color.SampleLevel(linear_smp, i.uv, 0);\n"
-        "  o.mv = src_mv.SampleLevel(point_smp, i.uv, 0) * mv_scale;\n"
-        "  o.depth = src_depth.SampleLevel(point_smp, i.uv, 0);\n"
-        "  o.mask = src_mask.SampleLevel(point_smp, i.uv, 0); return o; }\n";
+        "ResampleOut ps_resample(VSOut i) { ResampleOut o; float2 uv = i.uv + jitter_uv;\n"
+        "  o.color = src_color.SampleLevel(linear_smp, uv, 0);\n"
+        "  o.mv = src_mv.SampleLevel(point_smp, uv, 0) * mv_scale;\n"
+        "  o.depth = src_depth.SampleLevel(point_smp, uv, 0);\n"
+        "  o.mask = src_mask.SampleLevel(point_smp, uv, 0); return o; }\n";
 
     HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
     auto compile = m != nullptr ? reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
@@ -2236,6 +2279,7 @@ static bool MakeBlitShaders()
 }
 
 static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed);
+static bool PickSrQuality(UINT w, UINT h, UINT out_w, UINT out_h);
 
 // A failed create with two NGX module copies loaded is nearly always the game-local
 // nvngx_dlss.dll: an NGX interposer (the DLSS 5 add-on) detours BOTH copies, and the
@@ -2326,9 +2370,10 @@ static bool RecreateFeatureOnly(UINT w, UINT h)
 
 static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DXGI_FORMAT bb_fmt)
 {
+    const bool want_sr = g_cfg.work_upscale == 2 && g_cfg.mode >= 2 && (w != backbuffer_w || h != backbuffer_h);   // mode 1 copies COLOR->OUTPUT, so sizes must match
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
         w == g.width && h == g.height && backbuffer_w == g.backbuffer_width &&
-        backbuffer_h == g.backbuffer_height && bb_fmt == g.bb_fmt)
+        backbuffer_h == g.backbuffer_height && bb_fmt == g.bb_fmt && want_sr == g.sr_requested)
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building shared textures");
@@ -2356,8 +2401,29 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
         return false;
     }
 
+    // work_upscale=2: DLSS itself expands the work-size frame to native, so the Output is
+    // native-sized and the feature is created in Super Resolution mode -- if NGX has a
+    // quality preset whose dynamic render range covers this ratio. Otherwise fall back to
+    // the DLAA contract and let the spatial expand-back handle it, and say so once.
+    g.sr_requested = want_sr;
+    g.sr_active    = want_sr && PickSrQuality(w, h, backbuffer_w, backbuffer_h);
+    if (want_sr && !g.sr_active)
+        Log("[feed] work_upscale=2: no DLSS preset covers %ux%u -> %ux%u; staying on DLAA + FSR 1 for this build", w, h, backbuffer_w, backbuffer_h);
+    g.output_width  = g.sr_active ? backbuffer_w : w;
+    g.output_height = g.sr_active ? backbuffer_h : h;
+    g.jitter_index  = 0;
+    g.jitter_x = g.jitter_y = 0.0f;
+    if (g.sr_active)
+    {
+        const float ratio = static_cast<float>(backbuffer_w) / static_cast<float>(w);
+        g.jitter_phases = g_cfg.jitter_phases > 0 ? static_cast<UINT>(g_cfg.jitter_phases)
+                                                  : static_cast<UINT>(ceilf(8.0f * ratio * ratio));
+        Log("[feed] work_upscale=2: DLSS %s, %ux%u -> %ux%u, Halton(2,3) over %u phases, jitter sign %+d",
+            g.sr_quality_name, w, h, backbuffer_w, backbuffer_h, g.jitter_phases, g_cfg.jitter_sign);
+    }
+
     bool ok = MakeSharedPair(dev1, SLOT_COLOR,  w, h, g.color_fmt,             false, true)  &&
-              MakeSharedPair(dev1, SLOT_OUTPUT, w, h, g.output_fmt,            true,  false) &&
+              MakeSharedPair(dev1, SLOT_OUTPUT, g.output_width, g.output_height, g.output_fmt, true, false) &&
               MakeSharedPair(dev1, SLOT_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,   false, true)  &&
               MakeSharedPair(dev1, SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false, true) &&
               MakeSharedPair(dev1, SLOT_MASK,   w, h, DXGI_FORMAT_R8_UNORM,     false, true);
@@ -2441,6 +2507,39 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
 
 // The DLSS contract, shared by the D3D11 and D3D12 paths. DLAA: render size == output
 // size, no jitter, MVs at render size. The DLSS 5 add-on captures this create inline.
+// work_upscale=2: find the DLSS quality preset whose dynamic render range contains the
+// work size for this output size. DLSS accepts any render size inside [min, max] of the
+// chosen preset, so the slider keeps its 50-100% freedom. Fills g.sr_quality(_name).
+static bool PickSrQuality(UINT w, UINT h, UINT out_w, UINT out_h)
+{
+    static const struct { NVSDK_NGX_PerfQuality_Value q; const char *name; const char *hint; } kOrder[] = {
+        { NVSDK_NGX_PerfQuality_Value_UltraQuality,     "Ultra Quality",     NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality },
+        { NVSDK_NGX_PerfQuality_Value_MaxQuality,       "Quality",           NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality },
+        { NVSDK_NGX_PerfQuality_Value_Balanced,         "Balanced",          NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced },
+        { NVSDK_NGX_PerfQuality_Value_MaxPerf,          "Performance",       NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance },
+        { NVSDK_NGX_PerfQuality_Value_UltraPerformance, "Ultra Performance", NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance },
+    };
+    if (g.params == nullptr) return false;
+    for (const auto &o : kOrder)
+    {
+        unsigned opt_w = 0, opt_h = 0, max_w = 0, max_h = 0, min_w = 0, min_h = 0;
+        float sharp = 0.0f;
+        const NVSDK_NGX_Result r = NGX_DLSS_GET_OPTIMAL_SETTINGS(g.params, out_w, out_h, o.q,
+                                                                 &opt_w, &opt_h, &max_w, &max_h, &min_w, &min_h, &sharp);
+        if (NVSDK_NGX_FAILED(r) || opt_w == 0 || opt_h == 0) continue;   // preset not offered at this size
+        Log("[feed] DLSS %s at %ux%u: optimal %ux%u, render range %ux%u .. %ux%u",
+            o.name, out_w, out_h, opt_w, opt_h, min_w, min_h, max_w, max_h);
+        if (w >= min_w && w <= max_w && h >= min_h && h <= max_h)
+        {
+            g.sr_quality      = static_cast<int>(o.q);
+            g.sr_quality_name = o.name;
+            g.sr_quality_hint = o.hint;
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
 {
     if (crashed != nullptr) *crashed = false;
@@ -2450,12 +2549,16 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
     if (g_cfg.flags >= 0) flags = g_cfg.flags;
     g.create_flags = flags;
 
+    // DLAA: render == target, unjittered. work_upscale=2 (D3D11 only, g.sr_active): render
+    // at the work size, target at the native size, DLSS reconstructs from our jitter.
+    const bool sr = g.sr_active && g.output_width != 0;
+    const UINT target_w = sr ? g.output_width : w, target_h = sr ? g.output_height : h;
     NVSDK_NGX_DLSS_Create_Params cp = {};
     cp.Feature.InWidth            = w;
     cp.Feature.InHeight           = h;
-    cp.Feature.InTargetWidth      = w;
-    cp.Feature.InTargetHeight     = h;
-    cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+    cp.Feature.InTargetWidth      = target_w;
+    cp.Feature.InTargetHeight     = target_h;
+    cp.Feature.InPerfQualityValue = sr ? static_cast<NVSDK_NGX_PerfQuality_Value>(g.sr_quality) : NVSDK_NGX_PerfQuality_Value_DLAA;
     cp.InFeatureCreateFlags       = flags;
     cp.InEnableOutputSubrects     = false;
 
@@ -2465,7 +2568,7 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
     // the modern default; E=5/F=6 are the legacy CNN presets with stronger clamping.
     if (g_cfg.preset > 0)
     {
-        g.params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, static_cast<unsigned int>(g_cfg.preset));
+        g.params->Set(sr ? g.sr_quality_hint : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, static_cast<unsigned int>(g_cfg.preset));
         Log("[feed] DLSS render preset hint: %d (%s)", g_cfg.preset,
             g_cfg.preset == 5 ? "E" : g_cfg.preset == 6 ? "F" : g_cfg.preset == 10 ? "J" : g_cfg.preset == 11 ? "K" : "?");
     }
@@ -2510,6 +2613,10 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
         return false;
     }
 
+    if (sr)
+        Log("[feed] feature ready: %ux%u -> %ux%u DLSS %s (synthetic jitter), flags=%d, color %s -> output %s",
+            w, h, target_w, target_h, g.sr_quality_name, flags, FormatName(g.color_fmt), FormatName(g.output_fmt));
+    else
     Log("[feed] feature ready: %ux%u DLAA, flags=%d (%s%s%s%s), color %s -> output %s, depth R32_FLOAT%s, mv R16G16_FLOAT",
         w, h, flags,
         (flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) ? "HDR " : "SDR ",
@@ -3568,9 +3675,12 @@ static bool CopyOrResampleInputs(ID3D11DeviceContext *ctx,
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(ctx->Map(g.resample_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
     { Log("[feed] resample constant-buffer map failed"); return false; }
+    // A shift of j work pixels is j / work_size in uv, whatever the source size is.
     const float constants[4] = {
         static_cast<float>(g.width) / static_cast<float>(source_w),
-        static_cast<float>(g.height) / static_cast<float>(source_h), 0.0f, 0.0f
+        static_cast<float>(g.height) / static_cast<float>(source_h),
+        g.sr_active ? g.jitter_x / static_cast<float>(g.width)  : 0.0f,
+        g.sr_active ? g.jitter_y / static_cast<float>(g.height) : 0.0f
     };
     memcpy(mapped.pData, constants, sizeof(constants));
     ctx->Unmap(g.resample_cb, 0);
@@ -3702,8 +3812,12 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->RSGetState(&old_rs);
     ctx->RSGetViewports(&nvp, &old_vp);
 
-    const bool scaled = g.width != g.backbuffer_width || g.height != g.backbuffer_height;
-    const bool fsr    = g_cfg.work_upscale == 1 && g.fsr_ok && g.easu_ps != nullptr;
+    // The Output is work-sized under DLAA and native-sized under work_upscale=2, where DLSS
+    // did the expanding and only the optional RCAS pass is left for us.
+    const UINT out_w = g.output_width  != 0 ? g.output_width  : g.width;
+    const UINT out_h = g.output_height != 0 ? g.output_height : g.height;
+    const bool scaled = out_w != g.backbuffer_width || out_h != g.backbuffer_height;
+    const bool fsr    = g_cfg.work_upscale != 0 && g.fsr_ok && g.easu_ps != nullptr;
     const bool easu   = fsr && scaled && g.easu_rtv != nullptr;
     const bool rcas   = fsr && g_cfg.work_sharpness > 0.0f && (easu || !scaled);   // RCAS reads at native texel indices
 
@@ -3722,7 +3836,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->PSSetSamplers(0, 1, smps);
     if (easu || rcas)
     {
-        UpdateFsrConstants(ctx, easu ? g.width : g.backbuffer_width, easu ? g.height : g.backbuffer_height);
+        UpdateFsrConstants(ctx, easu ? out_w : g.backbuffer_width, easu ? out_h : g.backbuffer_height);
         ctx->PSSetConstantBuffers(0, 1, &g.fsr_cb);
     }
 
@@ -5021,9 +5135,10 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     // follows a runtime (re-)init until that settled.
     const UINT work_w = ScaledExtent(cd.Width, g_cfg.work_resolution);
     const UINT work_h = ScaledExtent(cd.Height, g_cfg.work_resolution);
+    const bool want_sr = g_cfg.work_upscale == 2 && g_cfg.mode >= 2 && (work_w != cd.Width || work_h != cd.Height);
     const bool needs_build11 = !g.frame_ready || work_w != g.width || work_h != g.height ||
                                cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height ||
-                               cd.Format != g.bb_fmt;
+                               cd.Format != g.bb_fmt || want_sr != g.sr_requested;
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
@@ -5048,6 +5163,13 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
 
     if (ok)
     {
+        // work_upscale=2: this frame's grid shift. The sequence restarts with the DLSS
+        // history so a reset frame is the unshifted one.
+        if (g.sr_active)
+        {
+            if (g.need_reset || g_cfg.reset_every) g.jitter_index = 0;
+            HaltonJitter(g.jitter_index, g.jitter_phases, &g.jitter_x, &g.jitter_y);
+        }
         Breadcrumb("preparing work-resolution inputs");
         ok = CopyOrResampleInputs(ctx, color, mv, depth, mask,
                                   nullptr,
@@ -5091,8 +5213,10 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 ep.pInDepth          = g.tex12[SLOT_DEPTH];
                 ep.pInMotionVectors  = g.tex12[SLOT_MV];
                 ep.pInBiasCurrentColorMask = g.mask_ok ? g.tex12[SLOT_MASK] : nullptr;   // the shader's validation mask
-                ep.InJitterOffsetX   = 0.0f;
-                ep.InJitterOffsetY   = 0.0f;
+                // Jitter in render-pixel units, as the SDK asks. Only the synthetic-jitter path
+                // ever has one; the sign is what jitter_sign is for (see the README).
+                ep.InJitterOffsetX   = g.sr_active ? static_cast<float>(g_cfg.jitter_sign) * g.jitter_x : 0.0f;
+                ep.InJitterOffsetY   = g.sr_active ? static_cast<float>(g_cfg.jitter_sign) * g.jitter_y : 0.0f;
                 ep.InRenderSubrectDimensions.Width  = g.width;
                 ep.InRenderSubrectDimensions.Height = g.height;
                 ep.InReset           = reset;
@@ -5136,10 +5260,12 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                     BlitOutputToBackbuffer(ctx, rtv11);
                     const UINT64 n = ++g.frames_done;
                     g.consecutive_fails = 0;
+                    if (g.sr_active) ++g.jitter_index;
                     if (n <= static_cast<UINT64>(g_cfg.log_frames) || (n % 1800) == 0)
-                        Log("[feed] frame %llu delivered (%ux%u at %d%% -> %ux%u, reset=%d)", n,
+                        Log("[feed] frame %llu delivered (%ux%u at %d%% -> %ux%u, reset=%d%s, jitter %+.3f,%+.3f)", n,
                             g.width, g.height, g_cfg.work_resolution,
-                            g.backbuffer_width, g.backbuffer_height, reset);
+                            g.backbuffer_width, g.backbuffer_height, reset,
+                            g.sr_active ? ", DLSS SR" : "", g.jitter_x, g.jitter_y);
 
                     // The DLSS 5 add-on sometimes latches STANDBY/FAILED on the very first create and only
                     // recovers on a fresh one; re-create once after the pipeline has settled.
@@ -5601,23 +5727,31 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
             ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
                                 g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
 
-        const bool fsr_available = g.blit_vs == nullptr || g.fsr_ok;   // unknown until the shaders compile
-        if (!fsr_available) ImGui::BeginDisabled();
-        bool fsr = g_cfg.work_upscale == 1;
-        if (ImGui::Checkbox("FSR 1 expand-back (EASU + RCAS)", &fsr)) { g_cfg.work_upscale = fsr ? 1 : 0; dirty = true; }
-        ImGui::SameLine(); HelpMarker("Replaces the bilinear stretch of the work-size output with AMD FSR 1 spatial "
-                                      "upscaling and RCAS sharpening. A better filter for the cost knob above, not DLSS "
-                                      "Quality: the result can never exceed the native frame. At 100% only the "
-                                      "sharpening runs.");
-        if (fsr)
+        static const char *kUpscale[] = { "Bilinear stretch", "FSR 1 (EASU + RCAS)", "DLSS reconstruction (experimental)" };
+        if (ImGui::Combo("Expand-back", &g_cfg.work_upscale, kUpscale, 3)) dirty = true;
+        ImGui::SameLine(); HelpMarker("How the work-size result gets back to native size. FSR 1: AMD's spatial upscaler "
+                                      "plus RCAS sharpening, much crisper than the stretch at 50-75%. DLSS reconstruction: "
+                                      "the frame is downsampled with a different sub-pixel shift every frame and DLSS "
+                                      "Super Resolution rebuilds the native size from that history -- near-native when "
+                                      "still, but it leans on the estimated motion vectors far more than DLAA does, so "
+                                      "expect smear in motion. Neither is DLSS Quality: nothing here can exceed the "
+                                      "native frame the game already rendered. At 100% only the sharpening runs.");
+        if (g_cfg.work_upscale != 0)
         {
             ImGui::SliderFloat("Sharpness", &g_cfg.work_sharpness, 0.0f, 1.0f, "%.2f");
             if (ImGui::IsItemDeactivatedAfterEdit()) dirty = true;
         }
-        if (!fsr_available)
+        if (g_cfg.work_upscale != 0 && g.blit_vs != nullptr && !g.fsr_ok)
+            ImGui::TextDisabled("FSR 1 shaders failed to compile (see the log); the spatial expand-back stays bilinear.");
+        if (g_cfg.work_upscale == 2 && g.backbuffer_width != 0)
         {
-            ImGui::EndDisabled();
-            ImGui::TextDisabled("FSR 1 shaders failed to compile (see the log); expand-back stays bilinear.");
+            if (g.sr_active)
+                ImGui::TextDisabled("DLSS %s: %ux%u -> %ux%u, %u jitter phases, sign %+d", g.sr_quality_name,
+                                    g.width, g.height, g.output_width, g.output_height, g.jitter_phases, g_cfg.jitter_sign);
+            else if (g.sr_requested)
+                ImGui::TextDisabled("No DLSS preset covers this ratio; using DLAA + FSR 1 instead.");
+            else if (g_cfg.work_resolution >= 100)
+                ImGui::TextDisabled("Nothing to reconstruct at 100%%; lower the work resolution.");
         }
     }
     else

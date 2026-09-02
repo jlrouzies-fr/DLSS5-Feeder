@@ -779,8 +779,10 @@ if you prefer editing the file directly:
 | `enabled` | 1 | 0 disables everything. |
 | `mode` | 2 | 0 inert · 1 transport test (no NGX; on 32-bit it copies only the left half, so a split screen proves the round trip) · 2 full DLSS path. |
 | `work_resolution` | 100 | **D3D11 only (64-bit and 32-bit).** 50–100% of each backbuffer axis for the private DLAA + Neural Rendering work textures. The Add-ons overlay slider applies once 400 ms after dragging stops. Other paths remain at 100%. A cost knob, not DLSS upscaling — below 100% the image is downsampled, processed, and expanded back (see the troubleshooting FAQ). |
-| `work_upscale` | 0 | **D3D11 only.** How the work-size output is expanded back over the backbuffer: `0` bilinear stretch · `1` AMD FSR 1 (EASU + RCAS), visibly crisper at 50–75% than the stretch. Also on the overlay as "FSR 1 expand-back". A better filter for `work_resolution`, not DLSS Quality: the result can never exceed the native frame. If the FSR shaders fail to compile the log says so and the blit stays bilinear. |
-| `work_sharpness` | 0.3 | RCAS strength for `work_upscale=1`, `0` (off) to `1` (sharpest). At 100% work resolution only the sharpening runs. Overlay slider "Sharpness". |
+| `work_upscale` | 0 | **D3D11 only.** How the work-size output is expanded back over the backbuffer: `0` bilinear stretch · `1` AMD FSR 1 (EASU + RCAS), visibly crisper at 50–75% than the stretch · `2` **64-bit only, experimental:** DLSS Super Resolution on synthetic jitter — the downsample grid shifts sub-pixel every frame and DLSS rebuilds the native size from that history (see the FAQ for what it can and cannot do). Overlay combo "Expand-back". Better filters for `work_resolution`, not DLSS Quality: the result can never exceed the native frame. If the FSR shaders fail to compile the log says so and the spatial path stays bilinear. |
+| `work_sharpness` | 0.3 | RCAS strength for `work_upscale` 1 and 2, `0` (off) to `1` (sharpest). At 100% work resolution only the sharpening runs. Overlay slider "Sharpness". |
+| `jitter_sign` | 1 | **Diagnostic for `work_upscale=2`, parse-only.** `1` or `-1`: the sign of the grid shift handed to DLSS. On a static scene the right sign converges to a stable image within a second, the wrong one crawls. Here until the convention is confirmed in a game. |
+| `jitter_phases` | 0 | **Diagnostic for `work_upscale=2`, parse-only.** Halton sequence length; `0` = NVIDIA's 8 × (native ÷ work)². |
 | `hdr` | -1 | -1 auto (FP16 / R11G11B10 backbuffer = HDR), 0 force SDR, 1 force HDR. |
 | `depth_inverted` | -1 | -1 follow `RESHADE_DEPTH_INPUT_IS_REVERSED`, 0/1 force. |
 | `flags` | -1 | raw `DLSS.Feature.Create.Flags` override. |
@@ -921,6 +923,23 @@ Common cases:
   `NREnableUpscaling` at 0: with a 1:1 contract it cannot engage, and on v4.6 it parks neural
   rendering for the run. For games that ship DLSS already, use the game's own DLSS (or OptiScaler)
   instead of this feeder.
+* **What about adding the jitter ourselves? (`work_upscale=2`, 64-bit D3D11, experimental)** — it
+  exists, and it is honest about its limits. The feeder shifts the downsample grid by a Halton
+  sub-pixel offset every frame, reports that offset to DLSS, and creates the feature in Super
+  Resolution mode (render = work size, target = native), so DLSS itself rebuilds the native frame
+  from the jittered history. Three things it cannot change: the game still rendered every native
+  pixel, so there is no frame-rate win on the game side; every jittered sample comes from that
+  same native frame, so the best DLSS can converge to is the image you already had at 100%; and
+  DLSS SR leans on motion vectors far more than DLAA — with the feeder's *estimated* vectors, a
+  rejected history means a blurry low-res frame rather than a sharp native one, so expect smear in
+  motion. Where it earns its place: when the neural pass is what costs (Bioshock-class 350→48 fps),
+  a 50–66% work resolution with DLSS reconstruction gives near-native stills at the reduced neural
+  cost. It needs a DLSS quality preset whose render range covers the ratio (the log prints them);
+  otherwise the build falls back to DLAA + FSR 1 and says so. The only route to a real frame-rate
+  win is the game rendering fewer pixels: set a lower resolution in the game and let the GPU scale
+  it to the panel (NVIDIA Control Panel → Adjust desktop size and position → GPU scaling); the
+  feeder then works 1:1 at that size. See `PLAN-PROXY-SWAPCHAIN.md` for what doing that
+  in-process would take.
 * **32-bit game: `tex 1 CreateTexture2D failed 0x80070057`, `failure: shared build` forever** —
   the game's D3D11 device is feature level 10.x and cannot bind the UAV the DLSS output needs.
   From 0.11.0-beta.2 the helper creates the shared set instead (the log says `the host will
@@ -973,6 +992,12 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
 * **Geometry vectors are experimental and off.** The camera-model fit is derived from the provider's
   own flow, so it inherits that noise, and it has no way to know the HUD is not part of the scene.
   Doing it properly needs the game's real view-projection matrices, not a fit.
+* **Synthetic-jitter DLSS reconstruction (`work_upscale=2`) is experimental and off.** It turns
+  DLSS into the expand-back for the work-resolution cost knob: near-native when still, smeary in
+  motion because it trusts the estimated vectors more than DLAA does, never more than the native
+  frame, and untested in a game as of 0.12.0 (the jitter sign convention is a cfg key for that
+  reason). 64-bit D3D11 only; the 32-bit path would need the target size and the per-frame jitter
+  on the IPC.
 * A light that flickers faster than DLSS's history converges is averaged into a slow pulse. The
   trust mask reduces it; nothing available to a post-process feed removes it.
 * Exclusive-fullscreen swapchain churn can make some games reload effects repeatedly; windowed is
