@@ -68,8 +68,22 @@ param(
 
     [string] $Exe,
 
-    [switch] $Quiet
+    [switch] $Quiet,
+
+    # Skip the "Press Enter to exit" pause at the end. The pause exists for the
+    # right-click > "Run with PowerShell" case, where the window would otherwise close
+    # before the output can be read; -Quiet implies it.
+    [switch] $NoPause
 )
+
+function Exit-Verifier {
+    param([int] $Code)
+    if (-not $Quiet -and -not $NoPause) {
+        Write-Host ''
+        try { [void](Read-Host '  Press Enter to exit') } catch { }
+    }
+    exit $Code
+}
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -446,7 +460,7 @@ if (-not $resolved) {
     Report -Status 'Fail' -Text ('Path not found: ' + $GamePath) `
            -Action 'Pass a game folder, or the game''s .exe, that actually exists.'
     Write-Host ''
-    exit 1
+    Exit-Verifier 1
 }
 
 if (Test-DirHere $resolved) {
@@ -461,7 +475,7 @@ if (-not $gameDir) {
     Report -Status 'Fail' -Text ('Cannot make a game folder out of: ' + $GamePath) `
            -Action 'Point -GamePath at the folder holding the game''s real .exe.'
     Write-Host ''
-    exit 1
+    Exit-Verifier 1
 }
 
 if (-not $Quiet) {
@@ -1304,5 +1318,5 @@ else {
 
 Write-Host ''
 
-if ($script:CountFail -gt 0) { exit 1 }
-exit 0
+if ($script:CountFail -gt 0) { Exit-Verifier 1 }
+Exit-Verifier 0
