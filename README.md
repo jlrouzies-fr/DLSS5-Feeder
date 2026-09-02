@@ -50,7 +50,9 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 >
 > **Deep Fried Chicken** (by Alexander), distributed as its own archive through Discord:
 > <https://discord.com/channels/1543931653976498207/1543936250657120366>. Current version
-> **1.4.4-alpha**; the feeder interop was introduced in **1.4.0**.
+> **1.4.8-alpha**; the feeder interop was introduced in **1.4.0**. **Take 1.4.8 or newer** —
+> earlier builds rescanned every module in the process every 300 presented frames, which shows
+> up as a periodic stutter in module-heavy hosts (see [Logs and troubleshooting](#logs-and-troubleshooting)).
 >
 > Three files go next to the 64-bit game `.exe` (or into `host64\` for a 32-bit game):
 > `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll` and `deep-fried-chicken.cfg`.
@@ -337,6 +339,12 @@ Create and Evaluate for it automatically — there is nothing to configure on ou
 - **Start with one pass.** It can run up to 30, which is a stress mode, not a setting to open on.
   Its work scale is a continuous 10–150% slider (`neural_work_percent`); 1.4.4 replaced the older
   Full/Half selector with it, and old `neural_work_divisor` configs migrate.
+- **Use 1.4.8 or newer if you see a regular stutter.** Up to 1.4.7 Chicken rescanned every module
+  in the process every 300 presented frames looking for a late-loaded NGX host. In a host with a
+  large module list that scan is expensive enough to cost a frame, on a fixed cadence — about
+  every 5 s at 60 fps — which reads as a periodic hitch and poor 1% lows while average frame rate
+  stays flat. 1.4.8 replaced the polling with an OS loader callback; its log then says
+  `smart discovery settled: periodic full-module fallback disabled`.
 - The feeder's `warmup_rebuild` frame count is not used while Chicken is present. Instead the feeder watches
   Chicken's exported interception state and re-creates the feature once, the moment it reads `ARMED` — Chicken
   arms its NGX detours several seconds after it claims ownership, and it never adopts a create it did not see.
@@ -353,13 +361,19 @@ Chicken's version, its interop ABI and its feature-1 interception state (`ARMED`
 `CONFLICT` or `FAILED` mean it will not run its passes, and why). For a report send that log together with
 `deep-fried-chicken.log` and `ReShade.log` from the same run.
 
-**Verification status.** Confirmed working on this machine on 2026-09-02 with **DOOM (2016),
-Vulkan, 3840x2160, in-process**: Chicken ARMED, 1200+ neural frames, zero failures. The 32-bit
-x64 helper path is confirmed in-game too — **Fable Anniversary, D3D9 via dgVoodoo2, 3578x2013**:
-Chicken armed 6 s after the first create, the feeder re-created once on its `ARMED` state, and
-Chicken adopted that create and rendered for the rest of the session. Everything else — 64-bit
-D3D11, D3D12, OpenGL, 32-bit Vulkan — is source-contract compatible per its author but **not
-game-validated**. The interop is ABI 1 in both 1.4.0-alpha and 1.4.4-alpha.
+**Verification status.** Confirmed working on this machine on 2026-09-02:
+
+- **DOOM (2016), 64-bit Vulkan, 3840x2160, in-process** — Chicken ARMED, 1200+ neural frames, zero failures.
+- **Fable Anniversary, 32-bit D3D9 via dgVoodoo2, 3578x2013, through the x64 helper** — Chicken armed 6 s
+  after the first create, the feeder re-created once on its `ARMED` state, and Chicken adopted that
+  create and rendered for the rest of the session.
+- **A 64-bit D3D11 host, in-process, 3840x2160 HDR10** — marker accepted (`feeder_marker=1
+  legacy_exact=0`), neural frames throughout. This one is a capture/streaming application rather than
+  a game, so it also exercised a swapchain that changes size and format live.
+
+D3D12, OpenGL and 32-bit Vulkan are source-contract compatible per its author but **not
+game-validated**. The interop is ABI 1 in 1.4.0-alpha, 1.4.4-alpha and 1.4.8-alpha alike —
+`FEEDER-INTEROP-v1.md` is byte-identical across all three.
 
 ### Alternative: the RenoDX add-on
 
@@ -746,6 +760,7 @@ if you prefer editing the file directly:
 | `preset` | 0 | DLSS render-preset hint: `0` default, `5`/`6` = legacy CNN presets E/F (clamp history harder — try these if motion warps around transparents like dust or flames), `10`/`11` = transformer presets J/K. |
 | `gpu_timeout_ms` | 2000 | how long a frame waits for the GPU to retire a command allocator before that frame is abandoned. Three abandoned frames in a row stop the feed. Raise it on a heavily contended GPU; clamped to 100–60000. |
 | `mv_scale_x/y` | 1.0 | extra motion-vector multiplier. |
+| `stall_log_ms` | 50 | **Diagnostic.** Log a breakdown for any frame whose present-to-present interval exceeds this, in ms (0 = off). Each `STALL frame` line splits the interval into the time inside the NGX evaluate call — which is where the neural consumer's own work runs — the rest of this add-on's work, and everything outside it, then names which of the three dominated. The `600 frames:` summary also carries the worst frame and a stall count. Use it to tell "the feed is slow" apart from "the neural consumer is slow" apart from "neither, something else in the process stalled". |
 | `async_home` | 1 | **32-bit games only.** 1 = pipelined handoff: each frame carries the DLSS output of the frame *before* it, so the game never waits for the helper process inside a frame — this is what lifts the ~35 fps ceiling of the original same-frame contract (issue #15). Costs one frame of latency on the DLSS output, which the temporal history hides. 0 = the original same-frame behaviour. Also on the overlay as "Pipelined handoff". |
 | `host_window` | 1 | **32-bit games only.** 1 shows the helper's window; 0 hides it (its own settings are now on the overlay page above, so you rarely need it). |
 
@@ -839,6 +854,16 @@ Common cases:
   took effect; `CONFLICT` means a second neural consumer (`renodx-dlss5.addon64`,
   `renodx-dlss.addon64`, `alexs-toolkit.addon64`) is loaded — remove it and fully restart.
   `dlss5-feed.log` prints the same state.
+* **A regular stutter every few seconds, with poor 1% lows but a normal average frame rate** —
+  first check the neural consumer's version. Deep Fried Chicken up to 1.4.7 rescanned every module
+  in the process every 300 presented frames, which is about every 5 s at 60 fps and costs a frame
+  each time in a host with a lot of DLLs loaded. **1.4.8 fixes it**; its log then says
+  `smart discovery settled: periodic full-module fallback disabled`. To confirm the cause rather
+  than guess, set `stall_log_ms` in `dlss5-feed.cfg` to roughly one and a half frame times (25 for
+  60 fps) and read the `STALL frame` lines: they say whether the lost time was inside the NGX
+  evaluate call, inside this add-on, or outside both. `arm=0` plus a full restart is the clean A/B,
+  because the live `enabled=0` switch leaves the consumer's observation hooks installed and the
+  scans running.
 * **Neural rendering stops mid-session, no crash** — the overlay's **Status** section now names the
   reason next to `Session: disabled`, and **Re-enable** restarts it. If the log says `the GPU did
   not retire allocator slot N within 2000 ms`, the GPU is not keeping up rather than broken: raise

@@ -25,10 +25,13 @@
 // both 1.4.0-alpha and 1.4.4-alpha, and corroborated at runtime: Chicken logs CLAIMING then
 // ARMED while these exports read 1 then 2. Re-check when the author ships the header.
 //
-// FEEDER-INTEROP-v1.md is byte-identical between 1.4.0 and 1.4.4, so ABI 1 is stable across
-// both. 1.4.4 changes only consumer-side things: a continuous 10-150% neural work scale in
-// place of the Full/Half selector, and automatic early-load registration (it appends itself
-// to [ADDON] LoadFromDllMain in the sibling ReShade.ini, backing the file up first).
+// FEEDER-INTEROP-v1.md is byte-identical between 1.4.0, 1.4.4 and 1.4.8, so ABI 1 is stable
+// across all three (the exports and the state enum are unchanged too -- re-checked against each
+// binary). Their differences are consumer-side only: 1.4.4 added a continuous 10-150% neural
+// work scale in place of the Full/Half selector and automatic early-load registration (it
+// appends itself to [ADDON] LoadFromDllMain in the sibling ReShade.ini, backing the file up
+// first); 1.4.8 replaced a full process-module rescan every 300 presents with an OS loader
+// callback, which is what cured a periodic stutter in module-heavy hosts.
 
 #pragma once
 

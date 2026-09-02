@@ -845,9 +845,15 @@ struct Cfg
                            // does not. Separates "transport lags" from "DLSS output lags".
     float mv_scale_x;      // multiplier applied to the motion vectors (the FX already outputs pixels)
     float mv_scale_y;
+    int   stall_log_ms;    // diagnostic: log a breakdown for any frame whose present-to-present
+                           // interval exceeds this (0 = off). Splits the interval into the time
+                           // spent inside the NGX evaluate call, the rest of our own work, and
+                           // everything outside it -- which is what separates "the feed is slow"
+                           // from "the neural consumer's detour is slow" from "neither, the
+                           // stall is elsewhere in the process".
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 2000, 1, 0, 0, 0, 0, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 2000, 1, 0, 0, 0, 0, 1.0f, 1.0f, 50 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -884,11 +890,12 @@ static void CfgWriteDefault()
             "async_home=%d\n"
             "sync_home=%d\n"
             "mv_scale_x=%.3f\n"
-            "mv_scale_y=%.3f\n",
+            "mv_scale_y=%.3f\n"
+            "stall_log_ms=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
-            g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -929,6 +936,7 @@ static bool CfgReload()
         else if (_stricmp(key, "passthrough")    == 0) next.passthrough    = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
+        else if (_stricmp(key, "stall_log_ms")   == 0) next.stall_log_ms   = iv;
     }
     fclose(f);
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
@@ -936,6 +944,7 @@ static bool CfgReload()
     // 0 would mean "give up instantly"; an unbounded wait would hang the game on a
     // genuinely dead GPU. Clamp to something a contended machine can still live with.
     if (next.gpu_timeout_ms < 100 || next.gpu_timeout_ms > 60000) next.gpu_timeout_ms = g_cfg.gpu_timeout_ms;
+    if (next.stall_log_ms < 0 || next.stall_log_ms > 10000) next.stall_log_ms = g_cfg.stall_log_ms;
 
     const bool rebuild = next.hdr != g_cfg.hdr || next.depth_inverted != g_cfg.depth_inverted ||
                          next.flags != g_cfg.flags || next.rebuild != g_cfg.rebuild ||
@@ -945,11 +954,11 @@ static bool CfgReload()
     if (!changed) return false;
     g_cfg = next;
     Log("[feed] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d warmup_rebuild=%d "
-        "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% gpu_timeout_ms=%d buffer_home=%d async_home=%d sync_home=%d mv_scale=%.3f,%.3f",
+        "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% gpu_timeout_ms=%d buffer_home=%d async_home=%d sync_home=%d mv_scale=%.3f,%.3f stall_log_ms=%d",
         g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
         g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay,
         g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
-        g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+        g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms);
     return rebuild;
 }
 
@@ -965,11 +974,11 @@ static void CfgSave()
     fprintf(f,
         "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
             "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\ngpu_timeout_ms=%d\n"
-            "buffer_home=%d\nasync_home=%d\nsync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+            "buffer_home=%d\nasync_home=%d\nsync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\nstall_log_ms=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.work_resolution, g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
-            g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms);
     fclose(f);
 }
 
@@ -1200,6 +1209,13 @@ struct Feed
 
     LONGLONG qpf, cpu_ticks, span_start;
     UINT64   timed_frames;
+
+    // Stall diagnostic (see stall_log_ms). prev_entry makes the present-to-present
+    // interval measurable from inside the technique callback; the window maxima give an
+    // always-on signal even when nothing crosses the threshold.
+    LONGLONG prev_entry;
+    LONGLONG win_max_interval, win_max_total, win_max_eval;
+    UINT64   win_stalls, win_stalls_logged;
 };
 
 static Feed g;
@@ -1528,14 +1544,29 @@ static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *de
     __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NVSDK_NGX_Result_Fail; }
 }
 
+// CPU ticks spent inside the last NGX call. The neural consumer's detour runs INSIDE these
+// calls, so timing them separately is what distinguishes a slow feed from a slow consumer.
+static LONGLONG g_last_eval_ticks;
+static LONGLONG g_last_create_ticks;
+
+static NVSDK_NGX_Result CreateDLSSGuarded(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
+{
+    __try { return NGX_D3D12_CREATE_DLSS_EXT(g.list, 1, 1, &g.feature, g.params, cp); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+}
+
 static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
 {
     *code = 0;
     ChickenPoll();
     g_chicken_created_unarmed = g_chicken_present && g_chicken_state != DFC_STATE_ARMED;
     PublishDfcInterop();
-    __try { return NGX_D3D12_CREATE_DLSS_EXT(g.list, 1, 1, &g.feature, g.params, cp); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    const NVSDK_NGX_Result r = CreateDLSSGuarded(cp, code);
+    QueryPerformanceCounter(&b);
+    g_last_create_ticks = b.QuadPart - a.QuadPart;
+    return r;
 }
 
 // Whether the one warm-up re-create should happen on delivered frame 'n'. Three regimes:
@@ -1567,12 +1598,22 @@ static bool WarmupRebuildDue(UINT64 n)
     return g_cfg.warmup_rebuild > 0 && n >= static_cast<UINT64>(g_cfg.warmup_rebuild);
 }
 
+static NVSDK_NGX_Result EvaluateDLSSGuarded(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, DWORD *code)
+{
+    __try { return NGX_D3D12_EVALUATE_DLSS_EXT(g.list, g.feature, g.params, ep); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+}
+
 static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, DWORD *code)
 {
     *code = 0;
     PublishDfcInterop();
-    __try { return NGX_D3D12_EVALUATE_DLSS_EXT(g.list, g.feature, g.params, ep); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    const NVSDK_NGX_Result r = EvaluateDLSSGuarded(ep, code);
+    QueryPerformanceCounter(&b);
+    g_last_eval_ticks = b.QuadPart - a.QuadPart;
+    return r;
 }
 
 static void CloseListGuarded()
@@ -3618,15 +3659,62 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
         g.span_start = entry;
     }
     g.cpu_ticks += (exit - entry);
+
+    // --- stall diagnostic -------------------------------------------------------
+    // interval  present-to-present, measured between two entries into this callback
+    // total     our whole per-frame job, this callback only
+    // eval      the NGX evaluate CALL, which is where the neural consumer's detour runs
+    // outside   interval - total: the game, ReShade's other add-ons, the driver, the
+    //           consumer's non-evaluate hooks. Not ours, and not inside the evaluate.
+    const LONGLONG total    = exit - entry;
+    const LONGLONG interval = g.prev_entry != 0 ? entry - g.prev_entry : 0;
+    const LONGLONG eval     = g_last_eval_ticks;
+    g.prev_entry = entry;
+    g_last_eval_ticks = 0;
+
+    if (interval > g.win_max_interval) g.win_max_interval = interval;
+    if (total    > g.win_max_total)    g.win_max_total    = total;
+    if (eval     > g.win_max_eval)     g.win_max_eval     = eval;
+
+    const double to_ms = 1000.0 / double(g.qpf);
+    if (g_cfg.stall_log_ms > 0 && interval > 0 &&
+        double(interval) * to_ms >= double(g_cfg.stall_log_ms))
+    {
+        ++g.win_stalls;
+        if (g.win_stalls_logged < 8)   // a burst must not turn the log into the bottleneck
+        {
+            ++g.win_stalls_logged;
+            const double iv_ms = double(interval) * to_ms;
+            const double tt_ms = double(total) * to_ms;
+            const double ev_ms = double(eval) * to_ms;
+            const double out_ms = iv_ms - tt_ms;
+            const char *verdict =
+                ev_ms >= 0.5 * iv_ms  ? "most of it was INSIDE the NGX evaluate -- the neural consumer's detour"
+              : tt_ms >= 0.5 * iv_ms  ? "most of it was inside this add-on, but outside the NGX evaluate"
+                                      : "most of it was OUTSIDE this add-on entirely (game, driver, or another add-on's hooks)";
+            Log("[feed] STALL frame %llu: interval %.1f ms | feed %.2f ms (of which NGX evaluate %.2f ms) | "
+                "outside the feed %.1f ms -- %s",
+                static_cast<unsigned long long>(g.frames_done), iv_ms, tt_ms, ev_ms, out_ms, verdict);
+        }
+    }
+
     if (++g.timed_frames < 600) return;
     const double span_ms = 1000.0 * double(exit - g.span_start) / double(g.qpf);
     const double cpu_ms  = 1000.0 * double(g.cpu_ticks) / double(g.qpf);
     const double n       = double(g.timed_frames);
-    Log("[feed] 600 frames: feed CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) | feed is %.0f%% of the frame",
-        cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms);
+    Log("[feed] 600 frames: feed CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) | feed is %.0f%% of the frame "
+        "| worst frame %.1f ms (feed %.2f, evaluate %.2f) | stalls %llu",
+        cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms,
+        double(g.win_max_interval) * to_ms, double(g.win_max_total) * to_ms, double(g.win_max_eval) * to_ms,
+        static_cast<unsigned long long>(g.win_stalls));
+    if (g.win_stalls > g.win_stalls_logged)
+        Log("[feed] (%llu further stall lines suppressed in that window)",
+            static_cast<unsigned long long>(g.win_stalls - g.win_stalls_logged));
     g.cpu_ticks = 0;
     g.timed_frames = 0;
     g.span_start = exit;
+    g.win_max_interval = g.win_max_total = g.win_max_eval = 0;
+    g.win_stalls = g.win_stalls_logged = 0;
 }
 
 static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *desc)
