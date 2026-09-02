@@ -214,7 +214,8 @@ uniform float GEOM_MASK_REJECTED <
     ui_label = "Mask strength on rejected flow";
     ui_tooltip = "Where the provider disagreed with the model but did not win the structure test (fire, smoke,\n"
                  "flicker), the geometric vector is used; this is how strongly DLSS is additionally asked to\n"
-                 "favour the current frame there. 0 = pure history (smoothest), 1 = mostly current frame.";
+                 "favour the current frame there. 0 = pure history (smoothest), 1 = mostly current frame.\n\n"
+                 "Also used by the static test's first frame when hysteresis holds its vector back.";
 > = 0.35;
 
 uniform bool MV_VALIDATE <
