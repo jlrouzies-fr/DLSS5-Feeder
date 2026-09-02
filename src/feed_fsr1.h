@@ -34,7 +34,8 @@ struct FsrConstants
     float con0[4];   // input-per-output scale (x,y), and the half-texel offset that maps an
                      // output pixel index to an input texel index (z,w)
     float con1[4];   // input size (x,y), 1/input size (z,w)
-    float rcas[4];   // x = RCAS sharpness as a linear factor exp2(-stops); y,z,w unused
+    float rcas[4];   // x = RCAS sharpness as a linear factor exp2(-stops); y,z = the size of the
+                     // texture RCAS reads (the output size: EASU result, or the native Output)
 };
 
 // sharpness01: 0 = RCAS off (the caller skips the pass), 1 = the sharpest FSR allows.
@@ -56,7 +57,9 @@ static inline void FsrFillConstants(FsrConstants *c, unsigned in_w, unsigned in_
     if (sharpness01 > 1.0f) sharpness01 = 1.0f;
     const float stops = (1.0f - sharpness01) * 2.0f;
     c->rcas[0] = exp2f(-stops);
-    c->rcas[1] = c->rcas[2] = c->rcas[3] = 0.0f;
+    c->rcas[1] = ow;   // RCAS runs after EASU (or alone at 100%), so its source is output-sized
+    c->rcas[2] = oh;
+    c->rcas[3] = 0.0f;
 }
 
 // Two entry points, `ps_easu` and `ps_rcas`, both driven by the add-on's existing
@@ -72,6 +75,12 @@ struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 float3 FsrLoad(int2 p)
 {
     p = clamp(p, int2(0, 0), int2(con1.xy) - int2(1, 1));
+    return fsr_src.Load(int3(p, 0)).rgb;
+}
+// RCAS reads the output-sized texture, so its clamp is the output extent, not EASU's input.
+float3 FsrLoadOut(int2 p)
+{
+    p = clamp(p, int2(0, 0), int2(rcas.yz) - int2(1, 1));
     return fsr_src.Load(int3(p, 0)).rgb;
 }
 float FsrLuma(float3 c) { return c.b * 0.5 + (c.r * 0.5 + c.g); }
@@ -195,11 +204,11 @@ float4 ps_rcas(VSOut i) : SV_Target
     //   b
     // d e f
     //   h
-    float3 b = FsrLoad(ip + int2( 0, -1));
-    float3 d = FsrLoad(ip + int2(-1,  0));
-    float3 e = FsrLoad(ip);
-    float3 f = FsrLoad(ip + int2( 1,  0));
-    float3 h = FsrLoad(ip + int2( 0,  1));
+    float3 b = FsrLoadOut(ip + int2( 0, -1));
+    float3 d = FsrLoadOut(ip + int2(-1,  0));
+    float3 e = FsrLoadOut(ip);
+    float3 f = FsrLoadOut(ip + int2( 1,  0));
+    float3 h = FsrLoadOut(ip + int2( 0,  1));
     float bL = FsrLuma(b), dL = FsrLuma(d), eL = FsrLuma(e), fL = FsrLuma(f), hL = FsrLuma(h);
     // Noise detection: back the sharpening off where the neighbourhood is already busy.
     float nz = 0.25 * (bL + dL + fL + hL) - eL;
