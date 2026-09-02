@@ -2519,14 +2519,20 @@ static bool PickSrQuality(UINT w, UINT h, UINT out_w, UINT out_h)
         { NVSDK_NGX_PerfQuality_Value_MaxPerf,          "Performance",       NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance },
         { NVSDK_NGX_PerfQuality_Value_UltraPerformance, "Ultra Performance", NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance },
     };
-    if (g.params == nullptr) return false;
+    // The optimal-settings callback lives on the CAPABILITY parameter object only; an
+    // AllocateParameters object answers every preset with "no callback" (seen on the
+    // 32-bit host first: every query failed and SR silently fell back to DLAA).
+    NVSDK_NGX_Parameter *caps = nullptr;
+    const NVSDK_NGX_Result rc = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
+    if (NVSDK_NGX_FAILED(rc) || caps == nullptr) { Log("[feed] GetCapabilityParameters failed 0x%08X; cannot pick an SR preset", rc); return false; }
     for (const auto &o : kOrder)
     {
         unsigned opt_w = 0, opt_h = 0, max_w = 0, max_h = 0, min_w = 0, min_h = 0;
         float sharp = 0.0f;
-        const NVSDK_NGX_Result r = NGX_DLSS_GET_OPTIMAL_SETTINGS(g.params, out_w, out_h, o.q,
+        const NVSDK_NGX_Result r = NGX_DLSS_GET_OPTIMAL_SETTINGS(caps, out_w, out_h, o.q,
                                                                  &opt_w, &opt_h, &max_w, &max_h, &min_w, &min_h, &sharp);
-        if (NVSDK_NGX_FAILED(r) || opt_w == 0 || opt_h == 0) continue;   // preset not offered at this size
+        if (NVSDK_NGX_FAILED(r) || opt_w == 0 || opt_h == 0)
+        { Log("[feed] DLSS %s at %ux%u: not offered (0x%08X, optimal %ux%u)", o.name, out_w, out_h, r, opt_w, opt_h); continue; }
         Log("[feed] DLSS %s at %ux%u: optimal %ux%u, render range %ux%u .. %ux%u",
             o.name, out_w, out_h, opt_w, opt_h, min_w, min_h, max_w, max_h);
         if (w >= min_w && w <= max_w && h >= min_h && h <= max_h)

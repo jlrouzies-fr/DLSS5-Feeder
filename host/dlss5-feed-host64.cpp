@@ -1098,14 +1098,20 @@ static bool PickSrQuality(UINT w, UINT h_, UINT out_w, UINT out_h)
         { NVSDK_NGX_PerfQuality_Value_MaxPerf,          "Performance" },
         { NVSDK_NGX_PerfQuality_Value_UltraPerformance, "Ultra Performance" },
     };
-    if (h.params == nullptr) return false;
+    // The optimal-settings callback lives on the CAPABILITY parameter object only; an
+    // AllocateParameters object answers every preset with "no callback" (the first Fable
+    // run: every query failed and SR silently fell back to DLAA).
+    NVSDK_NGX_Parameter *caps = nullptr;
+    const NVSDK_NGX_Result rc = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
+    if (NVSDK_NGX_FAILED(rc) || caps == nullptr) { Log("[host] GetCapabilityParameters failed 0x%08X; cannot pick an SR preset", rc); return false; }
     for (const auto &o : kOrder)
     {
         unsigned opt_w = 0, opt_h = 0, max_w = 0, max_h = 0, min_w = 0, min_h = 0;
         float sharp = 0.0f;
-        const NVSDK_NGX_Result r = NGX_DLSS_GET_OPTIMAL_SETTINGS(h.params, out_w, out_h, o.q,
+        const NVSDK_NGX_Result r = NGX_DLSS_GET_OPTIMAL_SETTINGS(caps, out_w, out_h, o.q,
                                                                  &opt_w, &opt_h, &max_w, &max_h, &min_w, &min_h, &sharp);
-        if (NVSDK_NGX_FAILED(r) || opt_w == 0 || opt_h == 0) continue;   // preset not offered at this size
+        if (NVSDK_NGX_FAILED(r) || opt_w == 0 || opt_h == 0)
+        { Log("[host] DLSS %s at %ux%u: not offered (0x%08X, optimal %ux%u)", o.name, out_w, out_h, r, opt_w, opt_h); continue; }
         Log("[host] DLSS %s at %ux%u: optimal %ux%u, render range %ux%u .. %ux%u",
             o.name, out_w, out_h, opt_w, opt_h, min_w, min_h, max_w, max_h);
         if (w >= min_w && w <= max_w && h_ >= min_h && h_ <= max_h)
@@ -1300,6 +1306,9 @@ static int RunTest()
 {
     const UINT W = 640, H = 360;
     Log("[host] --test: %ux%u synthetic DLAA", W, H);
+    // Also prove the SR preset query answers (work_upscale=2 depends on it): 50% of 1080p.
+    Log("[host] --test: SR preset probe for 960x540 -> 1920x1080: %s",
+        PickSrQuality(960, 540, 1920, 1080) ? h.sr_quality_name : "none (the optimal-settings query failed)");
 
     ID3D12Resource *color  = MakeTex(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, false);
     ID3D12Resource *output = MakeTex(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true);
