@@ -797,7 +797,58 @@ static void FeedFail(const char *what)
 
 // ---------------------------------------------------------------------------
 // Host process + pipe
+//
+// Starting the helper, shaking hands with it and asking it to build all used to happen on
+// the render thread, inside Present. Starting it meant spinning on CreateFile for up to
+// 15 s and then blocking on the hello ack; every build blocked on an ack the host only
+// sends once NGX is up and the feature is created, which on a cold host includes the
+// ~165 MB model load. So every Apply, restart, resize and work-resolution change froze the
+// game for seconds while the overlay's own text claimed it kept rendering. And a host that
+// hung rather than died froze it for good: the pipe calls had no timeout, and HostAlive()
+// cannot tell a hang from health.
+//
+// So: a worker thread does the waiting, the frame path polls it, and every pipe transfer
+// is bounded. The worker touches nothing but Win32 and the pipe -- never ReShade, never the
+// game's device -- and the pipe has exactly one user at a time by construction, not by
+// lock: the render thread only writes a frame message once a build has finished, and a
+// build only finishes after the job that carried it was consumed here.
 // ---------------------------------------------------------------------------
+
+enum { LINK_IDLE = 0, LINK_RUNNING, LINK_DONE, LINK_FAILED };
+enum { JOB_CONNECT = 1, JOB_BUILD };
+
+struct HostLink
+{
+    HANDLE        thread;
+    volatile LONG state;        // LINK_*; the worker only ever moves RUNNING -> DONE/FAILED
+    volatile LONG abort;        // set by the render thread; the worker checks it between steps
+    HANDLE        abort_event;  // and it wakes every wait the worker is parked in
+    int           job;          // JOB_*
+    FeedBuild     build;        // JOB_BUILD in
+    FeedBuildAck  ack;          // JOB_BUILD out
+    HANDLE        pipe;         // JOB_CONNECT out -- adopted into g.pipe / g.hproc by the
+    HANDLE        proc;         //   render thread, on success AND on failure (so HostClose
+    uint32_t      panel_w;      //   disposes of a half-made link the usual way)
+    uint32_t      panel_h;
+    bool          fatal;        // true = FeedDisable(why), false = HostLost(why)
+    char          why[192];
+    DWORD         ms;           // how long the job took, for the log
+};
+static HostLink g_link;
+
+// How long the render thread is willing to wait for the host at each step. The first two
+// are the worker's, so the game never feels them; the last one is on the frame path, where
+// 21 bytes into a 1 KB pipe buffer only ever blocks if the host has stopped reading.
+static const DWORD kPipeHelloMs = 15000;
+static const DWORD kPipeBuildMs = 60000;
+static const DWORD kPipeFrameMs = 250;
+
+static void HostLinkStop();   // below: abort and join the worker, from HostClose
+
+// A build is in flight (waiting for the host to connect, or for its answer). The frame path
+// skips feeding while this is set WITHOUT counting a failure: the exponential backoff in
+// FeedFail is for a build that went wrong, not for one that has simply not come back yet.
+static bool g_build_pending;
 
 static void HostDrain()
 {
@@ -877,6 +928,8 @@ static void CastFlushInput();     // below: release any key/button the host stil
 
 static void HostClose()
 {
+    HostLinkStop();   // first: nothing else here may run beside a worker still using the pipe
+    g_build_pending = false;   // whatever was in flight went with the link
     CastHostLost();
     CastReleasePanel();
     HostDrain();   // BEFORE the pipe closes: the host must still be around to signal
@@ -1685,10 +1738,60 @@ static void OnOverlay(reshade::api::effect_runtime *rt)
     dl->AddPolyline(arrow, 7, IM_COL32(0, 0, 0, 255), ImDrawFlags_Closed, 1.5f);
 }
 
+// One bounded transfer. The pipe is opened FILE_FLAG_OVERLAPPED, so every read and write in
+// this file goes through here: a host that stops answering costs the caller `timeout_ms`
+// and an error, where a synchronous call would have parked it forever -- on the render
+// thread, mid-Present. `ev` is the caller's own manual-reset event (the worker and the
+// render thread never transfer at the same time, but they do not share one either).
+static bool PipeXfer(HANDLE pipe, HANDLE ev, bool write, void *buf, DWORD len, DWORD timeout_ms)
+{
+    if (pipe == nullptr || pipe == INVALID_HANDLE_VALUE || ev == nullptr) return false;
+    BYTE *p = static_cast<BYTE *>(buf);
+    DWORD left = len;
+    while (left > 0)
+    {
+        OVERLAPPED ov = {};
+        ov.hEvent = ev;
+        ResetEvent(ev);
+        DWORD moved = 0;
+        const BOOL done = write ? WriteFile(pipe, p, left, &moved, &ov)
+                                : ReadFile(pipe, p, left, &moved, &ov);
+        if (!done)
+        {
+            if (GetLastError() != ERROR_IO_PENDING) return false;
+            const HANDLE waits[2] = { ev, g_link.abort_event };
+            const DWORD  n = g_link.abort_event != nullptr ? 2u : 1u;
+            if (WaitForMultipleObjects(n, waits, FALSE, timeout_ms) != WAIT_OBJECT_0)
+            {
+                // This OVERLAPPED is on the stack, so the I/O has to be finished with before
+                // the frame goes -- otherwise the kernel writes into memory that is gone.
+                // Once cancelled (or already complete) the event is signalled, so the wait
+                // returns at once; it is unbounded on purpose, because the alternative is
+                // memory corruption.
+                CancelIoEx(pipe, &ov);
+                WaitForSingleObject(ev, INFINITE);
+                return false;
+            }
+            if (!GetOverlappedResult(pipe, &ov, &moved, FALSE)) return false;
+        }
+        if (moved == 0) return false;   // the far end closed
+        p    += moved;
+        left -= moved;
+    }
+    return true;
+}
+
+// The render thread's own event for PipeXfer, made on first use.
+static HANDLE g_pipe_ev;
+static HANDLE PipeEvent()
+{
+    if (g_pipe_ev == nullptr) g_pipe_ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    return g_pipe_ev;
+}
+
 static bool PipeWrite(const void *buf, DWORD len)
 {
-    DWORD put = 0;
-    return g.pipe != nullptr && WriteFile(g.pipe, buf, len, &put, nullptr) && put == len;
+    return PipeXfer(g.pipe, PipeEvent(), true, const_cast<void *>(buf), len, kPipeFrameMs);
 }
 
 // The tag and the message go in ONE write. Two writes put two round trips through the
@@ -1702,12 +1805,6 @@ static bool PipeWriteFrame(const FeedFrameMsg &fm)
 {
     const FeedTaggedFrame msg = { 'F', fm };
     return PipeWrite(&msg, sizeof(msg));
-}
-
-static bool PipeRead(void *buf, DWORD len)
-{
-    DWORD got = 0;
-    return g.pipe != nullptr && ReadFile(g.pipe, buf, len, &got, nullptr) && got == len;
 }
 
 // ---------------------------------------------------------------------------
@@ -1767,11 +1864,16 @@ static void ChickenCfgRefresh()
     fclose(f);
 }
 
-static bool EnsureHost()
+static const char *HostClientKindName()
 {
-    if (g.pipe != nullptr && HostAlive()) return true;
-    HostClose();
+    return g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : "D3D11";
+}
 
+// Worker side of JOB_CONNECT: spawn the helper, wait for its pipe, shake hands. Everything
+// it opens goes into g_link so the render thread can adopt it -- on failure too, so a
+// half-made link is disposed of by the usual HostClose path rather than by hand here.
+static bool HostWorkerConnect(HANDLE ev)
+{
     char dir[MAX_PATH];
     GetModuleFileNameA(g_self, dir, MAX_PATH);
     if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
@@ -1781,68 +1883,241 @@ static bool EnsureHost()
     sprintf_s(wd, "%shost64", dir);
     if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES)
     {
-        Warn("host64\\dlss5-feed-host64.exe not found next to the add-on");
-        FeedDisable("the 64-bit host is not installed");
+        g_link.fatal = true;
+        strcpy_s(g_link.why, "the 64-bit host is not installed");
         return false;
     }
-    // host_window=0: the host still makes its window (the cast below needs a shown one), but
-    // as a tool window parked behind everything -- --behind; 1: its own plain window.
+    // host_window=0: the host still makes its window (the cast needs a shown one), but as a
+    // tool window parked behind everything -- --behind; 1: its own plain window.
     sprintf_s(cmd, "\"%s\" %lu%s", exe, GetCurrentProcessId(), g_cfg.host_window ? "" : " --behind");
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
-    Breadcrumb("spawning the 64-bit host");
     if (!CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, wd, &si, &pi))
     {
         Log("[feed32] CreateProcess failed %lu", GetLastError());
-        FeedDisable("could not start the 64-bit host");
+        g_link.fatal = true;
+        strcpy_s(g_link.why, "could not start the 64-bit host");
         return false;
     }
     CloseHandle(pi.hThread);
-    g.hproc = pi.hProcess;
+    g_link.proc = pi.hProcess;
     Log("[feed32] host spawned (pid %lu)", pi.dwProcessId);
 
     char name[128];
     sprintf_s(name, FEED_PIPE_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
-    for (int i = 0; i < 150 && g.pipe == nullptr; ++i)   // up to 15 s (host loads ReShade + NGX)
+    for (int i = 0; i < 150 && g_link.pipe == nullptr; ++i)   // up to 15 s (host loads ReShade + NGX)
     {
-        HANDLE p = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (p != INVALID_HANDLE_VALUE) { g.pipe = p; break; }
-        if (!HostAlive()) { HostLost("exited during startup"); return false; }
-        Sleep(100);
+        // FILE_FLAG_OVERLAPPED: every transfer after this is bounded (see PipeXfer).
+        HANDLE p = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_OVERLAPPED, nullptr);
+        if (p != INVALID_HANDLE_VALUE) { g_link.pipe = p; break; }
+        if (WaitForSingleObject(g_link.proc, 0) != WAIT_TIMEOUT)
+        { strcpy_s(g_link.why, "exited during startup"); return false; }
+        if (WaitForSingleObject(g_link.abort_event, 100) == WAIT_OBJECT_0)
+        { strcpy_s(g_link.why, "cancelled while starting"); return false; }
     }
-    if (g.pipe == nullptr) { HostLost("pipe never appeared"); return false; }
+    if (g_link.pipe == nullptr) { strcpy_s(g_link.why, "pipe never appeared"); return false; }
 
     const uint32_t kind = g.is_vulkan ? FEED_CLIENT_VULKAN : g.is_gl ? FEED_CLIENT_GL : FEED_CLIENT_D3D11;
-    const char *kind_name = g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : "D3D11";
     // Hand the host a handle to this process instead of making it OpenProcess(pid): a
     // protective DACL on the game (anti-cheat/DRM; seen on vanilla WoW) denies that with
     // error 5, and this duplication never consults the game's DACL -- both process handles
     // involved are ours (the pseudo-handle, and the one CreateProcess just returned).
     HANDLE self_in_host = nullptr;
-    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), g.hproc, &self_in_host,
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), g_link.proc, &self_in_host,
                          PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, 0))
         Log("[feed32] could not duplicate our process handle into the host (%lu); it will fall back to OpenProcess",
             GetLastError());
     FeedHello hello = { FEED_IPC_MAGIC, FEED_IPC_VERSION, GetCurrentProcessId(), kind,
                         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(self_in_host)) };
     FeedHelloAck ack = {};
-    if (!PipeWrite(&hello, sizeof(hello)) || !PipeRead(&ack, sizeof(ack)) || ack.magic != FEED_IPC_MAGIC)
-    { HostLost("handshake failed"); return false; }
+    if (!PipeXfer(g_link.pipe, ev, true,  &hello, sizeof(hello), kPipeHelloMs) ||
+        !PipeXfer(g_link.pipe, ev, false, &ack,   sizeof(ack),   kPipeHelloMs) ||
+        ack.magic != FEED_IPC_MAGIC)
+    { strcpy_s(g_link.why, "handshake failed"); return false; }
     if (ack.version != FEED_IPC_VERSION)
     {
-        // The message structs after the hello changed size between versions, so a
-        // mismatched pair would not just misbehave, it would desync the pipe. Both
-        // sides refuse rather than guess.
+        // The message structs after the hello changed size between versions, so a mismatched
+        // pair would not just misbehave, it would desync the pipe. Both sides refuse.
         Log("[feed32] the host in host64\\ speaks protocol v%u, this add-on v%u", ack.version, FEED_IPC_VERSION);
-        HostClose();
-        FeedDisable("the host64\\ folder is from a different release -- reinstall both halves together");
+        g_link.fatal = true;
+        strcpy_s(g_link.why, "the host64\\ folder is from a different release -- reinstall both halves together");
         return false;
     }
-    Log("[feed32] host connected (protocol v%u, %s client)", ack.version, kind_name);
-    g.panel_w = ack.panel_width;    // v7: the size the panel texture has to be, if the host has one
-    g.panel_h = ack.panel_height;
+    g_link.panel_w = ack.panel_width;   // v7: the size the panel texture has to be, if any
+    g_link.panel_h = ack.panel_height;
+    return true;
+}
+
+// Worker side of JOB_BUILD: the 'B' exchange, nothing else. g.pipe is set and untouched by
+// the render thread for as long as this job is in flight.
+static bool HostWorkerBuild(HANDLE ev)
+{
+    const BYTE tag = 'B';
+    if (!PipeXfer(g.pipe, ev, true,  const_cast<BYTE *>(&tag), 1, kPipeBuildMs) ||
+        !PipeXfer(g.pipe, ev, true,  &g_link.build, sizeof(g_link.build), kPipeBuildMs) ||
+        !PipeXfer(g.pipe, ev, false, &g_link.ack,   sizeof(g_link.ack),   kPipeBuildMs))
+    { strcpy_s(g_link.why, "build exchange failed"); return false; }
+    return true;
+}
+
+static DWORD WINAPI HostWorker(void *)
+{
+    const ULONGLONG t0 = GetTickCount64();
+    HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    bool ok = false;
+    if (ev == nullptr) strcpy_s(g_link.why, "could not create the worker's I/O event");
+    else ok = g_link.job == JOB_CONNECT ? HostWorkerConnect(ev) : HostWorkerBuild(ev);
+    if (ev != nullptr) CloseHandle(ev);
+    g_link.ms = static_cast<DWORD>(GetTickCount64() - t0);
+    // Last write: everything above must be visible to the render thread before it sees this.
+    InterlockedExchange(&g_link.state, ok ? LINK_DONE : LINK_FAILED);
+    return 0;
+}
+
+static bool HostLinkStart(int job)
+{
+    if (g_link.thread != nullptr) return false;
+    if (g_link.abort_event == nullptr)
+    {
+        g_link.abort_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (g_link.abort_event == nullptr) return false;
+    }
+    ResetEvent(g_link.abort_event);
+    InterlockedExchange(&g_link.abort, 0);
+    g_link.job     = job;
+    g_link.fatal   = false;
+    g_link.why[0]  = '\0';
+    g_link.ms      = 0;
+    g_link.pipe    = nullptr;
+    g_link.proc    = nullptr;
+    InterlockedExchange(&g_link.state, LINK_RUNNING);
+    g_link.thread = CreateThread(nullptr, 0, HostWorker, nullptr, 0, nullptr);
+    if (g_link.thread == nullptr)
+    {
+        InterlockedExchange(&g_link.state, LINK_IDLE);
+        Log("[feed32] could not start the host worker thread (%lu)", GetLastError());
+        return false;
+    }
+    return true;
+}
+
+static void HostLinkJoin()
+{
+    if (g_link.thread == nullptr) return;
+    WaitForSingleObject(g_link.thread, INFINITE);   // it has already published its result
+    CloseHandle(g_link.thread);
+    g_link.thread = nullptr;
+}
+
+static void HostLinkStop()
+{
+    if (g_link.thread == nullptr) { InterlockedExchange(&g_link.state, LINK_IDLE); return; }
+    InterlockedExchange(&g_link.abort, 1);
+    if (g_link.abort_event != nullptr) SetEvent(g_link.abort_event);
+    // Wakes a transfer that is parked on the pipe; the worker's own OVERLAPPED wait then
+    // returns and it unwinds. Cancel on both handles, since a connect uses its own.
+    if (g.pipe != nullptr)      CancelIoEx(g.pipe, nullptr);
+    if (g_link.pipe != nullptr) CancelIoEx(g_link.pipe, nullptr);
+    // Every wait the worker can be in is bounded and wakes on the abort event or the cancel,
+    // so this should return almost at once. If it somehow does not, the one thing that must
+    // NOT happen is closing handles it is still using, or starting a second worker over the
+    // same state: leave the orphan and everything it owns strictly alone. g_link.thread stays
+    // set, so HostLinkStart refuses from here on and the feed stays down until the game is
+    // restarted -- unpleasant, and still much better than a handle reused under it.
+    if (WaitForSingleObject(g_link.thread, 5000) != WAIT_OBJECT_0)
+    {
+        Log("[feed32] the host worker did not stop within 5 s; abandoning it (no further host "
+            "connections this session -- restart the game)");
+        return;
+    }
+    CloseHandle(g_link.thread);
+    g_link.thread = nullptr;
+    // It is finished, so anything it had half-opened is ours to dispose of now.
+    if (g_link.pipe != nullptr) { CloseHandle(g_link.pipe); g_link.pipe = nullptr; }
+    if (g_link.proc != nullptr)
+    {
+        TerminateProcess(g_link.proc, 0);
+        CloseHandle(g_link.proc);
+        g_link.proc = nullptr;
+    }
+    InterlockedExchange(&g_link.state, LINK_IDLE);
+    InterlockedExchange(&g_link.abort, 0);
+    if (g_link.abort_event != nullptr) ResetEvent(g_link.abort_event);
+}
+
+// True when the pipe is up and the host is alive. Otherwise it starts (or keeps waiting on)
+// the connect and returns false: the caller renders this frame without a feed, which is the
+// whole point -- this used to be up to 15 s of frozen game.
+static bool HostConnectReady()
+{
+    if (g.pipe != nullptr && HostAlive()) return true;
+
+    if (g_link.state == LINK_RUNNING) return false;
+    if (g_link.state == LINK_IDLE)
+    {
+        if (g.pipe != nullptr || g.hproc != nullptr) HostClose();   // a stale half-link
+        if (HostLinkStart(JOB_CONNECT))
+            Log("[feed32] starting the 64-bit host in the background (the game keeps rendering)");
+        return false;
+    }
+    if (g_link.job != JOB_CONNECT) return false;   // a build result; not ours to consume
+
+    const bool  ok    = g_link.state == LINK_DONE;
+    const DWORD ms    = g_link.ms;
+    const bool  fatal = g_link.fatal;
+    char why[192];
+    strcpy_s(why, g_link.why[0] != '\0' ? g_link.why : "the host could not be started");
+    HostLinkJoin();
+    // Adopt whatever it opened either way, so the failure path disposes of it the usual way.
+    if (g_link.pipe != nullptr) { g.pipe  = g_link.pipe; g_link.pipe = nullptr; }
+    if (g_link.proc != nullptr) { g.hproc = g_link.proc; g_link.proc = nullptr; }
+    InterlockedExchange(&g_link.state, LINK_IDLE);
+
+    if (!ok)
+    {
+        if (fatal) { HostClose(); FeedDisable(why); }
+        else       HostLost(why);
+        return false;
+    }
+    g.panel_w = g_link.panel_w;
+    g.panel_h = g_link.panel_h;
+    Log("[feed32] host connected in %lu ms (protocol v%u, %s client)", ms, FEED_IPC_VERSION, HostClientKindName());
     RestoreGameFocus();   // the replacement host is up; take the foreground back if we lost it
+    return true;
+}
+
+// The build exchange, from the render thread's side.
+enum HostXfer { XFER_NONE, XFER_BUSY, XFER_DONE, XFER_FAILED };
+
+static HostXfer HostBuildPoll(FeedBuildAck *ack)
+{
+    if (g_link.state == LINK_RUNNING) return XFER_BUSY;   // a connect counts as "not now" too
+    if (g_link.job != JOB_BUILD) return XFER_NONE;
+    if (g_link.state == LINK_DONE)
+    {
+        HostLinkJoin();
+        *ack = g_link.ack;
+        InterlockedExchange(&g_link.state, LINK_IDLE);
+        Log("[feed32] the host answered the build in %lu ms", g_link.ms);
+        return XFER_DONE;
+    }
+    if (g_link.state == LINK_FAILED)
+    {
+        HostLinkJoin();
+        InterlockedExchange(&g_link.state, LINK_IDLE);
+        return XFER_FAILED;
+    }
+    return XFER_NONE;
+}
+
+static bool HostBuildSubmit(const FeedBuild &b)
+{
+    if (g_link.state != LINK_IDLE) return false;
+    g_link.build = b;
+    if (!HostLinkStart(JOB_BUILD)) return false;
+    Breadcrumb("waiting for the host's build (off the render thread)");
     return true;
 }
 
@@ -1850,9 +2125,11 @@ static bool EnsureHost()
 // The host's DLSS 5 settings, controlled from the game's own ReShade panel.
 // The renodx add-on reads [RenoDX.DLSS5] from the HOST's ReShade.ini at startup
 // (only its own panel can change them live), so applying = write that ini and
-// cycle the host. The game renders normally during the gap, which is usually a couple of
-// seconds but can reach ~15 s -- the replacement host has to re-init NGX and reload the
-// ~165 MB DLSSNR model before it can serve a frame.
+// cycle the host. The gap is usually a couple of seconds but can reach ~15 s -- the
+// replacement host has to re-init NGX and reload the ~165 MB DLSSNR model before it can
+// serve a frame. The game really does render normally throughout now: the spawn, the
+// handshake and the build all happen on the worker (see "Host process + pipe" above), where
+// they used to hold the render thread for exactly that long.
 // ---------------------------------------------------------------------------
 
 // This table mirrors the DLSS 5 add-on's own panel one-for-one: same order, same
@@ -2008,22 +2285,39 @@ static void HostClose();   // below
 // it is the right button for any neural consumer, not just RenoDX. HostApplySettings below
 // repeats these steps rather than calling this, because it has to write the host's ini in
 // the middle of the sequence and the order there is load-bearing.
+// The overlay runs on the render thread but OUTSIDE the feed lock, and HostClose drains
+// fences, tears down shared state and stops the worker -- none of which may happen beside a
+// frame that is using them. So the buttons only record what they want; FeedFrame consumes
+// it at the top of the next frame, inside the lock.
+enum { HOST_REQ_NONE = 0, HOST_REQ_RESTART, HOST_REQ_APPLY };
+static volatile LONG g_host_request;
+static char          g_host_request_why[160];
+
+static void HostRequest(int req, const char *why)
+{
+    if (why != nullptr) strcpy_s(g_host_request_why, why);
+    InterlockedExchange(&g_host_request, req);
+    CaptureGameFocus();   // spent once the replacement host has connected
+}
+
+// Note both of these still pay HostClose's shutdown wait (up to 4 s, so the old helper's
+// ReShade can save its ini before the replacement claims the pipe -- the pipe name is per
+// game PID and only one instance may own it, so the two cannot overlap). What they no longer
+// pay is the START: that is the worker's, and the game renders through it.
 static void HostRestart(const char *why)
 {
-    CaptureGameFocus();   // spent once the replacement host has connected
     HostClose();          // drains the in-flight frame and releases the shared fences
     g.built = false;
     g.disabled = false;
     g.consecutive_fails = 0;
     g_retry_at = 0;
     g_disable_why[0] = '\0';
-    Warn("%s -- restarting the host (up to 15 s)", why);
+    Warn("%s -- the replacement starts in the background", why);
 }
 
 static void HostApplySettings()
 {
     LogHostNR("applying DLSS 5 host settings");
-    CaptureGameFocus();   // spent once the replacement host has connected
 
     // Order matters: the host's ReShade saves its ini ON EXIT and would clobber our
     // values -- close the host first (HostClose drains the in-flight frame and
@@ -2035,7 +2329,15 @@ static void HostApplySettings()
     g.disabled = false;
     g.consecutive_fails = 0;
     g_retry_at = 0;
-    Warn("DLSS 5 settings applied -- restarting the host (up to 15 s)");
+    Warn("DLSS 5 settings applied -- the replacement host starts in the background");
+}
+
+// Called from FeedFrame, on the render thread and inside the feed lock.
+static void HostConsumeRequest()
+{
+    const LONG req = InterlockedExchange(&g_host_request, HOST_REQ_NONE);
+    if (req == HOST_REQ_RESTART) HostRestart(g_host_request_why);
+    else if (req == HOST_REQ_APPLY) HostApplySettings();
 }
 
 // ---------------------------------------------------------------------------
@@ -2225,7 +2527,19 @@ static bool MakeBlitShaders()
 
 static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DXGI_FORMAT bb_fmt)
 {
+    // The exchange with the host runs on the worker, so this function is entered twice per
+    // build: once to prepare and hand it over, and once more -- some frames later -- to
+    // finish with the ack. Everything before the hand-over is the same code it always was.
+    FeedBuildAck ack = {};
+    const HostXfer st = HostBuildPoll(&ack);
+    if (st == XFER_BUSY)   { g_build_pending = true;  return false; }
+    if (st == XFER_FAILED) { g_build_pending = false; HostLost("build exchange failed"); return false; }
+    if (st != XFER_DONE)
+    {
     Breadcrumb("building the shared textures");
+    // Connect first, and off this thread: nothing below is worth doing without a host, and
+    // re-creating the shared textures on every frame of a 15 s spawn would be worse still.
+    if (!HostConnectReady()) { g_build_pending = true; return false; }
     ReleaseShared();
 
     g.width      = w;
@@ -2284,8 +2598,6 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         }
     }
 
-    if (!EnsureHost()) return false;
-
     FeedBuild b = {};
     b.width          = w;
     b.height         = h;
@@ -2308,11 +2620,29 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     // only burn a texture nobody writes; CastAdoptHostPanel11 opens the host's from the ack.
     b.panel_tex = g.host_creates ? 0 : CastMakePanel();
 
-    Breadcrumb("asking the host to build");
-    BYTE tag = 'B';
-    FeedBuildAck ack = {};
-    if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
-    { HostLost("build exchange failed"); return false; }
+    // Hand it to the worker and let the frame go. The ack lands on a later frame, which is
+    // where this function picks up again.
+    if (!HostBuildSubmit(b)) { g_build_pending = false; FeedFail("could not hand the build to the host"); return false; }
+    g_build_pending = true;
+    Log("[feed32] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer fmt=%u (depth reversed=%d, mode=%d) "
+        "-- handed to the host, the game keeps rendering",
+        w, h, g_cfg.work_resolution, backbuffer_w, backbuffer_h, bb_fmt, g.depth_reversed ? 1 : 0, g_cfg.mode);
+    return false;
+    }
+
+    // ---- the host has answered: everything below runs with `ack` in hand ----
+    //
+    // Finish against what was actually BUILT, not against this frame's arguments. The caller
+    // re-derives those from the current backbuffer every frame, and the resolution can have
+    // changed while the build was in flight -- finishing against the new size would size the
+    // staging texture and the RTVs for one resolution and the shared set for another. The
+    // prepare half recorded the real ones, and nothing else writes them. A build that has
+    // been overtaken is spotted by the caller's own size test on the very next frame and
+    // simply rebuilt.
+    g_build_pending = false;
+    w = g.width;                     h = g.height;
+    backbuffer_w = g.backbuffer_width; backbuffer_h = g.backbuffer_height;
+    bb_fmt = g.bb_fmt;
 
     // Take ownership of every handle the host duplicated in, BEFORE any early return can drop
     // it. The host fills ack.tex[] whenever it created the textures, whether or not the
@@ -2458,7 +2788,9 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     Log("[feed32] shared set ready: %ux%u (%d%% of %ux%u) color fmt=%u output fmt=%u (host ngx 0x%08X, %s)",
         w, h, g_cfg.work_resolution, backbuffer_w, backbuffer_h,
         g.color_fmt, g.output_fmt, ack.ngx_result, g_cfg.mode == 1 ? "transport" : "DLSS");
-    if (want_sr && (ack.flags & FEED_ACK_SR_ACTIVE) != 0)
+    // g.sr_requested is what the prepare half asked for; `want_sr` itself is out of scope
+    // here, since the two halves are now separated by the worker's round trip.
+    if (g.sr_requested && (ack.flags & FEED_ACK_SR_ACTIVE) != 0)
     {
         g.sr_active  = true;
         g.sr_quality = ack.sr_quality;
@@ -2467,7 +2799,7 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         Log("[feed32] work_upscale=2: DLSS %s, %ux%u -> %ux%u, Halton(2,3) over %u phases",
             SrQualityName(g.sr_quality), w, h, backbuffer_w, backbuffer_h, g.jitter_phases);
     }
-    else if (want_sr)
+    else if (g.sr_requested)
         Log("[feed32] work_upscale=2 was asked for but the host built DLAA (an older host?); expand-back stays spatial");
     if (g.host_creates)
         Log("[feed32] the shared set is host-created and opened here%s", g.no_uav ? "; the DLSS output is copied into it host-side" : "");
@@ -2486,7 +2818,16 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
 
 static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handle)
 {
+    // Same two-part shape as BuildShared: prepare and hand over, then finish with the ack a
+    // few frames later. See the comment there.
+    FeedBuildAck ack = {};
+    const HostXfer st = HostBuildPoll(&ack);
+    if (st == XFER_BUSY)   { g_build_pending = true;  return false; }
+    if (st == XFER_FAILED) { g_build_pending = false; HostLost("build exchange failed"); return false; }
+    if (st != XFER_DONE)
+    {
     Breadcrumb("building the shared textures (OpenGL)");
+    if (!HostConnectReady()) { g_build_pending = true; return false; }
     ReleaseShared();
 
     g.width  = w;
@@ -2497,11 +2838,9 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
     g.color_fmt  = GlSafeColorFormat(TypedColorFormat(bb_fmt));
     g.output_fmt = g_cfg.mode == 1 ? g.color_fmt : GlSafeColorFormat(OutputFormatFor(g.color_fmt));
     if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
-    { FeedDisable("unsupported backbuffer format"); return false; }
+    { g_build_pending = false; FeedDisable("unsupported backbuffer format"); return false; }
     const bool hdr      = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
-
-    if (!EnsureHost()) return false;
 
     FeedBuild b = {};
     b.width          = w;
@@ -2516,11 +2855,18 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
     b.mv_scale_y     = g_cfg.mv_scale_y;
     // b.tex stays zero: on this path the host creates, and answers with its handles.
 
-    Breadcrumb("asking the host to build (OpenGL)");
-    BYTE tag = 'B';
-    FeedBuildAck ack = {};
-    if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
-    { HostLost("build exchange failed"); return false; }
+    if (!HostBuildSubmit(b)) { g_build_pending = false; FeedFail("could not hand the build to the host"); return false; }
+    g_build_pending = true;
+    Log("[feed32] building: %ux%u backbuffer fmt=%u (OpenGL, depth reversed=%d, mode=%d) "
+        "-- handed to the host, the game keeps rendering",
+        w, h, bb_fmt, g.depth_reversed ? 1 : 0, g_cfg.mode);
+    return false;
+    }
+
+    // ---- the host has answered ----
+    // Against what was built, not this frame's arguments -- see BuildShared.
+    g_build_pending = false;
+    w = g.width; h = g.height; bb_fmt = g.bb_fmt;
 
     // Own the duplicated handles before any early return can drop them -- see the same
     // step in BuildSharedVk for why the failing build is exactly when this bites.
@@ -2652,7 +2998,16 @@ static bool EnsureVulkanLoaded(reshade::api::effect_runtime *rt)
 
 static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
+    // Same two-part shape as BuildShared: prepare and hand over, then finish with the ack a
+    // few frames later. See the comment there.
+    FeedBuildAck ack = {};
+    const HostXfer st = HostBuildPoll(&ack);
+    if (st == XFER_BUSY)   { g_build_pending = true;  return false; }
+    if (st == XFER_FAILED) { g_build_pending = false; HostLost("build exchange failed"); return false; }
+    if (st != XFER_DONE)
+    {
     Breadcrumb("building the shared textures (Vulkan)");
+    if (!HostConnectReady()) { g_build_pending = true; return false; }
     ReleaseShared();
 
     g.width  = w;
@@ -2664,6 +3019,7 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
     {
         Log("[feed32] backbuffer format %u (%s) is not supported", bb_fmt, FeedFmtName(bb_fmt));
+        g_build_pending = false;
         FeedDisable("unsupported backbuffer format");
         return false;
     }
@@ -2671,10 +3027,9 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     // then. Otherwise ask for the channel order the backbuffer has, so the way home is a
     // raw vkCmdCopyImage -- the host gets the final say (see ack.output_fmt below).
     const DXGI_FORMAT want_output = g_cfg.mode == 1 ? g.color_fmt : FeedFmtOutputFor(g.color_fmt);
+    g.output_fmt = want_output;   // what we asked for; the finish half compares the ack against it
     const bool hdr      = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : FeedFmtIsHdr(g.color_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
-
-    if (!EnsureHost()) return false;
 
     FeedBuild b = {};
     b.width          = w;
@@ -2689,11 +3044,18 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     b.mv_scale_y     = g_cfg.mv_scale_y;
     // b.tex stays zero: on this path the host creates, and answers with its handles.
 
-    Breadcrumb("asking the host to build (Vulkan)");
-    BYTE tag = 'B';
-    FeedBuildAck ack = {};
-    if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
-    { HostLost("build exchange failed"); return false; }
+    if (!HostBuildSubmit(b)) { g_build_pending = false; FeedFail("could not hand the build to the host"); return false; }
+    g_build_pending = true;
+    Log("[feed32] building: %ux%u backbuffer %s (Vulkan, depth reversed=%d, mode=%d) "
+        "-- handed to the host, the game keeps rendering",
+        w, h, FeedFmtName(bb_fmt), g.depth_reversed ? 1 : 0, g_cfg.mode);
+    return false;
+    }
+
+    // ---- the host has answered ----
+    // Against what was built, not this frame's arguments -- see BuildShared.
+    g_build_pending = false;
+    w = g.width; h = g.height; bb_fmt = g.bb_fmt;
 
     // Take ownership of the duplicated handles NOW, before any early return can drop
     // them on the floor. The host duplicates all four into this process and fills
@@ -2713,10 +3075,11 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 
     // The host owns the Output format: only its device can be asked whether a typed UAV
     // store to BGRA8 exists on this GPU, and it falls back to RGBA8 where it does not.
-    g.output_fmt = ack.output_fmt != 0 ? static_cast<DXGI_FORMAT>(ack.output_fmt) : want_output;
-    if (g.output_fmt != want_output)
+    const DXGI_FORMAT requested = g.output_fmt;   // the prepare half's want_output, out of scope here
+    g.output_fmt = ack.output_fmt != 0 ? static_cast<DXGI_FORMAT>(ack.output_fmt) : requested;
+    if (g.output_fmt != requested)
         Log("[feed32] the host created the Output as %s, not the requested %s",
-            FeedFmtName(g.output_fmt), FeedFmtName(want_output));
+            FeedFmtName(g.output_fmt), FeedFmtName(requested));
 
     // The fences are per session, not per build: import them once.
     if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
@@ -3139,11 +3502,11 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
             ok = false;                       // backing off after a failed build
         else
         {
-            Log("[feed32] building: %ux%u backbuffer fmt=%u (OpenGL, depth reversed=%d, mode=%d)",
-                w, h, bbf, g.depth_reversed ? 1 : 0, g_cfg.mode);
             ok = BuildSharedGl(w, h, bbf, bb_res.handle);
             if (ok) g.consecutive_fails = 0;
-            else if (!g.disabled) FeedFail("shared build");
+            // A build that is merely still with the host is not a failure: no backoff, and
+            // no log line for it -- this runs every frame until the ack lands.
+            else if (!g_build_pending && !g.disabled) FeedFail("shared build");
         }
     }
 
@@ -3335,11 +3698,9 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             ok = false;                       // backing off after a failed build
         else
         {
-            Log("[feed32] building: %ux%u backbuffer %s (Vulkan, depth reversed=%d, mode=%d)",
-                w, h, FeedFmtName(bbf), g.depth_reversed ? 1 : 0, g_cfg.mode);
             ok = BuildSharedVk(w, h, bbf);
             if (ok) g.consecutive_fails = 0;
-            else if (!g.disabled) FeedFail("shared build");
+            else if (!g_build_pending && !g.disabled) FeedFail("shared build");   // see the OpenGL path
         }
     }
 
@@ -3640,11 +4001,9 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
             ok = false;                       // backing off after a failed build
         else
         {
-            Log("[feed32] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer fmt=%u (depth reversed=%d, mode=%d)",
-                work_w, work_h, g_cfg.work_resolution, cd.Width, cd.Height, cd.Format, g.depth_reversed ? 1 : 0, g_cfg.mode);
             ok = BuildShared(work_w, work_h, cd.Width, cd.Height, cd.Format);
             if (ok) g.consecutive_fails = 0;
-            else if (!g.disabled) FeedFail("shared build");
+            else if (!g_build_pending && !g.disabled) FeedFail("shared build");   // see the OpenGL path
         }
     }
 
@@ -3751,11 +4110,16 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
 // caller per frame. See the Smooth Motion note next to FeedEnter.
 static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
-    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+    // A pending overlay request has to get through even with the feed disabled -- that is
+    // precisely when the user reaches for "Start the DLSS 5 host".
+    const bool request = g_host_request != HOST_REQ_NONE;
+    if (g.disabled && !request) return;
 
     if (!FeedEnter()) return;   // logs the dropped call, with its thread id
     FeedThreadTrace();
-    FeedFrameDispatch(rt, cl, rtv);
+    if (request) HostConsumeRequest();   // inside the lock: it tears down what a frame uses
+    if (!g.disabled) FeedFrameDispatch(rt, cl, rtv);
     FeedLeave();
 }
 
@@ -4219,7 +4583,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
         ImGui::Spacing();
         if (ImGui::Button("Apply to the DLSS 5 host"))
-            HostApplySettings();
+            HostRequest(HOST_REQ_APPLY, nullptr);
         ImGui::SameLine();
         if (ImGui::Button("Reload from host"))
         {
@@ -4227,7 +4591,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             LogHostNR("host DLSS 5 settings reloaded from the overlay page");
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("(applying restarts the helper process; up to 15 s without DLSS)");
+        ImGui::TextDisabled("(applying restarts the helper; a brief pause while it saves, then it comes back in the background)");
     }   // end of the RenoDX-only settings mirror
 
     // Host process controls, both consumers. The helper is a separate process: it can die,
@@ -4237,14 +4601,21 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Separator();
     ImGui::TextUnformatted("Host process");
     if (ImGui::Button(HostAlive() ? "Restart the DLSS 5 host" : "Start the DLSS 5 host"))
-        HostRestart(HostAlive() ? "host restart requested from the overlay"
-                                : "host start requested from the overlay");
+        HostRequest(HOST_REQ_RESTART, HostAlive() ? "host restart requested from the overlay"
+                                                  : "host start requested from the overlay");
     ImGui::SameLine();
     if (HostAlive())
-        ImGui::TextDisabled("(running -- restarting costs up to 15 s without DLSS)");
+        ImGui::TextDisabled("(running -- the replacement starts in the background; only its shutdown pauses the game)");
     else
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
                            "not running -- press this to start it again");
+    // What the worker is doing, so the wait is visible rather than mysterious.
+    if (g_link.state == LINK_RUNNING)
+        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%s",
+                           g_link.job == JOB_CONNECT ? "starting the host and shaking hands (the game keeps rendering)"
+                                                     : "waiting for the host to build (the game keeps rendering)");
+    else if (g_build_pending)
+        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "a build is in progress");
     ImGui::TextDisabled("Its own log is host64\\dlss5-feed-host.log; the neural consumer's panel lives in "
                         "its window (\"Show the DLSS 5 panel in-game\" above brings it here).");
 
