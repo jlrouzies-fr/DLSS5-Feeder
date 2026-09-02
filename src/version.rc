@@ -1,7 +1,7 @@
 #include <windows.h>
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    0,8,0,0
- PRODUCTVERSION 0,7,0,0
+ FILEVERSION    0,12,0,0
+ PRODUCTVERSION 0,12,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -13,11 +13,11 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "FileDescription",  "DLSS 5 Feed - synthetic DLSS contract from ReShade depth + estimated motion vectors"
-            VALUE "FileVersion",      "0.8.0.0"
+            VALUE "FileVersion",      "0.12.0.0"
             VALUE "InternalName",     "dlss5-feed"
             VALUE "OriginalFilename", "dlss5-feed.addon64"
             VALUE "ProductName",      "DLSS 5 Feed"
-            VALUE "ProductVersion",   "0.8.0.0"
+            VALUE "ProductVersion",   "0.12.0.0"
         END
     END
     BLOCK "VarFileInfo"

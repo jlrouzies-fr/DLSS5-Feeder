@@ -391,10 +391,16 @@ static bool FeedGlLoad(FeedGl *gl)
 
     // An entry point that will not resolve while the extension was also unadvertised is
     // the extension genuinely being absent -- report it as such, so the wrong-GPU case
-    // reads the same whether the driver hands back stubs or nothing at all.
+    // reads the same whether the driver hands back stubs or nothing at all. Name the
+    // entry point too: "GL_EXT_memory_object" alone could not distinguish a missing
+    // extension from an unrelated core entry failing to resolve (issue #31 cost time
+    // to that ambiguity).
     #define FEED_GL_EXT(member, name) \
         gl->member = reinterpret_cast<PFN_gl##member##_>(gl->wglGetProcAddress(name)); \
-        if (gl->member == nullptr) { strcpy_s(gl->missing, unadvertised != nullptr ? unadvertised : name); return false; }
+        if (gl->member == nullptr) { \
+            if (unadvertised != nullptr) sprintf_s(gl->missing, "%s (%s did not resolve)", unadvertised, name); \
+            else strcpy_s(gl->missing, name); \
+            return false; }
     FEED_GL_EXT(GenFramebuffers,        "glGenFramebuffers")
     FEED_GL_EXT(DeleteFramebuffers,     "glDeleteFramebuffers")
     FEED_GL_EXT(BindFramebuffer,        "glBindFramebuffer")

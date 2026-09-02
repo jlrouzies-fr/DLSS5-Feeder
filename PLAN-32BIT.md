@@ -126,9 +126,14 @@ Two workable models, both GPU-side only (no CPU wait in the game's frame):
   this mostly invisible) and hides all jitter. Keep as a cfg knob (`pipeline=1`) and flip to default if A
   shows hitching in practice.
 
-Host loop: `SetEventOnCompletion(in_fence, n)` → CPU wake → `queue->Wait(in_fence, n)` (belt and braces)
-→ evaluate → `queue->Signal(out_fence, n)`. Watchdog timeout (2 s, as `BeginCommands` does today) on
-both sides; on timeout the add-on disables the feed and lets the game render normally.
+> **Status (2026-09-01):** A shipped first and stalled exactly as feared — a hard ~35 fps ceiling at any
+> resolution (issue #15). **B is now the default**, as `async_home=1` (named for the 64-bit add-on's
+> matching knob), with A back under `async_home=0`. Two details differ from the sketch above: the wait
+> targets the last frame sent to the *current host session*, not `n-1` — the fences restart at zero with
+> every host respawn, and a stale value would deadlock into a TDR — and the blit is recorded *before*
+> `Signal(in_fence, n)`, which is what lets one shared Output slot stay race-free. The host loop below
+> also lost its CPU wait: `queue->Wait(in_fence, n)` alone orders the evaluate, the serve loop wakes on
+> an overlapped pipe read instead of a `Sleep(8)` poll, and the banner Present left the frame path.
 
 ## 5. Estimate, risks, phases
 

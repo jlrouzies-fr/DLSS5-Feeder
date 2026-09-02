@@ -421,6 +421,15 @@ docs. Chicken's own docs still claim only *source-contract* compatibility for th
 backends, and explicitly do not claim Frame Generation (a live test there gave a black
 screen) or 32-bit Vulkan.
 
+**Take 1.4.8 or newer.** Up to 1.4.7 Chicken rescanned every module in the process every 300
+presented frames looking for a late-loaded NGX host. In a host with a large module list that costs
+a frame on a fixed ~5 s cadence: a periodic stutter and poor 1% lows with a flat average frame
+rate. Confirmed here on a 64-bit D3D11 capture host and fixed by 1.4.8, which swaps the polling
+for an `LdrRegisterDllNotification` callback and logs `smart discovery settled: periodic
+full-module fallback disabled`. The feeder's own `stall_log_ms` (see README's config table) is the
+tool for attributing a stall like this: it times the NGX evaluate call separately from the rest of
+the frame, so "the consumer's detour is slow" is distinguishable from "the feed is slow".
+
 **1.4.4 differences that matter to a deploy:** the Full/Half work-scale selector became a
 continuous 10-150% slider (`neural_work_percent` replaces `neural_work_divisor`, old configs
 migrate), and early load is now automatic — on its first armed run Chicken appends itself to

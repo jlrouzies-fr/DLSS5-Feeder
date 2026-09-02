@@ -20,147 +20,186 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
                                     neural output written back over the frame → later effects → present
 ```
 
-> # 🔄 This project is being partially superseded
->
-> ShortFuse's **renodx-dlss** add-on now handles **D3D9, D3D11, and D3D12 presentation natively**
-> — in-process, through a same-adapter D3D12 endpoint, with real motion-vector and depth sharing
-> on D3D11. **For any 64-bit D3D9 / D3D11 / D3D12 game, use that add-on directly — you do not
-> need DLSS5-Feeder.**
->
-> **Where to get it:** this build is *not* published on the
-> [renodx GitHub](https://github.com/clshortfuse/renodx). It is distributed through the **RenoDX
-> Discord, `#DLSS5` channel** — check the pinned messages there for the current binary:
-> <https://discord.com/channels/1408098019194310818/1542647972695904317>
->
-> DLSS5-Feeder remains the only option for what renodx-dlss does not cover:
->
-> - **32-bit games** — renodx-dlss is 64-bit only, and NVIDIA ships no 32-bit NGX runtime, so an
->   in-process approach is impossible there. The feeder's cross-process host is the only way.
-> - **Vulkan games** — via the bundled layer.
-> - **Real motion vectors on D3D9** — renodx-dlss evaluates only the finished backbuffer there
->   (no temporal inputs); the feeder drives a full temporal evaluate from ReShade motion vectors.
+**[↓ Jump to the Contents](#contents)**
 
-> ## ⚠️ Which DLSS 5 add-on to install next to this one
->
-> Every install below needs a separate **neural consumer** — the add-on that hooks the DLSS
-> calls this feeder manufactures and does the actual neural rendering. Two are supported, and
-> you install **exactly one** of them.
->
-> ### Recommended: Deep Fried Chicken
->
-> **Deep Fried Chicken** (by Alexander), distributed as its own archive through Discord:
-> <https://discord.gg/g2v2XGqvR>. Current version
-> **1.4.4-alpha**; the feeder interop was introduced in **1.4.0**.
->
-> Three files go next to the 64-bit game `.exe` (or into `host64\` for a 32-bit game):
-> `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll` and `deep-fried-chicken.cfg`.
-> It does **not** bundle NVIDIA's DLLs — you still supply `nvngx_dlssnr.dll` and
-> `nvngx_dlss.dll`, exactly as before. Its shipped `.cfg` is already the recommended
-> first-run configuration, so there is nothing to edit.
->
-> ### Alternative: Krish's `renodx-dlss5.addon64`
->
-> The `#DLSS5` build, from the RenoDX Discord, `#DLSS5` channel:
-> <https://discord.com/channels/1408098019194310818/1542647972695904317>. Still fully
-> supported by this feeder — it is what every release up to now was developed against.
->
-> **Add-on generations.** The feeder fingerprints the RenoDX build it finds next to it and
-> adapts, so any recent one works; take the newest in the channel. It writes `EnableHooks=2`,
-> `NeuralUplift=1` and `NREnableUpscaling=0` when they are unset, and in the `host64` helper
-> unbinds the global hotkeys so a gameplay keypress cannot silently toggle NR in a background
-> process. Every guard is keyed to a marker only the build that needs it carries. **None of
-> this applies to Deep Fried Chicken**, which has its own config file and its own overlay tab.
->
-> | Build | Marker | What the feeder does about it |
-> | --- | --- | --- |
-> | v4.7 | `NRGlobalTone` | Newest, checked 2026-09-01. Replaces the paper-white codec with a reversible colour bridge (SDR sRGB / linear HDR BT.709 / PQ BT.2020) picked from the contract the feeder already publishes, plus a fenced D3D12 workset pool. Nothing new is required from the feeder; the 32-bit overlay mirrors its renamed sliders and its two new keys. |
-> | v4.6 | `NRToggleKey` | Global hotkeys, WIP upscaling with a rejection latch, richer decline diagnostics. See the `NRStyle=2` note below. |
-> | v45+ | `EnableHooks` | Rescans every present and adopts missed features lazily, so the feeder skips its warm-up re-create. |
-> | older | — | Classic single hook pass; the warm-up re-create stays on. |
->
-> **Verification status:** no game row has verified a v4.6 or v4.7 run end-to-end yet. The
-> compatibility work is static — marker detection, key defaults, panel mirroring — and both
-> generations were checked against the shipped binaries.
->
-> ### Exactly one neural consumer
->
-> Never install both. Chicken stays inert for the whole process if `renodx-dlss5.addon64` (or
-> `renodx-dlss.addon64`) is loaded alongside it, and says so in red in its own tab; the feeder
-> reports the collision in its log and overlay too. If you have `alexs-toolkit.addon64` (a third
-> NGX interposer) installed, remove that as well when using Chicken.
->
-> **Not ShortFuse's `renodx-dlss` add-on.** That is a different add-on again: it builds the DLSS
-> contract itself (see the banner above), so it does not need — and conflicts with — this
-> feeder. One or the other, never both.
+---
 
-> ## ⚠️ NVIDIA Smooth Motion and Optiscaler
->
-> **Optiscaler** replaces the same upscaling path this feeder drives. Do not run both.
->
-> ### Smooth Motion — the short version
->
-> **In a Vulkan game, turn Smooth Motion off.** The two cannot work together, and this is not
-> something a future release can fix (the reason is below). Use the per-API switch in the table
-> at the end of this section so you keep Smooth Motion for your D3D11/D3D12 games — you only
-> need to give it up for Vulkan ones.
->
-> **In a D3D11/D3D12 game** it may well be fine. Since 0.8.0 the feeder is thread-safe against
-> Smooth Motion's extra `Present` calls, and Metro 2033 Redux ran with it active (2026-09-01):
-> session open, frames delivered at the normal cost, nothing raced. Full visual sign-off is still
-> pending, so if you see corruption there, say so on
-> [#1](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/1).
->
-> ### Why it can't work on Vulkan
->
-> Smooth Motion doubles your frame rate by **inventing an extra frame in between each pair of
-> real ones**. On Vulkan it does that inside the graphics driver itself — the very last step
-> before the picture reaches your monitor, past everything ReShade or any add-on can touch.
->
-> This feeder does its work earlier, while the frame is still being built. So the frames the game
-> really renders get DLSS 5 applied correctly — but the frames the *driver invents* are built
-> from a copy it took before we ran, so they have no DLSS on them at all.
->
-> The result is that **half the frames you see are DLSS-processed and half are not**, which looks
-> like heavy flickering, or like the picture is stuck on an old frame. Nothing is crashing, and
-> the log will happily report every frame delivered — because from the feeder's point of view
-> they were.
->
-> We tried to close that gap and could not, which is why this is documented rather than fixed.
-> Across five rebuilds on DOOM 2016 (a game that works perfectly with Smooth Motion off) we
-> confirmed the feeder's own work is correct and complete before the frame is handed over, that
-> it can finish early enough, and that it can be made to look structurally identical to a normal
-> game's frame. The invented frames still never carried our output. The driver simply does not
-> read what we wrote. Full detail in [`PLAN-DETROIT.md`](PLAN-DETROIT.md).
->
-> **Note the feeder cannot warn you about this on Vulkan.** Its Smooth Motion check looks for a
-> file the driver only loads for D3D games, so **a silent log does not mean Smooth Motion is
-> off**. To check for certain, turn on "Smooth Motion - Debug Bars" (`0xB01B8B02`) in NVIDIA
-> Profile Inspector and launch: coloured bars on screen mean it is running. (0.9.0 also watches
-> for the tell-tale extra frames and warns when it spots them, but the Debug Bars check is the
-> reliable one.)
->
-> **Two other add-ons Smooth Motion breaks**, found during the Metro 2033 Redux run above and
-> neither of them this feeder — both crash the game 1–2 s into boot with a null read on the
-> present path, before the feeder feeds a frame:
->
-> - **Luma** (`Luma-Metro Redux.addon`): reads `GetCurrentBackBufferIndex()` and passes it to
->   `GetBuffer()`, which fails under Smooth Motion's flip-model wrapper; the null back buffer is
->   then dereferenced. Fix offered upstream to Filoppi/Luma-Framework. Remove the Luma add-on to
->   boot, or turn Smooth Motion off for the game.
-> - **`NRStyle=2`** (the RenoDX add-on's own setting, v4.6+, from its overlay panel): crashes at the next boot
->   even without Luma. The feeder now warns when it sees it; set `NRStyle=0` in `ReShade.ini`'s
->   `[RenoDX.DLSS5]` section to recover.
->
-> **How to turn it off for one API only** (rather than everywhere), in NVIDIA Profile Inspector:
->
-> | Setting | ID | Value |
-> | --- | --- | --- |
-> | Smooth Motion - Enabled APIs | `0xB0CC0875` | bitfield, default `7`: `1` DX12, `2` DX11, `4` Vulkan — clear only the bit for this game |
-> | Smooth Motion - Enable | `0xB0D384C0` | `0` / `1`, per application |
-> | Smooth Motion - Debug Bars | `0xB01B8B02` | draws coloured bars on generated frames — use it to check whether bad frames *are* the generated ones |
+## Before you install: three things
+
+None of this is hard, and the [install checker](#install-read-first) verifies most of it for you.
+
+### 1. You might not need this project at all
+
+If your game is **64-bit** and uses **DirectX 9, 11 or 12**, there is now a simpler option:
+ShortFuse's **renodx-dlss** add-on does the whole job by itself. Use that instead — it is one
+add-on rather than two, and there is nothing for this project to add.
+
+| Your game | What to use |
+| --- | --- |
+| 64-bit, DirectX 9 / 11 / 12 | **renodx-dlss** on its own — you do not need DLSS5-Feeder |
+| **32-bit** (any graphics API) | **DLSS5-Feeder** |
+| **Vulkan** | **DLSS5-Feeder** |
+| **DirectX 9**, and you want the best handling of motion | **DLSS5-Feeder** |
+
+renodx-dlss is not on GitHub. It comes from the RenoDX Discord, `#DLSS5` channel:
+<https://discord.com/invite/renodx>
+
+<details>
+<summary>Why DLSS5-Feeder is still the only option for those three</summary>
+
+- **32-bit games.** renodx-dlss is 64-bit only, and NVIDIA ships no 32-bit NGX runtime at all, so
+  an in-process approach is impossible there by construction. This project's cross-process helper
+  is the only route.
+- **Vulkan games.** Covered here through the bundled layer.
+- **Real motion vectors on D3D9.** renodx-dlss evaluates only the finished backbuffer there, with
+  no temporal inputs. This project drives a full temporal evaluate from ReShade motion vectors.
+
+</details>
+
+### 2. You need one neural add-on installed next to this one
+
+DLSS5-Feeder does not sharpen anything by itself. It builds the DLSS request your game never
+makes; a **second add-on** does the actual neural rendering. You install **exactly one** of them.
+
+**Recommended: Deep Fried Chicken**, by Alexander, from its Discord:
+<https://discord.gg/g2v2XGqvR> — take **1.4.8 or newer**.
+
+Copy its three files next to your game's `.exe` (or into `host64\` for a 32-bit game):
+`deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll` and `deep-fried-chicken.cfg`.
+Its settings file already arrives set up correctly, so leave it alone for your first run. You
+supply `nvngx_dlssnr.dll` and `nvngx_dlss.dll` yourself, as always.
+
+> **Never install two neural add-ons.** If Deep Fried Chicken finds RenoDX's add-on or Alex's
+> Toolkit loaded beside it, it does nothing at all for the whole session — silently, as far as
+> your eyes are concerned. Pick one. If something looks like it is not working, this is the first
+> thing to check.
+
+<details>
+<summary>Using Krish's RenoDX add-on instead (the older option, still fully supported)</summary>
+
+`renodx-dlss5.addon64`, the `#DLSS5` build, from the RenoDX Discord, `#DLSS5` channel:
+<https://discord.com/invite/renodx>. It is what every release
+up to now was developed against.
+
+The feeder fingerprints whichever build it finds and adapts, so any recent one works — take the
+newest in the channel. Any `renodx-dlss5*.addon64` name is recognised (`renodx-dlss5-4.7.addon64`
+included; before 0.11.0-beta.2 only the exact name was, and a versioned file was logged as "not
+found" and treated as the classic engine). Keep just one copy — ReShade loads them all.
+
+The feeder writes `EnableHooks=2`, `NeuralUplift=1` and `NREnableUpscaling=0` when they are unset,
+and in the `host64` helper it unbinds the global hotkeys so a gameplay keypress cannot silently
+toggle neural rendering in a background process. Every guard is keyed to a marker only the build
+that needs it carries. **None of this applies to Deep Fried Chicken**, which has its own config
+file and its own overlay tab.
+
+| Build | Marker | What the feeder does about it |
+| --- | --- | --- |
+| v4.7 | `NRGlobalTone` | Newest, checked 2026-09-01. Replaces the paper-white codec with a reversible colour bridge (SDR sRGB / linear HDR BT.709 / PQ BT.2020) picked from the contract the feeder already publishes, plus a fenced D3D12 workset pool. Nothing new is required from the feeder; the 32-bit overlay mirrors its renamed sliders and its two new keys. |
+| v4.6 | `NRToggleKey` | Global hotkeys, WIP upscaling with a rejection latch, richer decline diagnostics. See the `NRStyle=2` note under Smooth Motion below. |
+| v45+ | `EnableHooks` | Rescans every present and adopts missed features lazily, so the feeder skips its warm-up re-create. |
+| older | — | Classic single hook pass; the warm-up re-create stays on. |
+
+**Verification status:** no game row has verified a v4.6 or v4.7 run end-to-end yet. The
+compatibility work is static — marker detection, key defaults, panel mirroring — and both
+generations were checked against the shipped binaries.
+
+</details>
+
+<details>
+<summary>Careful: renodx-dlss and renodx-dlss5 are two different add-ons</summary>
+
+- **`renodx-dlss5`** (Krish) is a *neural add-on*. It works **with** this project, as the
+  alternative to Deep Fried Chicken above.
+- **`renodx-dlss`** (ShortFuse) *replaces* this project — it builds the DLSS request itself, so it
+  neither needs nor tolerates the feeder. One or the other, never both.
+
+</details>
+
+### 3. Turn off OptiScaler, and Smooth Motion on Vulkan
+
+- **OptiScaler** — turn it off. It drives the same upscaling path this project does, and the two
+  fight over it.
+- **NVIDIA Smooth Motion** — turn it off **for Vulkan games only**. On Vulkan the two cannot work
+  together, and no future release can fix that. You would see roughly half your frames
+  unprocessed, which looks like heavy flickering or a picture stuck on an old frame. Nothing is
+  broken and nothing is crashing; it simply cannot work.
+- **DirectX 11 and 12 games are fine.** Leave Smooth Motion on there if you like it.
+
+To switch it off for Vulkan alone and keep it everywhere else: in **NVIDIA Profile Inspector**, set
+**Smooth Motion - Enabled APIs** (`0xB0CC0875`) and clear the Vulkan bit — the value is a sum of
+`1` for DX12, `2` for DX11 and `4` for Vulkan, so `7` becomes `3`.
+
+<details>
+<summary>Why Vulkan cannot work, and how to check whether Smooth Motion is on</summary>
+
+Smooth Motion doubles your frame rate by inventing an extra frame between each pair of real ones.
+On Vulkan it does that **inside the graphics driver** — the very last step before the picture
+reaches your monitor, past anything ReShade or any add-on can touch.
+
+This project does its work earlier, while the frame is still being built. So the frames the game
+really renders get neural rendering applied correctly, but the frames the driver *invents* are
+built from a copy taken before we ran, and carry none of it. Half the frames you see are processed
+and half are not. The log will happily report every frame delivered, because from the feeder's
+point of view they were.
+
+We tried to close that gap and could not, which is why this is documented rather than fixed.
+Across five rebuilds on DOOM 2016 — a game that works perfectly with Smooth Motion off — we
+confirmed the feeder's work is correct and complete before the frame is handed over, that it can
+finish early enough, and that it can be made structurally identical to a normal game's frame. The
+invented frames still never carried our output. The driver simply does not read what we wrote.
+Full detail in [`PLAN-DETROIT.md`](PLAN-DETROIT.md).
+
+**The feeder cannot warn you about this on Vulkan.** Its Smooth Motion check looks for a file the
+driver only loads for DirectX games, so a silent log does **not** mean Smooth Motion is off. To be
+certain, turn on **Smooth Motion - Debug Bars** (`0xB01B8B02`) in Profile Inspector and launch:
+coloured bars on screen mean it is running. (0.9.0 and newer also watch for the tell-tale extra
+frames and warn when they spot them, but the Debug Bars check is the reliable one.)
+
+| Profile Inspector setting | ID | Value |
+| --- | --- | --- |
+| Smooth Motion - Enabled APIs | `0xB0CC0875` | bitfield, default `7`: `1` DX12, `2` DX11, `4` Vulkan — clear only the bit for this game |
+| Smooth Motion - Enable | `0xB0D384C0` | `0` / `1`, per application |
+| Smooth Motion - Debug Bars | `0xB01B8B02` | draws coloured bars on generated frames — use it to check whether the bad frames *are* the generated ones |
+
+</details>
+
+<details>
+<summary>Smooth Motion on DirectX 11 / 12: what changed in 0.11.0-beta.2</summary>
+
+It should work from 0.11.0-beta.2 on. Smooth Motion adds its own D3D11 device and an invisible
+proxy swapchain (`InvisibleWindowClassNvPresent`), and ReShade creates an effect runtime on
+**each** — `ReShade.ini` for one, `ReShade2.ini` for the other. Until beta.2 the feeder fed
+whichever runtime initialised last, which under Smooth Motion was routinely the one *without* your
+preset: the log looked healthy and nothing was neural (issue
+[#1](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/1), Ghost Recon Breakpoint and AC
+Syndicate). It now tracks every runtime and feeds the one that actually renders `DLSS5_Feed`;
+`dlss5-feed.log` lists each runtime with its device and window class, and says which one is bound.
+Since 0.8.0 it is also thread-safe against Smooth Motion's extra `Present` calls.
+
+If the picture still shows no effect with Smooth Motion on, post the log after a minute of play
+(not the first seconds) on #1, and say whether your *other* ReShade effects are visible.
+
+</details>
+
+<details>
+<summary>Two other add-ons Smooth Motion is known to crash (neither is this one)</summary>
+
+Both crash the game 1–2 s into boot with a null read on the present path, before the feeder feeds
+a frame. Found during a Metro 2033 Redux run.
+
+- **Luma** (`Luma-Metro Redux.addon`): reads `GetCurrentBackBufferIndex()` and passes it to
+  `GetBuffer()`, which fails under Smooth Motion's flip-model wrapper; the null back buffer is then
+  dereferenced. Fix offered upstream to Filoppi/Luma-Framework. Remove the Luma add-on to boot, or
+  turn Smooth Motion off for that game.
+- **`NRStyle=2`** (the RenoDX add-on's own setting, v4.6+, from its overlay panel): crashes at the
+  next boot even without Luma. The feeder warns when it sees it; set `NRStyle=0` in `ReShade.ini`'s
+  `[RenoDX.DLSS5]` section to recover.
+
+</details>
 
 ## Contents
 
+- [Before you install: three things](#before-you-install-three-things)
 - [Status](#status)
 - [Install: read first](#install-read-first) — the installation verifier script
 - [Install for a 64-bit game](#install-for-a-64-bit-game)
@@ -200,6 +239,9 @@ Proven working in seven games covering every supported path:
 | **Fable Anniversary** | 32-bit **D3D9** via dgVoodoo2 | 1440p, 60 fps |
 | **DOOM (2016)** | 64-bit **Vulkan** | 4K, D3D12 evaluate via cross-API interop |
 | **Worms Ultimate Mayhem** | 32-bit **OpenGL** | 4K, GL↔D3D12 interop + cross-process host, 0.13 ms/frame |
+| **Guild Wars Reforged** | 32-bit **Vulkan** via DXVK | User-reported (#32): 3440x1440, 55 fps on an RTX 4070 (350+ without) |
+| **World of Warcraft 3.3.5a** | 32-bit **Vulkan** via DXVK | User-reported (#15): 4K on an RTX 5080/5090; the working `dxvk.conf` is in the DXVK section |
+| **Star Wars: KOTOR** | 32-bit **OpenGL** | User-reported (#31): RTX 2060, fixed in 0.9.0 (capped `GL_EXTENSIONS` string) |
 
 In each, the DLSS 5 add-on reports `feature 18 created … inline feature 18 evaluation succeeded`,
 driven entirely by ReShade depth + estimated motion vectors.
@@ -282,8 +324,8 @@ powershell -ExecutionPolicy Bypass -File .\Verify-DLSS5Feeder.ps1 -GamePath "C:\
    its `Shaders\` folder (the `lumenite_*.fx` files and `include\`) into `reshade-shaders\Shaders\`,
    and `Textures\lumenite_bluenoise256.png` into `reshade-shaders\Textures\`.
    *(Other providers: see [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider).)*
-4. Get the neural consumer — (invite: <https://discord.gg/g2v2XGqvR>) **[Deep Fried Chicken](https://discord.com/channels/1543931653976498207/1543936250657120366)**
-   (see the warning above) — and put its three files next to the game `.exe`:
+4. Get the neural consumer — **[Deep Fried Chicken](https://discord.gg/g2v2XGqvR)**
+   (see [Before you install](#2-you-need-one-neural-add-on-installed-next-to-this-one)) — and put its three files next to the game `.exe`:
    `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll` and `deep-fried-chicken.cfg`.
    Add **`nvngx_dlssnr.dll`** (from the RenoDX Discord — Chicken does not bundle it) and a
    **`nvngx_dlss.dll`** (from any DLSS game, or
@@ -306,53 +348,85 @@ and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`. The 
 
 ### Deep Fried Chicken: first run
 
-**Deep Fried Chicken** (by Alexander) is a multi-pass DLSS 5 renderer that attaches to the feature-1
-DLSS calls this feeder makes. From 1.4.0 it negotiates with DLSS5-Feeder instead of colliding with it
-(the ABI is in `src/feed_dfc.h`; the story behind it is in `FEEDBACK-DFC.md`). This feeder marks every
-Create and Evaluate for it automatically — there is nothing to configure on our side.
+**Deep Fried Chicken** (by Alexander) is the add-on that does the neural rendering on top of what
+this project feeds it. There is nothing to set up on our side — the two recognise each other
+automatically.
 
-- **The shipped `deep-fried-chicken.cfg` is already the recommended first-run configuration:**
-  `arm=1`, one pass (`layers=1`), Texture Boost off, Clean Fry off, 100% neural work scale. Leave
-  it alone for the first launch. `arm=0` is a restart-only hard disarm; the live `enabled=0`
-  switch only drains neural work, it does not disarm anything.
-- **Expect one extra restart on the first armed run.** From 1.4.4 Chicken appends itself to
-  `[ADDON] LoadFromDllMain` in the sibling `ReShade.ini`, backs the original file up beside it,
-  and asks you to restart once more. On 1.4.0 that entry had to be added by hand.
-- **Exactly one neural consumer.** No `renodx-dlss5.addon64`, no `renodx-dlss.addon64`, no
-  `alexs-toolkit.addon64` — with any of them loaded Chicken stays inert for the whole process.
-  Never add `dlss5-dx11-bridge.addon64` either: that bridge is for D3D11 games that already have
-  their own DLSS. Disable NVIDIA Smooth Motion and OptiScaler while testing.
-- **Start with one pass.** It can run up to 30, which is a stress mode, not a setting to open on.
-  Its work scale is a continuous 10–150% slider (`neural_work_percent`); 1.4.4 replaced the older
-  Full/Half selector with it, and old `neural_work_divisor` configs migrate.
-- The feeder's `warmup_rebuild` frame count is not used while Chicken is present. Instead the feeder watches
-  Chicken's exported interception state and re-creates the feature once, the moment it reads `ARMED` — Chicken
-  arms its NGX detours several seconds after it claims ownership, and it never adopts a create it did not see.
-  The log says `warm-up: re-creating the feature once (Deep Fried Chicken armed its NGX detours after our
-  first create)` when this happens; it is expected, not a fault.
-- Chicken forwards **Frame Generation** (NGX feature 11) and **Ray Reconstruction** (feature 13)
-  untouched and adopts neither. Its author does not claim Frame Generation works — a live test
-  gave a black screen — and does not claim 32-bit Vulkan.
-- For a **32-bit game** the three Chicken files go into `host64\` next to `dlss5-feed-host64.exe`,
-  **not** beside the 32-bit game `.exe` — a 32-bit process cannot load a 64-bit add-on.
+Four things to know:
 
-The overlay's **Status** section and `dlss5-feed.log` (`host64\dlss5-feed-host.log` for 32-bit) show
-Chicken's version, its interop ABI and its feature-1 interception state (`ARMED` is what you want; `DISARMED`,
-`CONFLICT` or `FAILED` mean it will not run its passes, and why). For a report send that log together with
-`deep-fried-chicken.log` and `ReShade.log` from the same run.
+1. **Don't edit its settings file.** The `deep-fried-chicken.cfg` it ships with is already the
+   right starting point: on, one pass, extras off.
+2. **It will ask you to restart once more.** On its first run it adds itself to ReShade's startup
+   list and wants one more restart. That is normal, and only happens once.
+3. **Start with one pass.** It can do up to 30. That is a stress test, not a starting point.
+4. **Nothing else neural in the folder.** No RenoDX add-on, no Alex's Toolkit, no DX11 bridge. With
+   any of those present, Chicken quietly does nothing at all.
 
-**Verification status.** Confirmed working on this machine on 2026-09-02 with **DOOM (2016),
-Vulkan, 3840x2160, in-process**: Chicken ARMED, 1200+ neural frames, zero failures. The 32-bit
-x64 helper path is confirmed in-game too — **Fable Anniversary, D3D9 via dgVoodoo2, 3578x2013**:
-Chicken armed 6 s after the first create, the feeder re-created once on its `ARMED` state, and
-Chicken adopted that create and rendered for the rest of the session. Everything else — 64-bit
-D3D11, D3D12, OpenGL, 32-bit Vulkan — is source-contract compatible per its author but **not
-game-validated**. The interop is ABI 1 in both 1.4.0-alpha and 1.4.4-alpha.
+For a **32-bit game**, its three files go in the `host64\` folder, next to `dlss5-feed-host64.exe` —
+not beside the game itself. A 32-bit game cannot load them.
+
+**Is it working?** The overlay's **Status** section and `dlss5-feed.log` both show Chicken's version
+and its state. **`ARMED` is what you want.** `DISARMED`, `CONFLICT` or `FAILED` mean it is not
+running its passes, and the log says which and why.
+
+<details>
+<summary>Version notes, and one log line that looks alarming but isn't</summary>
+
+**Take 1.4.8 or newer.** Up to 1.4.7 Chicken rescanned every module in the process every 300
+presented frames, looking for a graphics component that might have loaded late. In an application
+with a lot of DLLs loaded that scan costs a frame each time it runs, on a fixed cadence of roughly
+five seconds at 60 fps. The result is a periodic hitch and poor 1% lows while the average frame
+rate stays flat. 1.4.8 replaced the polling with a callback from the operating system, and its log
+then says `smart discovery settled: periodic full-module fallback disabled`. If you are stuck on an
+older build, the feeder's `stall_log_ms` setting will confirm whether this is what you are seeing.
+
+**`warm-up: re-creating the feature once` is expected.** Chicken arms its hooks a few seconds after
+it loads, and it never picks up work that started before it was ready. So the feeder watches for it
+to report `ARMED` and rebuilds once at that moment. Without that rebuild you would get plain DLSS
+and an idle Chicken. The feeder's own `warmup_rebuild` frame count is not used while Chicken is
+present.
+
+**Frame Generation and Ray Reconstruction** pass straight through untouched; Chicken adopts
+neither. Its author does not claim Frame Generation works — a live test gave a black screen — and
+does not claim 32-bit Vulkan.
+
+`arm=0` in its config is a full off switch that needs a restart. The live `enabled=0` only stops the
+neural work, leaving its hooks in place — worth knowing if you are trying to rule Chicken out of a
+problem, because only `arm=0` truly takes it out of the picture.
+
+The interop is ABI 1 in 1.4.0-alpha, 1.4.4-alpha and 1.4.8-alpha alike (`FEEDER-INTEROP-v1.md` is
+byte-identical across all three). The protocol is in `src/feed_dfc.h`; the request that produced it
+is in `FEEDBACK-DFC.md`.
+
+</details>
+
+<details>
+<summary>Where it has been confirmed working</summary>
+
+Confirmed on this machine on 2026-09-02:
+
+- **DOOM (2016)**, 64-bit Vulkan, 3840x2160, in-process — ARMED, 1200+ neural frames, zero failures.
+- **Fable Anniversary**, 32-bit D3D9 via dgVoodoo2, 3578x2013, through the x64 helper — Chicken
+  armed 6 s after the first create, the feeder rebuilt once on its `ARMED` state, and Chicken
+  rendered for the rest of the session.
+- **A 64-bit D3D11 host**, in-process, 3840x2160 HDR10 — marker accepted (`feeder_marker=1
+  legacy_exact=0`), neural frames throughout. This one is a capture/streaming application rather
+  than a game, so it also exercised a swapchain that changes size and format live.
+
+D3D12, OpenGL and 32-bit Vulkan are source-contract compatible per its author but **not
+game-validated**.
+
+</details>
+
+**Reporting a problem?** Send `dlss5-feed.log`, `deep-fried-chicken.log` and `ReShade.log` from the
+same run (plus `host64\dlss5-feed-host.log` for a 32-bit game), and the output of the
+[install checker](#install-read-first).
 
 ### Alternative: the RenoDX add-on
 
-To use **Krish's `renodx-dlss5.addon64`** (the `#DLSS5` build — see the warning near the top of this
-README for where to get it and which generations exist) instead of Deep Fried Chicken:
+To use **Krish's `renodx-dlss5.addon64`** (the `#DLSS5` build) instead of Deep Fried Chicken —
+[Before you install](#2-you-need-one-neural-add-on-installed-next-to-this-one) has the download and
+the list of build generations:
 
 - In step 4, put `renodx-dlss5.addon64` next to the game `.exe` in place of the three Chicken files.
   `nvngx_dlssnr.dll` and `nvngx_dlss.dll` are needed either way. For a 32-bit game it goes into
@@ -366,30 +440,40 @@ README for where to get it and which generations exist) instead of Deep Fried Ch
 
 ## Install for a 32-bit game (beta)
 
-32-bit games need one extra piece: a 64-bit helper that does the actual DLSS work, since NGX only
-exists as 64-bit code.
+NGX only exists as 64-bit code, so a 32-bit game gets a 64-bit helper process that does the DLSS
+work. Two folders to fill:
 
-1. Run ReShade's installer, point it at your game's `.exe` — it detects **32-bit** automatically.
-2. Download **`dlss5-feed.addon32`**, **`DLSS5_Feed.fx`** and **`dlss5-feed-host64.exe`** from the
-   **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)**. Put
-   `dlss5-feed.addon32` next to the game `.exe`, `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`,
-   and `dlss5-feed-host64.exe` into a new `host64\` folder next to the game `.exe`.
-3. Put a 64-bit ReShade `dxgi.dll`, the neural consumer, `nvngx_dlssnr.dll` and `nvngx_dlss.dll`
-   into `host64\` — **not** beside the 32-bit game `.exe`, which cannot load 64-bit code. The
-   consumer is Deep Fried Chicken's three files (`deep-fried-chicken.addon64`,
-   `deep-fried-chicken-nvngx.dll`, `deep-fried-chicken.cfg`), or `renodx-dlss5.addon64` if you took
-   [the RenoDX route](#alternative-the-renodx-add-on). (Get the x64 `dxgi.dll` by running the
-   ReShade installer once against any 64-bit game.)
-4. Install a motion-vector provider into the game's `reshade-shaders\`, same as steps 3 and 5 of the
-   [64-bit instructions](#install-for-a-64-bit-game).
-5. Turn it on in-game as above. Day-to-day DLSS 5 settings live in **ReShade's overlay → Add-ons tab
-   → DLSS 5 Feed** — see [Configuration](#configuration).
+**Next to the game `.exe`** (32-bit side)
+- ReShade, installed with its installer (it detects 32-bit itself; tick "Enable loading of add-ons").
+- `dlss5-feed.addon32` from the [latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest).
+- `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`, plus a motion-vector provider (steps 3 and 5 of the
+  [64-bit instructions](#install-for-a-64-bit-game)).
 
-The first fed frame also spawns `host64\dlss5-feed-host64.exe`, which opens a window titled
-**"32-bit DLSS 5 Feeder"** — the add-on and the game never share a ReShade instance, so this is
-where the neural consumer's *own* full panel lives — the **Deep Fried Chicken** tab, or the RenoDX
-add-on's panel — for anything not covered by our overlay page.
-Press Home in that window to open it:
+**In a new `host64\` folder next to the game `.exe`** (64-bit side, nothing here can go beside the game)
+- `dlss5-feed-host64.exe` from the same release.
+- A 64-bit ReShade `dxgi.dll` (run the ReShade installer once against any 64-bit game and take it from there).
+- The neural consumer: Deep Fried Chicken's three files (`deep-fried-chicken.addon64`,
+  `deep-fried-chicken-nvngx.dll`, `deep-fried-chicken.cfg`), or `renodx-dlss5.addon64`
+  ([the RenoDX route](#alternative-the-renodx-add-on)).
+- `nvngx_dlssnr.dll` and `nvngx_dlss.dll`.
+
+**Then, in-game**
+- Turn it on as for a 64-bit game. The first fed frame starts the helper by itself.
+- Day-to-day settings: ReShade overlay → Add-ons → **DLSS 5 Feed** (see [Configuration](#configuration)).
+- The neural consumer's own panel lives in the helper, not in the game's ReShade. No alt-tab needed:
+  press **Show the DLSS 5 panel in-game** on that page, or bind a key with **Set key**, and it is drawn
+  at the top right of the game window with your clicks forwarded to it. Changes apply live.
+  - That button uses the desktop compositor: windowed or borderless games only.
+  - **Show as texture** draws it through the game's own ReShade instead and also works in exclusive
+    fullscreen; it appears once the feed has built.
+  - While the panel is up the mouse and keyboard belong to it. Escape away from it hides it, Alt+F4
+    hides it and closes the game, and the X in its corner always closes it. **Panel size** scales it.
+- `host_window=1` in `dlss5-feed.cfg` gives the helper a visible window of its own instead (Home opens
+  the panel there).
+
+![32-bit-overlay-ingame](Ingame-32bit-overlay.png)
+
+The helper's own window, with `host_window=1`:
 
 <img width="1880" height="1058" alt="image" src="https://github.com/user-attachments/assets/57abd732-94d2-401c-a524-6536006f3c86" />
 
@@ -451,6 +535,16 @@ Almost every 32-bit game that reaches Vulkan does it through
    install both halves from the same release.
 
 DLSS runs at the game's native resolution here, so the **Work resolution** slider is fixed at 100%.
+
+A working configuration from issue #15 (World of Warcraft 3.3.5a, DXVK 3.0.2, ReShade 6.8 x86 as
+a global Vulkan layer, Guild Wars Reforged likewise): the default `dxvk.conf` is fine; the only
+setting that mattered was `dxvk.allowFse = False`. Expect roughly half the frame rate — DLAA at
+native size plus the 32→64-bit hop — and, from 0.11.0-beta.2, no more plateaus at exactly 30 fps
+(the helper's own `Present` used to block on the compositor while the game waited behind it; it
+no longer waits). If frame times still step between two fixed values, run once with `mode=1`
+(transport only, no DLSS) and once with `async_home=0` and post both `dlss5-feed.log`s; the
+`present probe` line now also counts presents against frames fed here, which tells an external
+frame pacer apart from a slow helper.
 
 If `dlss5-feed.log` says the interop entry points are missing, use the 32-bit fallback layer:
 
@@ -539,8 +633,9 @@ the pixel is flagged in a `DLSS5_Mask` texture the add-on passes to DLSS as its
 * On a **64-bit D3D11 game** the optional **Work resolution** slider can run the private
   DLAA + Neural Rendering contract at 50–100% of each backbuffer axis. Color is resampled
   linearly; depth, motion vectors and the trust mask use point sampling; motion-vector
-  magnitudes are corrected for the selected work extent. The result is linearly expanded
-  back over the native-size backbuffer. At 100% this reduces to the original copy path.
+  magnitudes are corrected for the selected work extent. The result is expanded back over the
+  native-size backbuffer, bilinearly or (`work_upscale=1`) through AMD FSR 1 EASU + RCAS. At 100%
+  this reduces to the original copy path.
 * On a **D3D12 game** there is no transport at all: NGX runs on the game's own device and queue,
   motion vectors and depth are consumed zero-copy straight from the effect textures, and the feature
   survives alt-tabs and effect reloads untouched (only a real resolution change rebuilds).
@@ -560,6 +655,11 @@ NGX and the DLSS 5 add-on only exist as x64 code, and a 32-bit process cannot lo
 
 * It creates the four Color/Output/Depth/MV textures as **cross-process shared** D3D11 resources
   (`D3D11_RESOURCE_MISC_SHARED_NTHANDLE`) on the game's own device, plus two shared fences.
+  If the game's device refuses (a feature-level 10.x device cannot bind the UAV the DLSS output
+  needs — NFS Most Wanted 2012, issue #33), it switches to the route the GL and Vulkan clients
+  use: the host creates the set on D3D12 and hands the handles in, keeps the output's UAV on its
+  own side and copies the result into a plain shared texture. The log says so
+  (`the host will create the shared set instead`).
 * It spawns `dlss5-feed-host64.exe` and hands it the texture/fence handles over a named pipe
   (`DuplicateHandle` across the process boundary — the same WDDM sharing the driver already uses,
   just one hop further).
@@ -570,7 +670,11 @@ NGX and the DLSS 5 add-on only exist as x64 code, and a 32-bit process cannot lo
   it: a window with a minimal D3D12 swap chain lets its own bundled ReShade (`host64\dxgi.dll`)
   attach and the add-on arm its hooks, exactly as in a real D3D12 title. The 32-bit `dlss5-feed.cfg`
   add-on writes settings changes made in the *game's* own overlay straight into that window's
-  ReShade.ini and restarts it to apply them.
+  ReShade.ini and restarts it to apply them. For live changes it instead *casts* that window into
+  the game: a DWM live thumbnail of the host window is registered on the game window (no pixel
+  transport, no protocol change), and while the cursor is over it the game's mouse and keys —
+  read through ReShade's add-on API and blocked from the game — are posted to the host window as
+  ordinary `WM_*` messages, which is where the host's ReShade reads its input.
 * If the host process dies, the pipe breaks, the add-on notices and disables itself — the game keeps
   rendering normally.
 * Verified end to end with a deliberate split-screen test (`mode=1`): the host copies only the left
@@ -684,7 +788,7 @@ memory objects are import-only and a GL process cannot export one. Both directio
 | --- | --- |
 | D3D11, D3D12, Vulkan or OpenGL game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan works out of the box at both bitnesses (the add-on adds the interop extensions itself; a small bundled layer is the fallback — [64-bit](#install-for-a-vulkan-game), [32-bit/DXVK](#32-bit-vulkan-dxvk)); OpenGL needs nothing extra at all, but the game must be rendering on the NVIDIA GPU (see [Install for an OpenGL game](#install-for-an-opengl-game)). D3D10 is not supported. |
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
-| A neural consumer + `nvngx_dlssnr.dll` | **Deep Fried Chicken** (recommended — `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll`, `deep-fried-chicken.cfg`, from its Discord), or **Krish's `renodx-dlss5.addon64`** `#DLSS5` build as the alternative. Exactly one of them. Not ShortFuse's `renodx-dlss`, which is a different add-on that replaces this project rather than working with it (see the warning near the top). Neither is included here, and neither bundles `nvngx_dlssnr.dll`. |
+| A neural consumer + `nvngx_dlssnr.dll` | **Deep Fried Chicken** (recommended — `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll`, `deep-fried-chicken.cfg`, from its Discord), or **Krish's `renodx-dlss5.addon64`** `#DLSS5` build as the alternative. Exactly one of them. Not ShortFuse's `renodx-dlss`, which is a different add-on that replaces this project rather than working with it (see [Before you install](#1-you-might-not-need-this-project-at-all)). Neither is included here, and neither bundles `nvngx_dlssnr.dll`. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
 | A motion vector provider | one of five, selected with the `DLSS5_MV_PROVIDER` definition — **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) Kernel is recommended** (`=3`); also iMMERSE Launchpad, VORT, LumeniteFX QuantMotion, or anything writing `texMotionVectors` (qUINT, `dh_uber_motion`). **Not DRME — it does not compile on ReShade 6.8.** See [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider). Install it yourself — nothing third-party is bundled, and our shader includes no third-party files. |
 | `dlss5-feed.addon64` (or `.addon32` + `host64\`) + `DLSS5_Feed.fx` | this project. |
@@ -707,7 +811,11 @@ if you prefer editing the file directly:
 | --- | --- | --- |
 | `enabled` | 1 | 0 disables everything. |
 | `mode` | 2 | 0 inert · 1 transport test (no NGX; on 32-bit it copies only the left half, so a split screen proves the round trip) · 2 full DLSS path. |
-| `work_resolution` | 100 | **64-bit D3D11 only.** 50–100% of each backbuffer axis for the private DLAA + Neural Rendering work textures. The Add-ons overlay slider applies once 400 ms after dragging stops. Other paths remain at 100%. |
+| `work_resolution` | 100 | **D3D11 only (64-bit and 32-bit).** 50–100% of each backbuffer axis for the private DLAA + Neural Rendering work textures. The Add-ons overlay slider applies once 400 ms after dragging stops. Other paths remain at 100%. A cost knob, not DLSS upscaling — below 100% the image is downsampled, processed, and expanded back (see the troubleshooting FAQ). |
+| `work_upscale` | 0 | **D3D11 only.** How the work-size output is expanded back over the backbuffer: `0` bilinear stretch · `1` AMD FSR 1 (EASU + RCAS), visibly crisper at 50–75% than the stretch · `2` **cfg-only experiment, not recommended:** DLSS Super Resolution on synthetic jitter — measured to cost as much as 100% and to shimmer (see the FAQ); on a 32-bit game the helper creates the SR feature (IPC v6: add-on and helper must be from the same build). Overlay checkbox "FSR 1 expand-back" toggles between 0 and 1. Better filters for `work_resolution`, not DLSS Quality: the result can never exceed the native frame. If the FSR shaders fail to compile the log says so and the spatial path stays bilinear. |
+| `work_sharpness` | 0.3 | RCAS strength for `work_upscale` 1 and 2, `0` (off) to `1` (sharpest). At 100% work resolution only the sharpening runs. Overlay slider "Sharpness". |
+| `jitter_sign` | 1 | **Diagnostic for `work_upscale=2`, parse-only.** `1` or `-1`: the sign of the grid shift handed to DLSS. On a static scene the right sign converges to a stable image within a second, the wrong one crawls. Here until the convention is confirmed in a game. |
+| `jitter_phases` | 0 | **Diagnostic for `work_upscale=2`, parse-only.** Halton sequence length; `0` = NVIDIA's 8 × (native ÷ work)². |
 | `hdr` | -1 | -1 auto (FP16 / R11G11B10 backbuffer = HDR), 0 force SDR, 1 force HDR. |
 | `depth_inverted` | -1 | -1 follow `RESHADE_DEPTH_INPUT_IS_REVERSED`, 0/1 force. |
 | `flags` | -1 | raw `DLSS.Feature.Create.Flags` override. |
@@ -719,8 +827,12 @@ if you prefer editing the file directly:
 | `preset` | 0 | DLSS render-preset hint: `0` default, `5`/`6` = legacy CNN presets E/F (clamp history harder — try these if motion warps around transparents like dust or flames), `10`/`11` = transformer presets J/K. |
 | `gpu_timeout_ms` | 2000 | how long a frame waits for the GPU to retire a command allocator before that frame is abandoned. Three abandoned frames in a row stop the feed. Raise it on a heavily contended GPU; clamped to 100–60000. |
 | `mv_scale_x/y` | 1.0 | extra motion-vector multiplier. |
+| `stall_log_ms` | 50 | **Diagnostic.** Log a breakdown for any frame whose present-to-present interval exceeds this, in ms (0 = off). Each `STALL frame` line splits the interval into the time inside the NGX evaluate call — which is where the neural consumer's own work runs — the rest of this add-on's work, and everything outside it, then names which of the three dominated. The `600 frames:` summary also carries the worst frame and a stall count. Use it to tell "the feed is slow" apart from "the neural consumer is slow" apart from "neither, something else in the process stalled". |
 | `async_home` | 1 | **32-bit games only.** 1 = pipelined handoff: each frame carries the DLSS output of the frame *before* it, so the game never waits for the helper process inside a frame — this is what lifts the ~35 fps ceiling of the original same-frame contract (issue #15). Costs one frame of latency on the DLSS output, which the temporal history hides. 0 = the original same-frame behaviour. Also on the overlay as "Pipelined handoff". |
-| `host_window` | 1 | **32-bit games only.** 1 shows the helper's window; 0 hides it (its own settings are now on the overlay page above, so you rarely need it). |
+| `host_window` | 0 | **32-bit games only.** 0 keeps the helper's window behind the game, off the taskbar, and lets the overlay's "Show the DLSS 5 panel in-game" button cast its tuning panel into the game window; 1 gives the helper its own visible window instead (press Home there). Read when the helper is started. |
+| `cast_key` | 0 | **32-bit games only.** Virtual-key code that shows/hides the cast DLSS 5 panel in-game; 0 = none. Set it from the overlay page with "Set key" rather than by hand. |
+| `cast_scale` | 100 | **32-bit games only.** Size of the cast panel, 25..300 % of the largest size that fits the game window (above 100 % it may run past the window's edges). Also on the overlay as "Panel size". |
+| `cast_mode` | 0 | **32-bit games only.** How the cast panel is drawn: 0 = a desktop-compositor thumbnail of the helper's window (windowed / borderless games, any API); 1 = a shared copy of the helper's frame drawn by the game's ReShade or blitted onto its backbuffer (works in exclusive fullscreen; D3D11, OpenGL and Vulkan). The two overlay buttons set it. |
 
 In `DLSS5_Feed.fx`'s own UI (settings that only make sense per-shader, not per-session):
 
@@ -812,15 +924,81 @@ Common cases:
   took effect; `CONFLICT` means a second neural consumer (`renodx-dlss5.addon64`,
   `renodx-dlss.addon64`, `alexs-toolkit.addon64`) is loaded — remove it and fully restart.
   `dlss5-feed.log` prints the same state.
+* **A regular stutter every few seconds, with poor 1% lows but a normal average frame rate** —
+  first check the neural consumer's version. Deep Fried Chicken up to 1.4.7 rescanned every module
+  in the process every 300 presented frames, which is about every 5 s at 60 fps and costs a frame
+  each time in a host with a lot of DLLs loaded. **1.4.8 fixes it**; its log then says
+  `smart discovery settled: periodic full-module fallback disabled`. To confirm the cause rather
+  than guess, set `stall_log_ms` in `dlss5-feed.cfg` to roughly one and a half frame times (25 for
+  60 fps) and read the `STALL frame` lines: they say whether the lost time was inside the NGX
+  evaluate call, inside this add-on, or outside both. `arm=0` plus a full restart is the clean A/B,
+  because the live `enabled=0` switch leaves the consumer's observation hooks installed and the
+  scans running.
 * **Neural rendering stops mid-session, no crash** — the overlay's **Status** section now names the
   reason next to `Session: disabled`, and **Re-enable** restarts it. If the log says `the GPU did
   not retire allocator slot N within 2000 ms`, the GPU is not keeping up rather than broken: raise
   `gpu_timeout_ms`. A single slow frame no longer stops the session — three consecutive failures do.
-* **Corruption or flicker with Smooth Motion on** — see the Smooth Motion warning at the top of
+* **Corruption or flicker with Smooth Motion on** — see [Before you install](#3-turn-off-optiscaler-and-smooth-motion-on-vulkan) at the top of
   this README. The overlay says whether Smooth Motion was detected, and `dlss5-feed.log` records the feeding
   thread: `frame fed from thread N, not the usual M` means `Present` is arriving off-thread, and
   `re-entrant frame … dropped` means it arrived twice at once. Both lines are worth quoting on an
   issue. Turn Smooth Motion off for this game's API only, with Profile Inspector.
+* **Smooth Motion on, everything reports healthy, nothing looks neural** — two ReShade runtimes
+  (`effect runtime … initialised (device …, window class '…'; 2 runtimes in this process)`), and
+  before 0.11.0-beta.2 the feeder could be bound to the wrong one. Update; the log then shows
+  `binding to effect runtime …: it is the one rendering DLSS5_Feed`.
+* **Can I use DLSS Quality / Balanced / Performance instead of DLAA?** No — not as a setting, and
+  not as a future one either. Real DLSS upscaling needs the game to render *smaller* than the
+  screen and jitter its camera, then hands DLSS that small frame; the feeder only ever sees the
+  finished, screen-sized frame ReShade has, so it publishes a 1:1 DLAA contract by construction.
+  `work_resolution` (D3D11) is a **cost** knob: the frame is downsampled, DLAA + neural
+  rendering run on the smaller image, and the result is expanded back — that is why 50–66% looks
+  blurry rather than like DLSS Quality. From 0.12.0 the expand-back can be AMD FSR 1 instead of a
+  bilinear stretch (`work_upscale=1`, or the "FSR 1 expand-back" checkbox under the slider): much
+  crisper at 50–75%, still bounded by the native frame. Leave the DLSS 5 add-on's
+  `NREnableUpscaling` at 0: with a 1:1 contract it cannot engage, and on v4.6 it parks neural
+  rendering for the run. For games that ship DLSS already, use the game's own DLSS (or OptiScaler)
+  instead of this feeder.
+* **What about adding the jitter ourselves? (`work_upscale=2`, D3D11, experimental)** — it
+  exists, and it is honest about its limits. The feeder shifts the downsample grid by a Halton
+  sub-pixel offset every frame, reports that offset to DLSS, and creates the feature in Super
+  Resolution mode (render = work size, target = native), so DLSS itself rebuilds the native frame
+  from the jittered history. Three things it cannot change: the game still rendered every native
+  pixel, so there is no frame-rate win on the game side; every jittered sample comes from that
+  same native frame, so the best DLSS can converge to is the image you already had at 100%; and
+  DLSS SR leans on motion vectors far more than DLAA — with the feeder's *estimated* vectors, a
+  rejected history means a blurry low-res frame rather than a sharp native one, so expect smear in
+  motion. **Measured (Fable Anniversary, 3578x2013, Deep Fried Chicken 1.4.8): it saves nothing.**
+  At 50% work resolution DLAA + FSR 1 ran at 57–62 fps and DLSS reconstruction at 44–48 fps, the
+  same as 100%. DLSS Super Resolution's cost follows the *output* size, and the neural consumer
+  takes DLSS's resolved native output as its input (`neural=3578x2013->3578x2013` in Chicken's
+  log), so the neural pass runs on every native pixel again. The image also shimmers. That is why
+  it is **not on the overlay**: it stays reachable as `work_upscale=2` in the cfg for anyone who
+  wants to repeat the experiment, and nothing more. What people actually want — render the game
+  smaller, run DLSS 5 on that, upscale the neural result — would need a neural model trained to
+  upscale, which is NVIDIA's to ship. The only route to a real frame-rate win today is the game
+  rendering fewer pixels: set a lower resolution in the game and let the GPU scale it to the
+  panel (NVIDIA Control Panel → Adjust desktop size and position → GPU scaling); the feeder then
+  works 1:1 at that size. See `PLAN-PROXY-SWAPCHAIN.md` for what doing that in-process would take.
+* **32-bit game: changing the work resolution froze the PC for a few seconds, then DLSS never
+  came back and the helper window stopped responding** — the helper's log shows `feature create
+  did not complete`, its `ReShade.log` shows `DXGI_ERROR_DEVICE_HUNG`, and every later rebuild
+  fails with `OpenSharedHandle … 0x887A0005`. Before 0.12.0 the helper released the old feature
+  and textures without waiting for the GPU, which a neural consumer that keeps a graph alive on
+  the feature (Deep Fried Chicken) turned into a GPU hang, and a helper whose D3D12 device was
+  removed retried against it forever. From 0.12.0 the rebuild drains the GPU first, and a helper
+  whose device was removed says so, exits, and is respawned by the add-on on the next frame.
+* **32-bit game: `tex 1 CreateTexture2D failed 0x80070057`, `failure: shared build` forever** —
+  the game's D3D11 device is feature level 10.x and cannot bind the UAV the DLSS output needs.
+  From 0.11.0-beta.2 the helper creates the shared set instead (the log says `the host will
+  create the shared set instead`); on older builds there is no workaround (`mode=1` uses the same
+  texture).
+* **The game crashed** — `dlss5-feed.log` (or `dlss5-feed-host.log`) ends with
+  `### CRASH RECORDED ###`, naming the exception, the module it faulted in and what the feeder was
+  doing at the time, and from 0.11.0-beta.2 a `dlss5-feed-crash.dmp` is written next to it. Post
+  the log and the `.dmp` on the issue; the last ordinary line before the crash line (the session
+  opens in fixed steps — adapter, D3D12 device, NGX init, multithread protection, session open)
+  pins the step.
 
 ## Building
 
@@ -836,7 +1014,7 @@ under `external/reshade/include` (BSD-3-Clause, Patrick Mours), as is **MinHook*
 | `build-addon32.bat` | `build\dlss5-feed.addon32` | Vulkan headers |
 | `host\build-host.bat` | `host\dlss5-feed-host64.exe` | NGX SDK |
 | `layer\build-layer.bat` | `layer\VkLayer_feed_vk.dll` and `layer\x86\VkLayer_feed_vk32.dll` (fallback for Vulkan games where the add-on's own `vkCreateDevice` hook cannot add the interop extensions; the 32-bit pair keeps its own subdirectory because the Vulkan loader tries every manifest on `VK_LAYER_PATH`) | Vulkan headers |
-| `spike\build-spike.bat` | the standalone proofs used during development: the 32↔64-bit shared-resource pair, plus `spike-gl64.exe` / `spike-gl32.exe` and `spike-vkhost64.exe` / `spike-vkclient32.exe`, which round-trip a texture and a fence between D3D12 and OpenGL / Vulkan, in-process and cross-process. They need an NVIDIA GPU to *run*, none to compile. | — |
+| `spike\build-spike.bat` | the standalone proofs used during development: the 32↔64-bit shared-resource pair, plus `spike-gl64.exe` / `spike-gl32.exe` and `spike-vkhost64.exe` / `spike-vkclient32.exe`, which round-trip a texture and a fence between D3D12 and OpenGL / Vulkan, in-process and cross-process, and `spike-proxy-swapchain.exe`, the `IDXGISwapChain` wrapper contract behind `PLAN-PROXY-SWAPCHAIN.md` (a 960×540 "game" presented at window size through FSR 1). They need an NVIDIA GPU to *run*, none to compile. | — |
 
 NGX links against the Release CRT, so the builds use `/MD`.
 
@@ -851,15 +1029,25 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
 
 ## Limitations and roadmap
 
-* **DLAA contract, optional reduced work extent on 64-bit D3D11** — render resolution still
+* **DLAA contract, optional reduced work extent on D3D11** — render resolution still
   equals DLAA output resolution, but the private work extent can be 50–100% of the native
-  backbuffer and is spatially expanded afterward. D3D12, Vulkan, OpenGL and 32-bit paths remain at
-  100%. This is not jittered DLSS Super Resolution.
+  backbuffer and is spatially expanded afterward (bilinear, or FSR 1 with `work_upscale=1`).
+  D3D12, Vulkan and OpenGL paths remain at 100%. This is not jittered DLSS Super Resolution, and a
+  Quality/Balanced/Performance mode cannot be added: see the FAQ entry in
+  [Logs and troubleshooting](#logs-and-troubleshooting).
 * Estimated motion vectors → temporal artifacts in fast motion; the UI is processed with the scene
   (a UI mask / pre-UI colour capture is future work).
 * **Geometry vectors are experimental and off.** The camera-model fit is derived from the provider's
   own flow, so it inherits that noise, and it has no way to know the HUD is not part of the scene.
   Doing it properly needs the game's real view-projection matrices, not a fit.
+* **Synthetic-jitter DLSS reconstruction (`work_upscale=2`) is a cfg-only experiment, not on
+  the overlay.** It turns DLSS into the expand-back for the work-resolution cost knob, and the
+  measurement says it costs as much as 100% (DLSS SR follows the output size; the neural consumer
+  runs on the resolved native output) and shimmers (the jitter sign convention, `jitter_sign` on
+  the 64-bit add-on, was never confirmed). D3D11 only. On the 32-bit path the add-on ships the
+  target size with each build and the grid shift with each frame (IPC v6) and the helper creates
+  the SR feature; no covering preset means a DLAA + FSR 1 rebuild. Kept so the result can be
+  reproduced; use FSR 1.
 * A light that flickers faster than DLSS's history converges is averaged into a slow pulse. The
   trust mask reduces it; nothing available to a post-process feed removes it.
 * Exclusive-fullscreen swapchain churn can make some games reload effects repeatedly; windowed is

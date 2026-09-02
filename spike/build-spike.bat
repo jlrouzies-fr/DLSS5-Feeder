@@ -14,6 +14,9 @@ cl /nologo /O2 /EHsc /W3 spike-gl64.cpp /Fe:spike-gl64.exe d3d12.lib dxgi.lib op
 if errorlevel 1 exit /b 1
 cl /nologo /O2 /EHsc /W3 spike-vkhost64.cpp /Fe:spike-vkhost64.exe d3d12.lib dxgi.lib
 if errorlevel 1 exit /b 1
+rem The proxy-swapchain contract (PLAN-PROXY-SWAPCHAIN.md); reuses src\feed_fsr1.h for the upscale.
+cl /nologo /O2 /EHsc /W3 /I..\src spike-proxy-swapchain.cpp /Fe:spike-proxy-swapchain.exe d3d11.lib dxgi.lib d3dcompiler.lib user32.lib
+if errorlevel 1 exit /b 1
 endlocal
 
 setlocal

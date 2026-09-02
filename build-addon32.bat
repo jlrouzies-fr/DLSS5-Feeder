@@ -14,7 +14,7 @@ call "%~dp0tools\vcvars.bat" amd64_x86 || exit /b 1
 cl /nologo /LD /EHsc /O2 /MD /W3 /std:c++20 /Iexternal\reshade\include /Iexternal\imgui /Iexternal\vulkan /Iexternal\minhook\include /Fobuild\x86\ /Fdbuild\x86\ ^
    src\dlss5-feed32.cpp ^
    external\minhook\src\buffer.c external\minhook\src\hook.c external\minhook\src\trampoline.c external\minhook\src\hde\hde32.c ^
-   /link /OUT:build\dlss5-feed.addon32 d3d11.lib kernel32.lib user32.lib advapi32.lib
+   /link /OUT:build\dlss5-feed.addon32 d3d11.lib dwmapi.lib kernel32.lib user32.lib advapi32.lib
 if errorlevel 1 exit /b 1
 endlocal
 echo addon32 built.

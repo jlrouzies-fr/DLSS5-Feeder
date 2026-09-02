@@ -55,8 +55,10 @@
 #include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
+#include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
+#include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 
-#define FEED_VERSION "0.8.0-beta.1"
+#define FEED_VERSION "0.12.0"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -124,6 +126,30 @@ static void Warn(const char *fmt, ...)
 static const char *volatile g_where = "starting up";
 static void Breadcrumb(const char *what) { g_where = what; }
 
+// A minidump next to the log, so a crash report can be read in a debugger instead of
+// guessed at from the breadcrumb. dbghelp is loaded on demand -- it is not a dependency
+// until the moment the process is already dying. Kept small (no full memory): the stack,
+// the module list and the memory the registers point at are what a crash needs.
+typedef BOOL (WINAPI *PFN_MiniDumpWriteDump_)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+static void WriteCrashDump(EXCEPTION_POINTERS *ep)
+{
+    char path[MAX_PATH];
+    strcpy_s(path, g_log_path);
+    if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "dlss5-feed-crash.dmp");
+    HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
+    auto write = dbghelp ? reinterpret_cast<PFN_MiniDumpWriteDump_>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+    if (write == nullptr) { Log("[feed] no dbghelp.dll; no crash dump written"); return; }
+    HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) { Log("[feed] could not create %s (error %lu)", path, GetLastError()); return; }
+    struct { DWORD tid; EXCEPTION_POINTERS *ep; BOOL client; } info = { GetCurrentThreadId(), ep, FALSE };
+    // MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithDataSegs | MiniDumpWithHandleData
+    const int type = 0x0040 | 0x0001 | 0x0004;
+    const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), f, type, ep != nullptr ? &info : nullptr, nullptr, nullptr);
+    CloseHandle(f);
+    Log(ok ? "[feed] crash dump written: %s -- attach it to the issue with this log"
+           : "[feed] crash dump FAILED (%s, error %lu)", path, GetLastError());
+}
+
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
@@ -137,6 +163,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
         GetModuleFileNameW(mod, owner, MAX_PATH);
     Log("### CRASH RECORDED ###  exception 0x%08X at %p in %ls; this add-on was last doing: %s%s", code, addr,
         owner, g_where, mod == g_self ? " (inside this add-on)" : "");
+    WriteCrashDump(ep);
     return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -152,13 +179,60 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 //  - v4.6 builds keep the v45+ engine (rescan every present, adopt lazily) and add
 //    global hotkeys, a rejected-upscaling latch and richer decline diagnostics;
 //    nothing they gate on is missing from the contract this feeder publishes.
-// The 'EnableHooks' string in the binary is the v45+ marker; 'NRToggleKey' is the
-// v4.6 one (its only new config keys are EnableHooks and the two hotkey binds).
+//  - v4.7 builds keep that engine again and rework the colour path: the Control-style
+//    soft-clip/paper-white codec is replaced by a reversible colour bridge that picks
+//    SDR sRGB, linear HDR BT.709 or PQ BT.2020 from the contract it is handed, with a
+//    diffuse-white-in-nits control instead of a paper-white scale, plus a new
+//    global-tone strength and a fenced D3D12 workset pool. Everything it decides on --
+//    the IsHDR create flag and the colour format -- is already in what this feeder
+//    publishes, so no contract change is needed here.
+// Markers, each a NUL-terminated literal in the add-on's string table: 'EnableHooks'
+// is v45+, 'NRToggleKey' is v4.6+, 'NRGlobalTone' is v4.7+ (each generation's new
+// config keys are the only reliable, purely additive fingerprint).
+// The file version resource cannot separate them -- v4.6 and v4.7 both report
+// 0.2026.0828.0517 -- but v4.6+ builds carry their own generation banner ("v4.6",
+// "v4.7") next to 'RenoDX DLSS5 Generic ', so read that when it is present and fall
+// back to the version resource on older builds that have none.
 // ---------------------------------------------------------------------------
 
 static char g_renodx_ver[48] = "not found";
+static char g_renodx_gen[16] = "";       // the add-on's own banner, e.g. "v4.7" (v4.6+ only)
+static bool g_renodx_present = false;
 static bool g_renodx_lazy    = false;
 static bool g_renodx_v46     = false;
+static bool g_renodx_v47     = false;
+
+// Does the add-on's string table hold this literal? The terminator is part of the
+// match, so a marker key can never be found inside a longer string that starts with
+// it (the "EnableHooks=0: NR disabled by policy" message, for one).
+static bool RenodxHasLiteral(const char *buf, DWORD size, const char *needle)
+{
+    const DWORD n = static_cast<DWORD>(strlen(needle)) + 1;   // include the NUL
+    if (buf == nullptr || size < n) return false;
+    for (DWORD i = 0; i + n <= size; ++i)
+        if (buf[i] == needle[0] && memcmp(buf + i, needle, n) == 0) return true;
+    return false;
+}
+
+// Find the add-on's generation banner: a NUL-terminated "v<d>.<d>[<d>]" literal, which
+// only v4.6+ builds carry (older classic-engine builds have none; fall back to the resource).
+static void RenodxFindBanner(const char *buf, DWORD size, char *out, size_t out_size)
+{
+    const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+    for (DWORD i = 1; i + 5 <= size; ++i)
+    {
+        if (buf[i - 1] != '\0' || buf[i] != 'v' || !digit(buf[i + 1]) || buf[i + 2] != '.' || !digit(buf[i + 3]))
+            continue;
+        DWORD end = i + 4;
+        while (end < size && digit(buf[end])) ++end;
+        if (end < size && buf[end] == '\0' && end - i < out_size)
+        {
+            memcpy(out, buf + i, end - i);
+            out[end - i] = '\0';
+            return;
+        }
+    }
+}
 
 // Set when the game's device (or the process) is being destroyed: from that moment,
 // never call back into NGX. The DLSS 5 add-on tears its hooks down during device
@@ -182,32 +256,67 @@ static void RenodxDefault(const char *key, const char *value, const char *why)
         Log("[feed] %s=%s (user-set; leaving it alone)", key, v);
 }
 
+static char g_renodx_file[MAX_PATH] = "renodx-dlss5.addon64";   // the file actually found
+
+// The add-on is distributed under versioned names too ("renodx-dlss5-4.7.addon64"), and
+// ReShade loads any *.addon64 -- so a user with the versioned file has a working add-on
+// that this feeder used to report as "not found", and then treated as the classic engine
+// (warm-up re-create on, no EnableHooks default, no lazy-engine grace). Match the prefix.
+static bool FindRenodxAddon(const char *dir, char *out, size_t out_size)
+{
+    char pattern[MAX_PATH];
+    sprintf_s(pattern, "%srenodx-dlss5*.addon64", dir);
+    WIN32_FIND_DATAA fd = {};
+    HANDLE find = FindFirstFileA(pattern, &fd);
+    if (find == INVALID_HANDLE_VALUE) return false;
+    int matches = 0;
+    char first[MAX_PATH] = "";
+    do
+    {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (++matches == 1) strcpy_s(first, fd.cFileName);
+        else Log("[feed] DLSS 5 add-on: %s is ALSO here -- ReShade loads every *.addon64, so two copies of the add-on "
+                 "will both hook NGX; keep one", fd.cFileName);
+    } while (FindNextFileA(find, &fd));
+    FindClose(find);
+    if (matches == 0) return false;
+    strcpy_s(out, out_size, first);
+    return true;
+}
+
 static void DetectRenodxAddon()
 {
     char path[MAX_PATH];
     GetModuleFileNameA(g_self, path, MAX_PATH);
-    if (char *s = strrchr(path, '\\'))
-        strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "renodx-dlss5.addon64");
+    if (char *s = strrchr(path, '\\')) *(s + 1) = '\0';
+    if (!FindRenodxAddon(path, g_renodx_file, sizeof(g_renodx_file)))
+    {
+        Log("[feed] DLSS 5 add-on: renodx-dlss5*.addon64 not found next to this add-on");
+        return;
+    }
+    strcat_s(path, g_renodx_file);
 
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE)
     {
-        Log("[feed] DLSS 5 add-on: renodx-dlss5.addon64 not found next to this add-on");
+        Log("[feed] DLSS 5 add-on: %s is here but could not be opened (error %lu)", g_renodx_file, GetLastError());
         return;
     }
+    g_renodx_present = true;
     const DWORD size = GetFileSize(f, nullptr);
     DWORD got = 0;
     char *buf = (size > 0 && size < 8u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
     if (buf != nullptr && ReadFile(f, buf, size, &got, nullptr) && got == size)
-        for (DWORD i = 0; i + 11 < size; ++i)   // both markers happen to be 11 bytes
-        {
-            if (!g_renodx_lazy && memcmp(buf + i, "EnableHooks", 11) == 0) g_renodx_lazy = true;
-            if (!g_renodx_v46  && memcmp(buf + i, "NRToggleKey", 11) == 0) g_renodx_v46  = true;
-            if (g_renodx_lazy && g_renodx_v46) break;
-        }
+    {
+        g_renodx_lazy = RenodxHasLiteral(buf, size, "EnableHooks");
+        g_renodx_v46  = RenodxHasLiteral(buf, size, "NRToggleKey");
+        g_renodx_v47  = RenodxHasLiteral(buf, size, "NRGlobalTone");
+        RenodxFindBanner(buf, size, g_renodx_gen, sizeof(g_renodx_gen));
+    }
     free(buf);
     CloseHandle(f);
-    if (g_renodx_v46) g_renodx_lazy = true;   // v4.6 is a per-present-rescan engine too
+    if (g_renodx_v47) g_renodx_v46 = true;    // each generation keeps the previous engine
+    if (g_renodx_v46) g_renodx_lazy = true;   // v4.6+ is a per-present-rescan engine too
 
     DWORD dummy = 0;
     const DWORD vsize = GetFileVersionInfoSizeA(path, &dummy);
@@ -223,8 +332,10 @@ static void DetectRenodxAddon()
         free(vdata);
     }
 
-    Log("[feed] DLSS 5 add-on: renodx-dlss5.addon64 v%s -- %s engine", g_renodx_ver,
-        g_renodx_v46  ? "v4.6+ (per-present rescan, lazy adoption, global hotkeys, upscaling latch)"
+    Log("[feed] DLSS 5 add-on: %s %s%s (file version %s) -- %s engine", g_renodx_file,
+        g_renodx_gen[0] != '\0' ? "" : "v", g_renodx_gen[0] != '\0' ? g_renodx_gen : g_renodx_ver, g_renodx_ver,
+        g_renodx_v47  ? "v4.7+ (per-present rescan, lazy adoption, reversible colour bridge, fenced workset pool)"
+      : g_renodx_v46  ? "v4.6+ (per-present rescan, lazy adoption, global hotkeys, upscaling latch)"
       : g_renodx_lazy ? "v45+ (per-present rescan, lazy feature adoption; warm-up re-create skipped)"
                       : "classic (single hook pass; warm-up re-create stays on)");
 
@@ -241,6 +352,23 @@ static void DetectRenodxAddon()
     // it, so both writes are inert on older generations.
     RenodxDefault("NeuralUplift", "1", "neural rendering on");
     RenodxDefault("NREnableUpscaling", "0", "upscaling off; this feeder publishes a complete 1:1 DLAA contract");
+
+    // NRStyle is the add-on's own setting (v4.6+), changed from ITS overlay panel and applied at the
+    // next launch. On the reference machine (Metro 2033 Redux, Smooth Motion active),
+    // NRStyle=2 crashed the game 1-2 s into every boot with a null read on the present
+    // path -- landing in whichever module presented next (Luma once, the game's CRT with
+    // Luma removed), which made it look like anything BUT this setting. NRStyle=0 boots
+    // clean. Warn, do not rewrite: it is the user's explicit choice in the RenoDX panel,
+    // and the warning reaches both logs even when the game dies before any overlay.
+    if (g_renodx_v46)
+    {
+        char v[16];
+        size_t n = sizeof(v);
+        if (reshade::get_config_value(nullptr, "RenoDX.DLSS5", "NRStyle", v, &n) && atoi(v) == 2)
+            Warn("RenoDX.DLSS5 NRStyle=2 is set -- this crashed at startup on the reference machine "
+                 "(null read on the present path, blamed on whichever module presents next). If this "
+                 "game crashes on launch, set NRStyle=0 in ReShade.ini's [RenoDX.DLSS5] section.");
+    }
 }
 // ---------------------------------------------------------------------------
 // Alex's Toolkit (alexs-toolkit.addon64) -- a third-party NGX interposer that sits
@@ -270,6 +398,7 @@ static void DetectRenodxAddon()
 static char g_toolkit_ver[64]     = "not found";
 static char g_toolkit_status[192] = "not present";
 static int  g_toolkit_passes      = 0;   // 0 = absent or disabled, 2 = two-pass, 3 = three-pass
+static bool g_toolkit_inert       = false; // cascade configured on, but the add-on generation refuses it
 
 // Reads "key=<int>" from a small ini-style file. Returns 'fallback' if absent.
 static int ToolkitCfgInt(const char *text, const char *key, int fallback)
@@ -359,8 +488,320 @@ static void DetectToolkitAddon()
     Log("[feed] Alex's Toolkit config: %s (enabled=%d two_pass=%d three_pass=%d); it re-reads that file live, "
         "so the cascade can change without restarting", have_cfg ? "alexs-toolkit.cfg" : "no cfg file, using its defaults",
         enabled, two_pass, three_pass);
+
+    // The toolkit attaches by recognising a structural layout inside the DLSS 5 add-on and
+    // hooking its resolver IAT slot. That signature only matches the older (v4.55-era) build:
+    // against v4.6 and v4.7 its scan finds "candidates=0 (expected exactly 1)", it declines to
+    // touch the IAT, and it STOPS RETRYING for the whole process -- so the cascade silently
+    // does nothing while its own overlay page still reads as enabled. Verified both ways with
+    // the host's --test mode, one folder, only the add-on swapped: v4.55 arms and cascades,
+    // v4.6 and v4.7 are both rejected (DLSS itself is fine either way, 300/300 evaluates).
+    if (g_toolkit_passes >= 2 && (g_renodx_v46 || g_renodx_v47))
+    {
+        g_toolkit_inert = true;
+        Warn("Alex's Toolkit %s cannot attach to DLSS 5 add-on %s: it only recognises the older (v4.55-era) "
+             "build, and against v4.6/v4.7 it gives up after one attempt -- alexs-toolkit.log will say "
+             "\"Generic structural layout rejected\". The cascade will do NOTHING this run. For the cascade, "
+             "put the v4.55-era renodx-dlss5.addon64 next to this add-on; to keep v4.6/v4.7, remove "
+             "alexs-toolkit.addon64 so nothing claims a cascade that is not running.",
+             g_toolkit_ver, g_renodx_gen[0] != '\0' ? g_renodx_gen : g_renodx_ver);
+    }
 }
 
+// ---------------------------------------------------------------------------
+// Deep Fried Chicken (deep-fried-chicken.addon64) -- an alternative neural consumer.
+// Like the DLSS 5 add-on it detours the NGX feature-1 entry points and runs its own
+// neural passes on whatever contract it finds there; unlike it, 1.4.0+ negotiates
+// with a feeder instead of fighting it (see feed_dfc.h and FEEDBACK-DFC.md):
+//
+//  - it exports DFC_FeederInteropAbi / DFC_Feature1InterceptionState so we can tell
+//    whether it is armed for feature-1 work in this process;
+//  - it treats dlss5-feed.addon64 and dlss5-feed-host64.exe as compatible transports
+//    (exempt from its loader-import patching; GetProcAddress keeps the genuine target);
+//  - it adopts every synthetic Create we mark with the four DFC.Feeder.* parameters,
+//    never releases our feature-1 handle, and reuses bounded slots across our
+//    resolution / history / device rebuilds, so no warm-up re-create is needed.
+//
+// It replaces the RenoDX neural provider rather than stacking on it: with both files
+// present it stays inert for the whole process and asks the user to remove Reno. We
+// keep feeding either way -- the genuine NGX DLAA call is always forwarded -- and only
+// report, the same way we report Alex's Toolkit. Chicken's exports can only be read
+// once ReShade has loaded it, which is later than this add-on's DllMain, so the file is
+// scanned here and the exports are polled from the first feature build onwards.
+// ---------------------------------------------------------------------------
+
+static char  g_chicken_ver[64]     = "not found";
+static char  g_chicken_status[192] = "not present";
+static bool  g_chicken_present     = false;   // the add-on file sits next to this one
+static bool  g_chicken_abi         = false;   // ABI-1 exports found on the loaded module
+static bool  g_chicken_loaded      = false;   // GetModuleHandle sees it
+static LONG  g_chicken_state       = DFC_STATE_UNKNOWN;   // last observed export value
+// True when the live feature was created while Chicken was not yet ARMED. Chicken arms its
+// NGX detours several seconds after claiming ownership, and a Create it did not see is never
+// adopted at Evaluate -- so WarmupRebuildDue() re-creates once when the state flips to ARMED.
+static bool  g_chicken_created_unarmed = false;
+
+// 'warmup_rebuild' is the configured value (g_cfg is declared further down).
+static void DetectChickenAddon(int warmup_rebuild)
+{
+    char dir[MAX_PATH];
+    GetModuleFileNameA(g_self, dir, MAX_PATH);
+    char *slash = strrchr(dir, '\\');
+    if (slash == nullptr) return;
+    slash[1] = '\0';
+
+    g_chicken_present = DfcScanFile(dir, g_chicken_ver, sizeof(g_chicken_ver));
+    if (!g_chicken_present)
+    {
+        Log("[feed] Deep Fried Chicken: not present");
+        return;
+    }
+    _snprintf_s(g_chicken_status, sizeof(g_chicken_status), _TRUNCATE,
+                "Deep Fried Chicken %s: present; waiting for ReShade to load it", g_chicken_ver);
+    Log("[feed] Deep Fried Chicken %s: present next to this add-on -- it is the neural consumer of the synthetic "
+        "DLAA contract; the DFC.Feeder.* interop marker (ABI 1, HostMode=0) is published on every Create and "
+        "Evaluate, and if the first create lands before Chicken has armed its NGX detours the feature is "
+        "re-created once when it does", g_chicken_ver);
+
+    if (g_renodx_present)
+        Warn("Deep Fried Chicken %s and renodx-dlss5.addon64 are BOTH next to this add-on. Chicken replaces "
+             "the RenoDX neural provider and stays inert for the whole process while both are loaded, so "
+             "neural rendering will come from RenoDX or from nothing. Keep dlss5-feed.addon64, remove "
+             "renodx-dlss5.addon64 (Chicken's own guidance) or remove deep-fried-chicken.addon64, then "
+             "fully restart the game.", g_chicken_ver);
+    if (warmup_rebuild > 0)
+        Log("[feed] warmup_rebuild=%d (a frame count) is not used while Deep Fried Chicken is present: the one "
+            "re-create is driven by its ARMED state instead", warmup_rebuild);
+}
+
+// Polled before each feature build: reads the ABI exports once Chicken is loaded and
+// reports the first sighting and every state change. Cheap (two GetProcAddress), and
+// bounded: nothing is logged again while nothing changes.
+static void ChickenPoll()
+{
+    if (!g_chicken_present) return;
+    unsigned int abi = 0;
+    LONG state = DFC_STATE_UNKNOWN;
+    bool loaded = false;
+    const bool have = DfcReadExports(&abi, &state, &loaded);
+    if (loaded != g_chicken_loaded)
+    {
+        g_chicken_loaded = loaded;
+        if (!have && loaded)
+        {
+            _snprintf_s(g_chicken_status, sizeof(g_chicken_status), _TRUNCATE,
+                        "Deep Fried Chicken %s: loaded, but pre-1.4.0 (no interop ABI) -- legacy exact-identity fallback only",
+                        g_chicken_ver);
+            Log("[feed] %s", g_chicken_status);
+        }
+    }
+    if (!have) return;
+    if (!g_chicken_abi)
+    {
+        g_chicken_abi = true;
+        Log("[feed] Deep Fried Chicken %s: interop ABI %u (this add-on speaks ABI %u), feature-1 interception state %ld (%s)",
+            g_chicken_ver, abi, DFC_CONTRACT_VERSION, state, DfcStateName(state));
+        if (abi != DFC_CONTRACT_VERSION)
+            Warn("Deep Fried Chicken %s publishes interop ABI %u, this add-on publishes ABI %u -- Chicken will "
+                 "reject the marker and skip its passes (the DLAA contract itself is unaffected). Update whichever "
+                 "side is older.", g_chicken_ver, abi, DFC_CONTRACT_VERSION);
+    }
+    if (state == g_chicken_state) return;
+    g_chicken_state = state;
+    if (DfcStateAvailable(state))
+    {
+        _snprintf_s(g_chicken_status, sizeof(g_chicken_status), _TRUNCATE,
+                    "Deep Fried Chicken %s: %s -- consuming the synthetic contract (interop ABI %u)",
+                    g_chicken_ver, DfcStateName(state), abi);
+        Log("[feed] %s", g_chicken_status);
+    }
+    else
+    {
+        _snprintf_s(g_chicken_status, sizeof(g_chicken_status), _TRUNCATE,
+                    "Deep Fried Chicken %s: %s -- NOT consuming; no neural passes this run", g_chicken_ver, DfcStateName(state));
+        Warn("Deep Fried Chicken %s reports feature-1 interception state %s: it will not run its passes on this "
+             "process. %s The feed keeps running (plain DLAA output). See deep-fried-chicken.log.",
+             g_chicken_ver, DfcStateName(state),
+             state == DFC_STATE_DISARMED ? "Its cfg has arm=0 (a restart-only hard disarm), or it has not armed yet."
+           : state == DFC_STATE_CONFLICT ? "Another feature-1 consumer already owns this process (RenoDX or a second Chicken?)."
+           : state == DFC_STATE_FAILED   ? "It could not create its ownership marker or arm its resolver hook."
+                                         : "Unknown state value; a newer Chicken ABI than this add-on knows.");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NVIDIA Smooth Motion -- driver frame generation that is implemented in-process.
+// The driver injects NvPresent64.dll from the DriverStore; it hooks
+// CreateDXGIFactory* and the factory vtables, wraps the game's IDXGISwapChain,
+// and calls Present more than once per game frame from its own pacer thread.
+//
+// That matters here because ReShade's effect chain -- and therefore FeedFrame --
+// runs inside Present. Under Smooth Motion, Present is re-entrant and can arrive
+// on a thread that is not the game's render thread, so every piece of shared
+// state this add-on owns (the g struct, the D3D12 allocator ring, the shared
+// textures, the game's immediate context) needs serializing. That is what
+// g_feed_cs below and the ID3D11Multithread protection in InitSession are for.
+//
+// Unlike DetectToolkitAddon, which scans a *file* because ReShade may not have
+// loaded that add-on yet, this has to be a loaded-module check: the module comes
+// from the DriverStore, not the game folder. It can also arrive after this add-on
+// does, so OnInitEffectRuntime re-checks.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// A stale d3dcompiler_47.dll in the game folder
+//
+// LoadLibrary("d3dcompiler_47.dll") is resolved by the normal search order, and the
+// application directory beats System32 (it is not a KnownDLL). Plenty of games ship
+// their own copy from the Windows 8.1 SDK era; that build knows nothing newer than
+// Shader Model 5.0 and rejects a cs_5_1 target outright:
+//
+//   error X3506: unrecognized compiler target 'cs_5_1'
+//
+// The DLSS 5 add-on's neural proxy-encode pass is compiled as cs_5_1, so under such a
+// copy it fails EVERY frame while everything else keeps working -- our own blit shaders
+// are vs_5_0/ps_5_0, the feed reports frames delivered, and neural rendering silently
+// does nothing. Reported on Space Engineers; confirmed fixed by deleting the file.
+//
+// The verdict is a live compile, not the path: a copy outside System32 may well be a
+// NEWER one, and only the compiler itself can say what it accepts.
+// ---------------------------------------------------------------------------
+
+static bool g_d3dcompiler_stale = false;
+static char g_d3dcompiler_path[MAX_PATH] = "";
+
+static void DetectStaleD3DCompiler()
+{
+    static bool checked = false;
+    if (checked) return;
+    checked = true;
+
+    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+    if (m == nullptr) return;   // MakeBlitShaders reports its own absence
+
+    wchar_t wpath[MAX_PATH] = {};
+    if (GetModuleFileNameW(m, wpath, MAX_PATH) == 0) return;
+    WideCharToMultiByte(CP_UTF8, 0, wpath, -1, g_d3dcompiler_path, sizeof(g_d3dcompiler_path), nullptr, nullptr);
+
+    wchar_t sysdir[MAX_PATH] = {};
+    GetSystemDirectoryW(sysdir, MAX_PATH);
+    const bool from_system = _wcsnicmp(wpath, sysdir, wcslen(sysdir)) == 0;
+
+    auto compile = reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile"));
+    if (compile == nullptr) return;
+
+    static const char kProbe[] =
+        "RWTexture2D<float4> o : register(u0);\n"
+        "[numthreads(8,8,1)] void cs(uint3 t : SV_DispatchThreadID) { o[t.xy] = 0; }\n";
+    ID3DBlob *code = nullptr, *err = nullptr;
+    const HRESULT hr = compile(kProbe, sizeof(kProbe) - 1, "sm51probe", nullptr, nullptr, "cs", "cs_5_1", 0, 0, &code, &err);
+    const bool sm51_ok = SUCCEEDED(hr) && code != nullptr;
+    if (code != nullptr) code->Release();
+
+    if (sm51_ok)
+    {
+        // Only worth a line when it is not the ordinary system copy, so a healthy run
+        // still leaves the path in the log for the next report to compare against.
+        if (!from_system) Log("[feed] d3dcompiler_47.dll: %s (not System32, but it accepts cs_5_1 -- fine)", g_d3dcompiler_path);
+        if (err != nullptr) err->Release();
+        return;
+    }
+
+    g_d3dcompiler_stale = true;
+    char msg[256] = {};
+    if (err != nullptr && err->GetBufferPointer() != nullptr)
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE, " (%.180s)", static_cast<const char *>(err->GetBufferPointer()));
+    if (err != nullptr) err->Release();
+    Log("[feed] d3dcompiler_47.dll: %s -- rejects cs_5_1, hr=0x%08X%s", g_d3dcompiler_path, hr, msg);
+    Warn("%s is too old for Shader Model 5.1. The DLSS 5 add-on compiles its neural pass as cs_5_1, so neural "
+         "rendering will silently do nothing -- this add-on will still report frames delivered, and ReShade.log "
+         "will show \"error X3506: unrecognized compiler target 'cs_5_1'\". %s",
+         g_d3dcompiler_path,
+         from_system ? "Unexpectedly this IS the System32 copy; update Windows / the graphics tools."
+                     : "Windows loads this copy in preference to the current one in System32 because it sits in "
+                       "the game folder: delete or rename it and the game will use System32's instead.");
+}
+
+static bool g_smooth_motion = false;
+
+static bool DetectSmoothMotion()
+{
+    if (g_smooth_motion) return true;
+    if (GetModuleHandleW(L"NvPresent64.dll") == nullptr) return false;
+    g_smooth_motion = true;
+    Warn("NVIDIA Smooth Motion is active in this process (NvPresent64.dll). It presents more than once "
+         "per game frame from its own thread; this add-on serializes its own work against that, but the "
+         "combination is not verified. If the image corrupts or flickers, turn Smooth Motion off for this "
+         "game's API only -- NVIDIA Profile Inspector, \"Smooth Motion - Enabled APIs\" (0xB0CC0875): "
+         "clear bit 1 for DX12, 2 for DX11, 4 for Vulkan.");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Feed serialization
+//
+// One lock for the whole per-frame path, plus a busy flag. The lock keeps two
+// Present threads out of each other's way; the flag is what a CRITICAL_SECTION
+// alone cannot do, since it is recursive and would let a genuinely re-entrant
+// Present on the SAME thread run straight through into a half-built frame.
+// A re-entrant call is dropped rather than nested: there is one allocator ring
+// and one set of shared textures, and feeding them twice at once corrupts both.
+// ---------------------------------------------------------------------------
+
+static CRITICAL_SECTION g_feed_cs;
+static bool             g_feed_busy    = false;   // guarded by g_feed_cs
+static DWORD            g_feed_thread  = 0;       // first thread seen in FeedFrame
+static int              g_feed_offthread_logged = 0;
+static int              g_feed_reentry_logged   = 0;
+static unsigned         g_feed_reentries = 0;
+
+// Records which thread drives the feed. A change mid-run is the signature of an
+// off-thread Present (Smooth Motion's pacer thread above all) and is the single
+// most useful line in the log when diagnosing this class of report. Called with
+// g_feed_cs held, so the counters below need no synchronization of their own.
+static void FeedThreadTrace()
+{
+    const DWORD tid = GetCurrentThreadId();
+    if (g_feed_thread == 0)
+    {
+        g_feed_thread = tid;
+        Log("[feed] first frame fed from thread %lu", tid);
+    }
+    else if (tid != g_feed_thread && g_feed_offthread_logged < 8)
+    {
+        ++g_feed_offthread_logged;
+        Log("[feed] frame fed from thread %lu, not the usual %lu -- Present is off-thread%s%s", tid, g_feed_thread,
+            g_smooth_motion ? " (Smooth Motion is loaded)" : "",
+            g_feed_offthread_logged == 8 ? "; further thread changes not logged" : "");
+    }
+}
+
+// The counters and the log call stay inside g_feed_cs: the lock order is always
+// g_feed_cs then g_log_cs (Log's own), and nothing takes them the other way round.
+static bool FeedEnter()
+{
+    EnterCriticalSection(&g_feed_cs);
+    if (g_feed_busy)
+    {
+        ++g_feed_reentries;
+        if (g_feed_reentry_logged < 8)
+        {
+            ++g_feed_reentry_logged;
+            Log("[feed] re-entrant frame on thread %lu dropped (%u so far)%s", GetCurrentThreadId(),
+                g_feed_reentries, g_feed_reentry_logged == 8 ? "; further drops not logged" : "");
+        }
+        LeaveCriticalSection(&g_feed_cs);
+        return false;
+    }
+    g_feed_busy = true;
+    return true;
+}
+
+static void FeedLeave()
+{
+    g_feed_busy = false;
+    LeaveCriticalSection(&g_feed_cs);
+}
 
 // ---------------------------------------------------------------------------
 // Configuration (dlss5-feed.cfg next to the add-on, re-read every 60 frames)
@@ -380,11 +821,52 @@ struct Cfg
     int   create_delay;    // frames to hold the FIRST feature create (the DLSS 5 add-on arms its NGX hooks asynchronously)
     int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer)
     int   work_resolution; // 64-bit D3D11 only: 50..100 percent of each backbuffer axis
+    int   work_upscale;    // how the work-size output is expanded back over the backbuffer:
+                           // 0 = bilinear stretch, 1 = AMD FSR 1 (EASU + RCAS), 2 = DLSS
+                           // Super Resolution fed with synthetic jitter (experimental: the
+                           // downsample grid is shifted sub-pixel each frame and DLSS
+                           // reconstructs the native size itself). Better filters for the
+                           // cost knob above, never more than the native frame (issue #34)
+    float work_sharpness;  // RCAS strength for work_upscale 1 and 2, 0 (off) .. 1 (sharpest)
+    int   gpu_timeout_ms;  // how long BeginCommands waits for the GPU to retire an allocator slot
+    int   buffer_home;     // Vulkan transport: 1 = route the output home through a shared linear
+                           // BUFFER instead of the shared image (dodges a one-directional
+                           // image-coherence driver bug -- Detroit: Become Human), 0 = image
+    int   half_home;       // diagnostic: mode-2 copy home writes only the LEFT half of the
+                           // frame (mode-1 style split screen), so the right half shows the
+                           // live game next to what DLSS handed back
+    int   async_home;      // Vulkan transport: 1 = the copy home carries the PREVIOUS frame's
+                           // output and waits on fence n-1, so the game's present path never
+                           // stalls on this frame's cross-API evaluate. Costs one frame of
+                           // latency; needs buffer_home (the buffer is double-slotted).
+                           // 2 = the same, recorded into the SAME command buffer as the input
+                           // copies, so the whole frame is ONE queue submit -- the shape a
+                           // normal game has, and the one structural difference left between
+                           // us and a game an in-driver frame pacer is happy with.
+    int   sync_home;       // Vulkan transport: 1 = flush and CPU-wait for the copy home to
+                           // FINISH before the technique callback returns, i.e. before the
+                           // game presents. Costs a full GPU drain every frame. It exists to
+                           // answer one question: does an external consumer of the swapchain
+                           // image (a driver frame pacer) read it before our writes land?
+    int   passthrough;     // diagnostic: mode-2 with the NGX evaluate swapped for a plain
+                           // CopyResource(OUTPUT <- COLOR) -- the whole transport runs, DLSS
+                           // does not. Separates "transport lags" from "DLSS output lags".
     float mv_scale_x;      // multiplier applied to the motion vectors (the FX already outputs pixels)
     float mv_scale_y;
+    int   stall_log_ms;    // diagnostic: log a breakdown for any frame whose present-to-present
+                           // interval exceeds this (0 = off). Splits the interval into the time
+                           // spent inside the NGX evaluate call, the rest of our own work, and
+                           // everything outside it -- which is what separates "the feed is slow"
+                           // from "the neural consumer's detour is slow" from "neither, the
+                           // stall is elsewhere in the process".
+    int   jitter_sign;     // diagnostic for work_upscale=2: +1 or -1, the sign handed to DLSS
+                           // for the grid shift. The wrong one converges to a crawl instead
+                           // of a stable image on a static scene. Parse-only, not written back.
+    int   jitter_phases;   // diagnostic for work_upscale=2: Halton sequence length, 0 = auto
+                           // (8 * (native/work)^2, NVIDIA's guidance). Parse-only.
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 0, 0.3f, 2000, 1, 0, 0, 0, 0, 1.0f, 1.0f, 50, 1, 0 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -416,11 +898,20 @@ static void CfgWriteDefault()
             "create_delay=%d\n"
             "preset=%d\n"
             "work_resolution=%d\n"
+            "work_upscale=%d\n"
+            "work_sharpness=%.2f\n"
+            "gpu_timeout_ms=%d\n"
+            "buffer_home=%d\n"
+            "async_home=%d\n"
+            "sync_home=%d\n"
             "mv_scale_x=%.3f\n"
-            "mv_scale_y=%.3f\n",
+            "mv_scale_y=%.3f\n"
+            "stall_log_ms=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
-            g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
+            g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
+            g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -453,24 +944,46 @@ static bool CfgReload()
         else if (_stricmp(key, "create_delay")   == 0) next.create_delay   = iv;
         else if (_stricmp(key, "preset")         == 0) next.preset         = iv;
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
+        else if (_stricmp(key, "work_upscale")   == 0) next.work_upscale   = iv;
+        else if (_stricmp(key, "work_sharpness") == 0) next.work_sharpness = val;
+        else if (_stricmp(key, "gpu_timeout_ms") == 0) next.gpu_timeout_ms  = iv;
+        else if (_stricmp(key, "buffer_home")    == 0) next.buffer_home    = iv;
+        else if (_stricmp(key, "async_home")     == 0) next.async_home     = iv;
+        else if (_stricmp(key, "sync_home")      == 0) next.sync_home      = iv;
+        else if (_stricmp(key, "half_home")      == 0) next.half_home      = iv;
+        else if (_stricmp(key, "passthrough")    == 0) next.passthrough    = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
+        else if (_stricmp(key, "stall_log_ms")   == 0) next.stall_log_ms   = iv;
+        else if (_stricmp(key, "jitter_sign")    == 0) next.jitter_sign    = iv;
+        else if (_stricmp(key, "jitter_phases")  == 0) next.jitter_phases  = iv;
     }
     fclose(f);
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
+    if (next.work_upscale < 0 || next.work_upscale > 2) next.work_upscale = g_cfg.work_upscale;
+    if (next.work_sharpness < 0.0f || next.work_sharpness > 1.0f) next.work_sharpness = g_cfg.work_sharpness;
+    if (next.jitter_sign != 1 && next.jitter_sign != -1) next.jitter_sign = g_cfg.jitter_sign;
+    if (next.jitter_phases < 0 || next.jitter_phases > 128) next.jitter_phases = g_cfg.jitter_phases;
+    // 0 would mean "give up instantly"; an unbounded wait would hang the game on a
+    // genuinely dead GPU. Clamp to something a contended machine can still live with.
+    if (next.gpu_timeout_ms < 100 || next.gpu_timeout_ms > 60000) next.gpu_timeout_ms = g_cfg.gpu_timeout_ms;
+    if (next.stall_log_ms < 0 || next.stall_log_ms > 10000) next.stall_log_ms = g_cfg.stall_log_ms;
 
     const bool rebuild = next.hdr != g_cfg.hdr || next.depth_inverted != g_cfg.depth_inverted ||
                          next.flags != g_cfg.flags || next.rebuild != g_cfg.rebuild ||
-                         next.preset != g_cfg.preset;
+                         next.preset != g_cfg.preset || next.buffer_home != g_cfg.buffer_home ||
+                         next.async_home != g_cfg.async_home;
     const bool changed = rebuild || memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
     if (!changed) return false;
     g_cfg = next;
     Log("[feed] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d warmup_rebuild=%d "
-        "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% mv_scale=%.3f,%.3f",
+        "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f gpu_timeout_ms=%d buffer_home=%d async_home=%d sync_home=%d mv_scale=%.3f,%.3f stall_log_ms=%d",
         g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
         g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay,
-        g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+        g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
+        g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
+        g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms);
     return rebuild;
 }
 
@@ -485,10 +998,13 @@ static void CfgSave()
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f,
         "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
-            "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+            "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\ngpu_timeout_ms=%d\n"
+            "buffer_home=%d\nasync_home=%d\nsync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\nstall_log_ms=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
-            g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
+            g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
+            g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms);
     fclose(f);
 }
 
@@ -622,6 +1138,7 @@ struct Feed
     bool need_reset;
     bool warmup_done;
     int  consecutive_fails;
+    int  create_fail_count; // consecutive CreateFeature failures/crashes (reset on success)
     int  cfg_rebuild_seen;
     int  create_grace;     // frames counted while holding the first feature create
 
@@ -637,6 +1154,8 @@ struct Feed
     ID3D12Fence               *fence12;
     ID3D11Fence               *fence11;
     ID3D11DeviceContext4      *ctx4;
+    ID3D11Multithread         *mt;          // immediate-context serialization, restored on teardown
+    bool                       mt_was_on;   // what the game had set before we turned it on
     UINT64                     fence_value;
     ID3D11Device              *dev11;      // not owned
     bool                       dev12_owned; // true on the D3D11/Vulkan paths (we created the private device)
@@ -656,8 +1175,22 @@ struct Feed
     FeedVk                 vk;
     VkImage                vk_img[SLOT_COUNT];
     VkDeviceMemory         vk_mem[SLOT_COUNT];
+    ID3D12Resource        *home_buf12;       // buffer_home: shared linear buffer for the output hop
+    HANDLE                 home_buf_handle;
+    VkBuffer               vk_home_buf;
+    VkDeviceMemory         vk_home_mem;
+    UINT                   home_pitch;       // bytes per row in the buffer (256-aligned)
+    UINT64                 home_slice;       // async_home: bytes per slot; the buffer holds two,
+                                             // D3D12 writes n&1 while Vulkan reads (n-1)&1. 0 = off
+    ID3D12Resource        *in_buf12[SLOT_COUNT];    // buffer_home, input direction: one shared linear
+    HANDLE                 in_buf_handle[SLOT_COUNT];  // buffer per input slot (OUTPUT unused) -- the
+    VkBuffer               vk_in_buf[SLOT_COUNT];      // image imports proved stale for D3D12 reads of
+    VkDeviceMemory         vk_in_mem[SLOT_COUNT];      // Vulkan writes on this driver, same as the
+    UINT                   in_pitch[SLOT_COUNT];       // output direction (Detroit: Become Human)
     VkSemaphore            vk_sem_in, vk_sem_out;
     bool                   vk_layout_init;   // our images transitioned UNDEFINED->GENERAL once
+    bool                   vk_released;      // our images are released to VK_QUEUE_FAMILY_EXTERNAL
+                                             // (the D3D12 device owns them until the next acquire)
     UINT64                 vk_frame;
 
     // OpenGL transport: raw-GL imports of the very same D3D12 shared objects. Nothing
@@ -683,8 +1216,22 @@ struct Feed
     ID3D11Texture2D          *color_stage;     // native-size copy of the frame, the only SRV-able source we get
     ID3D11ShaderResourceView *color_stage_srv; // its SRV, sampled by the work-resolution downsample
     ID3D11RenderTargetView   *input_rtv[SLOT_COUNT]; // D3D11 work-resolution resample targets
-    UINT        width, height;
+    ID3D11Texture2D          *easu_tex;        // work_upscale=1: native-size EASU result, RCAS reads it
+    ID3D11RenderTargetView   *easu_rtv;
+    ID3D11ShaderResourceView *easu_srv;
+    UINT        width, height;                  // the work size: what DLSS renders from
+    UINT        output_width, output_height;    // the Output texture: == work size (DLAA), or native (work_upscale=2)
     UINT        backbuffer_width, backbuffer_height;
+
+    // work_upscale=2: DLSS Super Resolution on synthetic jitter (64-bit D3D11 only)
+    bool        sr_requested;      // what the current build was asked for (rebuild when the cfg disagrees)
+    bool        sr_active;         // the build actually got an SR feature (NGX had a preset covering the ratio)
+    int         sr_quality;        // NVSDK_NGX_PerfQuality_Value in use
+    const char *sr_quality_name;
+    const char *sr_quality_hint;   // the NGX render-preset hint key for that quality
+    UINT        jitter_index;      // position in the Halton sequence, restarts on every DLSS reset
+    UINT        jitter_phases;     // sequence length for this build
+    float       jitter_x, jitter_y;   // this frame's grid shift, in work pixels
     DXGI_FORMAT color_fmt, output_fmt;      // shared texture formats
     DXGI_FORMAT bb_fmt;                     // the backbuffer's format, to notice swaps
     bool        hdr;
@@ -698,10 +1245,25 @@ struct Feed
     ID3D11SamplerState *point_sampler;
     ID3D11Buffer       *resample_cb;
 
+    // work_upscale=1 (feed_fsr1.h). Optional: when the compile fails the blit stays bilinear.
+    ID3D11PixelShader  *easu_ps;
+    ID3D11PixelShader  *rcas_ps;
+    ID3D11Buffer       *fsr_cb;
+    bool   fsr_ok;
+    UINT   fsr_in_w, fsr_in_h, fsr_out_w, fsr_out_h;   // what fsr_cb currently describes
+    float  fsr_sharpness;
+
     UINT64 frames_done;
 
     LONGLONG qpf, cpu_ticks, span_start;
     UINT64   timed_frames;
+
+    // Stall diagnostic (see stall_log_ms). prev_entry makes the present-to-present
+    // interval measurable from inside the technique callback; the window maxima give an
+    // always-on signal even when nothing crosses the threshold.
+    LONGLONG prev_entry;
+    LONGLONG win_max_interval, win_max_total, win_max_eval;
+    UINT64   win_stalls, win_stalls_logged;
 };
 
 static Feed g;
@@ -712,12 +1274,37 @@ static Feed g;
 
 template <typename T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
+// Halton(2,3) low-discrepancy sequence, centred on the pixel: each value in [-0.5, 0.5).
+// Index 0 (and every wrap) is the unshifted sample, which is what a history reset starts from.
+static void HaltonJitter(UINT index, UINT phases, float *x, float *y)
+{
+    if (phases == 0) phases = 8;
+    const UINT k = index % phases;
+    if (k == 0) { *x = 0.0f; *y = 0.0f; return; }
+    float fx = 0.0f, inv = 0.5f;
+    for (UINT n = k; n != 0; n /= 2) { fx += inv * static_cast<float>(n % 2); inv *= 0.5f; }
+    float fy = 0.0f; inv = 1.0f / 3.0f;
+    for (UINT n = k; n != 0; n /= 3) { fy += inv * static_cast<float>(n % 3); inv /= 3.0f; }
+    *x = fx - 0.5f;
+    *y = fy - 0.5f;
+}
+
 static UINT ScaledExtent(UINT native_extent, int percent)
 {
     if (percent >= 100) return native_extent;
     UINT extent = (native_extent * static_cast<UINT>(percent)) / 100u;
     extent &= ~1u; // NGX work textures use even dimensions
     return extent >= 2u ? extent : 2u;
+}
+
+// Same, rounding UP to even: what a DLSS Super Resolution build asks for, so the work
+// size never falls below the preset's minimum render size (ceil of 50% of the output).
+static UINT ScaledExtentUp(UINT native_extent, int percent)
+{
+    if (percent >= 100) return native_extent;
+    UINT extent = (native_extent * static_cast<UINT>(percent) + 99u) / 100u;
+    extent = (extent + 1u) & ~1u;
+    return extent < native_extent ? extent : native_extent;
 }
 
 static const char *FormatName(DXGI_FORMAT f)
@@ -816,6 +1403,21 @@ static bool SameTexelLayout(DXGI_FORMAT a, DXGI_FORMAT b)
     return fa != 0 && fa == TexelLayoutFamily(b);
 }
 
+// Bytes per texel for the formats the copy home can meet; 0 = not supported by the
+// buffer_home path (which must know the row pitch exactly).
+static UINT HomeTexelBytes(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R11G11B10_FLOAT:      return 4;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:   return 8;
+    default:                               return 0;
+    }
+}
+
 // NGX writes the output through a UAV, and typed UAV *stores* to B8G8R8A8_UNORM are an
 // optional D3D12 feature. Where the device lacks it, fall back to RGBA and the
 // converting copy home -- wrong colours beat a feature that cannot be created at all.
@@ -877,10 +1479,15 @@ static const char *NgxResultName(NVSDK_NGX_Result r)
     }
 }
 
+// Kept for the overlay: "disabled (see dlss5-feed.log)" on its own sends the player
+// to a file to find out what happened, and Warn() only reaches the two logs.
+static char g_disable_why[256] = "";
+
 static void FeedDisable(const char *why)
 {
     if (g.disabled) return;
     g.disabled = true;
+    _snprintf_s(g_disable_why, sizeof(g_disable_why), _TRUNCATE, "%s", why);
     Warn("stopped: %s. The game renders normally. See dlss5-feed.log for the detail.", why);
 }
 
@@ -901,11 +1508,42 @@ static bool BeginCommands()
     const UINT64 retire = g.alloc_fence[slot];
     if (retire != 0 && g.fence12->GetCompletedValue() < retire)
     {
+        // The event is auto-reset and a timed-out wait leaves its registration armed,
+        // so a later completion can signal it spuriously. Clear it first and confirm
+        // the fence really passed 'retire' afterwards -- resetting an allocator the
+        // GPU is still reading from is worse than dropping a frame.
+        ResetEvent(g.fence_event);
+        const DWORD timeout = static_cast<DWORD>(g_cfg.gpu_timeout_ms);
         g.fence12->SetEventOnCompletion(retire, g.fence_event);
-        if (WaitForSingleObject(g.fence_event, 2000) != WAIT_OBJECT_0)
+        // Wait in slices, checking for device removal between them: a removed device's
+        // fence never completes, and without this the feed blocked the present thread
+        // for the full timeout, three frames in a row, before latching off with the
+        // generic "repeated failures" (Starfield, issue #16).
+        bool signaled = false;
+        for (DWORD waited = 0; waited < timeout && !signaled; )
         {
-            Log("[feed] the GPU did not retire allocator slot %d within 2 s", slot);
-            FeedDisable("the GPU stopped completing work");
+            const DWORD slice = timeout - waited < 250 ? timeout - waited : 250;
+            signaled = WaitForSingleObject(g.fence_event, slice) == WAIT_OBJECT_0;
+            waited += slice;
+            if (!signaled && g.dev12 != nullptr)
+            {
+                const HRESULT removed = g.dev12->GetDeviceRemovedReason();
+                if (FAILED(removed))
+                {
+                    Log("[feed] the D3D12 device was removed (0x%08X) while waiting on the fence", removed);
+                    FeedDisable("the D3D12 device was removed (see dlss5-feed.log)");
+                    return false;
+                }
+            }
+        }
+        if (!signaled || g.fence12->GetCompletedValue() < retire)
+        {
+            // Fail this frame, do not latch the add-on off: one slow frame -- a
+            // contended GPU, a present-path interposer stealing submission slots --
+            // used to stop neural rendering permanently, with the overlay's Re-enable
+            // button as the only way back. FeedFail's 3-strikes rule decides instead,
+            // which is what the 32-bit host has always done.
+            Log("[feed] the GPU did not retire allocator slot %d within %u ms", slot, timeout);
             return false;
         }
     }
@@ -944,18 +1582,111 @@ static void DrainGpu()
 // snippet), especially across a resolution or device change. SEH keeps that from taking the game
 // down -- it becomes a graceful disable instead. These wrappers hold no C++ objects, so __try is
 // legal here under /EHsc (same approach as the dlss5-dx11-bridge).
+//
+// Both wrappers first stamp the Deep Fried Chicken interop marker on the parameter
+// object (feed_dfc.h): Chicken requires the complete tuple immediately before Create
+// AND before every Evaluate, bound to the same handle. Every backend funnels through
+// these two wrappers, so this is the one place it has to happen. The keys are ordinary
+// application parameters to the driver and to the RenoDX add-on, so they are set
+// unconditionally.
+static void PublishDfcInterop()
+{
+    if (g.params == nullptr) return;
+    g.params->Set(DFC_KEY_CONTRACT_VERSION, DFC_CONTRACT_VERSION);
+    g.params->Set(DFC_KEY_PROVIDER_ID,      DFC_PROVIDER_ID_DL5F);
+    g.params->Set(DFC_KEY_HOST_MODE,        DFC_HOST_MODE_IN_PROCESS);
+    g.params->Set(DFC_KEY_EVALUATE_CADENCE, DFC_EVALUATE_CADENCE);
+}
+
+// NGX init is the first NGX call of the session, made on the game's render thread the
+// moment DLSS5_Feed renders. It walks the driver's NGX modules and whatever else has
+// hooked them; a fault there used to take the game down with nothing in the log but
+// the crash filter's breadcrumb (issue #35, MGSV Ground Zeroes). Caught here it becomes
+// a disable with the exception code named.
+static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *dev, DWORD *code)
+{
+    *code = 0;
+    __try
+    {
+        NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, dev, nullptr, NVSDK_NGX_Version_API);
+        if (NVSDK_NGX_FAILED(r))
+            r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+                                                    "1.0", data_path, dev, nullptr, NVSDK_NGX_Version_API);
+        return r;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NVSDK_NGX_Result_Fail; }
+}
+
+// CPU ticks spent inside the last NGX call. The neural consumer's detour runs INSIDE these
+// calls, so timing them separately is what distinguishes a slow feed from a slow consumer.
+static LONGLONG g_last_eval_ticks;
+static LONGLONG g_last_create_ticks;
+
+static NVSDK_NGX_Result CreateDLSSGuarded(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
+{
+    __try { return NGX_D3D12_CREATE_DLSS_EXT(g.list, 1, 1, &g.feature, g.params, cp); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+}
+
 static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
 {
     *code = 0;
-    __try { return NGX_D3D12_CREATE_DLSS_EXT(g.list, 1, 1, &g.feature, g.params, cp); }
+    ChickenPoll();
+    g_chicken_created_unarmed = g_chicken_present && g_chicken_state != DFC_STATE_ARMED;
+    PublishDfcInterop();
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    const NVSDK_NGX_Result r = CreateDLSSGuarded(cp, code);
+    QueryPerformanceCounter(&b);
+    g_last_create_ticks = b.QuadPart - a.QuadPart;
+    return r;
+}
+
+// Whether the one warm-up re-create should happen on delivered frame 'n'. Three regimes:
+//  - classic RenoDX: it misses the very first create (STANDBY latch) when its hooks armed a
+//    moment too late, so re-create at the configured frame count;
+//  - v45+ RenoDX: rescans every present and adopts lazily -- never;
+//  - Deep Fried Chicken: it arms its NGX detours seconds after claiming ownership and never
+//    adopts a create it did not see, so if the feature was created before it read ARMED,
+//    poll its exported state every frame and re-create the moment it does (900 frames as
+//    a backstop, in case the state never flips -- then the log names the reason).
+static bool WarmupRebuildDue(UINT64 n)
+{
+    if (g.warmup_done) return false;
+    if (g_chicken_present)
+    {
+        if (!g_chicken_created_unarmed) return false;   // Chicken saw the create
+        ChickenPoll();
+        if (g_chicken_state == DFC_STATE_ARMED) return true;
+        if (n >= 900)
+        {
+            Warn("Deep Fried Chicken is still not ARMED 900 frames after the feature was created (state %s); "
+                 "re-creating once anyway. If neural rendering stays off, deep-fried-chicken.log names why.",
+                 DfcStateName(g_chicken_state));
+            return true;
+        }
+        return false;
+    }
+    if (g_renodx_lazy) return false;
+    return g_cfg.warmup_rebuild > 0 && n >= static_cast<UINT64>(g_cfg.warmup_rebuild);
+}
+
+static NVSDK_NGX_Result EvaluateDLSSGuarded(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, DWORD *code)
+{
+    __try { return NGX_D3D12_EVALUATE_DLSS_EXT(g.list, g.feature, g.params, ep); }
     __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
 }
 
 static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, DWORD *code)
 {
     *code = 0;
-    __try { return NGX_D3D12_EVALUATE_DLSS_EXT(g.list, g.feature, g.params, ep); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+    PublishDfcInterop();
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    const NVSDK_NGX_Result r = EvaluateDLSSGuarded(ep, code);
+    QueryPerformanceCounter(&b);
+    g_last_eval_ticks = b.QuadPart - a.QuadPart;
+    return r;
 }
 
 static void CloseListGuarded()
@@ -1170,10 +1901,116 @@ static void GuideProbeRecord(ID3D12Resource *mv, D3D12_RESOURCE_STATES mv_state,
     g_guide_probe_fence = g.fence_value + 1;   // exactly what EndCommands() signals for this list
 }
 
+// ---------------------------------------------------------------------------
+// Staleness probe. Every kStaleProbeEvery frames, copy a 64x64 centre block of the
+// D3D12 view of the colour INPUT (exactly what the evaluate is about to read) and of
+// the OUTPUT (exactly what the evaluate just wrote) into a readback buffer, hash both
+// once the fence confirms completion, and log whether each changed since the previous
+// probe. When the screen freezes but every frame reports "delivered", this says WHICH
+// hop of the cross-API transport is stale: colour-in SAME = the Vulkan->D3D12 input
+// copy is not landing; colour-in CHANGED but output SAME = DLSS is producing a
+// constant; both CHANGED = the D3D12->Vulkan copy home is the stale hop.
+// ---------------------------------------------------------------------------
+
+static const UINT kStaleProbeSize  = 64;
+static const UINT kStaleProbePitch = 256;   // 64 texels of a 4-byte format, already row-pitch aligned
+static const UINT kStaleProbeBlock = kStaleProbePitch * kStaleProbeSize;
+static const UINT kStaleProbeEvery = 60;
+static_assert(kStaleProbeBlock % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT == 0);
+
+static ID3D12Resource *g_stale_buf;
+static UINT64          g_stale_fence;          // fence value that completes the pending copies; 0 = none
+static UINT64          g_stale_frames;
+static UINT64          g_stale_capture_frame;
+static uint64_t        g_stale_hash[2];        // previous colour-in / output hashes
+static bool            g_stale_have_hash;
+
+static uint64_t StaleProbeHash(const uint8_t *p)   // FNV-1a over one block
+{
+    uint64_t h = 1469598103934665603ull;
+    for (UINT i = 0; i < kStaleProbeBlock; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+static void StaleProbeAnalyse()
+{
+    void *p = nullptr;
+    const D3D12_RANGE read = { 0, kStaleProbeBlock * 2 };
+    if (FAILED(g_stale_buf->Map(0, &read, &p)) || p == nullptr) return;
+    const uint64_t hc = StaleProbeHash(static_cast<const uint8_t *>(p));
+    const uint64_t ho = StaleProbeHash(static_cast<const uint8_t *>(p) + kStaleProbeBlock);
+    const D3D12_RANGE none = { 0, 0 };
+    g_stale_buf->Unmap(0, &none);
+    if (g_stale_have_hash)
+        Log("[feed] stale probe (frame %llu): colour-in %s (%016llx), output %s (%016llx)",
+            static_cast<unsigned long long>(g_stale_capture_frame),
+            hc == g_stale_hash[0] ? "SAME" : "changed", static_cast<unsigned long long>(hc),
+            ho == g_stale_hash[1] ? "SAME" : "changed", static_cast<unsigned long long>(ho));
+    g_stale_hash[0] = hc;
+    g_stale_hash[1] = ho;
+    g_stale_have_hash = true;
+}
+
+// Call while recording, after the evaluate: colour still in its input state, output in
+// its evaluate state. Both are returned to the states they came in with.
+static void StaleProbeRecord(ID3D12Resource *color, D3D12_RESOURCE_STATES color_state,
+                             ID3D12Resource *output, D3D12_RESOURCE_STATES output_state)
+{
+    if (color == nullptr || output == nullptr || g.dev12 == nullptr || g.list == nullptr || g.fence12 == nullptr) return;
+    ++g_stale_frames;
+
+    if (g_stale_fence != 0)
+    {
+        if (g.fence12->GetCompletedValue() < g_stale_fence) return;
+        StaleProbeAnalyse();
+        g_stale_fence = 0;
+    }
+    if ((g_stale_frames % kStaleProbeEvery) != 0) return;
+    if (g.width < kStaleProbeSize || g.height < kStaleProbeSize) return;
+    if (g_stale_buf == nullptr)
+    {
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC   rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = kStaleProbeBlock * 2;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                    __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g_stale_buf))))
+            return;
+    }
+
+    const UINT x0 = (g.width - kStaleProbeSize) / 2, y0 = (g.height - kStaleProbeSize) / 2;
+    const D3D12_BOX box = { x0, y0, 0, x0 + kStaleProbeSize, y0 + kStaleProbeSize, 1 };
+
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = g_stale_buf; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+
+    src.pResource = color;
+    dst.PlacedFootprint.Offset = 0;
+    dst.PlacedFootprint.Footprint = { g.color_fmt, kStaleProbeSize, kStaleProbeSize, 1, kStaleProbePitch };
+    if (color_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(color, color_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    if (color_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(color, D3D12_RESOURCE_STATE_COPY_SOURCE, color_state);
+
+    src.pResource = output;
+    dst.PlacedFootprint.Offset = kStaleProbeBlock;
+    dst.PlacedFootprint.Footprint = { g.output_fmt, kStaleProbeSize, kStaleProbeSize, 1, kStaleProbePitch };
+    if (output_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(output, output_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    if (output_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(output, D3D12_RESOURCE_STATE_COPY_SOURCE, output_state);
+
+    g_stale_capture_frame = g_stale_frames;
+    g_stale_fence = g.fence_value + 1;   // exactly what EndCommands() signals for this list
+}
+
 static void GuideProbeAbort()
 {
     g_guide_probe_fence = 0;
     g_guide_probe_capture_frame = 0;
+    g_stale_fence = 0;
+    g_stale_capture_frame = 0;
 }
 
 static void GuideProbeShutdown()
@@ -1183,6 +2020,11 @@ static void GuideProbeShutdown()
     g_guide_probe_fence = 0;
     g_guide_probe_frames = 0;
     g_guide_probe_capture_frame = 0;
+    SafeRelease(g_stale_buf);
+    g_stale_fence = 0;
+    g_stale_frames = 0;
+    g_stale_capture_frame = 0;
+    g_stale_have_hash = false;
 }
 
 static void SafeReleaseFeature(NVSDK_NGX_Handle *f)
@@ -1213,11 +2055,20 @@ static void ReleaseFrameResources()
     // Vulkan transport: drop our raw VkImage imports (the memory is the D3D12 resource's;
     // freeing the import does not free the D3D12 resource, which SafeRelease(tex12) does).
     if (g.vk.ok)
+    {
         for (int i = 0; i < SLOT_COUNT; ++i)
         {
             if (g.vk_img[i] != VK_NULL_HANDLE) { g.vk.DestroyImage(g.vk.dev, g.vk_img[i], nullptr); g.vk_img[i] = VK_NULL_HANDLE; }
             if (g.vk_mem[i] != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_mem[i], nullptr);   g.vk_mem[i] = VK_NULL_HANDLE; }
         }
+        if (g.vk_home_buf != VK_NULL_HANDLE) { g.vk.DestroyBuffer(g.vk.dev, g.vk_home_buf, nullptr); g.vk_home_buf = VK_NULL_HANDLE; }
+        if (g.vk_home_mem != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_home_mem, nullptr);    g.vk_home_mem = VK_NULL_HANDLE; }
+        for (int i = 0; i < SLOT_COUNT; ++i)
+        {
+            if (g.vk_in_buf[i] != VK_NULL_HANDLE) { g.vk.DestroyBuffer(g.vk.dev, g.vk_in_buf[i], nullptr); g.vk_in_buf[i] = VK_NULL_HANDLE; }
+            if (g.vk_in_mem[i] != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_in_mem[i], nullptr);    g.vk_in_mem[i] = VK_NULL_HANDLE; }
+        }
+    }
     // OpenGL transport: same idea -- deleting the texture and its memory object drops
     // our alias, not the D3D12 resource behind it. GL objects can only be deleted from
     // the context they live in; from anywhere else they are left to the driver, which
@@ -1242,10 +2093,26 @@ static void ReleaseFrameResources()
     }
     for (int i = 0; i < SLOT_COUNT; ++i)
         if (g.tex_shared_ext[i] != nullptr) { CloseHandle(g.tex_shared_ext[i]); g.tex_shared_ext[i] = nullptr; }
+    if (g.home_buf_handle != nullptr) { CloseHandle(g.home_buf_handle); g.home_buf_handle = nullptr; }
+    SafeRelease(g.home_buf12);
+    g.home_pitch = 0;
+    g.home_slice = 0;
+    for (int i = 0; i < SLOT_COUNT; ++i)
+    {
+        if (g.in_buf_handle[i] != nullptr) { CloseHandle(g.in_buf_handle[i]); g.in_buf_handle[i] = nullptr; }
+        SafeRelease(g.in_buf12[i]);
+        g.in_pitch[i] = 0;
+    }
     g.vk_layout_init = false;
+    g.vk_released    = false;
     SafeRelease(g.output_srv);
+    g.sr_active = false;              // a fresh build decides again
+    g.output_width = g.output_height = 0;
     SafeRelease(g.color_stage_srv);
     SafeRelease(g.color_stage);
+    SafeRelease(g.easu_srv);
+    SafeRelease(g.easu_rtv);
+    SafeRelease(g.easu_tex);
     for (int i = 0; i < SLOT_COUNT; ++i)
     {
         SafeRelease(g.input_rtv[i]);
@@ -1346,17 +2213,20 @@ static bool MakeBlitShaders()
         "Texture2D<float> src_mask : register(t3);\n"
         "SamplerState linear_smp : register(s0);\n"
         "SamplerState point_smp : register(s1);\n"
-        "cbuffer ResampleConstants : register(b0) { float2 mv_scale; float2 _pad; };\n"
+        // jitter_uv: work_upscale=2 shifts the whole sampling grid by a sub-pixel amount
+        // each frame (the synthetic jitter DLSS reconstructs from); zero otherwise. All four
+        // guides move together so depth/vectors/mask stay aligned with the colour sample.
+        "cbuffer ResampleConstants : register(b0) { float2 mv_scale; float2 jitter_uv; };\n"
         "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
         "VSOut vs(uint id : SV_VertexID) { VSOut o; float2 uv = float2((id << 1) & 2, id & 2);\n"
         "  o.uv = uv; o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
         "float4 ps(VSOut i) : SV_Target { return float4(src_color.Sample(linear_smp, i.uv).rgb, 1.0); }\n"
         "struct ResampleOut { float4 color : SV_Target0; float2 mv : SV_Target1; float depth : SV_Target2; float mask : SV_Target3; };\n"
-        "ResampleOut ps_resample(VSOut i) { ResampleOut o;\n"
-        "  o.color = src_color.SampleLevel(linear_smp, i.uv, 0);\n"
-        "  o.mv = src_mv.SampleLevel(point_smp, i.uv, 0) * mv_scale;\n"
-        "  o.depth = src_depth.SampleLevel(point_smp, i.uv, 0);\n"
-        "  o.mask = src_mask.SampleLevel(point_smp, i.uv, 0); return o; }\n";
+        "ResampleOut ps_resample(VSOut i) { ResampleOut o; float2 uv = i.uv + jitter_uv;\n"
+        "  o.color = src_color.SampleLevel(linear_smp, uv, 0);\n"
+        "  o.mv = src_mv.SampleLevel(point_smp, uv, 0) * mv_scale;\n"
+        "  o.depth = src_depth.SampleLevel(point_smp, uv, 0);\n"
+        "  o.mask = src_mask.SampleLevel(point_smp, uv, 0); return o; }\n";
 
     HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
     auto compile = m != nullptr ? reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
@@ -1396,10 +2266,92 @@ static bool MakeBlitShaders()
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(g.dev11->CreateBuffer(&cbd, nullptr, &g.resample_cb))) { Log("[feed] resample constant buffer failed"); return false; }
     Log("[feed] copy-back and work-resolution resample shaders ready");
+
+    // FSR 1 is optional: a failure here only pins work_upscale to the bilinear path.
+    ID3DBlob *easu = nullptr, *rcas = nullptr;
+    hr = compile(kFsr1Src, sizeof(kFsr1Src) - 1, "feedfsr1", nullptr, nullptr, "ps_easu", "ps_5_0", 0, 0, &easu, &err);
+    if (SUCCEEDED(hr)) { SafeRelease(err); hr = compile(kFsr1Src, sizeof(kFsr1Src) - 1, "feedfsr1", nullptr, nullptr, "ps_rcas", "ps_5_0", 0, 0, &rcas, &err); }
+    if (SUCCEEDED(hr)) hr = g.dev11->CreatePixelShader(easu->GetBufferPointer(), easu->GetBufferSize(), nullptr, &g.easu_ps);
+    if (SUCCEEDED(hr)) hr = g.dev11->CreatePixelShader(rcas->GetBufferPointer(), rcas->GetBufferSize(), nullptr, &g.rcas_ps);
+    if (SUCCEEDED(hr)) { cbd.ByteWidth = sizeof(FsrConstants); hr = g.dev11->CreateBuffer(&cbd, nullptr, &g.fsr_cb); }
+    g.fsr_ok = SUCCEEDED(hr);
+    if (!g.fsr_ok)
+    {
+        Log("[feed] fsr1 shaders: failed 0x%08X: %s -- work_upscale=1 falls back to bilinear", hr,
+            err ? (const char *)err->GetBufferPointer() : "");
+        SafeRelease(g.easu_ps); SafeRelease(g.rcas_ps); SafeRelease(g.fsr_cb);
+    }
+    else Log("[feed] fsr1 shaders: ok (EASU + RCAS expand-back available)");
+    SafeRelease(err); SafeRelease(easu); SafeRelease(rcas);
+    g.fsr_in_w = g.fsr_in_h = g.fsr_out_w = g.fsr_out_h = 0;
+    g.fsr_sharpness = -1.0f;
     return true;
 }
 
 static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed);
+static bool PickSrQuality(UINT w, UINT h, UINT out_w, UINT out_h);
+
+// A failed create with two NGX module copies loaded is nearly always the game-local
+// nvngx_dlss.dll: an NGX interposer (the DLSS 5 add-on) detours BOTH copies, and the
+// pair has produced 0xBAD00010 and caught access violations here (issues #4, #14, #16).
+static void LogNgxModuleHint()
+{
+    if (GetModuleHandleW(L"nvngx_dlss.dll") != nullptr && GetModuleHandleW(L"_nvngx.dll") != nullptr)
+        Log("[feed] two copies of the DLSS NGX module are loaded (the game-local nvngx_dlss.dll and the driver's "
+            "_nvngx.dll), and the DLSS 5 add-on hooks both -- if the create keeps failing, try removing the "
+            "game-local nvngx_dlss.dll, or update renodx-dlss5 to a v4.7+ build");
+}
+
+// The 32-bit host has recovered real machines with this since 0.5: a CreateFeature that
+// failed (or crashed -- caught, nothing submitted) often works after NGX itself is torn
+// down and re-initialised on the same device. Never ported to this add-on until now.
+static bool ReinitNgx()
+{
+    Log("[feed] re-initialising NGX after repeated feature-create failures");
+    if (g.params != nullptr) { NVSDK_NGX_D3D12_DestroyParameters(g.params); g.params = nullptr; }
+    if (g.ngx_inited && g.dev12 != nullptr) { NVSDK_NGX_D3D12_Shutdown1(g.dev12); g.ngx_inited = false; }
+
+    wchar_t data_path[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, data_path, MAX_PATH);
+    if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
+
+    DWORD ngx_code = 0;
+    NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
+    if (ngx_code != 0) Log("[feed] NGX re-init raised exception 0x%08X (caught)", ngx_code);
+    else               Log("[feed] NGX re-init -> 0x%08X (%s)", r, NgxResultName(r));
+    if (NVSDK_NGX_FAILED(r)) return false;
+    g.ngx_inited = true;
+
+    r = NVSDK_NGX_D3D12_AllocateParameters(&g.params);
+    if (NVSDK_NGX_FAILED(r) || g.params == nullptr) { Log("[feed] AllocateParameters failed 0x%08X on re-init", r); return false; }
+    return true;
+}
+
+// A first-build CreateFeature failure no longer latches the feed off on the spot (three
+// identical retries three frames apart never worked; see the DS3/GTA V/Starfield reports).
+// Each failure re-arms the hook-grace so the next attempt is a create_delay away, the
+// second failure re-initialises NGX first, and only the third gives up -- with the
+// specific reason, not the generic "repeated failures".
+static bool OnCreateFeatureFailed(bool crashed)
+{
+    ++g.create_fail_count;
+    LogNgxModuleHint();
+    if (g.create_fail_count >= 3)
+    {
+        FeedDisable(crashed ? "creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)"
+                            : "creating the DLSS feature keeps failing (see dlss5-feed.log)");
+        return false;
+    }
+    if (g.create_fail_count == 2 && !ReinitNgx())
+    {
+        FeedDisable("NGX would not re-initialise after a failed feature create");
+        return false;
+    }
+    g.create_grace = 0;   // space the retry behind a fresh hook-arming grace, not one frame
+    Log("[feed] feature create %s; retrying after the hook-arming grace (attempt %d of 3)",
+        crashed ? "crashed (caught; nothing was submitted)" : "failed", g.create_fail_count + 1);
+    return false;
+}
 
 // A same-size rebuild (warm-up, runtime recreation, cfg knob) only needs a fresh feature:
 // the textures stay put, the new feature is created FIRST, and if that fails or crashes
@@ -1428,9 +2380,10 @@ static bool RecreateFeatureOnly(UINT w, UINT h)
 
 static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DXGI_FORMAT bb_fmt)
 {
+    const bool want_sr = g_cfg.work_upscale == 2 && g_cfg.mode >= 2 && (w != backbuffer_w || h != backbuffer_h);   // mode 1 copies COLOR->OUTPUT, so sizes must match
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
         w == g.width && h == g.height && backbuffer_w == g.backbuffer_width &&
-        backbuffer_h == g.backbuffer_height && bb_fmt == g.bb_fmt)
+        backbuffer_h == g.backbuffer_height && bb_fmt == g.bb_fmt && want_sr == g.sr_requested)
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building shared textures");
@@ -1458,8 +2411,29 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
         return false;
     }
 
+    // work_upscale=2: DLSS itself expands the work-size frame to native, so the Output is
+    // native-sized and the feature is created in Super Resolution mode -- if NGX has a
+    // quality preset whose dynamic render range covers this ratio. Otherwise fall back to
+    // the DLAA contract and let the spatial expand-back handle it, and say so once.
+    g.sr_requested = want_sr;
+    g.sr_active    = want_sr && PickSrQuality(w, h, backbuffer_w, backbuffer_h);
+    if (want_sr && !g.sr_active)
+        Log("[feed] work_upscale=2: no DLSS preset covers %ux%u -> %ux%u; staying on DLAA + FSR 1 for this build", w, h, backbuffer_w, backbuffer_h);
+    g.output_width  = g.sr_active ? backbuffer_w : w;
+    g.output_height = g.sr_active ? backbuffer_h : h;
+    g.jitter_index  = 0;
+    g.jitter_x = g.jitter_y = 0.0f;
+    if (g.sr_active)
+    {
+        const float ratio = static_cast<float>(backbuffer_w) / static_cast<float>(w);
+        g.jitter_phases = g_cfg.jitter_phases > 0 ? static_cast<UINT>(g_cfg.jitter_phases)
+                                                  : static_cast<UINT>(ceilf(8.0f * ratio * ratio));
+        Log("[feed] work_upscale=2: DLSS %s, %ux%u -> %ux%u, Halton(2,3) over %u phases, jitter sign %+d",
+            g.sr_quality_name, w, h, backbuffer_w, backbuffer_h, g.jitter_phases, g_cfg.jitter_sign);
+    }
+
     bool ok = MakeSharedPair(dev1, SLOT_COLOR,  w, h, g.color_fmt,             false, true)  &&
-              MakeSharedPair(dev1, SLOT_OUTPUT, w, h, g.output_fmt,            true,  false) &&
+              MakeSharedPair(dev1, SLOT_OUTPUT, g.output_width, g.output_height, g.output_fmt, true, false) &&
               MakeSharedPair(dev1, SLOT_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,   false, true)  &&
               MakeSharedPair(dev1, SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false, true) &&
               MakeSharedPair(dev1, SLOT_MASK,   w, h, DXGI_FORMAT_R8_UNORM,     false, true);
@@ -1496,6 +2470,27 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
         { Log("[feed] work-resolution staging SRV failed"); ReleaseFrameResources(); return false; }
 
         Log("[feed] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
+
+        // work_upscale=1 needs somewhere native-sized for EASU to write and RCAS to read.
+        // Created regardless of the current setting so toggling it later is free.
+        D3D11_TEXTURE2D_DESC ed = sd;
+        ed.Format    = g.output_fmt;
+        ed.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        if (SUCCEEDED(g.dev11->CreateTexture2D(&ed, nullptr, &g.easu_tex)))
+        {
+            D3D11_RENDER_TARGET_VIEW_DESC rv = {};
+            rv.Format = g.output_fmt;
+            rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            D3D11_SHADER_RESOURCE_VIEW_DESC es = {};
+            es.Format              = g.output_fmt;
+            es.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+            es.Texture2D.MipLevels = 1;
+            if (FAILED(g.dev11->CreateRenderTargetView(g.easu_tex, &rv, &g.easu_rtv)) ||
+                FAILED(g.dev11->CreateShaderResourceView(g.easu_tex, &es, &g.easu_srv)))
+            { SafeRelease(g.easu_rtv); SafeRelease(g.easu_srv); SafeRelease(g.easu_tex); }
+        }
+        if (g.easu_tex == nullptr)
+            Log("[feed] fsr1 intermediate (%ux%u %s) failed; work_upscale=1 falls back to bilinear", backbuffer_w, backbuffer_h, FormatName(g.output_fmt));
     }
 
     const int input_slots[] = { SLOT_COLOR, SLOT_MV, SLOT_DEPTH, SLOT_MASK };
@@ -1516,15 +2511,51 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
 
     bool crashed = false;
     if (!CreateDlssFeature(w, h, inverted, &crashed))
-    {
-        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
-        return false;
-    }
+        return OnCreateFeatureFailed(crashed);
     return true;
 }
 
 // The DLSS contract, shared by the D3D11 and D3D12 paths. DLAA: render size == output
 // size, no jitter, MVs at render size. The DLSS 5 add-on captures this create inline.
+// work_upscale=2: find the DLSS quality preset whose dynamic render range contains the
+// work size for this output size. DLSS accepts any render size inside [min, max] of the
+// chosen preset, so the slider keeps its 50-100% freedom. Fills g.sr_quality(_name).
+static bool PickSrQuality(UINT w, UINT h, UINT out_w, UINT out_h)
+{
+    static const struct { NVSDK_NGX_PerfQuality_Value q; const char *name; const char *hint; } kOrder[] = {
+        { NVSDK_NGX_PerfQuality_Value_UltraQuality,     "Ultra Quality",     NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality },
+        { NVSDK_NGX_PerfQuality_Value_MaxQuality,       "Quality",           NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality },
+        { NVSDK_NGX_PerfQuality_Value_Balanced,         "Balanced",          NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced },
+        { NVSDK_NGX_PerfQuality_Value_MaxPerf,          "Performance",       NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance },
+        { NVSDK_NGX_PerfQuality_Value_UltraPerformance, "Ultra Performance", NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance },
+    };
+    // The optimal-settings callback lives on the CAPABILITY parameter object only; an
+    // AllocateParameters object answers every preset with "no callback" (seen on the
+    // 32-bit host first: every query failed and SR silently fell back to DLAA).
+    NVSDK_NGX_Parameter *caps = nullptr;
+    const NVSDK_NGX_Result rc = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
+    if (NVSDK_NGX_FAILED(rc) || caps == nullptr) { Log("[feed] GetCapabilityParameters failed 0x%08X; cannot pick an SR preset", rc); return false; }
+    for (const auto &o : kOrder)
+    {
+        unsigned opt_w = 0, opt_h = 0, max_w = 0, max_h = 0, min_w = 0, min_h = 0;
+        float sharp = 0.0f;
+        const NVSDK_NGX_Result r = NGX_DLSS_GET_OPTIMAL_SETTINGS(caps, out_w, out_h, o.q,
+                                                                 &opt_w, &opt_h, &max_w, &max_h, &min_w, &min_h, &sharp);
+        if (NVSDK_NGX_FAILED(r) || opt_w == 0 || opt_h == 0)
+        { Log("[feed] DLSS %s at %ux%u: not offered (0x%08X, optimal %ux%u)", o.name, out_w, out_h, r, opt_w, opt_h); continue; }
+        Log("[feed] DLSS %s at %ux%u: optimal %ux%u, render range %ux%u .. %ux%u",
+            o.name, out_w, out_h, opt_w, opt_h, min_w, min_h, max_w, max_h);
+        if (w >= min_w && w <= max_w && h >= min_h && h <= max_h)
+        {
+            g.sr_quality      = static_cast<int>(o.q);
+            g.sr_quality_name = o.name;
+            g.sr_quality_hint = o.hint;
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
 {
     if (crashed != nullptr) *crashed = false;
@@ -1534,12 +2565,16 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
     if (g_cfg.flags >= 0) flags = g_cfg.flags;
     g.create_flags = flags;
 
+    // DLAA: render == target, unjittered. work_upscale=2 (D3D11 only, g.sr_active): render
+    // at the work size, target at the native size, DLSS reconstructs from our jitter.
+    const bool sr = g.sr_active && g.output_width != 0;
+    const UINT target_w = sr ? g.output_width : w, target_h = sr ? g.output_height : h;
     NVSDK_NGX_DLSS_Create_Params cp = {};
     cp.Feature.InWidth            = w;
     cp.Feature.InHeight           = h;
-    cp.Feature.InTargetWidth      = w;
-    cp.Feature.InTargetHeight     = h;
-    cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+    cp.Feature.InTargetWidth      = target_w;
+    cp.Feature.InTargetHeight     = target_h;
+    cp.Feature.InPerfQualityValue = sr ? static_cast<NVSDK_NGX_PerfQuality_Value>(g.sr_quality) : NVSDK_NGX_PerfQuality_Value_DLAA;
     cp.InFeatureCreateFlags       = flags;
     cp.InEnableOutputSubrects     = false;
 
@@ -1549,7 +2584,7 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
     // the modern default; E=5/F=6 are the legacy CNN presets with stronger clamping.
     if (g_cfg.preset > 0)
     {
-        g.params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, static_cast<unsigned int>(g_cfg.preset));
+        g.params->Set(sr ? g.sr_quality_hint : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, static_cast<unsigned int>(g_cfg.preset));
         Log("[feed] DLSS render preset hint: %d (%s)", g_cfg.preset,
             g_cfg.preset == 5 ? "E" : g_cfg.preset == 6 ? "F" : g_cfg.preset == 10 ? "J" : g_cfg.preset == 11 ? "K" : "?");
     }
@@ -1562,17 +2597,28 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
     {
         AbortCommands();  // half-recorded NGX work must never reach the GPU
         Log("[feed] CreateFeature raised exception 0x%08X (caught; nothing was submitted)", ccode);
+        g.feature = nullptr;   // NGX may have partially written the handle before the fault; never trust it
         if (crashed != nullptr) *crashed = true;
         return false;
     }
     const UINT64 v = EndCommands();
     if (g.fence12->GetCompletedValue() < v)
     {
+        ResetEvent(g.fence_event);   // as in BeginCommands: never trust a leftover signal
         g.fence12->SetEventOnCompletion(v, g.fence_event);
-        if (WaitForSingleObject(g.fence_event, 4000) != WAIT_OBJECT_0)
+        if (WaitForSingleObject(g.fence_event, 4000) != WAIT_OBJECT_0 || g.fence12->GetCompletedValue() < v)
         {
-            Log("[feed] feature creation did not complete within 4 s");
-            FeedDisable("creating the DLSS feature hung");
+            const HRESULT removed = g.dev12 != nullptr ? g.dev12->GetDeviceRemovedReason() : S_OK;
+            if (FAILED(removed))
+            {
+                Log("[feed] the D3D12 device was removed (0x%08X) during feature creation", removed);
+                FeedDisable("the D3D12 device was removed (see dlss5-feed.log)");
+            }
+            else
+            {
+                Log("[feed] feature creation did not complete within 4 s");
+                FeedDisable("creating the DLSS feature hung");
+            }
             return false;
         }
     }
@@ -1583,6 +2629,10 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
         return false;
     }
 
+    if (sr)
+        Log("[feed] feature ready: %ux%u -> %ux%u DLSS %s (synthetic jitter), flags=%d, color %s -> output %s",
+            w, h, target_w, target_h, g.sr_quality_name, flags, FormatName(g.color_fmt), FormatName(g.output_fmt));
+    else
     Log("[feed] feature ready: %ux%u DLAA, flags=%d (%s%s%s%s), color %s -> output %s, depth R32_FLOAT%s, mv R16G16_FLOAT",
         w, h, flags,
         (flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) ? "HDR " : "SDR ",
@@ -1590,8 +2640,9 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
         (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) ? "DepthInverted " : "",
         (flags & NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) ? "AutoExposure" : "",
         FormatName(g.color_fmt), FormatName(g.output_fmt), inverted ? " (reversed)" : "");
-    g.need_reset  = true;
-    g.frame_ready = true;
+    g.need_reset        = true;
+    g.frame_ready       = true;
+    g.create_fail_count = 0;
     return true;
 }
 
@@ -1638,14 +2689,15 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
         Breadcrumb("initialising NGX on D3D12");
-        NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-        Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
-        if (NVSDK_NGX_FAILED(r))
+        DWORD ngx_code = 0;
+        NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
+        if (ngx_code != 0)
         {
-            r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                                                    "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-            Log("[feed] NVSDK_NGX_D3D12_Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
+            Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
+                "process faulted during init; the feed stays off for this run", ngx_code);
+            goto fail;
         }
+        Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
         if (NVSDK_NGX_FAILED(r)) { Log("[feed] NGX would not initialise on this device/driver"); goto fail; }
         g.ngx_inited = true;
 
@@ -1695,6 +2747,20 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g.ctx4))) || g.ctx4 == nullptr)
         { Log("[feed] ID3D11DeviceContext4 unavailable"); goto fail; }
 
+        // A present-path interposer (Smooth Motion, see DetectSmoothMotion) can drive
+        // ReShade's effect chain from a second thread. The immediate context is not
+        // thread-safe unless asked, and BlitOutputToBackbuffer save/restores a slice of
+        // device state around its own draw -- which a concurrent user of the context
+        // would tear. Turn protection on for as long as we are attached; a game that
+        // already had it on is left exactly as it was.
+        if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11Multithread), reinterpret_cast<void **>(&g.mt))) && g.mt != nullptr)
+        {
+            g.mt_was_on = g.mt->SetMultithreadProtected(TRUE) != FALSE;
+            Log("[feed] D3D11 multithread protection enabled (the game had it %s)", g.mt_was_on ? "on" : "off");
+        }
+        else
+            Log("[feed] ID3D11Multithread unavailable; the immediate context stays unprotected");
+
         if (g.queue == nullptr || g.list == nullptr) { Log("[feed] D3D12 queue/list creation failed"); goto fail; }
 
         Log("[feed] session ready: queue=%p list=%p fence12=%p fence11=%p", (void *)g.queue, (void *)g.list,
@@ -1722,6 +2788,16 @@ static void ShutdownSession()
     SafeRelease(g.blit_sampler);
     SafeRelease(g.point_sampler);
     SafeRelease(g.resample_cb);
+    SafeRelease(g.easu_ps);
+    SafeRelease(g.rcas_ps);
+    SafeRelease(g.fsr_cb);
+    g.fsr_ok = false;
+    if (g.mt != nullptr)
+    {
+        if (!g.mt_was_on) g.mt->SetMultithreadProtected(FALSE);
+        SafeRelease(g.mt);
+        g.mt_was_on = false;
+    }
     SafeRelease(g.ctx4);
     SafeRelease(g.fence11);
     SafeRelease(g.fence12);
@@ -1802,14 +2878,13 @@ static bool InitSession12(reshade::api::effect_runtime *rt)
     if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
     Breadcrumb("initialising NGX on the game's device");
-    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-    Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
-    if (NVSDK_NGX_FAILED(r))
-    {
-        r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                                                "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-        Log("[feed] NVSDK_NGX_D3D12_Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
-    }
+    DWORD ngx_code = 0;
+    NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
+    if (ngx_code != 0)
+        Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
+            "process faulted during init; the feed stays off for this run", ngx_code);
+    else
+        Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))
     {
         ShutdownSession();
@@ -1933,10 +3008,7 @@ static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 
     bool crashed = false;
     if (!CreateDlssFeature(w, h, inverted, &crashed))
-    {
-        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
-        return false;
-    }
+        return OnCreateFeatureFailed(crashed);
     return true;
 }
 
@@ -1990,14 +3062,13 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
     if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
     Breadcrumb("initialising NGX (Vulkan transport)");
-    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-    Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
-    if (NVSDK_NGX_FAILED(r))
-    {
-        r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                                                "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-        Log("[feed] NVSDK_NGX_D3D12_Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
-    }
+    DWORD ngx_code = 0;
+    NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
+    if (ngx_code != 0)
+        Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
+            "process faulted during init; the feed stays off for this run", ngx_code);
+    else
+        Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))
     {
         ShutdownSession();
@@ -2195,14 +3266,106 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         return false;
     }
 
+    // buffer_home: a shared LINEAR buffer for the output hop. The imported OUTPUT
+    // VkImage stays (NGX needs the texture, and it remains the fallback), but the copy
+    // home reads this buffer instead: on at least one driver/format combination the
+    // D3D12 image writes never became visible through the imported VkImage (Detroit:
+    // Become Human -- Vulkan kept presenting a stale snapshot while the D3D12 side
+    // demonstrably produced fresh frames; see the stale probe). A buffer has no opaque
+    // tiling or compression metadata to fall out of sync. Only the raw-copy layouts
+    // qualify -- the blit fallback converts formats, which a buffer copy cannot.
+    const UINT home_bpp = HomeTexelBytes(g.output_fmt);
+    if (g_cfg.buffer_home != 0 && home_bpp != 0 && SameTexelLayout(g.output_fmt, bb_fmt))
+    {
+        g.home_pitch = (w * home_bpp + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+        // async_home double-slots the buffer: the evaluate writes one slot while the copy
+        // home reads the other, so the two never alias and no wait on THIS frame is needed.
+        // The slot stride keeps D3D12's placed-footprint alignment.
+        const UINT64 one_slot = static_cast<UINT64>(g.home_pitch) * h;
+        g.home_slice = g_cfg.async_home != 0
+            ? ((one_slot + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~static_cast<UINT64>(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1))
+            : 0;
+        const UINT64 home_size = g.home_slice != 0 ? g.home_slice * 2 : one_slot;
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC   rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = home_size;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                      nullptr, __uuidof(ID3D12Resource),
+                                                      reinterpret_cast<void **>(&g.home_buf12));
+        if (SUCCEEDED(hr))
+            hr = g.dev12->CreateSharedHandle(g.home_buf12, nullptr, GENERIC_ALL, nullptr, &g.home_buf_handle);
+        if (SUCCEEDED(hr) && !FeedVkImportBuffer(&g.vk, g.home_buf_handle, home_size, &g.vk_home_buf, &g.vk_home_mem))
+            hr = E_FAIL;
+        if (FAILED(hr))
+        {
+            Log("[feed] buffer_home: shared buffer failed 0x%08X -- falling back to the image copy home", hr);
+            if (g.home_buf_handle != nullptr) { CloseHandle(g.home_buf_handle); g.home_buf_handle = nullptr; }
+            SafeRelease(g.home_buf12);
+            g.home_pitch = 0;
+        }
+        else
+            Log("[feed] buffer_home: output goes home through a shared linear buffer (%ux%u, pitch %u)%s",
+                w, h, g.home_pitch,
+                g.home_slice != 0 ? " -- async_home: double-slotted, copy home carries frame n-1" : "");
+    }
+
+    // Input direction of the same workaround: one shared linear buffer per input slot.
+    // The evaluate keeps reading the D3D12 TEXTURES; each frame D3D12 fills them from
+    // these buffers, which Vulkan wrote with vkCmdCopyImageToBuffer -- the image
+    // imports stay only as fallback and for mode 1.
+    if (g.home_buf12 != nullptr)
+    {
+        static const struct { int slot; DXGI_FORMAT fmt; UINT bpp; } kIn[] = {
+            { SLOT_COLOR, DXGI_FORMAT_UNKNOWN,       4 },   // fmt filled from g.color_fmt below
+            { SLOT_DEPTH, DXGI_FORMAT_R32_FLOAT,     4 },
+            { SLOT_MV,    DXGI_FORMAT_R16G16_FLOAT,  4 },
+            { SLOT_MASK,  DXGI_FORMAT_R8_UNORM,      1 },
+        };
+        bool all_ok = true;
+        for (const auto &d : kIn)
+        {
+            const UINT bpp = d.slot == SLOT_COLOR ? HomeTexelBytes(g.color_fmt) : d.bpp;
+            if (bpp == 0) { all_ok = false; break; }
+            g.in_pitch[d.slot] = (w * bpp + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+            const UINT64 size = static_cast<UINT64>(g.in_pitch[d.slot]) * h;
+            D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC   rd = {};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = size;
+            rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                          nullptr, __uuidof(ID3D12Resource),
+                                                          reinterpret_cast<void **>(&g.in_buf12[d.slot]));
+            if (SUCCEEDED(hr))
+                hr = g.dev12->CreateSharedHandle(g.in_buf12[d.slot], nullptr, GENERIC_ALL, nullptr, &g.in_buf_handle[d.slot]);
+            if (SUCCEEDED(hr) && !FeedVkImportBuffer(&g.vk, g.in_buf_handle[d.slot], size,
+                                                     &g.vk_in_buf[d.slot], &g.vk_in_mem[d.slot]))
+                hr = E_FAIL;
+            if (FAILED(hr)) { Log("[feed] buffer_home: input buffer %s failed 0x%08X", kSlotName[d.slot], hr); all_ok = false; break; }
+        }
+        if (!all_ok)
+        {
+            Log("[feed] buffer_home: input buffers unavailable -- inputs stay on the image imports");
+            for (int i = 0; i < SLOT_COUNT; ++i)
+            {
+                if (g.vk_in_buf[i] != VK_NULL_HANDLE) { g.vk.DestroyBuffer(g.vk.dev, g.vk_in_buf[i], nullptr); g.vk_in_buf[i] = VK_NULL_HANDLE; }
+                if (g.vk_in_mem[i] != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_in_mem[i], nullptr);    g.vk_in_mem[i] = VK_NULL_HANDLE; }
+                if (g.in_buf_handle[i] != nullptr)    { CloseHandle(g.in_buf_handle[i]); g.in_buf_handle[i] = nullptr; }
+                SafeRelease(g.in_buf12[i]);
+                g.in_pitch[i] = 0;
+            }
+        }
+        else
+            Log("[feed] buffer_home: inputs travel through shared linear buffers too");
+    }
+
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
     bool crashed = false;
     if (!CreateDlssFeature(w, h, inverted, &crashed))
-    {
-        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
-        return false;
-    }
+        return OnCreateFeatureFailed(crashed);
     return true;
 }
 
@@ -2277,14 +3440,13 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
     if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
     Breadcrumb("initialising NGX (OpenGL transport)");
-    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-    Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
-    if (NVSDK_NGX_FAILED(r))
-    {
-        r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                                                "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
-        Log("[feed] NVSDK_NGX_D3D12_Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
-    }
+    DWORD ngx_code = 0;
+    NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
+    if (ngx_code != 0)
+        Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
+            "process faulted during init; the feed stays off for this run", ngx_code);
+    else
+        Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))
     {
         ShutdownSession();
@@ -2486,10 +3648,7 @@ static bool BuildResourcesGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_ha
 
     bool crashed = false;
     if (!CreateDlssFeature(w, h, inverted, &crashed))
-    {
-        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
-        return false;
-    }
+        return OnCreateFeatureFailed(crashed);
     return true;
 }
 
@@ -2532,9 +3691,12 @@ static bool CopyOrResampleInputs(ID3D11DeviceContext *ctx,
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(ctx->Map(g.resample_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
     { Log("[feed] resample constant-buffer map failed"); return false; }
+    // A shift of j work pixels is j / work_size in uv, whatever the source size is.
     const float constants[4] = {
         static_cast<float>(g.width) / static_cast<float>(source_w),
-        static_cast<float>(g.height) / static_cast<float>(source_h), 0.0f, 0.0f
+        static_cast<float>(g.height) / static_cast<float>(source_h),
+        g.sr_active ? g.jitter_x / static_cast<float>(g.width)  : 0.0f,
+        g.sr_active ? g.jitter_y / static_cast<float>(g.height) : 0.0f
     };
     memcpy(mapped.pData, constants, sizeof(constants));
     ctx->Unmap(g.resample_cb, 0);
@@ -2617,6 +3779,26 @@ static bool CopyOrResampleInputs(ID3D11DeviceContext *ctx,
     return true;
 }
 
+// Refill the FSR constant buffer when the sizes or the sharpness it describes changed.
+static void UpdateFsrConstants(ID3D11DeviceContext *ctx, UINT in_w, UINT in_h)
+{
+    if (in_w == g.fsr_in_w && in_h == g.fsr_in_h && g.backbuffer_width == g.fsr_out_w &&
+        g.backbuffer_height == g.fsr_out_h && g_cfg.work_sharpness == g.fsr_sharpness) return;
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(ctx->Map(g.fsr_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return;
+    FsrFillConstants(static_cast<FsrConstants *>(mapped.pData), in_w, in_h,
+                     g.backbuffer_width, g.backbuffer_height, g_cfg.work_sharpness);
+    ctx->Unmap(g.fsr_cb, 0);
+    g.fsr_in_w = in_w; g.fsr_in_h = in_h;
+    g.fsr_out_w = g.backbuffer_width; g.fsr_out_h = g.backbuffer_height;
+    g.fsr_sharpness = g_cfg.work_sharpness;
+}
+
+// Expands the work-size Output over the native backbuffer. work_upscale=0: one bilinear
+// draw (at 100% every tap lands on a texel centre, so it is a copy). work_upscale=1: EASU
+// upsamples into easu_tex and RCAS sharpens from there into the backbuffer; at 100% EASU
+// has nothing to do and RCAS runs alone straight from the Output; with sharpness 0 EASU
+// writes the backbuffer directly. Either way the game and ReShade never see a size change.
 static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv)
 {
     // Save what we touch; ReShade rebinds its own state for every following pass anyway.
@@ -2626,6 +3808,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ID3D11PixelShader        *old_ps  = nullptr;
     ID3D11ShaderResourceView *old_srv = nullptr;
     ID3D11SamplerState       *old_smp = nullptr;
+    ID3D11Buffer             *old_cb  = nullptr;
     ID3D11InputLayout        *old_il  = nullptr;
     ID3D11BlendState         *old_bs  = nullptr; FLOAT old_bf[4]; UINT old_mask = 0;
     ID3D11DepthStencilState  *old_ds  = nullptr; UINT old_sref = 0;
@@ -2637,6 +3820,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->PSGetShader(&old_ps, nullptr, nullptr);
     ctx->PSGetShaderResources(0, 1, &old_srv);
     ctx->PSGetSamplers(0, 1, &old_smp);
+    ctx->PSGetConstantBuffers(0, 1, &old_cb);
     ctx->IAGetInputLayout(&old_il);
     ctx->IAGetPrimitiveTopology(&old_topo);
     ctx->OMGetBlendState(&old_bs, old_bf, &old_mask);
@@ -2644,14 +3828,20 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->RSGetState(&old_rs);
     ctx->RSGetViewports(&nvp, &old_vp);
 
+    // The Output is work-sized under DLAA and native-sized under work_upscale=2, where DLSS
+    // did the expanding and only the optional RCAS pass is left for us.
+    const UINT out_w = g.output_width  != 0 ? g.output_width  : g.width;
+    const UINT out_h = g.output_height != 0 ? g.output_height : g.height;
+    const bool scaled = out_w != g.backbuffer_width || out_h != g.backbuffer_height;
+    const bool fsr    = g_cfg.work_upscale != 0 && g.fsr_ok && g.easu_ps != nullptr;
+    const bool easu   = fsr && scaled && g.easu_rtv != nullptr;
+    const bool rcas   = fsr && g_cfg.work_sharpness > 0.0f && (easu || !scaled);   // RCAS reads at native texel indices
+
     D3D11_VIEWPORT vp = {};
     vp.Width    = static_cast<float>(g.backbuffer_width);
     vp.Height   = static_cast<float>(g.backbuffer_height);
     vp.MaxDepth = 1.0f;
-    ID3D11RenderTargetView *rtvs[] = { rtv };
-    ID3D11ShaderResourceView *srvs[] = { g.output_srv };
     ID3D11SamplerState *smps[] = { g.blit_sampler };
-    ctx->OMSetRenderTargets(1, rtvs, nullptr);
     ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     ctx->OMSetDepthStencilState(nullptr, 0);
     ctx->RSSetState(nullptr);
@@ -2659,10 +3849,33 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->IASetInputLayout(nullptr);
     ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ctx->VSSetShader(g.blit_vs, nullptr, 0);
-    ctx->PSSetShader(g.blit_ps, nullptr, 0);
-    ctx->PSSetShaderResources(0, 1, srvs);
     ctx->PSSetSamplers(0, 1, smps);
-    ctx->Draw(3, 0);
+    if (easu || rcas)
+    {
+        UpdateFsrConstants(ctx, easu ? out_w : g.backbuffer_width, easu ? out_h : g.backbuffer_height);
+        ctx->PSSetConstantBuffers(0, 1, &g.fsr_cb);
+    }
+
+    ID3D11ShaderResourceView *src = g.output_srv;
+    if (easu)
+    {
+        ID3D11RenderTargetView *target[] = { rcas ? g.easu_rtv : rtv };
+        ctx->OMSetRenderTargets(1, target, nullptr);
+        ctx->PSSetShader(g.easu_ps, nullptr, 0);
+        ctx->PSSetShaderResources(0, 1, &src);
+        ctx->Draw(3, 0);
+        src = g.easu_srv;
+    }
+    if (rcas || !easu)
+    {
+        ID3D11ShaderResourceView *unbind = nullptr;
+        ctx->PSSetShaderResources(0, 1, &unbind);      // easu_tex leaves the OM before it enters the PS
+        ID3D11RenderTargetView *target[] = { rtv };
+        ctx->OMSetRenderTargets(1, target, nullptr);
+        ctx->PSSetShader(rcas ? g.rcas_ps : g.blit_ps, nullptr, 0);
+        ctx->PSSetShaderResources(0, 1, &src);
+        ctx->Draw(3, 0);
+    }
 
     ID3D11ShaderResourceView *no_srv = nullptr;
     ctx->PSSetShaderResources(0, 1, &no_srv);
@@ -2671,6 +3884,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->PSSetShader(old_ps, nullptr, 0);
     ctx->PSSetShaderResources(0, 1, &old_srv);
     ctx->PSSetSamplers(0, 1, &old_smp);
+    ctx->PSSetConstantBuffers(0, 1, &old_cb);
     ctx->IASetInputLayout(old_il);
     ctx->IASetPrimitiveTopology(old_topo);
     ctx->OMSetBlendState(old_bs, old_bf, old_mask);
@@ -2678,7 +3892,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->RSSetState(old_rs);
     if (nvp) ctx->RSSetViewports(1, &old_vp);
     SafeRelease(old_rtv); SafeRelease(old_dsv); SafeRelease(old_vs); SafeRelease(old_ps); SafeRelease(old_srv);
-    SafeRelease(old_smp); SafeRelease(old_il); SafeRelease(old_bs); SafeRelease(old_ds); SafeRelease(old_rs);
+    SafeRelease(old_smp); SafeRelease(old_cb); SafeRelease(old_il); SafeRelease(old_bs); SafeRelease(old_ds); SafeRelease(old_rs);
 }
 
 // ---------------------------------------------------------------------------
@@ -2695,15 +3909,62 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
         g.span_start = entry;
     }
     g.cpu_ticks += (exit - entry);
+
+    // --- stall diagnostic -------------------------------------------------------
+    // interval  present-to-present, measured between two entries into this callback
+    // total     our whole per-frame job, this callback only
+    // eval      the NGX evaluate CALL, which is where the neural consumer's detour runs
+    // outside   interval - total: the game, ReShade's other add-ons, the driver, the
+    //           consumer's non-evaluate hooks. Not ours, and not inside the evaluate.
+    const LONGLONG total    = exit - entry;
+    const LONGLONG interval = g.prev_entry != 0 ? entry - g.prev_entry : 0;
+    const LONGLONG eval     = g_last_eval_ticks;
+    g.prev_entry = entry;
+    g_last_eval_ticks = 0;
+
+    if (interval > g.win_max_interval) g.win_max_interval = interval;
+    if (total    > g.win_max_total)    g.win_max_total    = total;
+    if (eval     > g.win_max_eval)     g.win_max_eval     = eval;
+
+    const double to_ms = 1000.0 / double(g.qpf);
+    if (g_cfg.stall_log_ms > 0 && interval > 0 &&
+        double(interval) * to_ms >= double(g_cfg.stall_log_ms))
+    {
+        ++g.win_stalls;
+        if (g.win_stalls_logged < 8)   // a burst must not turn the log into the bottleneck
+        {
+            ++g.win_stalls_logged;
+            const double iv_ms = double(interval) * to_ms;
+            const double tt_ms = double(total) * to_ms;
+            const double ev_ms = double(eval) * to_ms;
+            const double out_ms = iv_ms - tt_ms;
+            const char *verdict =
+                ev_ms >= 0.5 * iv_ms  ? "most of it was INSIDE the NGX evaluate -- the neural consumer's detour"
+              : tt_ms >= 0.5 * iv_ms  ? "most of it was inside this add-on, but outside the NGX evaluate"
+                                      : "most of it was OUTSIDE this add-on entirely (game, driver, or another add-on's hooks)";
+            Log("[feed] STALL frame %llu: interval %.1f ms | feed %.2f ms (of which NGX evaluate %.2f ms) | "
+                "outside the feed %.1f ms -- %s",
+                static_cast<unsigned long long>(g.frames_done), iv_ms, tt_ms, ev_ms, out_ms, verdict);
+        }
+    }
+
     if (++g.timed_frames < 600) return;
     const double span_ms = 1000.0 * double(exit - g.span_start) / double(g.qpf);
     const double cpu_ms  = 1000.0 * double(g.cpu_ticks) / double(g.qpf);
     const double n       = double(g.timed_frames);
-    Log("[feed] 600 frames: feed CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) | feed is %.0f%% of the frame",
-        cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms);
+    Log("[feed] 600 frames: feed CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) | feed is %.0f%% of the frame "
+        "| worst frame %.1f ms (feed %.2f, evaluate %.2f) | stalls %llu",
+        cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms,
+        double(g.win_max_interval) * to_ms, double(g.win_max_total) * to_ms, double(g.win_max_eval) * to_ms,
+        static_cast<unsigned long long>(g.win_stalls));
+    if (g.win_stalls > g.win_stalls_logged)
+        Log("[feed] (%llu further stall lines suppressed in that window)",
+            static_cast<unsigned long long>(g.win_stalls - g.win_stalls_logged));
     g.cpu_ticks = 0;
     g.timed_frames = 0;
     g.span_start = exit;
+    g.win_max_interval = g.win_max_total = g.win_max_eval = 0;
+    g.win_stalls = g.win_stalls_logged = 0;
 }
 
 static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *desc)
@@ -2801,11 +4062,16 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
     if (g.frame_ready && needs_build12) g.create_grace = 0;
-    if (ok && needs_build12 && g.create_grace < g_cfg.create_delay)
+    // A classic (single hook pass) DLSS 5 add-on engine needs far longer than the default
+    // 60 frames on the game's own device: Starfield lost the device with 60 and survived
+    // with 600 (issue #16). Lazy (v4.5+) engines re-scan per present and keep the default.
+    int create_delay12 = g_cfg.create_delay;
+    if (!g_renodx_lazy && g_renodx_present && create_delay12 < 300) create_delay12 = 300;
+    if (ok && needs_build12 && g.create_grace < create_delay12)
     {
         if (++g.create_grace == 1)
-            Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously)",
-                g_cfg.create_delay);
+            Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously%s)",
+                create_delay12, create_delay12 != g_cfg.create_delay ? "; classic engine on the game's device, so longer than configured" : "");
         ok = false;
     }
 
@@ -2942,7 +4208,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                     // in LOTR: hooks +215 ms), which latches it in STANDBY. One warm-up re-create
                     // fixes that -- and it is safe now: it goes through RecreateFeatureOnly, which
                     // keeps the old feature if the new create fails or crashes.
-                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                    if (WarmupRebuildDue(n))
                     {
                         g.warmup_done = true;
                         g.frame_ready = false;
@@ -3076,14 +4342,51 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         VkImage mv_img = FeedVkHandle<VkImage>(mv_res.handle);
         VkImage dp_img = FeedVkHandle<VkImage>(depth_res.handle);
 
-        // Our imported images -> GENERAL (first frame after a build, from UNDEFINED).
-        // ReShade never touches them; only these raw barriers do.
-        Breadcrumb("copying inputs (Vulkan)");
+        // The transfers to/from VK_QUEUE_FAMILY_EXTERNAL below need the graphics queue
+        // family. The vkCreateDevice hook captured it; family 0 is graphics on every
+        // Windows desktop driver, so that is the (loudly logged) fallback.
+        uint32_t gfx_family = g_vk_gfx_family;
+        if (gfx_family == VK_QUEUE_FAMILY_IGNORED)
         {
-            const VkImageLayout f = g.vk_layout_init ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+            static bool said_family = false;
+            if (!said_family)
+            {
+                said_family = true;
+                Log("[feed] the vkCreateDevice hook never saw this device; assuming graphics queue family 0 for the external ownership transfers");
+            }
+            gfx_family = 0;
+        }
+
+        // Our imported images -> GENERAL (first frame after a build, from UNDEFINED).
+        // ReShade never touches them; only these raw barriers do. A frame that released
+        // them to VK_QUEUE_FAMILY_EXTERNAL and then bailed before acquiring them back
+        // (evaluate crash, command-list failure) is picked up here instead.
+        Breadcrumb("copying inputs (Vulkan)");
+        if (!g.vk_layout_init)
+        {
             for (int i = 0; i < SLOT_COUNT; ++i)
-                FeedVkBarrier(&g.vk, cb, g.vk_img[i], f, VK_IMAGE_LAYOUT_GENERAL);
+                FeedVkBarrier(&g.vk, cb, g.vk_img[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
             g.vk_layout_init = true;
+            g.vk_released    = false;   // fresh images; nothing has been handed to D3D12 yet
+        }
+        else if (g.vk_released)
+        {
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                if (g.vk_img[i] != VK_NULL_HANDLE)
+                    FeedVkExternalTransfer(&g.vk, cb, g.vk_img[i], gfx_family, false /*acquire*/);
+            if (g.vk_home_buf != VK_NULL_HANDLE)
+                FeedVkExternalBufferTransfer(&g.vk, cb, g.vk_home_buf,
+                                             static_cast<VkDeviceSize>(g.home_pitch) * g.height, gfx_family, false);
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                if (g.vk_in_buf[i] != VK_NULL_HANDLE)
+                    FeedVkExternalBufferTransfer(&g.vk, cb, g.vk_in_buf[i],
+                                                 static_cast<VkDeviceSize>(g.in_pitch[i]) * g.height, gfx_family, false);
+            g.vk_released = false;
+        }
+        else
+        {
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                FeedVkBarrier(&g.vk, cb, g.vk_img[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
         }
         // Game images -> copy_source via ReShade (its layout tracking stays correct),
         // then raw-copy each into our GENERAL image.
@@ -3093,9 +4396,20 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             const resource_usage to[3]   = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source };
             cl->barrier(3, res, from, to);
         }
-        FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
-        FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MV],    VK_IMAGE_LAYOUT_GENERAL, w, h);
-        FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
+        const bool staged_in = g_cfg.mode >= 2 && g.vk_in_buf[SLOT_COLOR] != VK_NULL_HANDLE;
+        const UINT cbpp = HomeTexelBytes(g.color_fmt) != 0 ? HomeTexelBytes(g.color_fmt) : 4;
+        if (staged_in)
+        {
+            FeedVkCopyImageToBuffer(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_in_buf[SLOT_COLOR], w, h, g.in_pitch[SLOT_COLOR] / cbpp);
+            FeedVkCopyImageToBuffer(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_in_buf[SLOT_MV],    w, h, g.in_pitch[SLOT_MV] / 4);
+            FeedVkCopyImageToBuffer(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_in_buf[SLOT_DEPTH], w, h, g.in_pitch[SLOT_DEPTH] / 4);
+        }
+        else
+        {
+            FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
+            FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MV],    VK_IMAGE_LAYOUT_GENERAL, w, h);
+            FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
+        }
         if (g.mask_ok)
         {
             // The mask goes the same way, and is handed straight back to shader_resource here.
@@ -3106,7 +4420,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 const resource_usage to[1]   = { resource_usage::copy_source };
                 cl->barrier(1, res, from, to);
             }
-            FeedVkCopyImage(&g.vk, cb, mk_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MASK], VK_IMAGE_LAYOUT_GENERAL, w, h);
+            if (staged_in)
+                FeedVkCopyImageToBuffer(&g.vk, cb, mk_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_in_buf[SLOT_MASK], w, h, g.in_pitch[SLOT_MASK]);
+            else
+                FeedVkCopyImage(&g.vk, cb, mk_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MASK], VK_IMAGE_LAYOUT_GENERAL, w, h);
             {
                 const resource       res[1]  = { mask_res };
                 const resource_usage from[1] = { resource_usage::copy_source };
@@ -3148,9 +4465,53 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
             g.need_reset = false;
 
+            // async_home=2: the copy home carries frame n-1, which does not depend on
+            // anything this frame does on the D3D12 side -- so it can ride the SAME
+            // command buffer as the input copies. One submit per frame, the shape a
+            // normal game has. The entry acquire above already published last frame's
+            // D3D12 writes; the fence wait before the flush orders them.
+            const bool one_submit = g_cfg.async_home >= 2 && g.home_slice != 0 &&
+                                    g.vk_home_buf != VK_NULL_HANDLE;
+            if (one_submit)
+            {
+                if (n > 1)
+                {
+                    const UINT wh1 = g_cfg.half_home != 0 ? w / 2 : w;
+                    FeedVkCopyBufferToImage(&g.vk, cb, g.vk_home_buf, bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                            wh1, h, g.home_pitch / HomeTexelBytes(g.output_fmt),
+                                            g.home_slice * ((n - 1) & 1));
+                }
+                const resource       res1[1]  = { bb_res };
+                const resource_usage from1[1] = { resource_usage::copy_dest };
+                const resource_usage to1[1]   = { resource_usage::render_target };
+                cl->barrier(1, res1, from1, to1);
+            }
+
+            // Hand the images to the D3D12 device: release ownership to
+            // VK_QUEUE_FAMILY_EXTERNAL. This is what makes this frame's input copies
+            // *available* to the evaluate over there -- the in-fence below only orders
+            // the work, it does not publish the bytes. Recorded before the flush so it
+            // rides the same submit as the copies.
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                if (g.vk_img[i] != VK_NULL_HANDLE)
+                    FeedVkExternalTransfer(&g.vk, cb, g.vk_img[i], gfx_family, true /*release*/);
+            if (g.vk_home_buf != VK_NULL_HANDLE)
+                FeedVkExternalBufferTransfer(&g.vk, cb, g.vk_home_buf,
+                                             static_cast<VkDeviceSize>(g.home_pitch) * g.height, gfx_family, true);
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                if (g.vk_in_buf[i] != VK_NULL_HANDLE)
+                    FeedVkExternalBufferTransfer(&g.vk, cb, g.vk_in_buf[i],
+                                                 static_cast<VkDeviceSize>(g.in_pitch[i]) * g.height, gfx_family, true);
+            g.vk_released = true;
+
             Breadcrumb("signalling the game-side fence (Vulkan)");
+            // One-submit mode orders the copy home against the PREVIOUS frame's evaluate
+            // here, so the whole frame still leaves as a single submission. (If ReShade's
+            // backend flushes inside wait(), the count goes back to two and the experiment
+            // is inconclusive -- the log line below says which we got.)
+            if (one_submit && n > 1) g.rs_queue->wait(g.rs_fence_out, n - 1);
             g.rs_queue->flush_immediate_command_list();
-            g.rs_queue->signal(g.rs_fence_in, n);
+            const bool sig_ok = g.rs_queue->signal(g.rs_fence_in, n);
 
             // D3D12: wait for the copies, evaluate, signal back. Unchanged machinery.
             g.queue->Wait(g.fence12_in, n);
@@ -3158,6 +4519,33 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             if (!BeginCommands()) FeedFail("command list");
             else
             {
+                if (g.in_buf12[SLOT_COLOR] != nullptr && g_cfg.mode >= 2)
+                {
+                    // buffer_home inputs: the Vulkan side wrote the shared buffers;
+                    // land them in the textures the evaluate actually reads.
+                    static const struct { int slot; DXGI_FORMAT fmt; } kFill[] = {
+                        { SLOT_COLOR, DXGI_FORMAT_UNKNOWN }, { SLOT_DEPTH, DXGI_FORMAT_R32_FLOAT },
+                        { SLOT_MV, DXGI_FORMAT_R16G16_FLOAT }, { SLOT_MASK, DXGI_FORMAT_R8_UNORM },
+                    };
+                    for (const auto &d : kFill)
+                    {
+                        if (g.in_buf12[d.slot] == nullptr) continue;
+                        if (d.slot == SLOT_MASK && !g.mask_ok) continue;
+                        D3D12_TEXTURE_COPY_LOCATION src = {};
+                        src.pResource = g.in_buf12[d.slot];
+                        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                        src.PlacedFootprint.Offset = 0;
+                        src.PlacedFootprint.Footprint = { d.slot == SLOT_COLOR ? g.color_fmt : d.fmt,
+                                                          g.width, g.height, 1, g.in_pitch[d.slot] };
+                        D3D12_TEXTURE_COPY_LOCATION dst = {};
+                        dst.pResource = g.tex12[d.slot];
+                        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                        dst.SubresourceIndex = 0;
+                        Barrier(g.tex12[d.slot], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                        g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                        Barrier(g.tex12[d.slot], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+                    }
+                }
                 Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -3185,7 +4573,22 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
                 Breadcrumb("running the D3D12 evaluate (Vulkan transport)");
                 DWORD ecode = 0;
-                NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+                NVSDK_NGX_Result re;
+                if (g_cfg.passthrough != 0 && g.color_fmt == g.output_fmt)
+                {
+                    // Diagnostic passthrough: identical machinery, no DLSS. The output
+                    // becomes a byte copy of this frame's colour input.
+                    static bool said_pass = false;
+                    if (!said_pass) { said_pass = true; Log("[feed] passthrough=1: NGX evaluate replaced by CopyResource (diagnostic)"); }
+                    Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                    g.list->CopyResource(g.tex12[SLOT_OUTPUT], g.tex12[SLOT_COLOR]);
+                    Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    re = static_cast<NVSDK_NGX_Result>(0x1);   // NVSDK_NGX_Result_Success
+                }
+                else
+                    re = SafeEvaluateDLSS(&ep, &ecode);
                 if (ecode != 0)
                 {
                     AbortCommands();  // never execute a list NGX crashed while recording
@@ -3195,6 +4598,26 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 }
                 else
                 {
+                    StaleProbeRecord(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                     g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    if (g.home_buf12 != nullptr)
+                    {
+                        // buffer_home: linearise the output into the shared buffer on
+                        // this same list, so the out-fence signal below covers it too.
+                        // The buffer itself needs no barrier (COMMON promotion).
+                        Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        D3D12_TEXTURE_COPY_LOCATION src = {};
+                        src.pResource = g.tex12[SLOT_OUTPUT];
+                        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                        src.SubresourceIndex = 0;
+                        D3D12_TEXTURE_COPY_LOCATION dst = {};
+                        dst.pResource = g.home_buf12;
+                        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                        dst.PlacedFootprint.Offset = g.home_slice != 0 ? g.home_slice * (n & 1) : 0;
+                        dst.PlacedFootprint.Footprint = { g.output_fmt, g.width, g.height, 1, g.home_pitch };
+                        g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                        Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    }
                     Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -3218,9 +4641,75 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
             // The copy home lands on the fresh immediate list, which executes on the
             // game's queue after the wait below -- GPU-ordered, no CPU stall.
+            if (one_submit)
+            {
+                // Nothing more to record: the copy home already went out with the inputs.
+                static bool said_one = false;
+                if (!said_one)
+                {
+                    said_one = true;
+                    Log("[feed] async_home=2: one queue submit per frame (copy home rides the input buffer)");
+                }
+                if (done)
+                {
+                    const UINT64 fn = ++g.frames_done;
+                    g.consecutive_fails = 0;
+                    if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
+                        Log("[feed] frame %llu delivered (%ux%u, reset=%d, Vulkan transport, 1 submit)",
+                            fn, g.width, g.height, reset);
+                    FeedVkPresentTick(fn, 120);
+                    if (WarmupRebuildDue(fn))
+                    {
+                        g.warmup_done = true;
+                        g.frame_ready = false;
+                        Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu, Vulkan transport)", fn);
+                    }
+                }
+                QueryPerformanceCounter(&t1);
+                TimingTick(t0.QuadPart, t1.QuadPart);
+                return;
+            }
+
             Breadcrumb("waiting for the result (Vulkan)");
-            g.rs_queue->wait(g.rs_fence_out, n);
+            // async_home: wait for the PREVIOUS frame's evaluate, not this one. The game's
+            // present path then never carries a cross-API stall of unbounded length -- which
+            // is what an external frame pacer (Smooth Motion) cannot absorb, and is a cost
+            // worth removing regardless. Frame 1 has no predecessor: skip the copy home.
+            const bool async_home = g.home_slice != 0;
+            const UINT64 wait_n   = async_home ? (n > 1 ? n - 1 : 0) : n;
+            const bool   home_ok  = !async_home || n > 1;
+            const bool wait_ok = wait_n != 0 ? g.rs_queue->wait(g.rs_fence_out, wait_n) : true;
+            // Sync probe: does the cross-API fence machinery actually connect? The two
+            // D3D12 completed values are what the D3D12 device has retired; the two
+            // Vulkan values are what the IMPORTED timeline semaphores read from this
+            // side. If vk_out trails d12_out by hundreds, the fence import is broken
+            // and nothing orders the copy home against the evaluate. sig/wait are
+            // ReShade's own return values -- 0 means it refused the imported semaphore.
+            if ((n % 60) == 1)
+                Log("[feed] sync probe: n=%llu (waited out=%llu) sig=%d wait=%d | d12 in=%llu out=%llu | vk in=%llu out=%llu",
+                    static_cast<unsigned long long>(n), static_cast<unsigned long long>(wait_n),
+                    sig_ok ? 1 : 0, wait_ok ? 1 : 0,
+                    static_cast<unsigned long long>(g.fence12_in  != nullptr ? g.fence12_in->GetCompletedValue()  : 0),
+                    static_cast<unsigned long long>(g.fence12_out != nullptr ? g.fence12_out->GetCompletedValue() : 0),
+                    static_cast<unsigned long long>(FeedVkTimelineValue(&g.vk, g.vk_sem_in)),
+                    static_cast<unsigned long long>(FeedVkTimelineValue(&g.vk, g.vk_sem_out)));
             cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());  // fresh buffer after the flush
+            done = done && home_ok;   // async_home frame 1: nothing to carry home yet
+            // Take the images back from the D3D12 device: acquire from
+            // VK_QUEUE_FAMILY_EXTERNAL, making the evaluate's output writes visible to
+            // the copy home. This submit waits on the out-fence, so the acquire is
+            // GPU-ordered after the evaluate.
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                if (g.vk_img[i] != VK_NULL_HANDLE)
+                    FeedVkExternalTransfer(&g.vk, cb, g.vk_img[i], gfx_family, false /*acquire*/);
+            if (g.vk_home_buf != VK_NULL_HANDLE)
+                FeedVkExternalBufferTransfer(&g.vk, cb, g.vk_home_buf,
+                                             static_cast<VkDeviceSize>(g.home_pitch) * g.height, gfx_family, false);
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                if (g.vk_in_buf[i] != VK_NULL_HANDLE)
+                    FeedVkExternalBufferTransfer(&g.vk, cb, g.vk_in_buf[i],
+                                                 static_cast<VkDeviceSize>(g.in_pitch[i]) * g.height, gfx_family, false);
+            g.vk_released = false;
             if (done)
             {
                 // Prefer the raw copy. vkCmdBlitImage converts, and that conversion is
@@ -3229,12 +4718,20 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 // brighter with lifted blacks (issue #11). The frame we were handed is
                 // already encoded, so the bytes must go home untouched. The blit stays
                 // only for the layouts a raw copy genuinely cannot express.
-                if (SameTexelLayout(g.output_fmt, g.bb_fmt))
+                const UINT wh = g_cfg.half_home != 0 ? w / 2 : w;   // half_home: leave the right half raw
+                if (g.vk_home_buf != VK_NULL_HANDLE)
+                {
+                    // async_home reads the slot the evaluate is NOT writing this frame.
+                    const VkDeviceSize slot = async_home ? g.home_slice * ((n - 1) & 1) : 0;
+                    FeedVkCopyBufferToImage(&g.vk, cb, g.vk_home_buf, bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                            wh, h, g.home_pitch / HomeTexelBytes(g.output_fmt), slot);
+                }
+                else if (SameTexelLayout(g.output_fmt, g.bb_fmt))
                     FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
-                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, wh, h);
                 else
                     FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
-                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, wh, h);
             }
             {
                 const resource       res[1]  = { bb_res };
@@ -3243,14 +4740,30 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 cl->barrier(1, res, from, to);
             }
 
+            // sync_home: submit the copy home and block until the GPU has finished it,
+            // before this callback returns and the game presents. Everything else in this
+            // path is GPU-ordered against the game's own queue, which is sufficient for a
+            // normal swapchain -- but an in-driver frame pacer consumes the presented image
+            // on its own schedule and may not be ordered against us at all. If forcing the
+            // writes to be complete before present fixes the image, that is the answer; if
+            // it does not, no in-process ordering can, because there is nothing left to
+            // order. Costs a full drain per frame: a diagnostic, not a shipping default.
+            if (g_cfg.sync_home != 0)
+            {
+                g.rs_queue->flush_immediate_command_list();
+                g.rs_queue->wait_idle();
+            }
+
             if (done)
             {
                 const UINT64 fn = ++g.frames_done;
                 g.consecutive_fails = 0;
                 if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
                     Log("[feed] frame %llu delivered (%ux%u, reset=%d, Vulkan transport)", fn, g.width, g.height, reset);
+                // Feeds the pacer detector (presents vs. frames fed) and reports periodically.
+                FeedVkPresentTick(fn, 120);
 
-                if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                if (WarmupRebuildDue(fn))
                 {
                     g.warmup_done = true;
                     g.frame_ready = false;
@@ -3480,6 +4993,8 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
                 }
                 else
                 {
+                    StaleProbeRecord(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                     g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                     Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -3518,7 +5033,7 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
                 if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
                     Log("[feed] frame %llu delivered (%ux%u, reset=%d, OpenGL transport)", fn, g.width, g.height, reset);
 
-                if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                if (WarmupRebuildDue(fn))
                 {
                     g.warmup_done = true;
                     g.frame_ready = false;
@@ -3634,11 +5149,16 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     // asynchronously; calling into NGX while the vtable is being patched has crashed the
     // process (EXEC at 0x0, sometimes fatally on a foreign thread). Hold EVERY build that
     // follows a runtime (re-)init until that settled.
-    const UINT work_w = ScaledExtent(cd.Width, g_cfg.work_resolution);
-    const UINT work_h = ScaledExtent(cd.Height, g_cfg.work_resolution);
+    // DLSS's dynamic render range starts at ceil(50%) of the output; the cost knob rounds
+    // DOWN to even, which at exactly 50% lands one pixel short and no preset covers it.
+    // Under work_upscale=2 round UP to even instead.
+    const bool sr_wanted = g_cfg.work_upscale == 2 && g_cfg.mode >= 2 && g_cfg.work_resolution < 100;
+    const UINT work_w = sr_wanted ? ScaledExtentUp(cd.Width,  g_cfg.work_resolution) : ScaledExtent(cd.Width,  g_cfg.work_resolution);
+    const UINT work_h = sr_wanted ? ScaledExtentUp(cd.Height, g_cfg.work_resolution) : ScaledExtent(cd.Height, g_cfg.work_resolution);
+    const bool want_sr = sr_wanted && (work_w != cd.Width || work_h != cd.Height);
     const bool needs_build11 = !g.frame_ready || work_w != g.width || work_h != g.height ||
                                cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height ||
-                               cd.Format != g.bb_fmt;
+                               cd.Format != g.bb_fmt || want_sr != g.sr_requested;
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
@@ -3663,6 +5183,13 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
 
     if (ok)
     {
+        // work_upscale=2: this frame's grid shift. The sequence restarts with the DLSS
+        // history so a reset frame is the unshifted one.
+        if (g.sr_active)
+        {
+            if (g.need_reset || g_cfg.reset_every) g.jitter_index = 0;
+            HaltonJitter(g.jitter_index, g.jitter_phases, &g.jitter_x, &g.jitter_y);
+        }
         Breadcrumb("preparing work-resolution inputs");
         ok = CopyOrResampleInputs(ctx, color, mv, depth, mask,
                                   nullptr,
@@ -3706,8 +5233,10 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 ep.pInDepth          = g.tex12[SLOT_DEPTH];
                 ep.pInMotionVectors  = g.tex12[SLOT_MV];
                 ep.pInBiasCurrentColorMask = g.mask_ok ? g.tex12[SLOT_MASK] : nullptr;   // the shader's validation mask
-                ep.InJitterOffsetX   = 0.0f;
-                ep.InJitterOffsetY   = 0.0f;
+                // Jitter in render-pixel units, as the SDK asks. Only the synthetic-jitter path
+                // ever has one; the sign is what jitter_sign is for (see the README).
+                ep.InJitterOffsetX   = g.sr_active ? static_cast<float>(g_cfg.jitter_sign) * g.jitter_x : 0.0f;
+                ep.InJitterOffsetY   = g.sr_active ? static_cast<float>(g_cfg.jitter_sign) * g.jitter_y : 0.0f;
                 ep.InRenderSubrectDimensions.Width  = g.width;
                 ep.InRenderSubrectDimensions.Height = g.height;
                 ep.InReset           = reset;
@@ -3751,14 +5280,16 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                     BlitOutputToBackbuffer(ctx, rtv11);
                     const UINT64 n = ++g.frames_done;
                     g.consecutive_fails = 0;
+                    if (g.sr_active) ++g.jitter_index;
                     if (n <= static_cast<UINT64>(g_cfg.log_frames) || (n % 1800) == 0)
-                        Log("[feed] frame %llu delivered (%ux%u at %d%% -> %ux%u, reset=%d)", n,
+                        Log("[feed] frame %llu delivered (%ux%u at %d%% -> %ux%u, reset=%d%s, jitter %+.3f,%+.3f)", n,
                             g.width, g.height, g_cfg.work_resolution,
-                            g.backbuffer_width, g.backbuffer_height, reset);
+                            g.backbuffer_width, g.backbuffer_height, reset,
+                            g.sr_active ? ", DLSS SR" : "", g.jitter_x, g.jitter_y);
 
                     // The DLSS 5 add-on sometimes latches STANDBY/FAILED on the very first create and only
                     // recovers on a fresh one; re-create once after the pipeline has settled.
-                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                    if (WarmupRebuildDue(n))
                     {
                         g.warmup_done = true;
                         g.frame_ready = false;
@@ -3779,9 +5310,9 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     TimingTick(t0.QuadPart, t1.QuadPart);
 }
 
-static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::command_list *cl,
+                              reshade::api::resource_view rtv)
 {
-    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
     switch (rt->get_device()->get_api())
     {
     case reshade::api::device_api::d3d11: FeedFrame11(rt, cl, rtv); break;
@@ -3792,9 +5323,85 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
     }
 }
 
+// The single entry point for every backend, and so the one place the whole feed is
+// serialized. Everything below this line assumes it owns the g struct, the allocator
+// ring and the shared textures for the duration of a frame -- true when Present is
+// the game's own render thread and nothing else, and false the moment a present-path
+// interposer joins in. See the Smooth Motion note above FeedEnter.
+static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+{
+    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
+
+    if (!FeedEnter()) return;   // logs the dropped call, with its thread id
+    FeedThreadTrace();
+    FeedFrameDispatch(rt, cl, rtv);
+    FeedLeave();
+}
+
 // ---------------------------------------------------------------------------
 // ReShade events
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Which effect runtime is ours? A process normally has one. NVIDIA Smooth Motion
+// (NvPresent64.dll) adds a second D3D11 device with an invisible proxy swapchain
+// ("InvisibleWindowClassNvPresent"), and ReShade dutifully creates a runtime on each --
+// the first gets ReShade.ini (the user's preset), the second ReShade2.ini. The old rule
+// here was "the last runtime to initialise is the one we feed", which under Smooth
+// Motion bound this add-on to whichever runtime came second, resolved DLSS5_Feed.fx as
+// MISSING there, and then ignored every render of the technique on the other runtime:
+// a healthy-looking log, no neural rendering at all (issue #1, Ghost Recon Breakpoint
+// and AC Syndicate). The rule now is "the runtime that RENDERS DLSS5_Feed is ours":
+// every runtime is tracked, technique handles are resolved per runtime, and
+// OnRenderTechnique adopts the runtime whose DLSS5_Feed pass is actually being drawn.
+// ---------------------------------------------------------------------------
+struct RuntimeSlot
+{
+    reshade::api::effect_runtime  *rt;
+    reshade::api::effect_technique technique;   // this runtime's DLSS5_Feed, or 0
+    void                          *dev;         // native device, for the log
+    char                           wclass[48];  // window class of the swapchain's HWND
+    bool                           proxy;       // Smooth Motion's invisible proxy swapchain
+};
+static RuntimeSlot g_runtimes[6];
+static int         g_runtime_count;
+static ULONGLONG   g_bound_last_render;   // GetTickCount64 of the bound runtime's last DLSS5_Feed render
+
+static RuntimeSlot *FindRuntime(reshade::api::effect_runtime *rt)
+{
+    for (int i = 0; i < g_runtime_count; ++i)
+        if (g_runtimes[i].rt == rt) return &g_runtimes[i];
+    return nullptr;
+}
+
+static RuntimeSlot *TrackRuntime(reshade::api::effect_runtime *rt)
+{
+    RuntimeSlot *s = FindRuntime(rt);
+    if (s == nullptr)
+    {
+        if (g_runtime_count == static_cast<int>(sizeof(g_runtimes) / sizeof(g_runtimes[0])))
+            --g_runtime_count;   // overflow: recycle the last slot rather than lose track
+        s = &g_runtimes[g_runtime_count++];
+        *s = {};
+        s->rt = rt;
+        // Identity, for the log: the game's swapchain and Smooth Motion's proxy are only
+        // distinguishable by their window class and device.
+        reshade::api::device *dev = rt->get_device();
+        s->dev = dev != nullptr ? reinterpret_cast<void *>(dev->get_native()) : nullptr;
+        HWND hwnd = static_cast<HWND>(rt->get_hwnd());
+        if (hwnd != nullptr && !GetClassNameA(hwnd, s->wclass, sizeof(s->wclass))) s->wclass[0] = '\0';
+        if (hwnd == nullptr) strcpy_s(s->wclass, "(no window)");
+        s->proxy = strstr(s->wclass, "NvPresent") != nullptr;
+    }
+    s->technique = rt->find_technique(kEffectFile, kTechnique);
+    return s;
+}
+
+static void UntrackRuntime(reshade::api::effect_runtime *rt)
+{
+    for (int i = 0; i < g_runtime_count; ++i)
+        if (g_runtimes[i].rt == rt) { g_runtimes[i] = g_runtimes[--g_runtime_count]; return; }
+}
 
 static void ResolveHandles(reshade::api::effect_runtime *rt)
 {
@@ -3844,8 +5451,10 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
                           (g.launchpad.handle ? 16 : 0) | (g.depth_reversed ? 32 : 0) | (provider_on ? 64 : 0) |
                           (mode << 7) | (other.handle ? 1024 : 0) | ((other_mode & 7) << 11) | (provider_broken ? 16384 : 0);
     static int last_signature = -1;
-    if (signature == last_signature) return;
+    static reshade::api::effect_runtime *last_rt = nullptr;
+    if (signature == last_signature && rt == last_rt) return;
     last_signature = signature;
+    last_rt = rt;
 
     _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> %s (%s)",
                 mode, kMvModeName[mode], provider,
@@ -3857,8 +5466,19 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
         g.mv_var.handle ? "found" : "MISSING",
         g.depth_var.handle ? "found" : "MISSING", g.mask_var.handle ? "found" : "absent (older shader: no bias mask)",
         g_mv_status, g.depth_reversed ? 1 : 0);
+    static bool effect_ever_ok = false;
+    if (g.handles_ok) effect_ever_ok = true;
     if (!g.handles_ok)
-        Warn("DLSS5_Feed.fx is not loaded (technique/textures missing) -- install it into reshade-shaders\\Shaders.");
+    {
+        // Once the effect has resolved in this process, a MISSING transition is just a
+        // reload in flight (games and add-ons can trigger those in bursts); re-warning
+        // every time filled both logs (Space Engineers). The state-change log line above
+        // still records each transition.
+        if (effect_ever_ok)
+            Log("[feed] DLSS5_Feed.fx handles gone during an effect reload; waiting for the recompile");
+        else
+            Warn("DLSS5_Feed.fx is not loaded (technique/textures missing) -- install it into reshade-shaders\\Shaders.");
+    }
     else if (g.launchpad.handle == 0)
         _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
                     "DLSS5_Feed.fx is compiled for motion-vector provider %d (%s) but no known %s shader is installed: motion vectors will be zero (still images only). "
@@ -3883,32 +5503,62 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
 
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
-    g.runtime = rt;
-    ResolveHandles(rt);
-    // A recreated runtime means the DLSS 5 add-on has re-armed its hooks on our private
-    // device: give it a fresh feature (a cheap feature-only re-create -- the textures stay).
-    // On the same-device D3D12 path its hooks live on the game's device and survive; the
-    // feature must NOT be touched (re-creating a live one is where the add-on crashes).
-    if (g.session_ready && g.dev12_owned) g.frame_ready = false;
+    RuntimeSlot *slot = TrackRuntime(rt);
+    static int inits = 0;
+    if (++inits <= 8)
+        Log("[feed] effect runtime %p initialised (device %p, window class '%s'%s; %d runtime%s in this process)",
+            (void *)rt, slot->dev, slot->wclass,
+            slot->proxy ? " -- NVIDIA Smooth Motion's proxy swapchain, not the game's" : "",
+            g_runtime_count, g_runtime_count == 1 ? "" : "s");
+    else if (inits == 9) Log("[feed] (further runtime init/destroy messages suppressed)");
+
+    // Bind: the first runtime, or a re-init of the bound one. Another runtime only takes
+    // over when the bound one has no DLSS5_Feed and this one does; otherwise it is
+    // tracked, and OnRenderTechnique adopts it the moment it renders the technique.
+    const bool rebind = g.runtime == nullptr || rt == g.runtime ||
+                        (g.technique.handle == 0 && slot->technique.handle != 0);
+    if (rebind)
+    {
+        if (g.runtime != nullptr && rt != g.runtime)
+            Log("[feed] effect runtime %p takes over from %p: it has DLSS5_Feed.fx, the bound one did not", (void *)rt, (void *)g.runtime);
+        g.runtime = rt;
+        ResolveHandles(rt);
+        // A recreated runtime means the DLSS 5 add-on has re-armed its hooks on our private
+        // device: give it a fresh feature (a cheap feature-only re-create -- the textures stay).
+        // On the same-device D3D12 path its hooks live on the game's device and survive; the
+        // feature must NOT be touched (re-creating a live one is where the add-on crashes).
+        if (g.session_ready && g.dev12_owned) g.frame_ready = false;
+    }
+    else if (inits <= 8)
+        Log("[feed] effect runtime %p not bound (%p stays bound%s); it takes over if it renders DLSS5_Feed",
+            (void *)rt, (void *)g.runtime, slot->technique.handle ? ", both have DLSS5_Feed.fx" : "");
+    // The driver injects NvPresent64.dll around swapchain creation, which can be after
+    // this add-on attached -- so this is the re-check DllMain's first look cannot be.
+    DetectSmoothMotion();
+    // Not in DllMain: this LoadLibrary()s, which under the loader lock can deadlock.
+    DetectStaleD3DCompiler();
     // Either way the add-on may be re-patching its NGX hooks right now: hold any upcoming
     // feature create for a fresh grace period.
     g.create_grace = 0;
-    static int inits = 0;
-    if (++inits <= 8) Log("[feed] effect runtime %p initialised", (void *)rt);
-    else if (inits == 9) Log("[feed] (further runtime init/destroy messages suppressed)");
 }
 
 static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 {
+    UntrackRuntime(rt);
     if (rt != g.runtime) return;
     static int destroys = 0;
     if (++destroys <= 8) Log("[feed] effect runtime %p destroyed", (void *)rt);
-    // D3D11 path: the DLSS 5 add-on re-arms its hooks with the runtime, so the feature is
-    // rebuilt anyway. Same-device D3D12: feature and textures live on the GAME's device and
-    // survive runtime churn -- keep them. Every feature create near a hook re-arm has been
-    // a crash risk (EXEC 0x0 inside the add-on, sometimes fatal on a foreign thread), so
-    // the fewer creates, the better.
-    if (g.dev12_owned) ReleaseFrameResources();
+    // Same-device D3D12: feature and textures live on the GAME's device and survive runtime
+    // churn -- keep them. D3D11 bridge: the shared textures live on the game's D3D11 device
+    // and our private D3D12 device, neither of which dies with the ReShade runtime -- keep
+    // them too, so the re-init goes through RecreateFeatureOnly (feature-only, keeps the old
+    // feature if the new create fails or crashes) instead of a full rebuild whose crashed
+    // create latched the feed off permanently (alt-tab, issue #25). Every feature create
+    // near a hook re-arm has been a crash risk (EXEC 0x0 inside the add-on, sometimes fatal
+    // on a foreign thread), so the fewer creates -- and the smaller each one -- the better.
+    // Vulkan/OpenGL transports keep their release: their game-side imports are tied to
+    // swapchain state that churns with the runtime.
+    if (g.dev12_owned && g.dev11 == nullptr) ReleaseFrameResources();
     g.runtime = nullptr;
     g.technique = {}; g.launchpad = {}; g.color_var = {}; g.mv_var = {}; g.depth_var = {}; g.mask_var = {};
     g.handles_ok = false;
@@ -3916,14 +5566,51 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 
 static void OnReloadedEffects(reshade::api::effect_runtime *rt)
 {
-    if (rt == g.runtime || g.runtime == nullptr) { g.runtime = rt; ResolveHandles(rt); }
+    RuntimeSlot *slot = TrackRuntime(rt);
+    if (rt == g.runtime || g.runtime == nullptr || (g.technique.handle == 0 && slot->technique.handle != 0))
+    {
+        if (g.runtime != nullptr && rt != g.runtime)
+            Log("[feed] effect runtime %p takes over from %p: its reload produced DLSS5_Feed.fx, the bound one has none", (void *)rt, (void *)g.runtime);
+        g.runtime = rt;
+        ResolveHandles(rt);
+        // A reload recompiles the MV provider, which writes zero vectors until its own
+        // history re-fills -- discard the DLSS history built on those frames instead of
+        // smearing it forward (Space Engineers reload bursts).
+        g.need_reset = true;
+    }
 }
 
 static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::effect_technique technique,
                               reshade::api::command_list *cl, reshade::api::resource_view rtv,
                               reshade::api::resource_view /*rtv_srgb*/)
 {
-    if (rt != g.runtime || g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    if (rt != g.runtime)
+    {
+        // Another runtime is rendering DLSS5_Feed. Adopt it -- unless the bound runtime
+        // rendered the technique within the last second, in which case both are drawing
+        // it (the same preset on the game's swapchain and Smooth Motion's proxy) and
+        // flip-flopping between two devices every frame would rebuild the session each
+        // time. The bound one keeps it then; the other is dropped, and says so once.
+        const RuntimeSlot *slot = FindRuntime(rt);
+        if (slot == nullptr || slot->technique.handle == 0 || technique.handle != slot->technique.handle) return;
+        const ULONGLONG now = GetTickCount64();
+        if (g.technique.handle != 0 && now - g_bound_last_render < 1000)
+        {
+            static int both = 0;
+            if (++both <= 3)
+                Log("[feed] effect runtime %p (window class '%s') also renders DLSS5_Feed; feeding %p only%s",
+                    (void *)rt, slot->wclass, (void *)g.runtime, both == 3 ? " (further notices suppressed)" : "");
+            return;
+        }
+        Log("[feed] binding to effect runtime %p (device %p, window class '%s'): it is the one rendering DLSS5_Feed; %p was bound",
+            (void *)rt, slot->dev, slot->wclass, (void *)g.runtime);
+        g.runtime = rt;
+        ResolveHandles(rt);
+        g.need_reset = true;
+        g.create_grace = 0;
+    }
+    if (g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    g_bound_last_render = GetTickCount64();
     FeedFrame(rt, cl, rtv);
 }
 
@@ -3983,21 +5670,57 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
 
     ImGui::Separator();
     ImGui::TextUnformatted("Status");
-    ImGui::Text("Session: %s", g.disabled ? "disabled (see dlss5-feed.log)" : g.session_ready ? "open" : "not started");
+    ImGui::Text("Session: %s", g.disabled ? "disabled" : g.session_ready ? "open" : "not started");
+    if (g.disabled && g_disable_why[0])
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "Stopped: %s", g_disable_why);
     ImGui::Text("Feature: %s", g.frame_ready ? "ready" : "not built");
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
-    ImGui::Text("DLSS 5 add-on: v%s (%s)", g_renodx_ver,
-                g_renodx_v46 ? "v4.6+ engine" : g_renodx_lazy ? "v45+ engine" : "classic engine");
-    if (g_toolkit_passes >= 2)
+    ImGui::Text("DLSS 5 add-on: %s%s (%s)", g_renodx_gen[0] != '\0' ? "" : "v",
+                g_renodx_gen[0] != '\0' ? g_renodx_gen : g_renodx_ver,
+                g_renodx_v47 ? "v4.7+ engine" : g_renodx_v46 ? "v4.6 engine"
+                             : g_renodx_lazy ? "v45+ engine" : "classic engine");
+    if (g_toolkit_inert)
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
+                           "Alex's Toolkit %s cannot attach to DLSS 5 add-on %s -- THE CASCADE IS DOING NOTHING.\n"
+                           "It only recognises the v4.55-era build (alexs-toolkit.log: \"Generic structural layout rejected\").\n"
+                           "Use the v4.55-era renodx-dlss5.addon64 for the cascade, or remove alexs-toolkit.addon64.",
+                           g_toolkit_ver, g_renodx_gen[0] != '\0' ? g_renodx_gen : g_renodx_ver);
+    else if (g_toolkit_passes >= 2)
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
                            "Alex's Toolkit %s: %d-pass cascade -- ~%dx temporal history (smearing, slow settle)",
                            g_toolkit_ver, g_toolkit_passes, g_toolkit_passes);
     else if (strcmp(g_toolkit_ver, "not found") != 0)
         ImGui::Text("Alex's Toolkit %s: present, cascade off (single pass)", g_toolkit_ver);
+    if (g_chicken_present)
+    {
+        const bool bad = g_chicken_abi && !DfcStateAvailable(g_chicken_state);
+        if (bad || g_renodx_present)
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "%s", g_chicken_status);
+        else
+            ImGui::TextUnformatted(g_chicken_status);
+        if (g_renodx_present)
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
+                               "renodx-dlss5.addon64 is ALSO present -- Chicken stays inert while both are loaded.\n"
+                               "Keep dlss5-feed.addon64, remove one neural provider, then fully restart.");
+    }
+    if (g_d3dcompiler_stale)
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
+                           "d3dcompiler_47.dll is too old for Shader Model 5.1 -- NEURAL RENDERING IS DOING NOTHING.\n"
+                           "The DLSS 5 add-on's neural pass is cs_5_1 and cannot compile against it (ReShade.log: "
+                           "\"error X3506: unrecognized compiler target 'cs_5_1'\").\n"
+                           "Delete or rename %s, then restart the game.", g_d3dcompiler_path);
+    if (g_smooth_motion)
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                           "NVIDIA Smooth Motion is active (NvPresent64.dll). It adds a proxy swapchain, so ReShade runs "
+                           "%d effect runtimes here; this add-on feeds the one rendering DLSS5_Feed (%p). "
+                           "If the image corrupts or flickers, disable it for this game's API only: "
+                           "Profile Inspector, \"Smooth Motion - Enabled APIs\" (1=DX12, 2=DX11, 4=Vulkan).",
+                           g_runtime_count, (void *)g.runtime);
     if (g.disabled && ImGui::Button("Re-enable"))
     {
         g.disabled = false;
         g.consecutive_fails = 0;
+        g_disable_why[0] = '\0';
         Log("[feed] re-enabled from the overlay");
     }
 
@@ -4023,6 +5746,27 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         else if (g.backbuffer_width != 0)
             ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
                                 g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
+
+        // work_upscale=2 (DLSS reconstruction on synthetic jitter) is deliberately NOT on the
+        // overlay: measured on Fable Anniversary it costs as much as 100% -- DLSS SR scales
+        // with the output size and the neural consumer runs on the resolved native output --
+        // and the image shimmers. It stays reachable from the cfg as the experiment it is.
+        bool fsr = g_cfg.work_upscale != 0;
+        if (ImGui::Checkbox("FSR 1 expand-back (EASU + RCAS)", &fsr)) { g_cfg.work_upscale = fsr ? 1 : 0; dirty = true; }
+        ImGui::SameLine(); HelpMarker("Replaces the bilinear stretch of the work-size output with AMD FSR 1 spatial "
+                                      "upscaling and RCAS sharpening: much crisper than the stretch at 50-75%. A better "
+                                      "filter for the cost knob above, not DLSS Quality: the result can never exceed "
+                                      "the native frame. At 100% only the sharpening runs.");
+        if (fsr)
+        {
+            ImGui::SliderFloat("Sharpness", &g_cfg.work_sharpness, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemDeactivatedAfterEdit()) dirty = true;
+        }
+        if (fsr && g.blit_vs != nullptr && !g.fsr_ok)
+            ImGui::TextDisabled("FSR 1 shaders failed to compile (see the log); the spatial expand-back stays bilinear.");
+        if (g_cfg.work_upscale == 2 && g.backbuffer_width != 0)
+            ImGui::TextDisabled("work_upscale=2 (cfg only): %s", g.sr_active ? "DLSS reconstruction active -- costs as much as 100%" :
+                                g.sr_requested ? "no DLSS preset covers this ratio; DLAA + FSR 1" : "DLAA + FSR 1");
     }
     else
     {
@@ -4068,7 +5812,7 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         if (ImGui::SliderInt("Create delay (frames)", &g_cfg.create_delay, 0, 300)) dirty = true;
         ImGui::SameLine(); HelpMarker("Frames to hold a feature (re)build after a runtime (re)init -- "
                                        "the DLSS 5 add-on arms its NGX hooks asynchronously.");
-        if (!g_renodx_lazy)
+        if (!g_renodx_lazy && !g_chicken_present)
         {
             if (ImGui::SliderInt("Warm-up rebuild (frames)", &g_cfg.warmup_rebuild, 0, 600)) dirty = true;
             ImGui::SameLine(); HelpMarker("Re-creates the feature once after N delivered frames -- works around "
@@ -4102,6 +5846,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_self = module;
         DisableThreadLibraryCalls(module);
         InitializeCriticalSection(&g_log_cs);
+        InitializeCriticalSection(&g_feed_cs);
         GetModuleFileNameA(module, g_log_path, MAX_PATH);
         if (char *s = strrchr(g_log_path, '\\'))
             strcpy_s(s + 1, MAX_PATH - (s + 1 - g_log_path), "dlss5-feed.log");
@@ -4120,6 +5865,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         CfgReload();
         DetectRenodxAddon();
         DetectToolkitAddon();
+        DetectChickenAddon(g_cfg.warmup_rebuild);   // after DetectRenodxAddon: it needs g_renodx_present
+        // Usually too early to see it (the driver injects it around swapchain creation);
+        // OnInitEffectRuntime re-checks. Worth one look here for the case where ReShade
+        // itself was loaded late.
+        DetectSmoothMotion();
 
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
