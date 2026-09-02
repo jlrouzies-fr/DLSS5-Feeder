@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <string>
+#pragma comment(lib, "d3d12.lib")
 
 #define ImTextureID ImU64   // required by reshade_overlay.hpp before including imgui.h
 #include <imgui.h>
@@ -58,7 +59,7 @@
 #include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 
-#define FEED_VERSION "0.12.0"
+#define FEED_VERSION "0.12.0-dx12-resolution-sharpness"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -820,7 +821,7 @@ struct Cfg
     int   log_frames;      // how many first frames get a full parameter dump in the log
     int   create_delay;    // frames to hold the FIRST feature create (the DLSS 5 add-on arms its NGX hooks asynchronously)
     int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer)
-    int   work_resolution; // 64-bit D3D11 only: 50..100 percent of each backbuffer axis
+    int   work_resolution; // D3D11/D3D12: 50..100 percent of each backbuffer axis
     int   work_upscale;    // how the work-size output is expanded back over the backbuffer:
                            // 0 = bilinear stretch, 1 = AMD FSR 1 (EASU + RCAS), 2 = DLSS
                            // Super Resolution fed with synthetic jitter (experimental: the
@@ -1019,7 +1020,7 @@ static bool ApplyPendingWorkResolution()
     if (next == g_cfg.work_resolution) return false;
     g_cfg.work_resolution = next;
     CfgSave();
-    Log("[feed] settled D3D11 work resolution=%d%%; rebuilding private resources", g_cfg.work_resolution);
+    Log("[feed] settled work resolution=%d%%; rebuilding private resources", g_cfg.work_resolution);
     return true;
 }
 
@@ -1222,6 +1223,17 @@ struct Feed
     UINT        width, height;                  // the work size: what DLSS renders from
     UINT        output_width, output_height;    // the Output texture: == work size (DLAA), or native (work_upscale=2)
     UINT        backbuffer_width, backbuffer_height;
+
+    // D3D12 adjustable work-resolution patch resources. Owned only by
+    // D3D12ResolutionPatch and released before tex12 resources are destroyed.
+    ID3D12Resource  *color_stage12;
+    ID3D12Resource  *mask_dummy12;
+    ID3D12DescriptorHeap *resample_heap12[Feed::kFrames];
+    ID3D12DescriptorHeap *upscale_rtv_heap12[Feed::kFrames];
+    ID3D12RootSignature *resample_root12;
+    ID3D12PipelineState *resample_pso12;
+    ID3D12PipelineState *upscale_pso12;
+    UINT resample_descriptor_size12;
 
     // work_upscale=2: DLSS Super Resolution on synthetic jitter (64-bit D3D11 only)
     bool        sr_requested;      // what the current build was asked for (rebuild when the cfg disagrees)
@@ -2046,12 +2058,22 @@ static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOU
 }
 
 // ---------------------------------------------------------------------------
+// D3D12 adjustable work-resolution patch (isolated module)
+// ---------------------------------------------------------------------------
+#include "dlss5-dx12-resolution-patch.h"
+#include "dlss5-d3d12-sharpness-patch.h"  // isolated D3D12 post-process sharpening
+
+// ---------------------------------------------------------------------------
 // Resources
 // ---------------------------------------------------------------------------
 
 static void ReleaseFrameResources()
 {
     DrainGpu();
+    // PATCH_INTEGRATION #1A: release D3D12 sharpness patch resources before tex12.
+    D3D12SharpnessPatch::Shutdown();
+    // PATCH_INTEGRATION #1B: release D3D12 work-resolution patch resources before tex12.
+    D3D12ResolutionPatch::Shutdown();
     // Vulkan transport: drop our raw VkImage imports (the memory is the D3D12 resource's;
     // freeing the import does not free the D3D12 resource, which SafeRelease(tex12) does).
     if (g.vk.ok)
@@ -2965,20 +2987,23 @@ static bool MakeTex12(int i, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, D3D12_RE
     return true;
 }
 
-static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
+static bool BuildResources12(UINT work_w, UINT work_h, UINT backbuffer_w, UINT backbuffer_h, DXGI_FORMAT bb_fmt)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
-        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
-        return RecreateFeatureOnly(w, h);
+        work_w == g.width && work_h == g.height && backbuffer_w == g.backbuffer_width &&
+        backbuffer_h == g.backbuffer_height && bb_fmt == g.bb_fmt)
+        return RecreateFeatureOnly(work_w, work_h);
 
     Breadcrumb("building same-device textures");
     ReleaseFrameResources();
 
-    g.width      = w;
-    g.height     = h;
+    g.width      = work_w;
+    g.height     = work_h;
+    g.backbuffer_width = backbuffer_w;
+    g.backbuffer_height = backbuffer_h;
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = TypedColorFormat(bb_fmt);
-    g.output_fmt = g.color_fmt;   // the copy home is a plain CopyResource; no blit on this path
+    g.output_fmt = g.color_fmt;
     g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
 
@@ -2994,11 +3019,34 @@ static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) == 0)
         Log("[feed] note: %s reports no typed UAV store on this GPU; the DLSS output may fail", FormatName(g.output_fmt));
 
-    // Rest states: Color sits as a shader resource, Output as a UAV. Every transition away
-    // and back goes through ReShade's own barrier API so its state tracking stays right.
-    if (!MakeTex12(SLOT_COLOR, w, h, g.color_fmt, false,
+    const bool scaled = work_w != backbuffer_w || work_h != backbuffer_h;
+    if (!MakeTex12(SLOT_COLOR, work_w, work_h, g.color_fmt, scaled,
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
-        !MakeTex12(SLOT_OUTPUT, w, h, g.output_fmt, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        !MakeTex12(SLOT_OUTPUT, work_w, work_h, g.output_fmt, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    {
+        ReleaseFrameResources();
+        return false;
+    }
+
+    if (scaled)
+    {
+        // PATCH_INTEGRATION #2: create the work-size guide textures + native staging copy.
+        if (!MakeTex12(SLOT_DEPTH, work_w, work_h, DXGI_FORMAT_R32_FLOAT, true,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
+            !MakeTex12(SLOT_MV, work_w, work_h, DXGI_FORMAT_R16G16_FLOAT, true,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
+            !MakeTex12(SLOT_MASK, work_w, work_h, DXGI_FORMAT_R8_UNORM, true,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
+            !D3D12ResolutionPatch::Create(backbuffer_w, backbuffer_h, work_w, work_h, bb_fmt))
+        {
+            ReleaseFrameResources();
+            return false;
+        }
+    }
+
+    // PATCH_INTEGRATION #2S: D3D12 sharpness is an independent post-process.
+    // It owns its resources and does not touch the D3D11 FSR1/RCAS path.
+    if (!D3D12SharpnessPatch::Create(backbuffer_w, backbuffer_h, g.color_fmt))
     {
         ReleaseFrameResources();
         return false;
@@ -3007,7 +3055,7 @@ static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
     bool crashed = false;
-    if (!CreateDlssFeature(w, h, inverted, &crashed))
+    if (!CreateDlssFeature(work_w, work_h, inverted, &crashed))
         return OnCreateFeatureFailed(crashed);
     return true;
 }
@@ -3990,7 +4038,17 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
 
+    const bool work_resolution_changed = ApplyPendingWorkResolution();
+    if (work_resolution_changed) {
+        // ApplyPendingWorkResolution() runs before this function's render-state logic.
+        // Reset the hook-arming grace exactly once for the settled resolution change.
+        g.create_grace = 0;
+        g.frame_ready = false;
+    }
     if ((g.frames_done % 60) == 0 && CfgReload()) g.frame_ready = false;
+    // Keep the D3D12 post-process value in an interlocked module-local copy.
+    // The ImGui/config path may update g_cfg independently of the render recording path.
+    D3D12SharpnessPatch::SetSharpness(g_cfg.work_sharpness);
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
 
     device *dev_api = rt->get_device();
@@ -4054,13 +4112,21 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
     }
     bool ok = g.session_ready || InitSession12(rt);
 
+    // PATCH_INTEGRATION #3: D3D12 work-resolution dimensions are separate from the native backbuffer.
+    // At 100% this evaluates to the original 0.12.0 path.
+    const UINT work_w = ScaledExtent(w, g_cfg.work_resolution);
+    const UINT work_h = ScaledExtent(h, g_cfg.work_resolution);
+
     // Same hook-arming grace as the D3D11 path: never call into NGX while the DLSS 5
     // add-on may still be patching its vtable (that has crashed the process at EXEC 0x0),
     // and it re-patches after every runtime recreation.
-    const bool needs_build12 = !g.frame_ready || w != g.width || h != g.height || cd.Format != g.bb_fmt;
-    // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
-    // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
-    // with it. Without this the second build races hooks that are only half in place.
+    const bool needs_build12 = !g.frame_ready || work_w != g.width || work_h != g.height ||
+                               w != g.backbuffer_width || h != g.backbuffer_height || cd.Format != g.bb_fmt;
+    // ApplyPendingWorkResolution() resets create_grace exactly once when the user
+    // settles a new resolution. Keep the original frame_ready guard here so the
+    // counter can advance during the grace period instead of being reset every frame.
+    // The previous crashfix3 changed this to `if (needs_build12)`, which caused an
+    // infinite "holding ... 60 frames" loop and made resolution appear stuck.
     if (g.frame_ready && needs_build12) g.create_grace = 0;
     // A classic (single hook pass) DLSS 5 add-on engine needs far longer than the default
     // 60 frames on the game's own device: Starfield lost the device with 60 and survived
@@ -4077,9 +4143,9 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
 
     if (ok && needs_build12)
     {
-        Log("[feed] building: %ux%u backbuffer %s (same-device D3D12, depth reversed=%d)", w, h,
-            FormatName(cd.Format), g.depth_reversed ? 1 : 0);
-        ok = BuildResources12(w, h, cd.Format);
+        Log("[feed] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer %s (same-device D3D12, depth reversed=%d)",
+            work_w, work_h, g_cfg.work_resolution, w, h, FormatName(cd.Format), g.depth_reversed ? 1 : 0);
+        ok = BuildResources12(work_w, work_h, w, h, cd.Format);
         if (!ok) FeedFail("resource build");
         else g.consecutive_fails = 0;
     }
@@ -4090,43 +4156,68 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
         const resource output12 = { reinterpret_cast<uint64_t>(g.tex12[SLOT_OUTPUT]) };
 
         // ReShade renders effects into the backbuffer, so its tracked state here is render_target.
-        Breadcrumb("copying the backbuffer (D3D12)");
+        Breadcrumb("preparing the backbuffer (D3D12)");
         {
-            const resource       res[2]  = { bb_res, color12 };
-            const resource_usage from[2] = { resource_usage::render_target, resource_usage::shader_resource };
-            const resource_usage to[2]   = { resource_usage::copy_source, resource_usage::copy_dest };
-            cl->barrier(2, res, from, to);
+            const resource       res[1]  = { bb_res };
+            const resource_usage from[1] = { resource_usage::render_target };
+            const resource_usage to[1]   = { resource_usage::copy_dest };
+            cl->barrier(1, res, from, to);
         }
-        cl->copy_resource(bb_res, color12);
 
         if (g_cfg.mode == 1)
         {
-            // Transport test: the copied frame goes straight back.
+            if (work_w == w && work_h == h)
             {
-                const resource       res[2]  = { bb_res, color12 };
-                const resource_usage from[2] = { resource_usage::copy_source, resource_usage::copy_dest };
-                const resource_usage to[2]   = { resource_usage::copy_dest, resource_usage::copy_source };
-                cl->barrier(2, res, from, to);
+                // Original transport test, recorded on the game's queue after ReShade flush.
+                g.rs_queue->flush_immediate_command_list();
+                bool done = false;
+                if (BeginCommands())
+                {
+                    Barrier(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    Barrier(g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                    g.list->CopyResource(g.tex12[SLOT_COLOR], bb);
+                    Barrier(g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    Barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                    EndCommands();
+                    done = true;
+                }
+                if (!done) FeedFail("command list");
             }
-            cl->copy_resource(color12, bb_res);
+            else
             {
-                const resource       res[2]  = { bb_res, color12 };
-                const resource_usage from[2] = { resource_usage::copy_dest, resource_usage::copy_source };
-                const resource_usage to[2]   = { resource_usage::render_target, resource_usage::shader_resource };
-                cl->barrier(2, res, from, to);
+                // PATCH_INTEGRATION #4a: scaled transport path.
+                g.rs_queue->flush_immediate_command_list();
+                bool done = false;
+                if (BeginCommands())
+                {
+                    done = D3D12ResolutionPatch::Resample(bb, mv, depth, g.mask_ok ? mask : nullptr, w, h);
+                    if (done)
+                    {
+                        Barrier(g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                        g.list->CopyResource(g.tex12[SLOT_OUTPUT], g.tex12[SLOT_COLOR]);
+                        Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        Barrier(g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        Barrier(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                        done = D3D12ResolutionPatch::Upscale(bb);
+                        Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        Barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+                    }
+                    if (done) EndCommands(); else AbortCommands();
+                }
+                if (!done) FeedFail("work-resolution transport test");
             }
             ++g.frames_done;
+            {
+                const resource       res[1]  = { bb_res };
+                const resource_usage from[1] = { resource_usage::copy_dest };
+                const resource_usage to[1]   = { resource_usage::render_target };
+                cl->barrier(1, res, from, to);
+            }
         }
         else
         {
-            // Park the backbuffer to receive the output; the copy becomes DLSS's colour input.
-            {
-                const resource       res[2]  = { bb_res, color12 };
-                const resource_usage from[2] = { resource_usage::copy_source, resource_usage::copy_dest };
-                const resource_usage to[2]   = { resource_usage::copy_dest, resource_usage::shader_resource };
-                cl->barrier(2, res, from, to);
-            }
-
             // Everything recorded so far (the motion-vector provider, the feed passes, these copies) goes to
             // the game's queue now; our evaluate follows it on the same queue.
             Breadcrumb("flushing ReShade's command list");
@@ -4139,7 +4230,25 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
                 g.need_reset = false;
 
-                // ReShade parked the effect textures as shader_resource (both SR states on D3D12).
+                // PATCH_INTEGRATION #4b: feed native or scaled inputs.
+                if (work_w == w && work_h == h)
+                {
+                    Barrier(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    Barrier(g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    g.list->CopyResource(g.tex12[SLOT_COLOR], bb);
+                    Barrier(g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    Barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                }
+                else if (!D3D12ResolutionPatch::Resample(bb, mv, depth, g.mask_ok ? mask : nullptr, w, h))
+                {
+                    AbortCommands();
+                    FeedFail("D3D12 work-resolution resample");
+                    g.frame_ready = false;
+                    QueryPerformanceCounter(&t1);
+                    TimingTick(t0.QuadPart, t1.QuadPart);
+                    return;
+                }
+
                 GuideProbeRecord(mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                  depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
@@ -4147,9 +4256,9 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
                 ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
                 ep.Feature.InSharpness = 0.0f;
-                ep.pInDepth          = depth;   // the effect textures themselves: zero-copy
-                ep.pInMotionVectors  = mv;
-                ep.pInBiasCurrentColorMask = g.mask_ok ? mask : nullptr;   // the shader's validation mask
+                ep.pInDepth          = (work_w == w && work_h == h) ? depth : g.tex12[SLOT_DEPTH];
+                ep.pInMotionVectors  = (work_w == w && work_h == h) ? mv : g.tex12[SLOT_MV];
+                ep.pInBiasCurrentColorMask = g.mask_ok ? ((work_w == w && work_h == h) ? mask : g.tex12[SLOT_MASK]) : nullptr;
                 ep.InJitterOffsetX   = 0.0f;
                 ep.InJitterOffsetY   = 0.0f;
                 ep.InRenderSubrectDimensions.Width  = g.width;
@@ -4163,40 +4272,62 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 Breadcrumb("running the same-device evaluate");
                 DWORD ecode = 0;
                 NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
-                if (ecode != 0)
-                    AbortCommands();  // never execute a list NGX crashed while recording
-                else
-                    EndCommands();
 
                 if (ecode != 0)
                 {
-                    Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
-                    FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
-                    g.frame_ready = false;
+                    AbortCommands();
                 }
                 else if (NVSDK_NGX_FAILED(re))
                 {
-                    Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
-                    FeedFail("evaluate");
-                    g.frame_ready = false;
+                    EndCommands();
+                }
+                else if (work_w == w && work_h == h)
+                {
+                    // No D3D12 FSR1 expand-back at 100%. Sharpness belongs to the
+                    // sub-native work-resolution path only, matching the upstream design.
+                    EndCommands();
+                    const resource       res[1]  = { output12 };
+                    const resource_usage from[1] = { resource_usage::unordered_access };
+                    const resource_usage to[1]   = { resource_usage::copy_source };
+                    cl->barrier(1, res, from, to);
+                    cl->copy_resource(output12, bb_res);
+                    const resource       res2[2]  = { bb_res, output12 };
+                    const resource_usage from2[2] = { resource_usage::copy_dest, resource_usage::copy_source };
+                    const resource_usage to2[2]   = { resource_usage::render_target, resource_usage::unordered_access };
+                    cl->barrier(2, res2, from2, to2);
+                    restored = true;
                 }
                 else
                 {
-                    // The copy home is recorded on the (fresh) immediate list: it executes on
-                    // the same queue after the evaluate, so no fence is needed.
+                    Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    Barrier(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    if (!D3D12ResolutionPatch::Upscale(bb))
                     {
-                        const resource       res[1]  = { output12 };
-                        const resource_usage from[1] = { resource_usage::unordered_access };
-                        const resource_usage to[1]   = { resource_usage::copy_source };
-                        cl->barrier(1, res, from, to);
+                        AbortCommands();
+                        FeedFail("D3D12 work-resolution upscale");
+                        g.frame_ready = false;
+                        QueryPerformanceCounter(&t1);
+                        TimingTick(t0.QuadPart, t1.QuadPart);
+                        return;
                     }
-                    cl->copy_resource(output12, bb_res);
+                    // PATCH_INTEGRATION #5B: sharpen the native-size expanded result.
+                    if (!D3D12SharpnessPatch::Sharpen(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, w, h))
                     {
-                        const resource       res[2]  = { bb_res, output12 };
-                        const resource_usage from[2] = { resource_usage::copy_dest, resource_usage::copy_source };
-                        const resource_usage to[2]   = { resource_usage::render_target, resource_usage::unordered_access };
-                        cl->barrier(2, res, from, to);
+                        AbortCommands();
+                        FeedFail("D3D12 sharpness");
+                        g.frame_ready = false;
+                        QueryPerformanceCounter(&t1);
+                        TimingTick(t0.QuadPart, t1.QuadPart);
+                        return;
                     }
+                    Barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+                    Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    EndCommands();
+                    // ReShade's state tracker still owns the backbuffer, so restore its expected state.
+                    const resource       res[1]  = { bb_res };
+                    const resource_usage from[1] = { resource_usage::copy_dest };
+                    const resource_usage to[1]   = { resource_usage::render_target };
+                    cl->barrier(1, res, from, to);
                     restored = true;
 
                     const UINT64 n = ++g.frames_done;
@@ -5729,6 +5860,9 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     static const char *kModes[] = { "Inert", "Transport test (no NGX)", "Full DLSS path" };
     if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) dirty = true;
     const bool adjustable_work_resolution = rt != nullptr &&
+        (rt->get_device()->get_api() == reshade::api::device_api::d3d11 ||
+         rt->get_device()->get_api() == reshade::api::device_api::d3d12);
+    const bool d3d11_work_upscale = rt != nullptr &&
         rt->get_device()->get_api() == reshade::api::device_api::d3d11;
     if (adjustable_work_resolution)
     {
@@ -5747,30 +5881,43 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
             ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
                                 g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
 
-        // work_upscale=2 (DLSS reconstruction on synthetic jitter) is deliberately NOT on the
-        // overlay: measured on Fable Anniversary it costs as much as 100% -- DLSS SR scales
-        // with the output size and the neural consumer runs on the resolved native output --
-        // and the image shimmers. It stays reachable from the cfg as the experiment it is.
-        bool fsr = g_cfg.work_upscale != 0;
-        if (ImGui::Checkbox("FSR 1 expand-back (EASU + RCAS)", &fsr)) { g_cfg.work_upscale = fsr ? 1 : 0; dirty = true; }
-        ImGui::SameLine(); HelpMarker("Replaces the bilinear stretch of the work-size output with AMD FSR 1 spatial "
-                                      "upscaling and RCAS sharpening: much crisper than the stretch at 50-75%. A better "
-                                      "filter for the cost knob above, not DLSS Quality: the result can never exceed "
-                                      "the native frame. At 100% only the sharpening runs.");
-        if (fsr)
+        if (d3d11_work_upscale)
         {
-            ImGui::SliderFloat("Sharpness", &g_cfg.work_sharpness, 0.0f, 1.0f, "%.2f");
-            if (ImGui::IsItemDeactivatedAfterEdit()) dirty = true;
+                    // work_upscale=2 (DLSS reconstruction on synthetic jitter) is deliberately NOT on the
+                    // overlay: measured on Fable Anniversary it costs as much as 100% -- DLSS SR scales
+                    // with the output size and the neural consumer runs on the resolved native output --
+                    // and the image shimmers. It stays reachable from the cfg as the experiment it is.
+                    bool fsr = g_cfg.work_upscale != 0;
+                    if (ImGui::Checkbox("FSR 1 expand-back (EASU + RCAS)", &fsr)) { g_cfg.work_upscale = fsr ? 1 : 0; dirty = true; }
+                    ImGui::SameLine(); HelpMarker("Replaces the bilinear stretch of the work-size output with AMD FSR 1 spatial "
+                                                  "upscaling and RCAS sharpening: much crisper than the stretch at 50-75%. A better "
+                                                  "filter for the cost knob above, not DLSS Quality: the result can never exceed "
+                                                  "the native frame. At 100% only the sharpening runs.");
+                    if (fsr)
+                    {
+                        ImGui::SliderFloat("Sharpness", &g_cfg.work_sharpness, 0.0f, 1.0f, "%.2f");
+                        if (ImGui::IsItemDeactivatedAfterEdit()) dirty = true;
+                    }
+                    if (fsr && g.blit_vs != nullptr && !g.fsr_ok)
+                        ImGui::TextDisabled("FSR 1 shaders failed to compile (see the log); the spatial expand-back stays bilinear.");
+                    if (g_cfg.work_upscale == 2 && g.backbuffer_width != 0)
+                        ImGui::TextDisabled("work_upscale=2 (cfg only): %s", g.sr_active ? "DLSS reconstruction active -- costs as much as 100%" :
+                                            g.sr_requested ? "no DLSS preset covers this ratio; DLAA + FSR 1" : "DLAA + FSR 1");
         }
-        if (fsr && g.blit_vs != nullptr && !g.fsr_ok)
-            ImGui::TextDisabled("FSR 1 shaders failed to compile (see the log); the spatial expand-back stays bilinear.");
-        if (g_cfg.work_upscale == 2 && g.backbuffer_width != 0)
-            ImGui::TextDisabled("work_upscale=2 (cfg only): %s", g.sr_active ? "DLSS reconstruction active -- costs as much as 100%" :
-                                g.sr_requested ? "no DLSS preset covers this ratio; DLAA + FSR 1" : "DLAA + FSR 1");
+
+        if (rt->get_device()->get_api() == reshade::api::device_api::d3d12)
+        {
+            ImGui::SliderFloat("Sharpness (D3D12 RCAS)", &g_cfg.work_sharpness, 0.0f, 1.0f, "%.2f");
+            D3D12SharpnessPatch::SetSharpness(g_cfg.work_sharpness);
+            if (ImGui::IsItemDeactivatedAfterEdit()) dirty = true;
+            ImGui::SameLine(); HelpMarker("AMD FSR1-style RCAS sharpening in the isolated D3D12 patch. "
+                                          "It runs after the D3D12 work-resolution expand-back. "
+                                          "It does not modify the D3D11 FSR1/RCAS path.");
+        }
     }
     else
     {
-        ImGui::TextDisabled("Work resolution: 100%% (adjustable path currently supports 64-bit D3D11)");
+        ImGui::TextDisabled("Work resolution: 100%% (adjustable only on D3D11/D3D12)");
     }
     static const char *kTri[] = { "Auto", "Force off", "Force on" };
     int hdr_idx = g_cfg.hdr + 1, di_idx = g_cfg.depth_inverted + 1;
