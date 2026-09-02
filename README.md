@@ -684,13 +684,15 @@ NGX and the DLSS 5 add-on only exist as x64 code, and a 32-bit process cannot lo
   transport, no protocol change), and while the cursor is over it the game's mouse and keys —
   read through ReShade's add-on API and blocked from the game — are posted to the host window as
   ordinary `WM_*` messages, which is where the host's ReShade reads its input.
-* Everything that means waiting on the host — spawning it, the handshake, and each build request —
+* Everything that means *waiting on* the host — spawning it, the handshake, and each build request —
   happens on a worker thread, and every pipe transfer has a deadline. The render thread hands a
-  build over and returns; the answer is picked up on a later frame. So starting the host (which can
-  take 15 s while it loads ReShade, NGX and the ~165 MB model), pressing **Apply**, restarting it,
-  changing resolution or moving the work-resolution slider all leave the game rendering at full rate
-  instead of freezing it. A host that *hangs* rather than dies no longer freezes the game either:
-  the transfer times out and the add-on treats it as a lost host.
+  build over and returns; the answer is picked up on a later frame. So the expensive part, a host
+  starting up (up to 15 s while it loads ReShade, NGX and the ~165 MB model) and every build after
+  a resolution or work-resolution change, no longer freezes the game at all. A host that *hangs*
+  rather than dies no longer freezes it either: the transfer times out and the add-on treats it as
+  a lost host. **Apply** and **Restart** still pause briefly — up to about four seconds — because
+  the old helper has to be given time to save its ReShade.ini before the replacement can claim the
+  pipe; the reconnect after it is free.
 * If the host process dies, the pipe breaks, the add-on notices and disables itself — the game keeps
   rendering normally.
 * Verified end to end with a deliberate split-screen test (`mode=1`): the host copies only the left
