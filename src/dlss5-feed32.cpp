@@ -248,7 +248,9 @@ struct Cfg
     int   host_window;     // 1 = show the host's window (it carries the DLSS 5 tuning panel: press Home there)
     int   work_resolution; // 50..100 percent of each backbuffer axis; the game stays native-sized
     int   work_upscale;    // expand-back of the work-size output: 0 = bilinear, 1 = AMD FSR 1
-                           // (EASU + RCAS). Same key and meaning as the 64-bit add-on (issue #34)
+                           // (EASU + RCAS), 2 = DLSS Super Resolution on synthetic jitter (D3D11
+                           // clients, IPC v6: the host creates an SR feature, the Output is native
+                           // size). Same key and meaning as the 64-bit add-on (issue #34)
     float work_sharpness;  // RCAS strength for work_upscale=1, 0 (off) .. 1 (sharpest)
     int   async_home;      // 1 = the copy home carries the PREVIOUS frame's output and waits on
                            // the fence value of the frame BEFORE this one, so the game's present
@@ -271,6 +273,34 @@ static UINT ScaledExtent(UINT native_extent, int percent)
     UINT extent = (native_extent * static_cast<UINT>(percent)) / 100u;
     extent &= ~1u;
     return extent >= 2u ? extent : 2u;
+}
+
+// Halton(2,3) low-discrepancy sequence, centred on the pixel: each value in [-0.5, 0.5).
+// Index 0 (and every wrap) is the unshifted sample, which is what a history reset starts from.
+static void HaltonJitter(UINT index, UINT phases, float *x, float *y)
+{
+    if (phases == 0) phases = 8;
+    const UINT k = index % phases;
+    if (k == 0) { *x = 0.0f; *y = 0.0f; return; }
+    float fx = 0.0f, inv = 0.5f;
+    for (UINT n = k; n != 0; n /= 2) { fx += inv * static_cast<float>(n % 2); inv *= 0.5f; }
+    float fy = 0.0f; inv = 1.0f / 3.0f;
+    for (UINT n = k; n != 0; n /= 3) { fy += inv * static_cast<float>(n % 3); inv /= 3.0f; }
+    *x = fx - 0.5f;
+    *y = fy - 0.5f;
+}
+
+static const char *SrQualityName(uint32_t q)
+{
+    switch (q)
+    {
+    case 0: return "Performance";       // NVSDK_NGX_PerfQuality_Value_MaxPerf
+    case 1: return "Balanced";
+    case 2: return "Quality";
+    case 3: return "Ultra Performance";
+    case 4: return "Ultra Quality";
+    default: return "?";
+    }
 }
 
 static void CfgPath(char *out)
@@ -376,7 +406,7 @@ static bool CfgReload()   // true when a build-affecting value changed
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
-    if (next.work_upscale < 0 || next.work_upscale > 1) next.work_upscale = g_cfg.work_upscale;
+    if (next.work_upscale < 0 || next.work_upscale > 2) next.work_upscale = g_cfg.work_upscale;
     if (next.work_sharpness < 0.0f || next.work_sharpness > 1.0f) next.work_sharpness = g_cfg.work_sharpness;
     const bool rebuild = next.mode != g_cfg.mode || next.hdr != g_cfg.hdr ||
                          next.depth_inverted != g_cfg.depth_inverted || next.flags != g_cfg.flags ||
@@ -539,6 +569,15 @@ struct Feed32
 
     bool        built;
     UINT        width, height;                  // the work resolution DLSS runs at
+    UINT        output_width, output_height;    // the Output slot: == work (DLAA) or native (work_upscale=2)
+    // work_upscale=2: DLSS Super Resolution on synthetic jitter (D3D11 client, IPC v6)
+    bool        sr_requested;      // what the current build asked the host for
+    bool        sr_active;         // the host created an SR feature (FEED_ACK_SR_ACTIVE)
+    bool        sr_unavailable;    // the host said no preset covers this ratio; cleared on a size change
+    uint32_t    sr_quality;        // the host's NVSDK_NGX_PerfQuality_Value
+    UINT        jitter_index;      // position in the Halton sequence, restarts with the DLSS history
+    UINT        jitter_phases;
+    float       jitter_x, jitter_y;   // this frame's grid shift, in work pixels
     UINT        backbuffer_width, backbuffer_height;
     DXGI_FORMAT bb_fmt, color_fmt, output_fmt;
     UINT64      frame_n;
@@ -1125,6 +1164,23 @@ static void LogHostNR(const char *what)
 
 static void HostClose();   // below
 
+// Close the helper and let the next frame respawn it (EnsureHost). This is the recovery
+// path when the host died, was never started, or latched off -- it writes no settings, so
+// it is the right button for any neural consumer, not just RenoDX. HostApplySettings below
+// repeats these steps rather than calling this, because it has to write the host's ini in
+// the middle of the sequence and the order there is load-bearing.
+static void HostRestart(const char *why)
+{
+    CaptureGameFocus();   // spent once the replacement host has connected
+    HostClose();          // drains the in-flight frame and releases the shared fences
+    g.built = false;
+    g.disabled = false;
+    g.consecutive_fails = 0;
+    g_retry_at = 0;
+    g_disable_why[0] = '\0';
+    Warn("%s -- restarting the host (up to 15 s)", why);
+}
+
 static void HostApplySettings()
 {
     LogHostNR("applying DLSS 5 host settings");
@@ -1186,6 +1242,8 @@ static void ReleaseShared()
         }
     }
     SafeRelease(g.output_srv);
+    g.sr_active = false;              // the next build decides again
+    g.output_width = g.output_height = 0;
     SafeRelease(g.color_stage_srv);
     SafeRelease(g.color_stage);
     SafeRelease(g.easu_srv);
@@ -1239,7 +1297,10 @@ static bool MakeBlitShaders()
         "Texture2D<float> src_depth : register(t2);\n"
         "SamplerState smp : register(s0);\n"
         "SamplerState point_smp : register(s1);\n"
-        "cbuffer ResampleConstants : register(b0) { float2 mv_scale; float2 _pad; };\n"
+        // jitter_uv: work_upscale=2 shifts the whole sampling grid by a sub-pixel amount
+        // each frame (the synthetic jitter DLSS reconstructs from); zero otherwise. The
+        // guides move with the colour so depth and vectors stay aligned with the sample.
+        "cbuffer ResampleConstants : register(b0) { float2 mv_scale; float2 jitter_uv; };\n"
         "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
         "VSOut vs(uint id : SV_VertexID) { VSOut o; float2 uv = float2((id << 1) & 2, id & 2);\n"
         "  o.uv = uv; o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
@@ -1247,10 +1308,10 @@ static bool MakeBlitShaders()
         // Motion vectors are in pixels, so they scale with the resolution ratio; depth is a
         // point sample (interpolating across a silhouette would invent geometry).
         "struct ResampleOut { float4 color : SV_Target0; float2 mv : SV_Target1; float depth : SV_Target2; };\n"
-        "ResampleOut ps_resample(VSOut i) { ResampleOut o;\n"
-        "  o.color = src_color.SampleLevel(smp, i.uv, 0);\n"
-        "  o.mv = src_mv.SampleLevel(point_smp, i.uv, 0) * mv_scale;\n"
-        "  o.depth = src_depth.SampleLevel(point_smp, i.uv, 0); return o; }\n";
+        "ResampleOut ps_resample(VSOut i) { ResampleOut o; float2 uv = i.uv + jitter_uv;\n"
+        "  o.color = src_color.SampleLevel(smp, uv, 0);\n"
+        "  o.mv = src_mv.SampleLevel(point_smp, uv, 0) * mv_scale;\n"
+        "  o.depth = src_depth.SampleLevel(point_smp, uv, 0); return o; }\n";
     HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
     auto compile = m != nullptr ? reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
     if (compile == nullptr) { Log("[feed32] d3dcompiler_47.dll unavailable"); return false; }
@@ -1335,11 +1396,24 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     const bool hdr      = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
 
+    // work_upscale=2: the Output is native-sized and the host creates a DLSS Super
+    // Resolution feature that expands the work-size frame itself (IPC v6). Not in the
+    // transport test (it copies Color -> Output, sizes must match), and not once the host
+    // has said no preset covers this ratio.
+    const bool want_sr = g_cfg.work_upscale == 2 && g_cfg.mode == 2 && !g.sr_unavailable &&
+                         (w != backbuffer_w || h != backbuffer_h);
+    g.sr_requested  = want_sr;
+    g.sr_active     = false;
+    g.output_width  = want_sr ? backbuffer_w : w;
+    g.output_height = want_sr ? backbuffer_h : h;
+    g.jitter_index  = 0;
+    g.jitter_x = g.jitter_y = 0.0f;
+
     if (!g.host_creates)
     {
         int failed = -1;
         if      (!MakeShared(FEED_COLOR,  w, h, g.color_fmt,              false, true))  failed = FEED_COLOR;
-        else if (!MakeShared(FEED_OUTPUT, w, h, g.output_fmt,             true,  false)) failed = FEED_OUTPUT;
+        else if (!MakeShared(FEED_OUTPUT, g.output_width, g.output_height, g.output_fmt, true, false)) failed = FEED_OUTPUT;
         else if (!MakeShared(FEED_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,    false, true))  failed = FEED_DEPTH;
         else if (!MakeShared(FEED_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false, true))  failed = FEED_MV;
         if (failed >= 0)
@@ -1378,6 +1452,7 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
+    if (want_sr) { b.target_width = g.output_width; b.target_height = g.output_height; }
     if (g.host_creates)
         b.client_flags = FEED_BUILD_HOST_CREATES | (g.no_uav ? FEED_BUILD_OUTPUT_NO_UAV : 0);
     else
@@ -1389,6 +1464,13 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     FeedBuildAck ack = {};
     if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
     { HostLost("build exchange failed"); return false; }
+    if (!ack.ok && (ack.flags & FEED_ACK_SR_UNAVAILABLE) != 0)
+    {
+        // The host found no DLSS preset for this ratio: build again as DLAA + FSR 1, once.
+        Log("[feed32] work_upscale=2: no DLSS preset covers %ux%u -> %ux%u; staying on DLAA + FSR 1 for this size", w, h, backbuffer_w, backbuffer_h);
+        g.sr_unavailable = true;
+        return BuildShared(w, h, backbuffer_w, backbuffer_h, bb_fmt);
+    }
     if (!ack.ok)
     {
         Log("[feed32] host build failed (ngx 0x%08X)", ack.ngx_result);
@@ -1509,6 +1591,17 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     Log("[feed32] shared set ready: %ux%u (%d%% of %ux%u) color fmt=%u output fmt=%u (host ngx 0x%08X, %s)",
         w, h, g_cfg.work_resolution, backbuffer_w, backbuffer_h,
         g.color_fmt, g.output_fmt, ack.ngx_result, g_cfg.mode == 1 ? "transport" : "DLSS");
+    if (want_sr && (ack.flags & FEED_ACK_SR_ACTIVE) != 0)
+    {
+        g.sr_active  = true;
+        g.sr_quality = ack.sr_quality;
+        const float ratio = static_cast<float>(backbuffer_w) / static_cast<float>(w);
+        g.jitter_phases = static_cast<UINT>(ceilf(8.0f * ratio * ratio));
+        Log("[feed32] work_upscale=2: DLSS %s, %ux%u -> %ux%u, Halton(2,3) over %u phases",
+            SrQualityName(g.sr_quality), w, h, backbuffer_w, backbuffer_h, g.jitter_phases);
+    }
+    else if (want_sr)
+        Log("[feed32] work_upscale=2 was asked for but the host built DLAA (an older host?); expand-back stays spatial");
     if (g.host_creates)
         Log("[feed32] the shared set is host-created and opened here%s", g.no_uav ? "; the DLSS output is copied into it host-side" : "");
     g.built      = true;
@@ -1836,9 +1929,12 @@ static bool CopyOrResampleInputs(ID3D11DeviceContext *ctx,
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(ctx->Map(g.resample_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
     { Log("[feed32] resample constant-buffer map failed"); return false; }
+    // A shift of j work pixels is j / work_size in uv, whatever the source size is.
     const float constants[4] = {
         static_cast<float>(g.width)  / static_cast<float>(source_w),
-        static_cast<float>(g.height) / static_cast<float>(source_h), 0.0f, 0.0f
+        static_cast<float>(g.height) / static_cast<float>(source_h),
+        g.sr_active ? g.jitter_x / static_cast<float>(g.width)  : 0.0f,
+        g.sr_active ? g.jitter_y / static_cast<float>(g.height) : 0.0f
     };
     memcpy(mapped.pData, constants, sizeof(constants));
     ctx->Unmap(g.resample_cb, 0);
@@ -1970,8 +2066,12 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->RSGetState(&old_rs);
     ctx->RSGetViewports(&nvp, &old_vp);
 
-    const bool scaled = g.width != g.backbuffer_width || g.height != g.backbuffer_height;
-    const bool fsr    = g_cfg.work_upscale == 1 && g.fsr_ok && g.easu_ps != nullptr;
+    // The Output is work-sized under DLAA and native-sized under work_upscale=2, where DLSS
+    // did the expanding and only the optional RCAS pass is left for us.
+    const UINT out_w = g.output_width  != 0 ? g.output_width  : g.width;
+    const UINT out_h = g.output_height != 0 ? g.output_height : g.height;
+    const bool scaled = out_w != g.backbuffer_width || out_h != g.backbuffer_height;
+    const bool fsr    = g_cfg.work_upscale != 0 && g.fsr_ok && g.easu_ps != nullptr;
     const bool easu   = fsr && scaled && g.easu_rtv != nullptr;
     const bool rcas   = fsr && g_cfg.work_sharpness > 0.0f && (easu || !scaled);   // RCAS reads at native texel indices
 
@@ -1990,7 +2090,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->PSSetSamplers(0, 1, smps);
     if (easu || rcas)
     {
-        UpdateFsrConstants(ctx, easu ? g.width : g.backbuffer_width, easu ? g.height : g.backbuffer_height);
+        UpdateFsrConstants(ctx, easu ? out_w : g.backbuffer_width, easu ? out_h : g.backbuffer_height);
         ctx->PSSetConstantBuffers(0, 1, &g.fsr_cb);
     }
 
@@ -2639,8 +2739,12 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
 
     const UINT work_w = ScaledExtent(cd.Width, g_cfg.work_resolution);
     const UINT work_h = ScaledExtent(cd.Height, g_cfg.work_resolution);
-    if (ok && (!g.built || work_w != g.width || work_h != g.height ||
-               cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height || cd.Format != g.bb_fmt))
+    const bool size_changed = work_w != g.width || work_h != g.height ||
+                              cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height;
+    if (size_changed) g.sr_unavailable = false;   // a new ratio deserves a new answer from the host
+    const bool want_sr = g_cfg.work_upscale == 2 && g_cfg.mode == 2 && !g.sr_unavailable &&
+                         (work_w != cd.Width || work_h != cd.Height);
+    if (ok && (!g.built || size_changed || cd.Format != g.bb_fmt || want_sr != g.sr_requested))
     {
         if (GetTickCount64() < g_retry_at)
             ok = false;                       // backing off after a failed build
@@ -2672,6 +2776,13 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
                 g.wait_n            = g.sent_n;
             }
 
+            // work_upscale=2: this frame's grid shift. The sequence restarts with the DLSS
+            // history so a reset frame is the unshifted one.
+            if (g.sr_active)
+            {
+                if (g.need_reset || g_cfg.reset_every) g.jitter_index = 0;
+                HaltonJitter(g.jitter_index, g.jitter_phases, &g.jitter_x, &g.jitter_y);
+            }
             Breadcrumb("preparing work-resolution inputs");
             if (!CopyOrResampleInputs(ctx, color, mv, depth,
                                       reinterpret_cast<ID3D11ShaderResourceView *>(mv_srv.handle),
@@ -2700,8 +2811,13 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
             g.ctx4->Signal(g.fence_in, n);
             ctx->Flush();
 
-            const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
-            if (!PipeWriteFrame(fm))
+            // Jitter sign: the shift was applied to the sampling grid, so a sample sits at
+            // pixel centre + jitter -- the convention the SDK's jitter offset describes.
+            const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset),
+                                      g.sr_active ? g.jitter_x : 0.0f, g.sr_active ? g.jitter_y : 0.0f };
+            const bool sent = PipeWriteFrame(fm);
+            if (sent && g.sr_active) ++g.jitter_index;
+            if (!sent)
                 HostLost("frame message failed");
             else if (async_home)
             {
@@ -3007,13 +3123,17 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
         const bool fsr_available = g.blit_vs == nullptr || g.fsr_ok;   // unknown until the shaders compile
         if (!fsr_available) ImGui::BeginDisabled();
-        bool fsr = g_cfg.work_upscale == 1;
-        if (ImGui::Checkbox("FSR 1 expand-back (EASU + RCAS)", &fsr)) { g_cfg.work_upscale = fsr ? 1 : 0; dirty = true; }
-        ImGui::SameLine(); HelpMarker("Replaces the bilinear stretch of the work-size output with AMD FSR 1 spatial "
-                                      "upscaling and RCAS sharpening. A better filter for the cost knob above, not DLSS "
-                                      "Quality: the result can never exceed the native frame. At 100% only the "
+        static const char *kUpscale[] = { "Bilinear stretch", "FSR 1 (EASU + RCAS)", "DLSS reconstruction (experimental)" };
+        if (ImGui::Combo("Expand-back", &g_cfg.work_upscale, kUpscale, 3)) dirty = true;
+        ImGui::SameLine(); HelpMarker("How the work-size result gets back to native size. FSR 1: AMD's spatial upscaler "
+                                      "plus RCAS sharpening, much crisper than the stretch at 50-75%. DLSS reconstruction: "
+                                      "the frame is downsampled with a different sub-pixel shift every frame and the "
+                                      "helper's DLSS Super Resolution rebuilds the native size from that history -- "
+                                      "near-native when still, but it leans on the estimated motion vectors far more "
+                                      "than DLAA does, so expect smear in motion. Neither is DLSS Quality: nothing here "
+                                      "can exceed the native frame the game already rendered. At 100% only the "
                                       "sharpening runs.");
-        if (fsr)
+        if (g_cfg.work_upscale != 0)
         {
             ImGui::SliderFloat("Sharpness", &g_cfg.work_sharpness, 0.0f, 1.0f, "%.2f");
             if (ImGui::IsItemDeactivatedAfterEdit()) dirty = true;
@@ -3021,7 +3141,17 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         if (!fsr_available)
         {
             ImGui::EndDisabled();
-            ImGui::TextDisabled("FSR 1 shaders failed to compile (see the log); expand-back stays bilinear.");
+            ImGui::TextDisabled("FSR 1 shaders failed to compile (see the log); the spatial expand-back stays bilinear.");
+        }
+        if (g_cfg.work_upscale == 2 && g.backbuffer_width != 0)
+        {
+            if (g.sr_active)
+                ImGui::TextDisabled("DLSS %s: %ux%u -> %ux%u, %u jitter phases", SrQualityName(g.sr_quality),
+                                    g.width, g.height, g.output_width, g.output_height, g.jitter_phases);
+            else if (g.sr_unavailable)
+                ImGui::TextDisabled("No DLSS preset covers this ratio; using DLAA + FSR 1 instead.");
+            else if (g_cfg.work_resolution >= 100)
+                ImGui::TextDisabled("Nothing to reconstruct at 100%%; lower the work resolution.");
         }
     }
 
@@ -3075,81 +3205,99 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         }
         else
             ImGui::TextDisabled("(host64\\deep-fried-chicken.cfg not readable yet)");
-        if (dirty) CfgSave();
-        return;
     }
+    else
+    {
+        ImGui::Separator();
+        ImGui::TextUnformatted("DLSS 5 neural-rendering settings (on the host)");
+        ImGui::SameLine();
+        HelpMarker("The same settings, in the same order, as the \"DLSS 5 Neural Rendering\" panel in "
+                   "the host window -- mirrored here so you do not have to alt-tab. They live in the "
+                   "host's own ReShade.ini, which it reads at startup, so applying them restarts the "
+                   "host. Settings you never touch here are left exactly as the add-on wrote them.");
 
+        // The overlay can be opened before the first effect-runtime resolve has loaded these.
+        if (!g_host_nr_loaded) { ReadHostNR(); g_host_nr_loaded = true; }
+
+        for (int i = 0; i < NR_COUNT; ++i)
+        {
+            if (i == NR_BRIDGE_FIRST)
+            {
+                ImGui::Spacing();
+                ImGui::TextDisabled("HDR color bridge (v4.7 and newer add-on builds)");
+            }
+            else if (i == NR_LEGACY_FIRST)
+            {
+                ImGui::Spacing();
+                ImGui::TextDisabled("Control-compatible color transfer (v4.6 and older; v4.7 replaced it above)");
+            }
+            else if (i == NR_GUIDE_FIRST)
+            {
+                ImGui::Spacing();
+                ImGui::TextDisabled("Guide overrides (leave at defaults unless diagnostics require them)");
+            }
+
+            const NRSetting &s = kNR[i];
+            bool edited = false;
+            if (s.kind == NR_BOOL)
+            {
+                bool b = g_nr[i] != 0.0f;
+                if (ImGui::Checkbox(s.label, &b)) { g_nr[i] = b ? 1.0f : 0.0f; edited = true; }
+            }
+            else if (s.kind == NR_COMBO)
+            {
+                int idx = static_cast<int>(g_nr[i]);
+                if (idx < 0 || idx >= s.item_count) idx = 0;   // a value the add-on could not have written
+                if (ImGui::Combo(s.label, &idx, s.items, s.item_count)) { g_nr[i] = static_cast<float>(idx); edited = true; }
+            }
+            else
+            {
+                if (ImGui::SliderFloat(s.label, &g_nr[i], s.lo, s.hi, s.format)) edited = true;
+            }
+            if (edited) g_nr_touched[i] = true;
+
+            if (s.tooltip != nullptr) { ImGui::SameLine(); HelpMarker(s.tooltip); }
+
+            // Flag a stored value the add-on's own widget could never produce (an older build of
+            // this panel wrote NRStyle=2 into a two-entry dropdown).
+            if (s.kind == NR_COMBO && (g_nr[i] < 0.0f || g_nr[i] >= static_cast<float>(s.item_count)))
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f),
+                                   "   stored value %d is out of range - pick one above to correct it",
+                                   static_cast<int>(g_nr[i]));
+            else if (!g_nr_present[i] && !g_nr_touched[i])
+                { ImGui::SameLine(); ImGui::TextDisabled("(add-on default)"); }
+        }
+
+        ImGui::Spacing();
+        if (ImGui::Button("Apply to the DLSS 5 host"))
+            HostApplySettings();
+        ImGui::SameLine();
+        if (ImGui::Button("Reload from host"))
+        {
+            ReadHostNR();
+            LogHostNR("host DLSS 5 settings reloaded from the overlay page");
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(applying restarts the helper process; up to 15 s without DLSS)");
+    }   // end of the RenoDX-only settings mirror
+
+    // Host process controls, both consumers. The helper is a separate process: it can die,
+    // be blocked at startup, or be shut down with the feed disabled, and then nothing on
+    // this page would bring it back. Under RenoDX this used to be reachable only as a side
+    // effect of "Apply to the DLSS 5 host".
     ImGui::Separator();
-    ImGui::TextUnformatted("DLSS 5 neural-rendering settings (on the host)");
+    ImGui::TextUnformatted("Host process");
+    if (ImGui::Button(HostAlive() ? "Restart the DLSS 5 host" : "Start the DLSS 5 host"))
+        HostRestart(HostAlive() ? "host restart requested from the overlay"
+                                : "host start requested from the overlay");
     ImGui::SameLine();
-    HelpMarker("The same settings, in the same order, as the \"DLSS 5 Neural Rendering\" panel in "
-               "the host window -- mirrored here so you do not have to alt-tab. They live in the "
-               "host's own ReShade.ini, which it reads at startup, so applying them restarts the "
-               "host. Settings you never touch here are left exactly as the add-on wrote them.");
-
-    // The overlay can be opened before the first effect-runtime resolve has loaded these.
-    if (!g_host_nr_loaded) { ReadHostNR(); g_host_nr_loaded = true; }
-
-    for (int i = 0; i < NR_COUNT; ++i)
-    {
-        if (i == NR_BRIDGE_FIRST)
-        {
-            ImGui::Spacing();
-            ImGui::TextDisabled("HDR color bridge (v4.7 and newer add-on builds)");
-        }
-        else if (i == NR_LEGACY_FIRST)
-        {
-            ImGui::Spacing();
-            ImGui::TextDisabled("Control-compatible color transfer (v4.6 and older; v4.7 replaced it above)");
-        }
-        else if (i == NR_GUIDE_FIRST)
-        {
-            ImGui::Spacing();
-            ImGui::TextDisabled("Guide overrides (leave at defaults unless diagnostics require them)");
-        }
-
-        const NRSetting &s = kNR[i];
-        bool edited = false;
-        if (s.kind == NR_BOOL)
-        {
-            bool b = g_nr[i] != 0.0f;
-            if (ImGui::Checkbox(s.label, &b)) { g_nr[i] = b ? 1.0f : 0.0f; edited = true; }
-        }
-        else if (s.kind == NR_COMBO)
-        {
-            int idx = static_cast<int>(g_nr[i]);
-            if (idx < 0 || idx >= s.item_count) idx = 0;   // a value the add-on could not have written
-            if (ImGui::Combo(s.label, &idx, s.items, s.item_count)) { g_nr[i] = static_cast<float>(idx); edited = true; }
-        }
-        else
-        {
-            if (ImGui::SliderFloat(s.label, &g_nr[i], s.lo, s.hi, s.format)) edited = true;
-        }
-        if (edited) g_nr_touched[i] = true;
-
-        if (s.tooltip != nullptr) { ImGui::SameLine(); HelpMarker(s.tooltip); }
-
-        // Flag a stored value the add-on's own widget could never produce (an older build of
-        // this panel wrote NRStyle=2 into a two-entry dropdown).
-        if (s.kind == NR_COMBO && (g_nr[i] < 0.0f || g_nr[i] >= static_cast<float>(s.item_count)))
-            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f),
-                               "   stored value %d is out of range - pick one above to correct it",
-                               static_cast<int>(g_nr[i]));
-        else if (!g_nr_present[i] && !g_nr_touched[i])
-            { ImGui::SameLine(); ImGui::TextDisabled("(add-on default)"); }
-    }
-
-    ImGui::Spacing();
-    if (ImGui::Button("Apply to the DLSS 5 host"))
-        HostApplySettings();
-    ImGui::SameLine();
-    if (ImGui::Button("Reload from host"))
-    {
-        ReadHostNR();
-        LogHostNR("host DLSS 5 settings reloaded from the overlay page");
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("(applying restarts the helper process; up to 15 s without DLSS)");
+    if (HostAlive())
+        ImGui::TextDisabled("(running -- restarting costs up to 15 s without DLSS)");
+    else
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                           "not running -- press this to start it again");
+    ImGui::TextDisabled("Its own log is host64\\dlss5-feed-host.log; the neural consumer's panel lives in "
+                        "its window (tick \"Show the DLSS 5 host window\" above, then press Home there).");
 
     if (dirty) CfgSave();
 }

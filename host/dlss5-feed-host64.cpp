@@ -579,7 +579,10 @@ struct Host
 
     ID3D12Resource *tex[FEED_SLOTS];
     ID3D12Resource *out_scratch;   // FEED_BUILD_OUTPUT_NO_UAV: NGX writes here; copied into the shared Output
-    UINT            width, height;
+    UINT            width, height;          // the work size: what DLSS renders from
+    UINT            out_width, out_height;  // the Output slot: == work (DLAA) or the native size (SR, v6)
+    int             sr_quality;             // NVSDK_NGX_PerfQuality_Value in use when out != work
+    const char     *sr_quality_name;
     DXGI_FORMAT     color_fmt, output_fmt;
 
     HANDLE          latency_wait;  // the disguise swapchain's frame-latency waitable object
@@ -1083,14 +1086,49 @@ static bool InitNgx()
     return true;
 }
 
-static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r)
+// work_upscale=2 (v6): find the DLSS quality preset whose dynamic render range contains
+// the work size for this output size. DLSS accepts any render size inside [min, max] of
+// the chosen preset. Fills h.sr_quality(_name); false when no preset covers the ratio.
+static bool PickSrQuality(UINT w, UINT h_, UINT out_w, UINT out_h)
 {
+    static const struct { NVSDK_NGX_PerfQuality_Value q; const char *name; } kOrder[] = {
+        { NVSDK_NGX_PerfQuality_Value_UltraQuality,     "Ultra Quality" },
+        { NVSDK_NGX_PerfQuality_Value_MaxQuality,       "Quality" },
+        { NVSDK_NGX_PerfQuality_Value_Balanced,         "Balanced" },
+        { NVSDK_NGX_PerfQuality_Value_MaxPerf,          "Performance" },
+        { NVSDK_NGX_PerfQuality_Value_UltraPerformance, "Ultra Performance" },
+    };
+    if (h.params == nullptr) return false;
+    for (const auto &o : kOrder)
+    {
+        unsigned opt_w = 0, opt_h = 0, max_w = 0, max_h = 0, min_w = 0, min_h = 0;
+        float sharp = 0.0f;
+        const NVSDK_NGX_Result r = NGX_DLSS_GET_OPTIMAL_SETTINGS(h.params, out_w, out_h, o.q,
+                                                                 &opt_w, &opt_h, &max_w, &max_h, &min_w, &min_h, &sharp);
+        if (NVSDK_NGX_FAILED(r) || opt_w == 0 || opt_h == 0) continue;   // preset not offered at this size
+        Log("[host] DLSS %s at %ux%u: optimal %ux%u, render range %ux%u .. %ux%u",
+            o.name, out_w, out_h, opt_w, opt_h, min_w, min_h, max_w, max_h);
+        if (w >= min_w && w <= max_w && h_ >= min_h && h_ <= max_h)
+        {
+            h.sr_quality      = static_cast<int>(o.q);
+            h.sr_quality_name = o.name;
+            return true;
+        }
+    }
+    return false;
+}
+
+// target 0 = DLAA (render == output). Otherwise DLSS Super Resolution at the preset
+// PickSrQuality chose; the caller made sure it did.
+static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r, UINT target_w = 0, UINT target_h = 0)
+{
+    const bool sr = target_w != 0 && target_h != 0 && (target_w != w || target_h != h_);
     NVSDK_NGX_DLSS_Create_Params cp = {};
     cp.Feature.InWidth            = w;
     cp.Feature.InHeight           = h_;
-    cp.Feature.InTargetWidth      = w;
-    cp.Feature.InTargetHeight     = h_;
-    cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+    cp.Feature.InTargetWidth      = sr ? target_w : w;
+    cp.Feature.InTargetHeight     = sr ? target_h : h_;
+    cp.Feature.InPerfQualityValue = sr ? static_cast<NVSDK_NGX_PerfQuality_Value>(h.sr_quality) : NVSDK_NGX_PerfQuality_Value_DLAA;
     cp.InFeatureCreateFlags       = flags;
     cp.InEnableOutputSubrects     = false;
 
@@ -1110,7 +1148,8 @@ static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r)
     if (!WaitFenceValue(h.fence, v, 4000)) { Log("[host] feature create did not complete"); return false; }
     if (NVSDK_NGX_FAILED(rf) || h.feature == nullptr)
     { Log("[host] CreateFeature failed 0x%08X (%s)", rf, NgxResultName(rf)); h.feature = nullptr; return false; }
-    Log("[host] feature ready: %ux%u DLAA flags=%d", w, h_, flags);
+    if (sr) Log("[host] feature ready: %ux%u -> %ux%u DLSS %s (synthetic jitter) flags=%d", w, h_, target_w, target_h, h.sr_quality_name, flags);
+    else    Log("[host] feature ready: %ux%u DLAA flags=%d", w, h_, flags);
     return true;
 }
 
@@ -1129,7 +1168,7 @@ static bool ReinitNgx()
 }
 
 static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resource *depth, ID3D12Resource *mv,
-                     UINT w, UINT h_, int reset, float mvsx, float mvsy)
+                     UINT w, UINT h_, int reset, float mvsx, float mvsy, float jitter_x = 0.0f, float jitter_y = 0.0f)
 {
     if (!BeginCommands()) return false;
 
@@ -1138,6 +1177,8 @@ static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resour
     ep.Feature.pInOutput = output;
     ep.pInDepth          = depth;
     ep.pInMotionVectors  = mv;
+    ep.InJitterOffsetX   = jitter_x;   // render-pixel units; the game's synthetic grid shift (v6), 0 under DLAA
+    ep.InJitterOffsetY   = jitter_y;
     ep.InRenderSubrectDimensions.Width  = w;
     ep.InRenderSubrectDimensions.Height = h_;
     ep.InReset           = reset;
@@ -1507,6 +1548,18 @@ static int Serve(DWORD game_pid)
             // the copy is Color -> Output on this side, so the two must stay equal.
             DXGI_FORMAT out_fmt = static_cast<DXGI_FORMAT>(b.output_fmt);
             if (host_creates_b && b.transport == 0) out_fmt = ResolveOutputFormatHost(out_fmt);
+            // v6: an Output larger than the work size means DLSS Super Resolution. Settle the
+            // preset before any texture exists, so a ratio no preset covers costs nothing.
+            const bool want_sr = b.target_width != 0 && b.target_height != 0 &&
+                                 (b.target_width != b.width || b.target_height != b.height) && b.transport == 0;
+            const UINT out_w = want_sr ? b.target_width : b.width, out_h = want_sr ? b.target_height : b.height;
+            bool sr_unavailable = false;
+            if (want_sr && !PickSrQuality(b.width, b.height, out_w, out_h))
+            {
+                Log("[host] work_upscale=2: no DLSS preset covers %ux%u -> %ux%u; telling the game to rebuild as DLAA", b.width, b.height, out_w, out_h);
+                sr_unavailable = true;
+                ok = false;
+            }
             if (host_creates_b)
             {
                 // OpenGL / Vulkan client: WE create, and duplicate the handles into the
@@ -1517,7 +1570,8 @@ static int Serve(DWORD game_pid)
                 for (int i = 0; i < FEED_SLOTS && ok; ++i)
                 {
                     HANDLE local = nullptr;
-                    h.tex[i] = MakeSharedTexHost(b.width, b.height, fmt[i], i == FEED_OUTPUT && !no_uav, &local, &tex_size[i],
+                    h.tex[i] = MakeSharedTexHost(i == FEED_OUTPUT ? out_w : b.width, i == FEED_OUTPUT ? out_h : b.height,
+                                                 fmt[i], i == FEED_OUTPUT && !no_uav, &local, &tex_size[i],
                                                  d3d11_opener && i != FEED_OUTPUT);
                     if (h.tex[i] == nullptr) { ok = false; break; }
                     HANDLE remote = nullptr;
@@ -1539,8 +1593,8 @@ static int Serve(DWORD game_pid)
                     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
                     D3D12_RESOURCE_DESC rd = {};
                     rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-                    rd.Width            = b.width;
-                    rd.Height           = b.height;
+                    rd.Width            = out_w;
+                    rd.Height           = out_h;
                     rd.DepthOrArraySize = 1;
                     rd.MipLevels        = 1;
                     rd.Format           = out_fmt;
@@ -1572,6 +1626,7 @@ static int Serve(DWORD game_pid)
             if (ok)
             {
                 h.width = b.width; h.height = b.height;
+                h.out_width = out_w; h.out_height = out_h;
                 h.color_fmt  = static_cast<DXGI_FORMAT>(b.color_fmt);
                 h.output_fmt = out_fmt;
                 mvsx = b.mv_scale_x; mvsy = b.mv_scale_y;
@@ -1590,14 +1645,14 @@ static int Serve(DWORD game_pid)
                 {
                     const UINT64 now = GetTickCount64();
                     if (now < hold_until) Sleep(static_cast<DWORD>(hold_until - now));  // hook-arming grace
-                    ok = CreateFeature(b.width, b.height, flags_active, &rf);
+                    ok = CreateFeature(b.width, b.height, flags_active, &rf, out_w, out_h);
                     hold_until = GetTickCount64() + 1000;   // next create not before +1 s
 
                     if (ok) build_fails = 0;
                     else if (++build_fails >= 2 && ReinitNgx())
                     {
                         Log("[host] retrying the create after an NGX reinit");
-                        ok = CreateFeature(b.width, b.height, flags_active, &rf);
+                        ok = CreateFeature(b.width, b.height, flags_active, &rf, out_w, out_h);
                         if (ok) build_fails = 0;
                     }
                 }
@@ -1611,6 +1666,8 @@ static int Serve(DWORD game_pid)
             FeedBuildAck back = {};
             back.ok         = ok ? 1 : 0;
             back.ngx_result = static_cast<uint32_t>(rf);
+            if (sr_unavailable)   back.flags |= FEED_ACK_SR_UNAVAILABLE;
+            else if (ok && want_sr) { back.flags |= FEED_ACK_SR_ACTIVE; back.sr_quality = static_cast<uint32_t>(h.sr_quality); }
             back.fence_in   = reinterpret_cast<uint64_t>(game_in);
             back.fence_out  = reinterpret_cast<uint64_t>(game_out);
             back.output_fmt = static_cast<uint32_t>(out_fmt);
@@ -1653,7 +1710,7 @@ static int Serve(DWORD game_pid)
             else
                 done = Evaluate(h.tex[FEED_COLOR], h.out_scratch != nullptr ? h.out_scratch : h.tex[FEED_OUTPUT],
                                 h.tex[FEED_DEPTH], h.tex[FEED_MV],
-                                h.width, h.height, fm.reset ? 1 : 0, mvsx, mvsy);
+                                h.width, h.height, fm.reset ? 1 : 0, mvsx, mvsy, fm.jitter_x, fm.jitter_y);
 
             if (done)
             {
@@ -1687,7 +1744,7 @@ static int Serve(DWORD game_pid)
                     NVSDK_NGX_Handle *old = h.feature;
                     h.feature = nullptr;
                     NVSDK_NGX_Result rr = NVSDK_NGX_Result_Fail;
-                    if (CreateFeature(h.width, h.height, flags_active, &rr)) SafeReleaseFeature(old);
+                    if (CreateFeature(h.width, h.height, flags_active, &rr, h.out_width, h.out_height)) SafeReleaseFeature(old);
                     else { h.feature = old; Log("[host] keeping the previous feature"); }
                 }
             }

@@ -46,6 +46,12 @@
 // cannot bind a UAV, and the DLSS output needs one) asks the host to create the set
 // instead, exactly as GL/Vulkan clients always have, and to keep the UAV on its own
 // side (the host evaluates into a private scratch and copies into the shared Output).
+// Version 6 added FeedBuild::target_width/height and FeedFrameMsg::jitter_x/y for
+// work_upscale=2 (issue #34): the game asks for a DLSS Super Resolution feature whose
+// output is the native size while the guides stay at the work size, and reports the
+// sub-pixel shift it applied to the downsample grid on every frame. The host answers
+// with FeedBuildAck::flags -- FEED_ACK_SR_UNAVAILABLE when no DLSS quality preset covers
+// the ratio, so the game rebuilds as plain DLAA -- and the preset it picked.
 //
 // Both sides refuse a version they do not understand rather than misparsing it: the
 // struct sizes differ between versions, so a mismatched pair would desync the pipe.
@@ -54,11 +60,16 @@
 #include <cstdint>
 
 #define FEED_IPC_MAGIC   0x35534C44u  // 'DLS5'
-#define FEED_IPC_VERSION 5u
+#define FEED_IPC_VERSION 6u
 
 // FeedBuild::client_flags (v5+)
 #define FEED_BUILD_HOST_CREATES  1u   // tex[] are zero: the host creates the shared set and answers with handles
 #define FEED_BUILD_OUTPUT_NO_UAV 2u   // the game's device cannot bind UAVs: share the Output without one
+
+// FeedBuildAck::flags (v6+)
+#define FEED_ACK_SR_ACTIVE       1u   // the feature is DLSS Super Resolution work -> target (sr_quality says which preset)
+#define FEED_ACK_SR_UNAVAILABLE  2u   // SR was asked for, no preset covers the ratio: the build failed on purpose,
+                                      // rebuild with target == work (DLAA)
 #define FEED_PIPE_FMT    "\\\\.\\pipe\\dlss5-feed.%lu"   // %lu = game PID
 
 // The bytes a version-1 client sends as its hello: magic, version, pid.
@@ -111,6 +122,9 @@ struct FeedBuild        // game -> host, on every resolution/format change
                                  // duplicates them out). GL/Vulkan clients: all zero -- the host
                                  // creates, and answers with its own handles.
     uint32_t client_flags;       // v5+: FEED_BUILD_* -- a D3D11 client can opt into host-created textures
+    uint32_t target_width, target_height;   // v6+: 0 = DLAA (target == width/height). Otherwise the Output
+                                            // slot is THIS size and the feature is DLSS Super Resolution
+                                            // (work_upscale=2); Color/Depth/MV stay at width/height.
 };
 
 struct FeedBuildAck     // host -> game
@@ -127,12 +141,16 @@ struct FeedBuildAck     // host -> game
                                  // FeedBuild::output_fmt: only the host's device can answer whether
                                  // a typed UAV store to B8G8R8A8 is supported, and where it is not
                                  // the output falls back to R8G8B8A8. Echoed for D3D11 clients too.
+    uint32_t flags;              // v6+: FEED_ACK_*
+    uint32_t sr_quality;         // v6+: NVSDK_NGX_PerfQuality_Value of an SR feature (FEED_ACK_SR_ACTIVE)
 };
 
 struct FeedFrameMsg     // game -> host, per frame
 {
     uint64_t n;                  // fence value for this frame
     uint32_t reset;              // 1 = reset temporal history
+    float    jitter_x, jitter_y; // v6+: the sub-pixel shift applied to this frame's downsample grid, in
+                                 // work pixels; 0 under DLAA. Handed to DLSS as the jitter offset.
 };
 
 #pragma pack(pop)
