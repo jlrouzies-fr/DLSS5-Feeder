@@ -275,6 +275,16 @@ static UINT ScaledExtent(UINT native_extent, int percent)
     return extent >= 2u ? extent : 2u;
 }
 
+// Same, rounding UP to even: what a DLSS Super Resolution build asks for, so the work
+// size never falls below the preset's minimum render size (ceil of 50% of the output).
+static UINT ScaledExtentUp(UINT native_extent, int percent)
+{
+    if (percent >= 100) return native_extent;
+    UINT extent = (native_extent * static_cast<UINT>(percent) + 99u) / 100u;
+    extent = (extent + 1u) & ~1u;
+    return extent < native_extent ? extent : native_extent;
+}
+
 // Halton(2,3) low-discrepancy sequence, centred on the pixel: each value in [-0.5, 0.5).
 // Index 0 (and every wrap) is the unshifted sample, which is what a history reset starts from.
 static void HaltonJitter(UINT index, UINT phases, float *x, float *y)
@@ -2737,13 +2747,19 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
         }
     }
 
-    const UINT work_w = ScaledExtent(cd.Width, g_cfg.work_resolution);
-    const UINT work_h = ScaledExtent(cd.Height, g_cfg.work_resolution);
+    // DLSS's dynamic render range starts at ceil(50%) of the output; the cost knob rounds
+    // DOWN to even, which at exactly 50% lands one pixel short (1788x1006 vs 1789x1007 on
+    // Fable) and no preset covers it. Under work_upscale=2 round UP to even instead.
+    // The rounding does not depend on the host's answer: a DLAA fallback at the rounded-up
+    // size is harmless, and rounding down again after "unavailable" would change the size,
+    // clear the latch, and rebuild forever.
+    const bool sr_wanted = g_cfg.work_upscale == 2 && g_cfg.mode == 2 && g_cfg.work_resolution < 100;
+    const UINT work_w = sr_wanted ? ScaledExtentUp(cd.Width,  g_cfg.work_resolution) : ScaledExtent(cd.Width,  g_cfg.work_resolution);
+    const UINT work_h = sr_wanted ? ScaledExtentUp(cd.Height, g_cfg.work_resolution) : ScaledExtent(cd.Height, g_cfg.work_resolution);
     const bool size_changed = work_w != g.width || work_h != g.height ||
                               cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height;
     if (size_changed) g.sr_unavailable = false;   // a new ratio deserves a new answer from the host
-    const bool want_sr = g_cfg.work_upscale == 2 && g_cfg.mode == 2 && !g.sr_unavailable &&
-                         (work_w != cd.Width || work_h != cd.Height);
+    const bool want_sr = sr_wanted && !g.sr_unavailable && (work_w != cd.Width || work_h != cd.Height);
     if (ok && (!g.built || size_changed || cd.Format != g.bb_fmt || want_sr != g.sr_requested))
     {
         if (GetTickCount64() < g_retry_at)

@@ -1297,6 +1297,16 @@ static UINT ScaledExtent(UINT native_extent, int percent)
     return extent >= 2u ? extent : 2u;
 }
 
+// Same, rounding UP to even: what a DLSS Super Resolution build asks for, so the work
+// size never falls below the preset's minimum render size (ceil of 50% of the output).
+static UINT ScaledExtentUp(UINT native_extent, int percent)
+{
+    if (percent >= 100) return native_extent;
+    UINT extent = (native_extent * static_cast<UINT>(percent) + 99u) / 100u;
+    extent = (extent + 1u) & ~1u;
+    return extent < native_extent ? extent : native_extent;
+}
+
 static const char *FormatName(DXGI_FORMAT f)
 {
     switch (f)
@@ -5139,9 +5149,13 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     // asynchronously; calling into NGX while the vtable is being patched has crashed the
     // process (EXEC at 0x0, sometimes fatally on a foreign thread). Hold EVERY build that
     // follows a runtime (re-)init until that settled.
-    const UINT work_w = ScaledExtent(cd.Width, g_cfg.work_resolution);
-    const UINT work_h = ScaledExtent(cd.Height, g_cfg.work_resolution);
-    const bool want_sr = g_cfg.work_upscale == 2 && g_cfg.mode >= 2 && (work_w != cd.Width || work_h != cd.Height);
+    // DLSS's dynamic render range starts at ceil(50%) of the output; the cost knob rounds
+    // DOWN to even, which at exactly 50% lands one pixel short and no preset covers it.
+    // Under work_upscale=2 round UP to even instead.
+    const bool sr_wanted = g_cfg.work_upscale == 2 && g_cfg.mode >= 2 && g_cfg.work_resolution < 100;
+    const UINT work_w = sr_wanted ? ScaledExtentUp(cd.Width,  g_cfg.work_resolution) : ScaledExtent(cd.Width,  g_cfg.work_resolution);
+    const UINT work_h = sr_wanted ? ScaledExtentUp(cd.Height, g_cfg.work_resolution) : ScaledExtent(cd.Height, g_cfg.work_resolution);
+    const bool want_sr = sr_wanted && (work_w != cd.Width || work_h != cd.Height);
     const bool needs_build11 = !g.frame_ready || work_w != g.width || work_h != g.height ||
                                cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height ||
                                cd.Format != g.bb_fmt || want_sr != g.sr_requested;
