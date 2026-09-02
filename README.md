@@ -604,8 +604,9 @@ the pixel is flagged in a `DLSS5_Mask` texture the add-on passes to DLSS as its
 * On a **64-bit D3D11 game** the optional **Work resolution** slider can run the private
   DLAA + Neural Rendering contract at 50–100% of each backbuffer axis. Color is resampled
   linearly; depth, motion vectors and the trust mask use point sampling; motion-vector
-  magnitudes are corrected for the selected work extent. The result is linearly expanded
-  back over the native-size backbuffer. At 100% this reduces to the original copy path.
+  magnitudes are corrected for the selected work extent. The result is expanded back over the
+  native-size backbuffer, bilinearly or (`work_upscale=1`) through AMD FSR 1 EASU + RCAS. At 100%
+  this reduces to the original copy path.
 * On a **D3D12 game** there is no transport at all: NGX runs on the game's own device and queue,
   motion vectors and depth are consumed zero-copy straight from the effect textures, and the feature
   survives alt-tabs and effect reloads untouched (only a real resolution change rebuilds).
@@ -777,7 +778,9 @@ if you prefer editing the file directly:
 | --- | --- | --- |
 | `enabled` | 1 | 0 disables everything. |
 | `mode` | 2 | 0 inert · 1 transport test (no NGX; on 32-bit it copies only the left half, so a split screen proves the round trip) · 2 full DLSS path. |
-| `work_resolution` | 100 | **64-bit D3D11 only.** 50–100% of each backbuffer axis for the private DLAA + Neural Rendering work textures. The Add-ons overlay slider applies once 400 ms after dragging stops. Other paths remain at 100%. A cost knob, not DLSS upscaling — below 100% the image is downsampled, processed, and expanded back (see the troubleshooting FAQ). |
+| `work_resolution` | 100 | **D3D11 only (64-bit and 32-bit).** 50–100% of each backbuffer axis for the private DLAA + Neural Rendering work textures. The Add-ons overlay slider applies once 400 ms after dragging stops. Other paths remain at 100%. A cost knob, not DLSS upscaling — below 100% the image is downsampled, processed, and expanded back (see the troubleshooting FAQ). |
+| `work_upscale` | 0 | **D3D11 only.** How the work-size output is expanded back over the backbuffer: `0` bilinear stretch · `1` AMD FSR 1 (EASU + RCAS), visibly crisper at 50–75% than the stretch. Also on the overlay as "FSR 1 expand-back". A better filter for `work_resolution`, not DLSS Quality: the result can never exceed the native frame. If the FSR shaders fail to compile the log says so and the blit stays bilinear. |
+| `work_sharpness` | 0.3 | RCAS strength for `work_upscale=1`, `0` (off) to `1` (sharpest). At 100% work resolution only the sharpening runs. Overlay slider "Sharpness". |
 | `hdr` | -1 | -1 auto (FP16 / R11G11B10 backbuffer = HDR), 0 force SDR, 1 force HDR. |
 | `depth_inverted` | -1 | -1 follow `RESHADE_DEPTH_INPUT_IS_REVERSED`, 0/1 force. |
 | `flags` | -1 | raw `DLSS.Feature.Create.Flags` override. |
@@ -910,11 +913,14 @@ Common cases:
   not as a future one either. Real DLSS upscaling needs the game to render *smaller* than the
   screen and jitter its camera, then hands DLSS that small frame; the feeder only ever sees the
   finished, screen-sized frame ReShade has, so it publishes a 1:1 DLAA contract by construction.
-  `work_resolution` (64-bit D3D11) is a **cost** knob: the frame is downsampled, DLAA + neural
+  `work_resolution` (D3D11) is a **cost** knob: the frame is downsampled, DLAA + neural
   rendering run on the smaller image, and the result is expanded back — that is why 50–66% looks
-  blurry rather than like DLSS Quality. Leave the DLSS 5 add-on's `NREnableUpscaling` at 0: with a
-  1:1 contract it cannot engage, and on v4.6 it parks neural rendering for the run. For games that
-  ship DLSS already, use the game's own DLSS (or OptiScaler) instead of this feeder.
+  blurry rather than like DLSS Quality. From 0.12.0 the expand-back can be AMD FSR 1 instead of a
+  bilinear stretch (`work_upscale=1`, or the "FSR 1 expand-back" checkbox under the slider): much
+  crisper at 50–75%, still bounded by the native frame. Leave the DLSS 5 add-on's
+  `NREnableUpscaling` at 0: with a 1:1 contract it cannot engage, and on v4.6 it parks neural
+  rendering for the run. For games that ship DLSS already, use the game's own DLSS (or OptiScaler)
+  instead of this feeder.
 * **32-bit game: `tex 1 CreateTexture2D failed 0x80070057`, `failure: shared build` forever** —
   the game's D3D11 device is feature level 10.x and cannot bind the UAV the DLSS output needs.
   From 0.11.0-beta.2 the helper creates the shared set instead (the log says `the host will
@@ -956,11 +962,12 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
 
 ## Limitations and roadmap
 
-* **DLAA contract, optional reduced work extent on 64-bit D3D11** — render resolution still
+* **DLAA contract, optional reduced work extent on D3D11** — render resolution still
   equals DLAA output resolution, but the private work extent can be 50–100% of the native
-  backbuffer and is spatially expanded afterward. D3D12, Vulkan, OpenGL and 32-bit paths remain at
-  100%. This is not jittered DLSS Super Resolution, and a Quality/Balanced/Performance mode cannot
-  be added: see the FAQ entry in [Logs and troubleshooting](#logs-and-troubleshooting).
+  backbuffer and is spatially expanded afterward (bilinear, or FSR 1 with `work_upscale=1`).
+  D3D12, Vulkan and OpenGL paths remain at 100%. This is not jittered DLSS Super Resolution, and a
+  Quality/Balanced/Performance mode cannot be added: see the FAQ entry in
+  [Logs and troubleshooting](#logs-and-troubleshooting).
 * Estimated motion vectors → temporal artifacts in fast motion; the UI is processed with the scene
   (a UI mask / pre-UI colour capture is future work).
 * **Geometry vectors are experimental and off.** The camera-model fit is derived from the provider's

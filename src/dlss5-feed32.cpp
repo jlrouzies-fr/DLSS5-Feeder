@@ -44,6 +44,7 @@
 
 #include "feed_ipc.h"
 #include "feed_fmt.h"  // the DXGI format decisions shared with the host
+#include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 #include "feed_gl.h"   // raw-OpenGL interop, the same header the 64-bit add-on uses
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
@@ -246,6 +247,9 @@ struct Cfg
     int   log_frames;
     int   host_window;     // 1 = show the host's window (it carries the DLSS 5 tuning panel: press Home there)
     int   work_resolution; // 50..100 percent of each backbuffer axis; the game stays native-sized
+    int   work_upscale;    // expand-back of the work-size output: 0 = bilinear, 1 = AMD FSR 1
+                           // (EASU + RCAS). Same key and meaning as the 64-bit add-on (issue #34)
+    float work_sharpness;  // RCAS strength for work_upscale=1, 0 (off) .. 1 (sharpest)
     int   async_home;      // 1 = the copy home carries the PREVIOUS frame's output and waits on
                            // the fence value of the frame BEFORE this one, so the game's present
                            // never waits on this frame's round trip through the host process.
@@ -255,7 +259,7 @@ struct Cfg
     float mv_scale_x, mv_scale_y;
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 1, 100, 1, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 1, 100, 0, 0.3f, 1, 1.0f, 1.0f };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -284,10 +288,10 @@ static void CfgWriteDefault()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nwork_resolution=%d\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+               "host_window=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.async_home,
-            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
+            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
 }
 
@@ -301,10 +305,10 @@ static void CfgSave()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nwork_resolution=%d\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+               "host_window=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.async_home,
-            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
+            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
 }
 
@@ -364,12 +368,16 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
         else if (_stricmp(key, "host_window")    == 0) next.host_window    = iv;
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
+        else if (_stricmp(key, "work_upscale")   == 0) next.work_upscale   = iv;
+        else if (_stricmp(key, "work_sharpness") == 0) next.work_sharpness = val;
         else if (_stricmp(key, "async_home")     == 0) next.async_home     = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
+    if (next.work_upscale < 0 || next.work_upscale > 1) next.work_upscale = g_cfg.work_upscale;
+    if (next.work_sharpness < 0.0f || next.work_sharpness > 1.0f) next.work_sharpness = g_cfg.work_sharpness;
     const bool rebuild = next.mode != g_cfg.mode || next.hdr != g_cfg.hdr ||
                          next.depth_inverted != g_cfg.depth_inverted || next.flags != g_cfg.flags ||
                          next.mv_scale_x != g_cfg.mv_scale_x || next.mv_scale_y != g_cfg.mv_scale_y;
@@ -377,8 +385,9 @@ static bool CfgReload()   // true when a build-affecting value changed
     if (changed)
     {
         g_cfg = next;
-        Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d",
-            g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every);
+        Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f",
+            g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
+            g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness);
     }
     return rebuild;
 }
@@ -489,6 +498,9 @@ struct Feed32
     ID3D11RenderTargetView   *input_rtv[FEED_SLOTS];  // work-resolution resample targets
     ID3D11Texture2D          *color_stage;            // native-size copy of the frame (the only SRV-able source)
     ID3D11ShaderResourceView *color_stage_srv;
+    ID3D11Texture2D          *easu_tex;               // work_upscale=1: native-size EASU result, RCAS reads it
+    ID3D11RenderTargetView   *easu_rtv;
+    ID3D11ShaderResourceView *easu_srv;
     ID3D11Fence     *fence_in;    // we signal        (D3D11 client)
     ID3D11Fence     *fence_out;   // host signals     (D3D11 client)
     HANDLE           fence_in_handle, fence_out_handle;   // GL client: kept for the GL import
@@ -548,6 +560,14 @@ struct Feed32
     ID3D11SamplerState *blit_sampler;
     ID3D11SamplerState *point_sampler;
     ID3D11Buffer       *resample_cb;
+
+    // work_upscale=1 (feed_fsr1.h). Optional: when the compile fails the blit stays bilinear.
+    ID3D11PixelShader  *easu_ps;
+    ID3D11PixelShader  *rcas_ps;
+    ID3D11Buffer       *fsr_cb;
+    bool   fsr_ok;
+    UINT   fsr_in_w, fsr_in_h, fsr_out_w, fsr_out_h;   // what fsr_cb currently describes
+    float  fsr_sharpness;
 
     UINT64   frames_done;
     LONGLONG qpf, cpu_ticks, span_start;
@@ -1168,6 +1188,9 @@ static void ReleaseShared()
     SafeRelease(g.output_srv);
     SafeRelease(g.color_stage_srv);
     SafeRelease(g.color_stage);
+    SafeRelease(g.easu_srv);
+    SafeRelease(g.easu_rtv);
+    SafeRelease(g.easu_tex);
     for (int i = 0; i < FEED_SLOTS; ++i)
     {
         SafeRelease(g.input_rtv[i]);
@@ -1271,6 +1294,26 @@ static bool MakeBlitShaders()
     cbd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(g.dev->CreateBuffer(&cbd, nullptr, &g.resample_cb))) { Log("[feed32] resample constant buffer failed"); return false; }
+
+    // FSR 1 is optional: a failure here only pins work_upscale to the bilinear path.
+    // ps_4_0 on purpose -- the source uses integer Loads only, so feature level 10 is enough.
+    ID3DBlob *easu = nullptr, *rcas = nullptr;
+    hr = compile(kFsr1Src, sizeof(kFsr1Src) - 1, "feedfsr1", nullptr, nullptr, "ps_easu", "ps_4_0", 0, 0, &easu, &err);
+    if (SUCCEEDED(hr)) { SafeRelease(err); hr = compile(kFsr1Src, sizeof(kFsr1Src) - 1, "feedfsr1", nullptr, nullptr, "ps_rcas", "ps_4_0", 0, 0, &rcas, &err); }
+    if (SUCCEEDED(hr)) hr = g.dev->CreatePixelShader(easu->GetBufferPointer(), easu->GetBufferSize(), nullptr, &g.easu_ps);
+    if (SUCCEEDED(hr)) hr = g.dev->CreatePixelShader(rcas->GetBufferPointer(), rcas->GetBufferSize(), nullptr, &g.rcas_ps);
+    if (SUCCEEDED(hr)) { cbd.ByteWidth = sizeof(FsrConstants); hr = g.dev->CreateBuffer(&cbd, nullptr, &g.fsr_cb); }
+    g.fsr_ok = SUCCEEDED(hr);
+    if (!g.fsr_ok)
+    {
+        Log("[feed32] fsr1 shaders: failed 0x%08X: %s -- work_upscale=1 falls back to bilinear", hr,
+            err ? (const char *)err->GetBufferPointer() : "");
+        SafeRelease(g.easu_ps); SafeRelease(g.rcas_ps); SafeRelease(g.fsr_cb);
+    }
+    else Log("[feed32] fsr1 shaders: ok (EASU + RCAS expand-back available)");
+    SafeRelease(err); SafeRelease(easu); SafeRelease(rcas);
+    g.fsr_in_w = g.fsr_in_h = g.fsr_out_w = g.fsr_out_h = 0;
+    g.fsr_sharpness = -1.0f;
     return true;
 }
 
@@ -1427,6 +1470,27 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         { Log("[feed32] work-resolution staging SRV failed"); ReleaseShared(); return false; }
 
         Log("[feed32] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
+
+        // work_upscale=1 needs somewhere native-sized for EASU to write and RCAS to read.
+        // Created regardless of the current setting so toggling it later is free.
+        D3D11_TEXTURE2D_DESC ed = sd;
+        ed.Format    = g.output_fmt;
+        ed.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        if (SUCCEEDED(g.dev->CreateTexture2D(&ed, nullptr, &g.easu_tex)))
+        {
+            D3D11_RENDER_TARGET_VIEW_DESC rv = {};
+            rv.Format = g.output_fmt;
+            rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            D3D11_SHADER_RESOURCE_VIEW_DESC es = {};
+            es.Format              = g.output_fmt;
+            es.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+            es.Texture2D.MipLevels = 1;
+            if (FAILED(g.dev->CreateRenderTargetView(g.easu_tex, &rv, &g.easu_rtv)) ||
+                FAILED(g.dev->CreateShaderResourceView(g.easu_tex, &es, &g.easu_srv)))
+            { SafeRelease(g.easu_rtv); SafeRelease(g.easu_srv); SafeRelease(g.easu_tex); }
+        }
+        if (g.easu_tex == nullptr)
+            Log("[feed32] fsr1 intermediate (%ux%u fmt=%u) failed; work_upscale=1 falls back to bilinear", backbuffer_w, backbuffer_h, g.output_fmt);
     }
 
     if (g.fence_in == nullptr || g.fence_out == nullptr)
@@ -1858,6 +1922,26 @@ static bool CopyOrResampleInputs(ID3D11DeviceContext *ctx,
 // Copy-back blit (verbatim from the 64-bit add-on)
 // ---------------------------------------------------------------------------
 
+// Refill the FSR constant buffer when the sizes or the sharpness it describes changed.
+static void UpdateFsrConstants(ID3D11DeviceContext *ctx, UINT in_w, UINT in_h)
+{
+    if (in_w == g.fsr_in_w && in_h == g.fsr_in_h && g.backbuffer_width == g.fsr_out_w &&
+        g.backbuffer_height == g.fsr_out_h && g_cfg.work_sharpness == g.fsr_sharpness) return;
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(ctx->Map(g.fsr_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return;
+    FsrFillConstants(static_cast<FsrConstants *>(mapped.pData), in_w, in_h,
+                     g.backbuffer_width, g.backbuffer_height, g_cfg.work_sharpness);
+    ctx->Unmap(g.fsr_cb, 0);
+    g.fsr_in_w = in_w; g.fsr_in_h = in_h;
+    g.fsr_out_w = g.backbuffer_width; g.fsr_out_h = g.backbuffer_height;
+    g.fsr_sharpness = g_cfg.work_sharpness;
+}
+
+// Expands the work-size Output over the native backbuffer. work_upscale=0: one bilinear
+// draw (at 100% every tap lands on a texel centre, so it is a copy). work_upscale=1: EASU
+// upsamples into easu_tex and RCAS sharpens from there into the backbuffer; at 100% EASU
+// has nothing to do and RCAS runs alone straight from the Output; with sharpness 0 EASU
+// writes the backbuffer directly. Either way the game and ReShade never see a size change.
 static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv)
 {
     ID3D11RenderTargetView   *old_rtv = nullptr;
@@ -1866,6 +1950,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ID3D11PixelShader        *old_ps  = nullptr;
     ID3D11ShaderResourceView *old_srv = nullptr;
     ID3D11SamplerState       *old_smp = nullptr;
+    ID3D11Buffer             *old_cb  = nullptr;
     ID3D11InputLayout        *old_il  = nullptr;
     ID3D11BlendState         *old_bs  = nullptr; FLOAT old_bf[4]; UINT old_mask = 0;
     ID3D11DepthStencilState  *old_ds  = nullptr; UINT old_sref = 0;
@@ -1877,6 +1962,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->PSGetShader(&old_ps, nullptr, nullptr);
     ctx->PSGetShaderResources(0, 1, &old_srv);
     ctx->PSGetSamplers(0, 1, &old_smp);
+    ctx->PSGetConstantBuffers(0, 1, &old_cb);
     ctx->IAGetInputLayout(&old_il);
     ctx->IAGetPrimitiveTopology(&old_topo);
     ctx->OMGetBlendState(&old_bs, old_bf, &old_mask);
@@ -1884,14 +1970,16 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->RSGetState(&old_rs);
     ctx->RSGetViewports(&nvp, &old_vp);
 
+    const bool scaled = g.width != g.backbuffer_width || g.height != g.backbuffer_height;
+    const bool fsr    = g_cfg.work_upscale == 1 && g.fsr_ok && g.easu_ps != nullptr;
+    const bool easu   = fsr && scaled && g.easu_rtv != nullptr;
+    const bool rcas   = fsr && g_cfg.work_sharpness > 0.0f && (easu || !scaled);   // RCAS reads at native texel indices
+
     D3D11_VIEWPORT vp = {};
     vp.Width    = static_cast<float>(g.backbuffer_width);
     vp.Height   = static_cast<float>(g.backbuffer_height);
     vp.MaxDepth = 1.0f;
-    ID3D11RenderTargetView *rtvs[] = { rtv };
-    ID3D11ShaderResourceView *srvs[] = { g.output_srv };
     ID3D11SamplerState *smps[] = { g.blit_sampler };
-    ctx->OMSetRenderTargets(1, rtvs, nullptr);
     ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     ctx->OMSetDepthStencilState(nullptr, 0);
     ctx->RSSetState(nullptr);
@@ -1899,10 +1987,33 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->IASetInputLayout(nullptr);
     ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ctx->VSSetShader(g.blit_vs, nullptr, 0);
-    ctx->PSSetShader(g.blit_ps, nullptr, 0);
-    ctx->PSSetShaderResources(0, 1, srvs);
     ctx->PSSetSamplers(0, 1, smps);
-    ctx->Draw(3, 0);
+    if (easu || rcas)
+    {
+        UpdateFsrConstants(ctx, easu ? g.width : g.backbuffer_width, easu ? g.height : g.backbuffer_height);
+        ctx->PSSetConstantBuffers(0, 1, &g.fsr_cb);
+    }
+
+    ID3D11ShaderResourceView *src = g.output_srv;
+    if (easu)
+    {
+        ID3D11RenderTargetView *target[] = { rcas ? g.easu_rtv : rtv };
+        ctx->OMSetRenderTargets(1, target, nullptr);
+        ctx->PSSetShader(g.easu_ps, nullptr, 0);
+        ctx->PSSetShaderResources(0, 1, &src);
+        ctx->Draw(3, 0);
+        src = g.easu_srv;
+    }
+    if (rcas || !easu)
+    {
+        ID3D11ShaderResourceView *unbind = nullptr;
+        ctx->PSSetShaderResources(0, 1, &unbind);      // easu_tex leaves the OM before it enters the PS
+        ID3D11RenderTargetView *target[] = { rtv };
+        ctx->OMSetRenderTargets(1, target, nullptr);
+        ctx->PSSetShader(rcas ? g.rcas_ps : g.blit_ps, nullptr, 0);
+        ctx->PSSetShaderResources(0, 1, &src);
+        ctx->Draw(3, 0);
+    }
 
     ID3D11ShaderResourceView *no_srv = nullptr;
     ctx->PSSetShaderResources(0, 1, &no_srv);
@@ -1911,6 +2022,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->PSSetShader(old_ps, nullptr, 0);
     ctx->PSSetShaderResources(0, 1, &old_srv);
     ctx->PSSetSamplers(0, 1, &old_smp);
+    ctx->PSSetConstantBuffers(0, 1, &old_cb);
     ctx->IASetInputLayout(old_il);
     ctx->IASetPrimitiveTopology(old_topo);
     ctx->OMSetBlendState(old_bs, old_bf, old_mask);
@@ -1918,7 +2030,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->RSSetState(old_rs);
     if (nvp) ctx->RSSetViewports(1, &old_vp);
     SafeRelease(old_rtv); SafeRelease(old_dsv); SafeRelease(old_vs); SafeRelease(old_ps); SafeRelease(old_srv);
-    SafeRelease(old_smp); SafeRelease(old_il); SafeRelease(old_bs); SafeRelease(old_ds); SafeRelease(old_rs);
+    SafeRelease(old_smp); SafeRelease(old_cb); SafeRelease(old_il); SafeRelease(old_bs); SafeRelease(old_ds); SafeRelease(old_rs);
 }
 
 // ---------------------------------------------------------------------------
@@ -2793,7 +2905,14 @@ static void OnDestroyDevice(reshade::api::device *dev)
     SafeRelease(g.ctx4);
     SafeRelease(g.blit_vs);
     SafeRelease(g.blit_ps);
+    SafeRelease(g.resample_ps);
     SafeRelease(g.blit_sampler);
+    SafeRelease(g.point_sampler);
+    SafeRelease(g.resample_cb);
+    SafeRelease(g.easu_ps);
+    SafeRelease(g.rcas_ps);
+    SafeRelease(g.fsr_cb);
+    g.fsr_ok = false;
     g.dev = nullptr;
 }
 
@@ -2885,6 +3004,25 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         else if (g.backbuffer_width != 0)
             ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
                                 g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
+
+        const bool fsr_available = g.blit_vs == nullptr || g.fsr_ok;   // unknown until the shaders compile
+        if (!fsr_available) ImGui::BeginDisabled();
+        bool fsr = g_cfg.work_upscale == 1;
+        if (ImGui::Checkbox("FSR 1 expand-back (EASU + RCAS)", &fsr)) { g_cfg.work_upscale = fsr ? 1 : 0; dirty = true; }
+        ImGui::SameLine(); HelpMarker("Replaces the bilinear stretch of the work-size output with AMD FSR 1 spatial "
+                                      "upscaling and RCAS sharpening. A better filter for the cost knob above, not DLSS "
+                                      "Quality: the result can never exceed the native frame. At 100% only the "
+                                      "sharpening runs.");
+        if (fsr)
+        {
+            ImGui::SliderFloat("Sharpness", &g_cfg.work_sharpness, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemDeactivatedAfterEdit()) dirty = true;
+        }
+        if (!fsr_available)
+        {
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("FSR 1 shaders failed to compile (see the log); expand-back stays bilinear.");
+        }
     }
 
     static const char *kTri[] = { "Auto", "Force off", "Force on" };
