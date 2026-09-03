@@ -71,6 +71,7 @@ static int  g_pump_count  = 0;
 static unsigned long long g_present_forced  = 0;   // per-evaluate PumpPresent(true) calls
 static unsigned long long g_present_skipped = 0;   // ... that found no free back buffer
 static unsigned long long g_present_owed    = 0;   // ... still to be retired from the idle path
+static unsigned long long g_present_debt_run = 0;  // consecutive skips with the debt already at its cap
 
 static void Log(const char *fmt, ...);
 
@@ -577,14 +578,28 @@ static const char *NgxResultName(NVSDK_NGX_Result r)
 {
     switch (static_cast<unsigned>(r))
     {
+    // Kept in step with the add-on's copy. This table used to be the short one, so the
+    // single most-reported failure -- 0xBAD00001 from Init -- printed as "(?)" here while
+    // the add-on named it (issue #47, case C).
     case 0x1:        return "Success";
+    case 0xBAD00001: return "FeatureNotSupported";
+    case 0xBAD00002: return "PlatformError";
+    case 0xBAD00003: return "FeatureAlreadyExists";
+    case 0xBAD00004: return "FeatureNotFound";
     case 0xBAD00005: return "InvalidParameter";
+    case 0xBAD00006: return "ScratchBufferTooSmall";
     case 0xBAD00007: return "NotInitialized";
     case 0xBAD00008: return "UnsupportedInputFormat";
+    case 0xBAD00009: return "RWFlagMissing";
     case 0xBAD0000A: return "MissingInput";
     case 0xBAD0000B: return "UnableToInitializeFeature";
+    case 0xBAD0000C: return "OutOfDate";
     case 0xBAD0000D: return "OutOfGPUMemory";
     case 0xBAD0000E: return "UnsupportedFormat";
+    case 0xBAD0000F: return "UnableToWriteToAppDataPath";
+    case 0xBAD00010: return "UnsupportedParameter";
+    case 0xBAD00011: return "Denied";
+    case 0xBAD00012: return "NotImplemented";
     default:         return "?";
     }
 }
@@ -946,11 +961,20 @@ static void InitBanner()
 // After Present: copy the buffer that was just presented -- banner plus whatever ReShade
 // drew on it inside its Present hook -- into the shared panel texture. FLIP_SEQUENTIAL
 // keeps that buffer's contents intact until it is handed back to us.
+//
+// The index arithmetic has to follow BufferCount, which is why it is read from the
+// swapchain rather than written here: this used to be "(current + 1) % 2" from when the
+// chain had two buffers, and it survived the move to three (issue #15's third buffer).
+// With three it picks 0 or 1 arbitrarily and never 2, so the panel the 32-bit game shows
+// in its cast was fed a stale buffer roughly a third of the time -- a picture that stops
+// tracking the helper while the helper is perfectly healthy (issue #33).
 static void CopyPanel()
 {
     if (h.panel == nullptr || g_panel_list == nullptr || g_swap3 == nullptr) return;
     if (g_panel_fence->GetCompletedValue() < g_panel_val) return;   // the last copy is still running
-    const UINT presented = (g_swap3->GetCurrentBackBufferIndex() + 1) % 2;
+    DXGI_SWAP_CHAIN_DESC sd = {};
+    if (FAILED(g_swap3->GetDesc(&sd)) || sd.BufferCount == 0) return;
+    const UINT presented = (g_swap3->GetCurrentBackBufferIndex() + sd.BufferCount - 1) % sd.BufferCount;
     ID3D12Resource *bb = nullptr;
     if (FAILED(g_swap3->GetBuffer(presented, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&bb))) || bb == nullptr)
         return;
@@ -1037,6 +1061,18 @@ static bool PumpPresent(bool force = false)
                 "%llu owed; the game is never made to wait for it)",
                 (unsigned long long)g_present_skipped, (unsigned long long)g_present_forced,
                 (unsigned long long)g_present_owed);
+        // A rising skip count on its own reads as benign, because it usually is. The debt
+        // sitting at its cap is the state that is not: from there every further skip is a
+        // frame the consumer will never get, and the window has stopped repainting. Say so
+        // once, rather than leaving a reader to infer it from two counters (issue #33).
+        if (force && h.async_home && g_present_owed >= 4)
+        {
+            if (++g_present_debt_run == 120)
+                Log("[host] the present debt has been at its cap for 120 evaluates: the back buffer is never "
+                    "free, so this window has stopped repainting and the consumer is missing frames. The feed "
+                    "itself is unaffected; a window that looks frozen from here is this, not a hang.");
+        }
+        else g_present_debt_run = 0;
         return false;
     }
 
@@ -1080,6 +1116,7 @@ static bool PumpPresent(bool force = false)
         return false;
     }
     if (FAILED(hr)) return false;
+    g_present_debt_run = 0;   // a present went through; the window is repainting again
     CopyPanel();
     return true;
 }
@@ -1216,11 +1253,58 @@ static bool InitDisguise()
     return true;
 }
 
+// Which GPU this helper actually landed on. It creates its device on DXGI's DEFAULT adapter
+// while the 64-bit add-on creates its private device on the GAME's adapter, and neither side
+// logged an adapter identity -- so a report where the helper and the game are on different
+// GPUs was indistinguishable from one where they are not (issue #47).
+static void LogHostAdapter()
+{
+    if (h.dev == nullptr) return;
+    const LUID luid = h.dev->GetAdapterLuid();
+    wchar_t desc[128] = L"(unnamed)";
+    IDXGIFactory1 *f = nullptr;
+    // GetProcAddress like InitDisguise does: this exe carries no dxgi import, so that the
+    // app-directory dxgi.dll (which is ReShade) is loaded in the order a real game gives it.
+    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    auto create_factory = dxgi != nullptr
+        ? reinterpret_cast<PFN_CreateDXGIFactory1_>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+    if (create_factory != nullptr &&
+        SUCCEEDED(create_factory(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&f))) && f != nullptr)
+    {
+        IDXGIAdapter1 *a = nullptr;
+        for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i)
+        {
+            DXGI_ADAPTER_DESC1 ad = {};
+            a->GetDesc1(&ad);
+            if (ad.AdapterLuid.LowPart == luid.LowPart && ad.AdapterLuid.HighPart == luid.HighPart)
+            { wcscpy_s(desc, ad.Description); a->Release(); break; }
+            a->Release();
+        }
+        f->Release();
+    }
+    Log("[host] device adapter: %ls  LUID %08lX:%08lX (DXGI's default adapter)", desc,
+        (unsigned long)luid.HighPart, (unsigned long)luid.LowPart);
+}
+
 static bool InitNgx()
 {
     wchar_t data_path[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, data_path, MAX_PATH);
     if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
+
+    LogHostAdapter();
+    // Say where NGX is being pointed, and whether it can write there. NGX puts its own logs
+    // in this folder, and an install under Program Files is not writable without elevation
+    // -- which nothing checked or reported (issue #47).
+    {
+        wchar_t probe[MAX_PATH];
+        _snwprintf_s(probe, _TRUNCATE, L"%sdlss5-feed-ngx-probe.tmp", data_path);
+        HANDLE t = CreateFileW(probe, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        const bool writable = t != INVALID_HANDLE_VALUE;
+        if (writable) CloseHandle(t);
+        Log("[host] NGX application data path: %ls (%s)", data_path, writable ? "writable" : "NOT WRITABLE");
+    }
 
     NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, h.dev, nullptr, NVSDK_NGX_Version_API);
     Log("[host] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
@@ -1230,7 +1314,38 @@ static bool InitNgx()
                                                 "1.0", data_path, h.dev, nullptr, NVSDK_NGX_Version_API);
         Log("[host] Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
     }
-    if (NVSDK_NGX_FAILED(r)) return false;
+    if (NVSDK_NGX_FAILED(r))
+    {
+        // The helper failing here is the case the add-on's data-path theory does NOT explain
+        // (issue #47, case C: same files, same driver, the helper itself returns
+        // FeatureNotSupported). Leave a reader everything needed to tell the two apart.
+        static const wchar_t *kMods[] = { L"_nvngx.dll", L"nvngx.dll", L"nvngx_dlss.dll", L"nvngx_dlssnr.dll" };
+        for (const wchar_t *m : kMods)
+        {
+            HMODULE mh = GetModuleHandleW(m);
+            if (mh == nullptr) continue;
+            wchar_t path[MAX_PATH] = {};
+            GetModuleFileNameW(mh, path, MAX_PATH);
+            Log("[host] NGX module loaded: %ls -> %ls", m, path);
+        }
+        HKEY k = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", 0,
+                          KEY_READ | KEY_WOW64_64KEY, &k) == ERROR_SUCCESS)
+        {
+            DWORD installed = 0, cb = sizeof(installed), type = 0;
+            if (RegQueryValueExW(k, L"NGXCoreInstalled", nullptr, &type, reinterpret_cast<BYTE *>(&installed), &cb) != ERROR_SUCCESS)
+            { cb = sizeof(installed); RegQueryValueExW(k, L"Installed", nullptr, &type, reinterpret_cast<BYTE *>(&installed), &cb); }
+            wchar_t full[MAX_PATH] = {};
+            cb = sizeof(full);
+            RegQueryValueExW(k, L"FullPath", nullptr, &type, reinterpret_cast<BYTE *>(full), &cb);
+            Log("[host] NGX Core: Installed=%lu FullPath=%ls", (unsigned long)installed,
+                full[0] != L'\0' ? full : L"(unset)");
+            RegCloseKey(k);
+        }
+        else
+            Log("[host] NGX Core: the HKLM NGXCore key could not be opened -- the driver's NGX runtime may not be installed");
+        return false;
+    }
     h.ngx_inited = true;
 
     NVSDK_NGX_Parameter *caps = nullptr;
@@ -1519,6 +1634,17 @@ static int RunTest()
 // wait on alongside the window's message queue), so every synchronous transfer has to
 // carry an OVERLAPPED and block on it here. Byte-mode pipes may satisfy a read short,
 // hence the loop; the game's end stays an ordinary blocking handle and is unaffected.
+//
+// This runs on the window thread -- the host has exactly one thread, and it owns the
+// window, the pipe and the D3D12 queue alike. So the wait cannot be the plain
+// GetOverlappedResult(..., TRUE) it used to be: the pipe buffer is 1024 bytes, a
+// FeedBuild is written in pieces, and a game that stalls between them froze the window
+// outright with no upper bound (issue #33). Pump the message queue while waiting, and
+// give up after kTransferStallMs so a wedged client costs us a reconnect rather than a
+// hung window. Not presenting here is deliberate: this is called during the hello, before
+// there is a swapchain to present on.
+static const DWORD kTransferStallMs = 30000;
+
 static bool TransferFull(HANDLE pipe, void *buf, DWORD len, bool write)
 {
     HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -1534,7 +1660,35 @@ static bool TransferFull(HANDLE pipe, void *buf, DWORD len, bool write)
         const BOOL started = write ? WriteFile(pipe, p, left, nullptr, &ov)
                                    : ReadFile(pipe, p, left, nullptr, &ov);
         if (!started && GetLastError() != ERROR_IO_PENDING) { ok = false; break; }
-        if (!GetOverlappedResult(pipe, &ov, &moved, TRUE) || moved == 0) { ok = false; break; }
+
+        const ULONGLONG deadline = GetTickCount64() + kTransferStallMs;
+        bool timed_out = false;
+        for (;;)
+        {
+            const ULONGLONG now  = GetTickCount64();
+            const DWORD     wait = now >= deadline ? 0 : static_cast<DWORD>(deadline - now);
+            const DWORD     r    = MsgWaitForMultipleObjects(1, &ev, FALSE, wait, QS_ALLINPUT);
+            if (r == WAIT_OBJECT_0) break;
+            if (r == WAIT_OBJECT_0 + 1)
+            {
+                MSG msg;
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+                continue;
+            }
+            timed_out = true;   // WAIT_TIMEOUT, or the wait itself failed
+            break;
+        }
+        if (timed_out)
+        {
+            Log("[host] the game stalled mid-message: %lu of %lu bytes %s after %lu ms; dropping the connection",
+                (unsigned long)(len - left), (unsigned long)len, write ? "written" : "read",
+                (unsigned long)kTransferStallMs);
+            CancelIoEx(pipe, &ov);
+            GetOverlappedResult(pipe, &ov, &moved, TRUE);   // the cancel completes it; do not leak the OVERLAPPED
+            ok = false;
+            break;
+        }
+        if (!GetOverlappedResult(pipe, &ov, &moved, FALSE) || moved == 0) { ok = false; break; }
         p    += moved;
         left -= moved;
     }
@@ -1974,7 +2128,13 @@ static int Serve(DWORD game_pid)
         {
             FeedFrameMsg fm = {};
             if (!ReadFull(pipe, &fm, sizeof(fm))) break;
-            if (h.feature == nullptr && !transport_only) { h.fence_out->Signal(fm.n); continue; }
+            // No feature yet: release the game's wait and take the next frame. The pump
+            // still has to run here. This loop's only other pumps are the per-evaluate
+            // PumpPresent below and the idle branch of the tag wait, and with frames
+            // arriving at game rate the tag wait never goes idle -- so a bare `continue`
+            // left the window unpumped for as long as the feature was missing, and
+            // Windows ghosts it as "Not Responding" within seconds while the game runs on.
+            if (h.feature == nullptr && !transport_only) { h.fence_out->Signal(fm.n); PumpPresent(); continue; }
 
             // Order the evaluate behind the game's input copies on the GPU timeline and
             // move on. This used to block the CPU on the same value first, which
@@ -2144,13 +2304,52 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 
 int main(int argc, char **argv)
 {
+    // A run with no arguments is somebody double-clicking this exe to find out what it is --
+    // and it used to answer by TRUNCATING the log of the run they were trying to explain,
+    // because the log is opened "w" as the first thing main does. Say what this is and
+    // leave, touching nothing (issue #46: the attached host log turned out to be a log of
+    // the investigation rather than of the fault).
+    if (argc < 2)
+    {
+        MessageBoxA(nullptr,
+                    "This is the 64-bit helper for the DLSS 5 Feed ReShade add-on.\r\n\r\n"
+                    "It is started by the add-on from inside the game -- there is nothing to run here.\r\n"
+                    "Its log is dlss5-feed-host.log, next to this file; this run has left it alone.",
+                    "DLSS 5 Feed helper", MB_OK | MB_ICONINFORMATION);
+        return 1;
+    }
+
     GetModuleFileNameA(nullptr, g_log_path, MAX_PATH);
     if (char *s = strrchr(g_log_path, '\\'))
         strcpy_s(s + 1, MAX_PATH - (s + 1 - g_log_path), "dlss5-feed-host.log");
-    { FILE *f = nullptr; if (fopen_s(&f, g_log_path, "w") == 0 && f) fclose(f); }
+    // An install under Program Files is not writable without elevation, and both fopen_s
+    // calls used to fail in silence -- CREATE_NO_WINDOW leaves no console for the duplicate
+    // printf either, so the helper ran completely mute. Fall back to LocalAppData, and log
+    // the path we settled on so nobody reads a stale file.
+    {
+        FILE *f = nullptr;
+        if (fopen_s(&f, g_log_path, "w") == 0 && f) fclose(f);
+        else
+        {
+            char fallback[MAX_PATH] = {};
+            size_t n = 0;
+            if (getenv_s(&n, fallback, MAX_PATH, "LOCALAPPDATA") == 0 && n > 1)
+            {
+                strcat_s(fallback, MAX_PATH, "\\DLSS5-Feeder");
+                CreateDirectoryA(fallback, nullptr);
+                strcat_s(fallback, MAX_PATH, "\\dlss5-feed-host.log");
+                FILE *g = nullptr;
+                if (fopen_s(&g, fallback, "w") == 0 && g) { fclose(g); strcpy_s(g_log_path, MAX_PATH, fallback); }
+            }
+        }
+    }
     SetUnhandledExceptionFilter(&CrashFilter);
 
     Log("dlss5-feed-host64 (built %s %s)", __DATE__, __TIME__);
+    // Logged before it is parsed, so a log that ends at the usage line says WHY: "no
+    // arguments" and "an argument zeroed the pid" used to be indistinguishable (issue #46).
+    Log("[host] command line (argc=%d): %s", argc, GetCommandLineA());
+    Log("[host] log file: %s", g_log_path);
 
     // Every Sleep in this process is a frame-pacing decision: at the default 15.6 ms
     // timer tick a Sleep(1) lands at 15.6 ms, and the serve loop's poll alone used to
@@ -2165,7 +2364,12 @@ int main(int argc, char **argv)
         if      (strcmp(argv[i], "--test") == 0) test = true;
         else if (strcmp(argv[i], "--hide") == 0) hide = true;
         else if (strcmp(argv[i], "--behind") == 0) behind = true;
-        else pid = static_cast<DWORD>(strtoul(argv[i], nullptr, 10));
+        // First numeric token wins. This used to be a bare assignment, so ANY later token
+        // the parser did not recognise ran through strtoul, came back 0, and silently
+        // overwrote an already-parsed pid -- turning a good command line into the usage
+        // exit with nothing in the log to say which argument did it.
+        else if (pid == 0 && (pid = static_cast<DWORD>(strtoul(argv[i], nullptr, 10))) != 0) {}
+        else Log("[host] ignoring an argument I do not understand: %s", argv[i]);
     }
     if (!test && pid == 0)
     {
