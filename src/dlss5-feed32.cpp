@@ -152,6 +152,23 @@ static void WriteCrashDump(EXCEPTION_POINTERS *ep)
 
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
 static volatile LONG g_crash_once;
+// An access violation carries two extra words, and they are the difference between "the
+// game read a null pointer" and "we wrote off the end of something". Free to log, and until
+// now only recoverable by opening the minidump by hand -- which is exactly what issue #44
+// (Bayonetta) needed to establish that the fault was a read of address 0 in the game's own
+// code, before this add-on had fed a single frame.
+static void CrashAccessDetail(const EXCEPTION_RECORD *r, char *out, size_t out_size)
+{
+    out[0] = '\0';
+    if (r == nullptr || r->NumberParameters < 2) return;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION && r->ExceptionCode != EXCEPTION_IN_PAGE_ERROR) return;
+    const char *verb = r->ExceptionInformation[0] == 0 ? "reading"
+                     : r->ExceptionInformation[0] == 1 ? "writing"
+                     : r->ExceptionInformation[0] == 8 ? "executing" : "accessing";
+    _snprintf_s(out, out_size, _TRUNCATE, " (%s address %p)", verb,
+                reinterpret_cast<void *>(r->ExceptionInformation[1]));
+}
+
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
     // One record per process, and only one thread may make it. Two ways this is reached
@@ -170,8 +187,10 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            static_cast<LPCWSTR>(addr), &mod) && mod != nullptr)
         GetModuleFileNameW(mod, owner, MAX_PATH);
-    Log("### CRASH RECORDED ###  exception 0x%08X at %p in %ls; this add-on was last doing: %s%s "
-        "(later faults in this process are not recorded)", code, addr,
+    char access[64];
+    CrashAccessDetail(ep != nullptr ? ep->ExceptionRecord : nullptr, access, sizeof(access));
+    Log("### CRASH RECORDED ###  exception 0x%08X%s at %p in %ls; this add-on was last doing: %s%s "
+        "(later faults in this process are not recorded)", code, access, addr,
         owner, g_where, mod == g_self ? " (inside this add-on)" : "");
     WriteCrashDump(ep);
     return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
@@ -303,9 +322,13 @@ struct Cfg
     int   cast_mode;       // how the panel is displayed: 0 = desktop-compositor thumbnail of the host window
                            // (windowed / borderless only), 1 = the host's shared panel texture drawn by the
                            // game's ReShade (IPC v7; works in exclusive fullscreen; all three client APIs)
+    int   host_creates;    // 0 = auto: this side creates the shared set and falls back to the host only when
+                           // its device refuses one (a feature-level 10.x game, issue #33/#43). 1 = always
+                           // let the host create it, which is the only way to exercise that path on a device
+                           // that does not need it. Parse-only, not written back, not on the overlay.
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 100, 0 };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 100, 0, 0 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -503,6 +526,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "cast_key")       == 0) next.cast_key       = (iv > 0 && iv < 256) ? iv : 0;
         else if (_stricmp(key, "cast_scale")     == 0) next.cast_scale     = iv < 25 ? 25 : iv > 300 ? 300 : iv;
         else if (_stricmp(key, "cast_mode")      == 0) next.cast_mode      = iv == 1 ? 1 : 0;
+        else if (_stricmp(key, "host_creates")   == 0) next.host_creates   = iv == 1 ? 1 : 0;
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
@@ -515,9 +539,16 @@ static bool CfgReload()   // true when a build-affecting value changed
     if (changed)
     {
         g_cfg = next;
-        Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f",
+        // Every knob, not a selection of them. async_home in particular decides the whole
+        // handoff contract, and no DXVK report could be triaged without asking the reporter
+        // what they had set (issue #15). The 64-bit side has always printed its full set.
+        Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d log_frames=%d "
+            "host_window=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f async_home=%d "
+            "mv_scale=%.3f,%.3f cast_key=%d cast_scale=%d cast_mode=%d host_creates=%d",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness);
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
+            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale,
+            g_cfg.cast_mode, g_cfg.host_creates);
     }
     return rebuild;
 }
@@ -2627,6 +2658,17 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     g.jitter_index  = 0;
     g.jitter_x = g.jitter_y = 0.0f;
 
+    // host_creates=1 in the cfg forces the route a feature-level 10.x device is pushed onto,
+    // on a device that does not need it. It is the only way to exercise that path on a healthy
+    // FL11 machine -- issue #43 shipped a fallback nobody here could run. Parse-only, not
+    // written back, not on the overlay: a diagnostic, like the 64-bit side's jitter_sign.
+    if (g_cfg.host_creates == 1 && !g.host_creates)
+    {
+        g.host_creates = true;
+        g.no_uav       = true;   // the interesting half: it is what makes the Output differ
+        Log("[feed32] host_creates=1: forcing the host to create the shared set (issue #43 test path)");
+    }
+
     if (!g.host_creates)
     {
         int failed = -1;
@@ -2645,14 +2687,13 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
             // handles in; this side opens them (OpenSharedResource1 needs no bind flags
             // of its own), and where UAVs are the problem the host keeps the Output's UAV
             // on its side and copies into a plain shared texture.
-            static const char *const slot_name[FEED_SLOTS] = { "Color", "Output", "Depth", "MV" };
             const D3D_FEATURE_LEVEL fl = g.dev->GetFeatureLevel();
             ReleaseShared();
             g.host_creates = true;
             g.no_uav       = failed == FEED_OUTPUT || fl < D3D_FEATURE_LEVEL_11_0;
             Log("[feed32] the game's D3D11 device (feature level %d_%d) refused the shared %s texture; the host will "
                 "create the shared set instead%s",
-                (fl >> 12) & 0xF, (fl >> 8) & 0xF, slot_name[failed],
+                (fl >> 12) & 0xF, (fl >> 8) & 0xF, FeedSlotName(failed),
                 g.no_uav ? ", keeping the DLSS output's UAV on its own side (this device cannot bind one)" : "");
         }
     }
@@ -2669,8 +2710,9 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
     if (want_sr) { b.target_width = g.output_width; b.target_height = g.output_height; }
+    if (g_cfg.async_home) b.client_flags |= FEED_BUILD_ASYNC_HOME;
     if (g.host_creates)
-        b.client_flags = FEED_BUILD_HOST_CREATES | (g.no_uav ? FEED_BUILD_OUTPUT_NO_UAV : 0);
+        b.client_flags |= FEED_BUILD_HOST_CREATES | (g.no_uav ? FEED_BUILD_OUTPUT_NO_UAV : 0);
     else
         for (int i = 0; i < FEED_SLOTS; ++i)
             b.tex[i] = reinterpret_cast<uintptr_t>(g.tex_handle[i]);
@@ -2738,21 +2780,38 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
             FeedDisable("ID3D11Device1 unavailable, so the host-created textures cannot be opened (Windows 8+ D3D11.1 runtime required)");
             return false;
         }
+        // Try every slot before giving up. Returning on the first failure meant a report
+        // only ever named one slot and never said whether the rest would have opened --
+        // and that single line was the entire evidence for issue #43. The host logs the
+        // D3D12 flags it used for each; together the two say which flag a device refuses.
+        int  failed_mask = 0;
+        char failed_names[64] = "";
+        char opened_names[64] = "";
+        static_assert(sizeof(failed_names) == sizeof(opened_names), "both lists share one size below");
         for (int i = 0; i < FEED_SLOTS; ++i)
         {
             const HRESULT hr = g.tex_handle[i] != nullptr
                 ? dev1->OpenSharedResource1(g.tex_handle[i], __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&g.tex[i]))
                 : E_HANDLE;
+            char *const names = FAILED(hr) ? failed_names : opened_names;
+            if (names[0] != '\0') strcat_s(names, sizeof(failed_names), ", ");
+            strcat_s(names, sizeof(failed_names), FeedSlotName(i));
             if (FAILED(hr))
             {
-                Log("[feed32] OpenSharedResource1(tex %d) failed 0x%08X -- this device cannot open the host's textures either",
-                    i, hr);
-                if (ack.panel_tex != 0) CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex)));
-                dev1->Release();
-                ReleaseShared();
-                FeedDisable("the shared textures cannot be created on the game's device or opened from the host's");
-                return false;
+                failed_mask |= 1 << i;
+                Log("[feed32] OpenSharedResource1(%s) failed 0x%08X", FeedSlotName(i), hr);
             }
+        }
+        if (failed_mask != 0)
+        {
+            Log("[feed32] this device cannot open the host's shared textures: %s failed; %s opened. "
+                "host64\\dlss5-feed-host.log lists the D3D12 flags each was created with.",
+                failed_names, opened_names[0] != '\0' ? opened_names : "none");
+            if (ack.panel_tex != 0) CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex)));
+            dev1->Release();
+            ReleaseShared();
+            FeedDisable("the shared textures cannot be created on the game's device or opened from the host's");
+            return false;
         }
         CastAdoptHostPanel11(dev1, ack);   // the host made the panel too; ours would never be written
         dev1->Release();
@@ -2912,6 +2971,7 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
+    if (g_cfg.async_home) b.client_flags |= FEED_BUILD_ASYNC_HOME;
     // b.tex stays zero: on this path the host creates, and answers with its handles.
 
     if (!HostBuildSubmit(b)) { g_build_pending = false; FeedFail("could not hand the build to the host"); return false; }
@@ -3101,6 +3161,11 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
+    // Under async_home the game copies home the PREVIOUS frame's result and is never
+    // waiting on the evaluate the host is running, so the host may take its own time to
+    // get a present slot rather than dropping the present. That drop is what starved the
+    // neural consumer on DXVK (issue #15).
+    if (g_cfg.async_home) b.client_flags |= FEED_BUILD_ASYNC_HOME;
     // b.tex stays zero: on this path the host creates, and answers with its handles.
 
     if (!HostBuildSubmit(b)) { g_build_pending = false; FeedFail("could not hand the build to the host"); return false; }
@@ -4262,21 +4327,122 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     if (g_mv_problem[0]) Warn("%s", g_mv_problem);
 }
 
+// ---------------------------------------------------------------------------
+// Which effect runtime is ours -- the 32-bit half of issue #1, which the 64-bit add-on
+// fixed in 0.11.0-beta.2 and this one never got.
+//
+// A process can hold several ReShade effect runtimes. NVIDIA Smooth Motion is the common
+// cause: its present interposer creates its OWN device and an invisible proxy swapchain
+// ("InvisibleWindowClassNvPresent"), so ReShade builds a runtime on each and gives them
+// separate configs -- the first gets ReShade.ini (the user's preset), the second
+// ReShade2.ini. The old rule here was "the last runtime to initialise is ours", which
+// bound to whichever came second, resolved DLSS5_Feed.fx as MISSING there, and then
+// silently ignored every render of the technique on the other one: a healthy-looking log
+// and no neural rendering at all. The rule now matches the 64-bit add-on's -- the runtime
+// that RENDERS DLSS5_Feed is ours.
+// ---------------------------------------------------------------------------
+struct RuntimeSlot
+{
+    reshade::api::effect_runtime  *rt;
+    reshade::api::effect_technique technique;    // this runtime's DLSS5_Feed, or 0
+    void                          *dev;          // native device, for the log
+    char                           wclass[48];   // window class of the swapchain's HWND
+    bool                           proxy;        // Smooth Motion's invisible proxy swapchain
+    ULONGLONG                      last_resolve; // GetTickCount64 of the last find_technique from the render path
+};
+static RuntimeSlot g_runtimes[6];
+static int         g_runtime_count;
+static ULONGLONG   g_bound_last_render;   // GetTickCount64 of the bound runtime's last DLSS5_Feed render
+
+static RuntimeSlot *FindRuntime(reshade::api::effect_runtime *rt)
+{
+    for (int i = 0; i < g_runtime_count; ++i)
+        if (g_runtimes[i].rt == rt) return &g_runtimes[i];
+    return nullptr;
+}
+
+static RuntimeSlot *TrackRuntime(reshade::api::effect_runtime *rt)
+{
+    RuntimeSlot *s = FindRuntime(rt);
+    if (s == nullptr)
+    {
+        if (g_runtime_count == static_cast<int>(sizeof(g_runtimes) / sizeof(g_runtimes[0])))
+            --g_runtime_count;   // overflow: recycle the last slot rather than lose track
+        s = &g_runtimes[g_runtime_count++];
+        *s = {};
+        s->rt = rt;
+        reshade::api::device *dev = rt->get_device();
+        s->dev = dev != nullptr ? reinterpret_cast<void *>(dev->get_native()) : nullptr;
+        HWND hwnd = static_cast<HWND>(rt->get_hwnd());
+        if (hwnd != nullptr && !GetClassNameA(hwnd, s->wclass, sizeof(s->wclass))) s->wclass[0] = '\0';
+        if (hwnd == nullptr) strcpy_s(s->wclass, "(no window)");
+        s->proxy = strstr(s->wclass, "NvPresent") != nullptr;
+    }
+    s->technique = rt->find_technique(kEffectFile, kTechnique);
+    return s;
+}
+
+static void UntrackRuntime(reshade::api::effect_runtime *rt)
+{
+    for (int i = 0; i < g_runtime_count; ++i)
+        if (g_runtimes[i].rt == rt)
+        {
+            g_runtimes[i] = g_runtimes[--g_runtime_count];
+            g_runtimes[g_runtime_count] = {};
+            return;
+        }
+}
+
+// This side captures g.dev from the first frame's immediate context and never re-checks it,
+// so adopting a runtime on a DIFFERENT device once the shared set is built would feed the
+// wrong device's textures. In the case this fix is for, that cannot happen: the runtime
+// rendering the technique is the game's, and it is adopted before anything is built. Refuse
+// the other case rather than pretend it works.
+static bool RuntimeDeviceCompatible(const RuntimeSlot *slot)
+{
+    return g.dev == nullptr || slot == nullptr || slot->dev == nullptr ||
+           reinterpret_cast<ID3D11Device *>(slot->dev) == g.dev;
+}
+
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
-    g.runtime = rt;
-    ResolveHandles(rt);
+    RuntimeSlot *slot = TrackRuntime(rt);
     DetectSmoothMotion();   // a present interposer can arrive after this add-on did
     // Not in DllMain (LoadLibrary under the loader lock) and not in the exception filter
     // (ReShade refuses a LoadLibrary from there): this is what makes a dump possible.
     FeedResolveDbghelp();
     static int inits = 0;
-    if (++inits <= 8) Log("[feed32] effect runtime %p initialised", (void *)rt);
+    if (++inits <= 8)
+        Log("[feed32] effect runtime %p initialised (device %p, window class '%s'%s; %d runtime%s in this process)",
+            (void *)rt, slot->dev, slot->wclass,
+            slot->proxy ? " -- NVIDIA Smooth Motion's proxy swapchain" : "",
+            g_runtime_count, g_runtime_count == 1 ? "" : "s");
+    else if (inits == 9)
+        Log("[feed32] (further runtime init/destroy messages suppressed)");
+
+    // Bind: the first runtime, or a re-init of the bound one. Another runtime only takes
+    // over when the bound one has no DLSS5_Feed and this one does; otherwise it is tracked,
+    // and OnRenderTechnique adopts it the moment it renders the technique.
+    if (g.runtime == nullptr || rt == g.runtime || (g.technique.handle == 0 && slot->technique.handle != 0))
+    {
+        g.runtime = rt;
+        ResolveHandles(rt);
+    }
 }
 
 static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 {
-    if (rt != g.runtime) return;
+    // Logged before the bound test: with several runtimes churning, a log that only ever
+    // reported the bound one could never show the topology changing underneath.
+    const bool was_bound = rt == g.runtime;
+    UntrackRuntime(rt);
+    static int destroys = 0;
+    if (++destroys <= 8)
+        Log("[feed32] effect runtime %p destroyed%s (%d runtime%s left)", (void *)rt,
+            was_bound ? " -- it was the bound one" : "", g_runtime_count, g_runtime_count == 1 ? "" : "s");
+    else if (destroys == 9)
+        Log("[feed32] (further runtime init/destroy messages suppressed)");
+    if (!was_bound) return;
     CastRelease();   // the thumbnail is registered on this runtime's window
     // The shared textures live on the game's device and survive runtime churn; keep them.
     g.runtime = nullptr;
@@ -4286,8 +4452,12 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 
 static void OnReloadedEffects(reshade::api::effect_runtime *rt)
 {
-    if (rt == g.runtime || g.runtime == nullptr)
+    RuntimeSlot *slot = TrackRuntime(rt);
+    if (rt == g.runtime || g.runtime == nullptr || (g.technique.handle == 0 && slot->technique.handle != 0))
     {
+        if (g.runtime != nullptr && rt != g.runtime)
+            Log("[feed32] effect runtime %p takes over from %p: its reload produced DLSS5_Feed.fx, the bound one has none",
+                (void *)rt, (void *)g.runtime);
         g.runtime = rt;
         ResolveHandles(rt);
         // A reload recompiles the MV provider, which writes zero vectors until its own
@@ -4300,7 +4470,85 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
                               reshade::api::command_list *cl, reshade::api::resource_view rtv,
                               reshade::api::resource_view /*rtv_srgb*/)
 {
-    if (rt != g.runtime || g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    if (rt != g.runtime)
+    {
+        // Another runtime is rendering DLSS5_Feed. Adopt it -- unless the bound one rendered
+        // the technique within the last second, in which case both are drawing it and
+        // flip-flopping every frame would rebuild the session each time.
+        RuntimeSlot *slot = FindRuntime(rt);
+        // A slot's technique handle is only written by TrackRuntime (init and reload). One
+        // that changes without either reaching us leaves the slot stale for the rest of the
+        // session, and the feed stops with nothing logged until a swapchain re-init. Cheap
+        // to re-resolve, throttled to once a second per runtime.
+        if (slot != nullptr && technique.handle != slot->technique.handle)
+        {
+            const ULONGLONG t = GetTickCount64();
+            if (t - slot->last_resolve >= 1000)
+            {
+                slot->last_resolve = t;
+                const reshade::api::effect_technique fresh = rt->find_technique(kEffectFile, kTechnique);
+                if (fresh.handle != slot->technique.handle)
+                {
+                    Log("[feed32] effect runtime %p: DLSS5_Feed handle changed under us (%llu -> %llu); re-resolved",
+                        (void *)rt, (unsigned long long)slot->technique.handle, (unsigned long long)fresh.handle);
+                    slot->technique = fresh;
+                }
+            }
+        }
+        // Still not this runtime's DLSS5_Feed: it is one of the other techniques in the
+        // preset, which arrive here constantly and are nothing to report.
+        if (slot == nullptr || slot->technique.handle == 0 || technique.handle != slot->technique.handle) return;
+        const ULONGLONG now = GetTickCount64();
+        if (g.technique.handle != 0 && now - g_bound_last_render < 1000)
+        {
+            static int both = 0;
+            if (++both <= 3)
+                Log("[feed32] effect runtime %p (window class '%s') also renders DLSS5_Feed; feeding %p only%s",
+                    (void *)rt, slot->wclass, (void *)g.runtime, both == 3 ? " (further notices suppressed)" : "");
+            return;
+        }
+        if (!RuntimeDeviceCompatible(slot))
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                Log("[feed32] effect runtime %p renders DLSS5_Feed but on device %p, and the shared set is already "
+                    "built on %p; staying on %p. Restart the game if the wrong window is being processed.",
+                    (void *)rt, slot->dev, (void *)g.dev, (void *)g.runtime);
+            }
+            return;
+        }
+        Log("[feed32] binding to effect runtime %p (device %p, window class '%s'): it is the one rendering DLSS5_Feed; %p was bound",
+            (void *)rt, slot->dev, slot->wclass, (void *)g.runtime);
+        g.runtime = rt;
+        ResolveHandles(rt);
+        g.need_reset = true;
+    }
+    if (g.technique.handle == 0 || technique.handle != g.technique.handle)
+    {
+        // Nearly every render arriving here is one of the OTHER techniques in the user's
+        // preset -- ordinary, and silent. The case worth catching is the same stale-handle
+        // hole one level up: g.technique no longer matching the bound runtime's DLSS5_Feed
+        // drops every one of ITS renders forever, with nothing in the frame path to
+        // re-resolve it. Ask ReShade at most once a second, and only speak when the fresh
+        // handle proves this render was ours after all.
+        const ULONGLONG t = GetTickCount64();
+        static ULONGLONG last_bound_resolve = 0;
+        if (rt == g.runtime && t - last_bound_resolve >= 1000)
+        {
+            last_bound_resolve = t;
+            const reshade::api::effect_technique fresh = rt->find_technique(kEffectFile, kTechnique);
+            if (fresh.handle == technique.handle && fresh.handle != g.technique.handle)
+            {
+                Log("[feed32] bound runtime %p: DLSS5_Feed handle changed under us (%llu -> %llu); re-resolving",
+                    (void *)rt, (unsigned long long)g.technique.handle, (unsigned long long)fresh.handle);
+                ResolveHandles(rt);
+            }
+        }
+        if (g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    }
+    g_bound_last_render = GetTickCount64();
     FeedFrame(rt, cl, rtv);
 }
 
