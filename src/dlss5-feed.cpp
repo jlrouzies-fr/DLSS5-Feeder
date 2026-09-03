@@ -123,7 +123,13 @@ static void Warn(const char *fmt, ...)
     reshade::log::message(reshade::log::level::warning, tagged);
 }
 
-static const char *volatile g_where = "starting up";
+// The initial value has to read as "nothing has happened yet", not as a phase. It used to
+// say "starting up", which is what a crash line reports whenever no Breadcrumb has been
+// reached -- and every Breadcrumb is inside the feed path, so with the feed off, or before
+// the first shared-texture build, it can never say anything else. A reporter (and the
+// maintainer answering them) read that as evidence the crash happened during our startup,
+// which it is not: the useful half of the line is the faulting module (issue #44).
+static const char *volatile g_where = "nothing yet -- no feed work has run in this process";
 static void Breadcrumb(const char *what) { g_where = what; }
 
 // A minidump next to the log, so a crash report can be read in a debugger instead of
@@ -1812,18 +1818,154 @@ static void PublishDfcInterop()
 // hooked them; a fault there used to take the game down with nothing in the log but
 // the crash filter's breadcrumb (issue #35, MGSV Ground Zeroes). Caught here it becomes
 // a disable with the exception code named.
-static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *dev, DWORD *code)
+// Can NGX actually write here? It puts its own logs in the application data path, and this
+// add-on hands it the add-on's folder -- which for a game under Program Files needs
+// elevation the game does not have. Never checked before, and never logged (issue #47).
+static bool NgxPathWritable(const wchar_t *dir)
+{
+    wchar_t probe[MAX_PATH];
+    _snwprintf_s(probe, _TRUNCATE, L"%sdlss5-feed-ngx-probe.tmp", dir);
+    HANDLE h = CreateFileW(probe, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
+}
+
+// Everything a reader needs to tell "NGX is broken here" from "NGX was pointed somewhere
+// wrong". None of this was in the log when three machines reported FeatureNotSupported from
+// the in-process session while the same files initialised fine in the host64 helper.
+static void LogNgxEnvironment()
+{
+    static const wchar_t *kMods[] = { L"_nvngx.dll", L"nvngx.dll", L"nvngx_dlss.dll", L"nvngx_dlssnr.dll" };
+    for (const wchar_t *m : kMods)
+    {
+        HMODULE h = GetModuleHandleW(m);
+        if (h == nullptr) continue;
+        wchar_t path[MAX_PATH] = {};
+        GetModuleFileNameW(h, path, MAX_PATH);
+        Log("[feed] NGX module loaded: %ls -> %ls", m, path);
+    }
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", 0,
+                      KEY_READ | KEY_WOW64_64KEY, &k) == ERROR_SUCCESS)
+    {
+        DWORD installed = 0, cb = sizeof(installed), type = 0;
+        if (RegQueryValueExW(k, L"NGXCoreInstalled", nullptr, &type, reinterpret_cast<BYTE *>(&installed), &cb) != ERROR_SUCCESS)
+        { cb = sizeof(installed); RegQueryValueExW(k, L"Installed", nullptr, &type, reinterpret_cast<BYTE *>(&installed), &cb); }
+        wchar_t full[MAX_PATH] = {};
+        cb = sizeof(full);
+        RegQueryValueExW(k, L"FullPath", nullptr, &type, reinterpret_cast<BYTE *>(full), &cb);
+        Log("[feed] NGX Core: Installed=%lu FullPath=%ls", (unsigned long)installed, full[0] != L'\0' ? full : L"(unset)");
+        RegCloseKey(k);
+    }
+    else
+        Log("[feed] NGX Core: the HKLM NGXCore key could not be opened -- the driver's NGX runtime may not be installed");
+}
+
+// The private device's adapter, by LUID as well as by name. The helper takes DXGI's default
+// adapter and the add-on takes the game's, and nothing said so, which left a hybrid or
+// multi-adapter split invisible in every report so far (issue #47).
+static void LogAdapterIdentity(const char *who, ID3D12Device *dev)
+{
+    if (dev == nullptr) return;
+    const LUID luid = dev->GetAdapterLuid();
+    IDXGIFactory1 *f = nullptr;
+    wchar_t desc[128] = L"(unnamed)";
+    // GetProcAddress, not a link-time import: this add-on deliberately carries no dxgi
+    // import (the module is already in the process, loaded by ReShade or the game).
+    typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1_)(REFIID, void **);
+    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    auto make_factory = dxgi != nullptr
+        ? reinterpret_cast<PFN_CreateDXGIFactory1_>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+    if (make_factory != nullptr &&
+        SUCCEEDED(make_factory(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&f))) && f != nullptr)
+    {
+        IDXGIAdapter1 *a = nullptr;
+        for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i)
+        {
+            DXGI_ADAPTER_DESC1 ad = {};
+            a->GetDesc1(&ad);
+            if (ad.AdapterLuid.LowPart == luid.LowPart && ad.AdapterLuid.HighPart == luid.HighPart)
+            { wcscpy_s(desc, ad.Description); a->Release(); break; }
+            a->Release();
+        }
+        f->Release();
+    }
+    Log("[feed] %s device adapter: %ls  LUID %08lX:%08lX", who, desc,
+        (unsigned long)luid.HighPart, (unsigned long)luid.LowPart);
+}
+
+static NVSDK_NGX_Result SafeNgxInitOnce(const wchar_t *data_path, ID3D12Device *dev,
+                                        const NVSDK_NGX_FeatureCommonInfo *info, DWORD *code)
 {
     *code = 0;
     __try
     {
-        NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, dev, nullptr, NVSDK_NGX_Version_API);
+        NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, dev, info, NVSDK_NGX_Version_API);
         if (NVSDK_NGX_FAILED(r))
             r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                                                    "1.0", data_path, dev, nullptr, NVSDK_NGX_Version_API);
+                                                    "1.0", data_path, dev, info, NVSDK_NGX_Version_API);
         return r;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NVSDK_NGX_Result_Fail; }
+}
+
+// Three machines report 0xBAD00001 (FeatureNotSupported) from this call while the SAME files
+// on the SAME driver initialise NGX successfully inside the host64 helper -- and on one of
+// them the game's own native DLSS works. The one argument that differs between the two is
+// the application data path: the helper's is its own folder (host64\), this side's is the
+// add-on's. Rather than ask three reporters to run three builds, try each candidate here and
+// log every result, so one run names the answer. A machine where the first attempt already
+// succeeds is unaffected: it never reaches the second.
+static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *dev, DWORD *code)
+{
+    wchar_t cand[3][MAX_PATH] = {};
+    const char *why[3] = { "the add-on's folder (what every build before this one used)",
+                           "host64\\, which is what the helper passes when it succeeds here",
+                           "LocalAppData, which is writable even under Program Files" };
+    int n = 0;
+
+    wcscpy_s(cand[n++], data_path);
+
+    _snwprintf_s(cand[n], _TRUNCATE, L"%shost64\\", data_path);
+    if (GetFileAttributesW(cand[n]) != INVALID_FILE_ATTRIBUTES) ++n; else cand[n][0] = L'\0';
+
+    wchar_t local[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH) != 0)
+    {
+        _snwprintf_s(cand[n], _TRUNCATE, L"%s\\DLSS5-Feeder\\ngx\\", local);
+        wchar_t parent[MAX_PATH];
+        _snwprintf_s(parent, _TRUNCATE, L"%s\\DLSS5-Feeder", local);
+        CreateDirectoryW(parent, nullptr);
+        if (CreateDirectoryW(cand[n], nullptr) || GetLastError() == ERROR_ALREADY_EXISTS) ++n; else cand[n][0] = L'\0';
+    }
+
+    // NGX only ever looked beside the exe for a feature runtime, because this has always
+    // passed a null FeatureCommonInfo. Name the folders we actually install them into.
+    wchar_t hostdir[MAX_PATH];
+    _snwprintf_s(hostdir, _TRUNCATE, L"%shost64\\", data_path);
+    const wchar_t *const search[2] = { data_path, hostdir };
+    NVSDK_NGX_FeatureCommonInfo info = {};
+    info.PathListInfo.Path   = search;
+    info.PathListInfo.Length = 2;
+
+    NVSDK_NGX_Result r = NVSDK_NGX_Result_Fail;
+    for (int i = 0; i < n; ++i)
+    {
+        Log("[feed] NGX init attempt %d/%d: data path %ls (%s; %s)", i + 1, n, cand[i], why[i],
+            NgxPathWritable(cand[i]) ? "writable" : "NOT WRITABLE");
+        r = SafeNgxInitOnce(cand[i], dev, &info, code);
+        if (*code != 0) return r;                       // a fault: the caller reports it and stops
+        if (NVSDK_NGX_SUCCEED(r))
+        {
+            if (i != 0) Log("[feed] NGX initialised on attempt %d -- the add-on's own folder was the problem", i + 1);
+            return r;
+        }
+        Log("[feed] NGX init attempt %d -> 0x%08X (%s)", i + 1, r, NgxResultName(r));
+    }
+    LogNgxEnvironment();
+    return r;
 }
 
 // CPU ticks spent inside the last NGX call. The neural consumer's detour runs INSIDE these
@@ -3204,6 +3346,7 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
         Breadcrumb("initialising NGX on D3D12");
+        LogAdapterIdentity("private", g.dev12);
         DWORD ngx_code = 0;
         NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
         if (ngx_code != 0)
@@ -6078,8 +6221,13 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     if (g_mv_problem[0]) Warn("%s", g_mv_problem);
 }
 
+// enabled=0 means enabled=0. Everything below this line queries the runtime, reads files or
+// scans modules -- none of which a user who set enabled=0 to take this add-on out of the
+// picture expects to still be happening (issue #44, and README's "0 disables everything").
+// Only the overlay page stays, so the checkbox can undo it.
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
+    if (!g_cfg.enabled) return;
     RuntimeSlot *slot = TrackRuntime(rt);
     static int inits = 0;
     if (++inits <= 8)
@@ -6157,6 +6305,7 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 
 static void OnReloadedEffects(reshade::api::effect_runtime *rt)
 {
+    if (!g_cfg.enabled) return;
     RuntimeSlot *slot = TrackRuntime(rt);
     if (rt == g.runtime || g.runtime == nullptr || (g.technique.handle == 0 && slot->technique.handle != 0))
     {
@@ -6175,6 +6324,7 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
                               reshade::api::command_list *cl, reshade::api::resource_view rtv,
                               reshade::api::resource_view /*rtv_srgb*/)
 {
+    if (!g_cfg.enabled) return;
     if (rt != g.runtime)
     {
         // Another runtime is rendering DLSS5_Feed. Adopt it -- unless the bound runtime
@@ -6309,7 +6459,16 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     // actually asks the frame path for a rebuild.
     bool rebuild = false;
     bool enabled = g_cfg.enabled != 0;
-    if (ImGui::Checkbox("Enabled", &enabled)) { g_cfg.enabled = enabled ? 1 : 0; dirty = true; }
+    if (ImGui::Checkbox("Enabled", &enabled))
+    {
+        g_cfg.enabled = enabled ? 1 : 0;
+        dirty = true;
+        // Turning it back on has to re-adopt the runtime by hand: every other adoption path
+        // is an event that has already fired for this runtime and will not fire again.
+        if (enabled && rt != nullptr) { Log("[feed] enabled from the overlay; re-adopting the effect runtime"); OnInitEffectRuntime(rt); }
+        else if (!enabled) Log("[feed] disabled from the overlay: no frames are fed and nothing is queried. "
+                               "An already-installed Vulkan interop hook stays until the game exits.");
+    }
 
     ImGui::Separator();
     ImGui::TextUnformatted("Status");
@@ -6488,8 +6647,17 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
 // extensions can still be added from in-process -- see feed_vk_hook.h.
 static bool OnCreateDevice(reshade::api::device_api api, uint32_t & /*api_version*/)
 {
+    // Gated on enabled: this is the one thing here that patches another module's code
+    // (MinHook trampolines over vulkan-1's exports) and appends extensions to every device
+    // the game creates. It used to run at enabled=0, which made "set enabled=0 and see if
+    // it still crashes" a test that proved nothing (issue #44). It cannot be installed
+    // later either -- the game's vkCreateDevice has been and gone.
     if (api == reshade::api::device_api::vulkan)
-        FeedVkHookInstall();
+    {
+        if (g_cfg.enabled) FeedVkHookInstall();
+        else Log("[feed] enabled=0: the Vulkan interop hook is NOT installed. Turning this add-on back on "
+                 "mid-session cannot install it -- a Vulkan game needs a restart with enabled=1.");
+    }
     return false;   // never change the requested API version
 }
 
@@ -6517,6 +6685,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         }
         CfgWriteDefault();
         CfgReload();
+        // Said once, plainly, because "enabled=0 but it still crashed" is only evidence if
+        // the reader knows what enabled=0 actually leaves behind (issue #44).
+        if (!g_cfg.enabled)
+            Log("[feed] enabled=0: no frames are fed, no runtime is queried, no session is opened and the "
+                "Vulkan interop hook is not installed. The add-on stays registered so the overlay's Enabled "
+                "checkbox can undo this; nothing else runs.");
         DetectRenodxAddon();
         DetectToolkitAddon();
         DetectChickenAddon(g_cfg.warmup_rebuild);   // after DetectRenodxAddon: it needs g_renodx_present
