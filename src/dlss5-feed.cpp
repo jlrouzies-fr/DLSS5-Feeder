@@ -2158,11 +2158,28 @@ static uint64_t        g_stale_hash[2];        // previous colour-in / output ha
 static UINT            g_stale_bytes[2];       // bytes actually written per block by the pending copies
 static bool            g_stale_have_hash;
 
-// 0 for a format this build cannot size, which skips the probe rather than record a
-// copy the runtime will reject.
+// Deliberately not HomeTexelBytes(): that one gates the buffer_home path and leaves out
+// formats the copy home cannot carry (B8G8R8X8_UNORM), which the probe can read perfectly
+// well. Every format TypedColorFormat and OutputFormatFor can produce is covered here.
+// 0 for anything else, which skips the probe rather than record a copy the runtime
+// will reject.
+static UINT StaleProbeTexelBytes(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R11G11B10_FLOAT:      return 4;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:   return 8;
+    default:                               return 0;
+    }
+}
+
 static UINT StaleProbePitch(DXGI_FORMAT f)
 {
-    const UINT bpp = HomeTexelBytes(f);
+    const UINT bpp = StaleProbeTexelBytes(f);
     if (bpp == 0 || bpp > kStaleProbeMaxTexel) return 0;
     return (kStaleProbeSize * bpp + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
            ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
