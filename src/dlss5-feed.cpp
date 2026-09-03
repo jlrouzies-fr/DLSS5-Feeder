@@ -1622,9 +1622,46 @@ static void FeedDisable(const char *why)
     Warn("stopped: %s. The game renders normally. See dlss5-feed.log for the detail.", why);
 }
 
+static void FeedDumpDred(HRESULT removed_reason);   // defined with the DRED helpers below
+static void FeedDrainInfoQueue(const char *when);   // defined with the DRED helpers below
+
+// ---------------------------------------------------------------------------
+// Removal checkpoints
+//
+// The device is removed with DXGI_ERROR_INVALID_CALL and DRED reports UNSUPPORTED for
+// both breadcrumbs and page faults, i.e. the runtime rejected an illegal API call rather
+// than the GPU faulting. The D3D12 debug layer would name it, but enabling it in this
+// process makes D3D12CreateDevice itself fail with DXGI_ERROR_DEVICE_RESET (it succeeds
+// in a bare process, with or without an explicit adapter), so the layer is unavailable
+// here. Set DLSS5_FEED_D3D12_DEBUG=1 to try it on a host where it does work.
+//
+// GetDeviceRemovedReason() flips synchronously for a runtime-rejected call, so polling it
+// after each call names the offending one without the layer. Diagnostic only: one runtime
+// call per checkpoint, compiled in because the failure is intermittent.
+// ---------------------------------------------------------------------------
+static const char *g_ck_last = "(none)";
+
+static bool CK(const char *label)
+{
+    if (g.dev12 == nullptr) return true;
+    const HRESULT r = g.dev12->GetDeviceRemovedReason();
+    if (SUCCEEDED(r)) { g_ck_last = label; return true; }
+    static bool reported = false;
+    if (!reported)
+    {
+        reported = true;
+        Log("[feed] ##### DEVICE REMOVED at checkpoint \"%s\" (reason 0x%08X); last good checkpoint was \"%s\" #####",
+            label, r, g_ck_last);
+        FeedDrainInfoQueue("at checkpoint");
+        FeedDumpDred(r);
+    }
+    return false;
+}
+
 static void FeedFail(const char *what)
 {
     Log("[feed] failure: %s", what);
+    FeedDrainInfoQueue("on failure");
     if (++g.consecutive_fails >= 3)
         FeedDisable("repeated failures");
 }
@@ -1635,6 +1672,21 @@ static void FeedFail(const char *what)
 
 static bool BeginCommands()
 {
+    // Notice a removal promptly: without this the first symptom is a rebuild failing
+    // with DXGI_ERROR_DEVICE_REMOVED long after the fact, by which time the breadcrumb
+    // trail is the only evidence left of what actually faulted.
+    FeedDrainInfoQueue("frame");
+    if (g.dev12 != nullptr)
+    {
+        const HRESULT removed_now = g.dev12->GetDeviceRemovedReason();
+        if (FAILED(removed_now))
+        {
+            Log("[feed] the D3D12 device is removed (0x%08X) at the start of a frame", removed_now);
+            FeedDumpDred(removed_now);
+            FeedDisable("the D3D12 device was removed (see dlss5-feed.log)");
+            return false;
+        }
+    }
     const int slot = g.frame_slot;
     const UINT64 retire = g.alloc_fence[slot];
     if (retire != 0 && g.fence12->GetCompletedValue() < retire)
@@ -1662,6 +1714,7 @@ static bool BeginCommands()
                 if (FAILED(removed))
                 {
                     Log("[feed] the D3D12 device was removed (0x%08X) while waiting on the fence", removed);
+                    FeedDumpDred(removed);
                     FeedDisable("the D3D12 device was removed (see dlss5-feed.log)");
                     return false;
                 }
@@ -1685,11 +1738,36 @@ static bool BeginCommands()
 
 static UINT64 EndCommands()
 {
-    g.list->Close();
+    // Close() reports any error hit while the list was being recorded -- a malformed
+    // barrier, a copy footprint that does not fit the resource. A list that failed to
+    // close is in an error state, and ExecuteCommandLists on it is an invalid call: the
+    // runtime removes the device with DXGI_ERROR_INVALID_CALL and, because nothing ever
+    // reached the GPU, DRED has nothing to report. Dropping the frame is always better.
+    const HRESULT closed = g.list->Close();
+    if (FAILED(closed))
+    {
+        Log("[feed] command list Close() failed 0x%08X -- NOT executing it "
+            "(executing a list that failed to close removes the device with DXGI_ERROR_INVALID_CALL)",
+            closed);
+        Log("[feed]   frame state: %ux%u color=%d output=%d home_pitch=%u home_slice=%llu "
+            "in_pitch=[%u %u %u %u] mask_ok=%d",
+            g.width, g.height, (int)g.color_fmt, (int)g.output_fmt,
+            g.home_pitch, (unsigned long long)g.home_slice,
+            g.in_pitch[0], g.in_pitch[1], g.in_pitch[2], g.in_pitch[3], g.mask_ok ? 1 : 0);
+        FeedDrainInfoQueue("close failure");
+        // The allocator still holds this frame's recording; retire the slot without a
+        // submit so the ring does not wait on a fence value that will never be signalled.
+        g.alloc_fence[g.frame_slot] = 0;
+        g.frame_slot = (g.frame_slot + 1) % Feed::kFrames;
+        FeedFail("command list would not close");
+        return 0;
+    }
     ID3D12CommandList *lists[] = { g.list };
     g.queue->ExecuteCommandLists(1, lists);
+    CK("ExecuteCommandLists");
     const UINT64 v = ++g.fence_value;
     g.queue->Signal(g.fence12, v);
+    CK("queue Signal(fence12)");
     g.alloc_fence[g.frame_slot] = v;
     g.frame_slot = (g.frame_slot + 1) % Feed::kFrames;
     return v;
@@ -2057,10 +2135,19 @@ static void GuideProbeRecord(ID3D12Resource *mv, D3D12_RESOURCE_STATES mv_state,
 // constant; both CHANGED = the D3D12->Vulkan copy home is the stale hop.
 // ---------------------------------------------------------------------------
 
-static const UINT kStaleProbeSize  = 64;
-static const UINT kStaleProbePitch = 256;   // 64 texels of a 4-byte format, already row-pitch aligned
-static const UINT kStaleProbeBlock = kStaleProbePitch * kStaleProbeSize;
-static const UINT kStaleProbeEvery = 60;
+static const UINT kStaleProbeSize = 64;
+// The probe copies the colour input and the DLSS output, whose format is whatever the
+// game presents -- 4 bytes per texel for the 8- and 10-bit formats, 8 for RGBA16F once a
+// swapchain is upgraded to scRGB/HDR. The row pitch therefore has to follow the format:
+// a footprint whose RowPitch is narrower than Width * bytes-per-texel is rejected while
+// the list is recorded, Close() then fails, and executing a list that failed to close
+// removes the device with DXGI_ERROR_INVALID_CALL (no GPU fault, so DRED reports
+// nothing). Sizing for the widest format keeps the two block offsets constant.
+static const UINT kStaleProbeMaxTexel = 16;                                     // RGBA32F
+static const UINT kStaleProbeMaxPitch = kStaleProbeSize * kStaleProbeMaxTexel;  // 1024
+static const UINT kStaleProbeBlock    = kStaleProbeMaxPitch * kStaleProbeSize;  // stride between the two blocks
+static const UINT kStaleProbeEvery    = 60;
+static_assert(kStaleProbeMaxPitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT == 0);
 static_assert(kStaleProbeBlock % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT == 0);
 
 static ID3D12Resource *g_stale_buf;
@@ -2068,22 +2155,33 @@ static UINT64          g_stale_fence;          // fence value that completes the
 static UINT64          g_stale_frames;
 static UINT64          g_stale_capture_frame;
 static uint64_t        g_stale_hash[2];        // previous colour-in / output hashes
+static UINT            g_stale_bytes[2];       // bytes actually written per block by the pending copies
 static bool            g_stale_have_hash;
 
-static uint64_t StaleProbeHash(const uint8_t *p)   // FNV-1a over one block
+// 0 for a format this build cannot size, which skips the probe rather than record a
+// copy the runtime will reject.
+static UINT StaleProbePitch(DXGI_FORMAT f)
+{
+    const UINT bpp = HomeTexelBytes(f);
+    if (bpp == 0 || bpp > kStaleProbeMaxTexel) return 0;
+    return (kStaleProbeSize * bpp + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+           ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+}
+
+static uint64_t StaleProbeHash(const uint8_t *p, UINT bytes)   // FNV-1a over one block
 {
     uint64_t h = 1469598103934665603ull;
-    for (UINT i = 0; i < kStaleProbeBlock; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    for (UINT i = 0; i < bytes; ++i) { h ^= p[i]; h *= 1099511628211ull; }
     return h;
 }
 
 static void StaleProbeAnalyse()
 {
     void *p = nullptr;
-    const D3D12_RANGE read = { 0, kStaleProbeBlock * 2 };
+    const D3D12_RANGE read = { 0, kStaleProbeBlock + g_stale_bytes[1] };
     if (FAILED(g_stale_buf->Map(0, &read, &p)) || p == nullptr) return;
-    const uint64_t hc = StaleProbeHash(static_cast<const uint8_t *>(p));
-    const uint64_t ho = StaleProbeHash(static_cast<const uint8_t *>(p) + kStaleProbeBlock);
+    const uint64_t hc = StaleProbeHash(static_cast<const uint8_t *>(p), g_stale_bytes[0]);
+    const uint64_t ho = StaleProbeHash(static_cast<const uint8_t *>(p) + kStaleProbeBlock, g_stale_bytes[1]);
     const D3D12_RANGE none = { 0, 0 };
     g_stale_buf->Unmap(0, &none);
     if (g_stale_have_hash)
@@ -2112,6 +2210,9 @@ static void StaleProbeRecord(ID3D12Resource *color, D3D12_RESOURCE_STATES color_
     }
     if ((g_stale_frames % kStaleProbeEvery) != 0) return;
     if (g.width < kStaleProbeSize || g.height < kStaleProbeSize) return;
+    const UINT color_pitch  = StaleProbePitch(g.color_fmt);
+    const UINT output_pitch = StaleProbePitch(g.output_fmt);
+    if (color_pitch == 0 || output_pitch == 0) return;
     if (g_stale_buf == nullptr)
     {
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
@@ -2134,18 +2235,20 @@ static void StaleProbeRecord(ID3D12Resource *color, D3D12_RESOURCE_STATES color_
 
     src.pResource = color;
     dst.PlacedFootprint.Offset = 0;
-    dst.PlacedFootprint.Footprint = { g.color_fmt, kStaleProbeSize, kStaleProbeSize, 1, kStaleProbePitch };
+    dst.PlacedFootprint.Footprint = { g.color_fmt, kStaleProbeSize, kStaleProbeSize, 1, color_pitch };
     if (color_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(color, color_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
     if (color_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(color, D3D12_RESOURCE_STATE_COPY_SOURCE, color_state);
 
     src.pResource = output;
     dst.PlacedFootprint.Offset = kStaleProbeBlock;
-    dst.PlacedFootprint.Footprint = { g.output_fmt, kStaleProbeSize, kStaleProbeSize, 1, kStaleProbePitch };
+    dst.PlacedFootprint.Footprint = { g.output_fmt, kStaleProbeSize, kStaleProbeSize, 1, output_pitch };
     if (output_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(output, output_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
     if (output_state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(output, D3D12_RESOURCE_STATE_COPY_SOURCE, output_state);
 
+    g_stale_bytes[0] = color_pitch * kStaleProbeSize;
+    g_stale_bytes[1] = output_pitch * kStaleProbeSize;
     g_stale_capture_frame = g_stale_frames;
     g_stale_fence = g.fence_value + 1;   // exactly what EndCommands() signals for this list
 }
@@ -2757,6 +2860,7 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
             if (FAILED(removed))
             {
                 Log("[feed] the D3D12 device was removed (0x%08X) during feature creation", removed);
+                FeedDumpDred(removed);
                 FeedDisable("the D3D12 device was removed (see dlss5-feed.log)");
             }
             else
@@ -2795,6 +2899,244 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
 // Session: private D3D12 device + NGX
 // ---------------------------------------------------------------------------
 
+typedef HRESULT (WINAPI *PFN_D3D12GetDebugInterface_)(REFIID, void **);
+
+// ---------------------------------------------------------------------------
+// Device Removed Extended Data (DRED)
+//
+// "The D3D12 device was removed" on its own says nothing about which GPU operation
+// killed it. DRED records an auto-breadcrumb trail of the commands each list was
+// executing when the device went down, plus the page-fault virtual address and the
+// allocations that surround it. Must be enabled BEFORE the device is created.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// D3D12 debug layer + info queue
+//
+// The device is removed with DXGI_ERROR_INVALID_CALL (0x887A0001) and DRED reports
+// DXGI_ERROR_UNSUPPORTED for both breadcrumbs and page faults: that combination means
+// the runtime rejected an illegal API call rather than the GPU faulting. The debug
+// layer names such calls exactly. It must be enabled before device creation.
+// ---------------------------------------------------------------------------
+static ID3D12InfoQueue *g_info_queue = nullptr;
+
+static void FeedEnableD3D12DebugLayer()
+{
+    // Off by default: enabling the layer in this process makes D3D12CreateDevice itself
+    // fail with DXGI_ERROR_DEVICE_RESET, while the same calls succeed in a bare process
+    // with or without an explicit adapter. DLSS5_FEED_D3D12_DEBUG=1 tries it anyway.
+    char opt[8] = {};
+    if (GetEnvironmentVariableA("DLSS5_FEED_D3D12_DEBUG", opt, sizeof(opt)) == 0 || opt[0] != '1') return;
+
+    HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+    if (d3d12 == nullptr) d3d12 = LoadLibraryW(L"d3d12.dll");
+    if (d3d12 == nullptr) return;
+    auto get_debug = reinterpret_cast<PFN_D3D12GetDebugInterface_>(GetProcAddress(d3d12, "D3D12GetDebugInterface"));
+    if (get_debug == nullptr) return;
+
+    ID3D12Debug *dbg = nullptr;
+    const HRESULT hr = get_debug(__uuidof(ID3D12Debug), reinterpret_cast<void **>(&dbg));
+    if (FAILED(hr) || dbg == nullptr)
+    {
+        Log("[feed] D3D12 debug layer unavailable 0x%08X (install the Graphics Tools optional feature)", hr);
+        return;
+    }
+    dbg->EnableDebugLayer();
+    dbg->Release();
+    Log("[feed] D3D12 debug layer ENABLED (diagnostic build; costs performance)");
+}
+
+static void FeedAttachInfoQueue()
+{
+    if (g.dev12 == nullptr || g_info_queue != nullptr) return;
+    const HRESULT hr = g.dev12->QueryInterface(__uuidof(ID3D12InfoQueue), reinterpret_cast<void **>(&g_info_queue));
+    if (FAILED(hr) || g_info_queue == nullptr)
+    {
+        Log("[feed] D3D12 info queue unavailable 0x%08X", hr);
+        g_info_queue = nullptr;
+        return;
+    }
+    g_info_queue->SetMuteDebugOutput(FALSE);
+    Log("[feed] D3D12 info queue attached");
+}
+
+// Drain whatever the debug layer has said since the last call.
+static void FeedDrainInfoQueue(const char *when)
+{
+    if (g_info_queue == nullptr) return;
+    const UINT64 n = g_info_queue->GetNumStoredMessages();
+    for (UINT64 i = 0; i < n; ++i)
+    {
+        SIZE_T len = 0;
+        if (FAILED(g_info_queue->GetMessage(i, nullptr, &len)) || len == 0) continue;
+        auto *msg = static_cast<D3D12_MESSAGE *>(malloc(len));
+        if (msg == nullptr) continue;
+        if (SUCCEEDED(g_info_queue->GetMessage(i, msg, &len)))
+        {
+            const char *sev = msg->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION ? "CORRUPTION"
+                            : msg->Severity == D3D12_MESSAGE_SEVERITY_ERROR      ? "ERROR"
+                            : msg->Severity == D3D12_MESSAGE_SEVERITY_WARNING    ? "WARNING"
+                            : msg->Severity == D3D12_MESSAGE_SEVERITY_INFO       ? "info"
+                                                                                 : "message";
+            if (msg->Severity <= D3D12_MESSAGE_SEVERITY_WARNING)
+                Log("[feed] D3D12 %s [%s] id=%d: %.*s", sev, when,
+                    static_cast<int>(msg->ID), static_cast<int>(msg->DescriptionByteLength), msg->pDescription);
+        }
+        free(msg);
+    }
+    if (n != 0) g_info_queue->ClearStoredMessages();
+}
+
+static void FeedEnableDred()
+{
+    HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+    if (d3d12 == nullptr) d3d12 = LoadLibraryW(L"d3d12.dll");
+    if (d3d12 == nullptr) return;
+    auto get_debug = reinterpret_cast<PFN_D3D12GetDebugInterface_>(GetProcAddress(d3d12, "D3D12GetDebugInterface"));
+    if (get_debug == nullptr) { Log("[feed] DRED: no D3D12GetDebugInterface"); return; }
+
+    ID3D12DeviceRemovedExtendedDataSettings *dred = nullptr;
+    const HRESULT hr = get_debug(__uuidof(ID3D12DeviceRemovedExtendedDataSettings),
+                                 reinterpret_cast<void **>(&dred));
+    if (FAILED(hr) || dred == nullptr) { Log("[feed] DRED: settings unavailable 0x%08X", hr); return; }
+    dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    dred->Release();
+    Log("[feed] DRED: auto-breadcrumbs and page-fault reporting enabled");
+}
+
+static const char *FeedDredOpName(D3D12_AUTO_BREADCRUMB_OP op)
+{
+    switch (op)
+    {
+    case D3D12_AUTO_BREADCRUMB_OP_SETMARKER:                 return "SetMarker";
+    case D3D12_AUTO_BREADCRUMB_OP_BEGINEVENT:                return "BeginEvent";
+    case D3D12_AUTO_BREADCRUMB_OP_ENDEVENT:                  return "EndEvent";
+    case D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED:             return "DrawInstanced";
+    case D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED:      return "DrawIndexedInstanced";
+    case D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT:           return "ExecuteIndirect";
+    case D3D12_AUTO_BREADCRUMB_OP_DISPATCH:                  return "Dispatch";
+    case D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION:          return "CopyBufferRegion";
+    case D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION:         return "CopyTextureRegion";
+    case D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE:              return "CopyResource";
+    case D3D12_AUTO_BREADCRUMB_OP_COPYTILES:                 return "CopyTiles";
+    case D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCE:        return "ResolveSubresource";
+    case D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW:     return "ClearRenderTargetView";
+    case D3D12_AUTO_BREADCRUMB_OP_CLEARUNORDEREDACCESSVIEW:  return "ClearUnorderedAccessView";
+    case D3D12_AUTO_BREADCRUMB_OP_CLEARDEPTHSTENCILVIEW:     return "ClearDepthStencilView";
+    case D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER:           return "ResourceBarrier";
+    case D3D12_AUTO_BREADCRUMB_OP_EXECUTEBUNDLE:             return "ExecuteBundle";
+    case D3D12_AUTO_BREADCRUMB_OP_PRESENT:                   return "Present";
+    case D3D12_AUTO_BREADCRUMB_OP_RESOLVEQUERYDATA:          return "ResolveQueryData";
+    case D3D12_AUTO_BREADCRUMB_OP_BEGINSUBMISSION:           return "BeginSubmission";
+    case D3D12_AUTO_BREADCRUMB_OP_ENDSUBMISSION:             return "EndSubmission";
+    case D3D12_AUTO_BREADCRUMB_OP_DECODEFRAME:               return "DecodeFrame";
+    case D3D12_AUTO_BREADCRUMB_OP_PROCESSFRAMES:             return "ProcessFrames";
+    case D3D12_AUTO_BREADCRUMB_OP_ATOMICCOPYBUFFERUINT:      return "AtomicCopyBufferUINT";
+    case D3D12_AUTO_BREADCRUMB_OP_ATOMICCOPYBUFFERUINT64:    return "AtomicCopyBufferUINT64";
+    case D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCEREGION:  return "ResolveSubresourceRegion";
+    case D3D12_AUTO_BREADCRUMB_OP_WRITEBUFFERIMMEDIATE:      return "WriteBufferImmediate";
+    case D3D12_AUTO_BREADCRUMB_OP_DISPATCHRAYS:              return "DispatchRays";
+    case D3D12_AUTO_BREADCRUMB_OP_INITIALIZEMETACOMMAND:     return "InitializeMetaCommand";
+    case D3D12_AUTO_BREADCRUMB_OP_EXECUTEMETACOMMAND:        return "ExecuteMetaCommand";
+    case D3D12_AUTO_BREADCRUMB_OP_ESTIMATEMOTION:            return "EstimateMotion";
+    case D3D12_AUTO_BREADCRUMB_OP_RESOLVEMOTIONVECTORHEAP:   return "ResolveMotionVectorHeap";
+    case D3D12_AUTO_BREADCRUMB_OP_SETPIPELINESTATE1:         return "SetPipelineState1";
+    case D3D12_AUTO_BREADCRUMB_OP_INITIALIZEEXTENSIONCOMMAND: return "InitializeExtensionCommand";
+    case D3D12_AUTO_BREADCRUMB_OP_EXECUTEEXTENSIONCOMMAND:   return "ExecuteExtensionCommand";
+    default:                                                 return "?";
+    }
+}
+
+static const char *FeedDredAllocName(D3D12_DRED_ALLOCATION_TYPE t)
+{
+    switch (t)
+    {
+    case D3D12_DRED_ALLOCATION_TYPE_COMMAND_QUEUE:     return "CommandQueue";
+    case D3D12_DRED_ALLOCATION_TYPE_COMMAND_ALLOCATOR: return "CommandAllocator";
+    case D3D12_DRED_ALLOCATION_TYPE_PIPELINE_STATE:    return "PipelineState";
+    case D3D12_DRED_ALLOCATION_TYPE_COMMAND_LIST:      return "CommandList";
+    case D3D12_DRED_ALLOCATION_TYPE_FENCE:             return "Fence";
+    case D3D12_DRED_ALLOCATION_TYPE_DESCRIPTOR_HEAP:   return "DescriptorHeap";
+    case D3D12_DRED_ALLOCATION_TYPE_HEAP:              return "Heap";
+    case D3D12_DRED_ALLOCATION_TYPE_QUERY_HEAP:        return "QueryHeap";
+    case D3D12_DRED_ALLOCATION_TYPE_COMMAND_SIGNATURE: return "CommandSignature";
+    case D3D12_DRED_ALLOCATION_TYPE_RESOURCE:          return "RESOURCE";
+    default:                                           return "?";
+    }
+}
+
+// Dump whatever DRED captured. Safe to call more than once; logs once per removal.
+static void FeedDumpDred(HRESULT removed_reason)
+{
+    static bool dumped = false;
+    if (dumped || g.dev12 == nullptr) return;
+    dumped = true;
+
+    Log("[feed] ===== DRED: device removed, reason 0x%08X =====", removed_reason);
+    FeedDrainInfoQueue("at removal");
+
+    ID3D12DeviceRemovedExtendedData1 *dred = nullptr;
+    HRESULT hr = g.dev12->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData1),
+                                         reinterpret_cast<void **>(&dred));
+    if (FAILED(hr) || dred == nullptr)
+    {
+        Log("[feed] DRED: QueryInterface failed 0x%08X (needs Windows 10 1903+ and DRED enabled before device creation)", hr);
+        return;
+    }
+
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 bc = {};
+    hr = dred->GetAutoBreadcrumbsOutput1(&bc);
+    if (SUCCEEDED(hr))
+    {
+        int node_index = 0;
+        for (const D3D12_AUTO_BREADCRUMB_NODE1 *node = bc.pHeadAutoBreadcrumbNode;
+             node != nullptr && node_index < 8; node = node->pNext, ++node_index)
+        {
+            const UINT32 last = node->pLastBreadcrumbValue != nullptr ? *node->pLastBreadcrumbValue : 0;
+            Log("[feed] DRED node %d: queue='%ls' list='%ls' executed %u of %u ops",
+                node_index,
+                node->pCommandQueueDebugNameW ? node->pCommandQueueDebugNameW : L"(unnamed)",
+                node->pCommandListDebugNameW ? node->pCommandListDebugNameW : L"(unnamed)",
+                last, node->BreadcrumbCount);
+            // The op at index 'last' is the one that had not finished: the culprit.
+            const UINT32 first = last > 6 ? last - 6 : 0;
+            for (UINT32 i = first; i < node->BreadcrumbCount && i <= last; ++i)
+                Log("[feed] DRED   op[%u]%s %s", i, i == last ? " <== FAULTED HERE" : "",
+                    FeedDredOpName(node->pCommandHistory[i]));
+        }
+        if (bc.pHeadAutoBreadcrumbNode == nullptr)
+            Log("[feed] DRED: no breadcrumb nodes (nothing was in flight on our queue)");
+    }
+    else
+    {
+        Log("[feed] DRED: GetAutoBreadcrumbsOutput1 failed 0x%08X", hr);
+    }
+
+    D3D12_DRED_PAGE_FAULT_OUTPUT1 pf = {};
+    hr = dred->GetPageFaultAllocationOutput1(&pf);
+    if (SUCCEEDED(hr))
+    {
+        Log("[feed] DRED page fault VA: 0x%llX", static_cast<unsigned long long>(pf.PageFaultVA));
+        int n = 0;
+        for (const D3D12_DRED_ALLOCATION_NODE1 *a = pf.pHeadExistingAllocationNode; a != nullptr && n < 8; a = a->pNext, ++n)
+            Log("[feed] DRED   existing alloc: %s '%ls'", FeedDredAllocName(a->AllocationType),
+                a->ObjectNameW ? a->ObjectNameW : L"(unnamed)");
+        n = 0;
+        for (const D3D12_DRED_ALLOCATION_NODE1 *a = pf.pHeadRecentFreedAllocationNode; a != nullptr && n < 8; a = a->pNext, ++n)
+            Log("[feed] DRED   RECENTLY FREED: %s '%ls'", FeedDredAllocName(a->AllocationType),
+                a->ObjectNameW ? a->ObjectNameW : L"(unnamed)");
+        if (pf.PageFaultVA == 0)
+            Log("[feed] DRED: no page fault recorded (the removal was not an invalid memory access)");
+    }
+    else
+    {
+        Log("[feed] DRED: GetPageFaultAllocationOutput1 failed 0x%08X", hr);
+    }
+
+    dred->Release();
+    Log("[feed] ===== DRED end =====");
+}
+
 typedef HRESULT (WINAPI *PFN_D3D12CreateDevice_)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
 
 static void ShutdownSession();   // defined below; every InitSession* unwinds through it
@@ -2830,6 +3172,9 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         HRESULT hr = create_device(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&g.dev12));
         if (FAILED(hr) || g.dev12 == nullptr) { Log("[feed] D3D12CreateDevice failed 0x%08X", hr); goto fail; }
         g.dev12_owned = true;
+    // Debug names make the DRED breadcrumb and page-fault output identify OUR objects.
+    g.dev12->SetName(L"dlss5-feed private device");
+    FeedAttachInfoQueue();
 
         wchar_t data_path[MAX_PATH] = {};
         GetModuleFileNameW(g_self, data_path, MAX_PATH);
@@ -3202,6 +3547,8 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
         FeedDisable("d3d12.dll unavailable");
         return false;
     }
+    FeedEnableD3D12DebugLayer();   // must precede device creation
+    FeedEnableDred();              // must precede device creation
     HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&g.dev12));
     if (FAILED(hr) || g.dev12 == nullptr)
     {
@@ -3293,7 +3640,7 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
     // ourselves (ReShade's create_fence imports as the wrong external type). Then wrap
     // the VkSemaphores back into api::fence handles -- in ReShade's Vulkan backend an
     // api::fence handle IS a VkSemaphore -- so queue signal/wait stay inside its locks.
-    if (!FeedVkLoad(&g.vk, FeedVkDispatch<VkDevice>(g.rs_dev->get_native())))
+    if (!FeedVkLoad(&g.vk, FeedVkDispatch<VkDevice>(g.rs_dev->get_native()), g_vk_phys))
     {
         // The KHR external-interop extensions were not enabled at vkCreateDevice. Our
         // vkCreateDevice hook (feed_vk_hook.h) normally appends them; if it never saw
@@ -3357,6 +3704,12 @@ static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
     if (FAILED(hr))
     {
         Log("[feed] %s: shared D3D12 texture failed 0x%08X", kSlotName[slot], hr);
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+        {
+            const HRESULT reason = g.dev12 != nullptr ? g.dev12->GetDeviceRemovedReason() : hr;
+            Log("[feed] the device was already removed before this rebuild; reason 0x%08X", reason);
+            FeedDumpDred(reason);
+        }
         return false;
     }
 
@@ -3369,7 +3722,9 @@ static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
         Log("[feed] %s: no VkFormat mapping for %s", kSlotName[slot], FormatName(fmt));
         return false;
     }
-    if (!FeedVkImportImage(&g.vk, g.tex_shared_ext[slot], w, h, vkf, uav, &g.vk_img[slot], &g.vk_mem[slot]))
+    const D3D12_RESOURCE_ALLOCATION_INFO ai = g.dev12->GetResourceAllocationInfo(0, 1, &rd);
+    if (!FeedVkImportImage(&g.vk, g.tex_shared_ext[slot], w, h, vkf, uav, &g.vk_img[slot], &g.vk_mem[slot],
+                           ai.SizeInBytes))
     {
         Log("[feed] texture import FAILED: %s %ux%u %s (raw Vulkan external-memory import)", kSlotName[slot], w, h, FormatName(fmt));
         return false;
@@ -3580,6 +3935,8 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
         FeedDisable("d3d12.dll unavailable");
         return false;
     }
+    FeedEnableD3D12DebugLayer();   // must precede device creation
+    FeedEnableDred();              // must precede device creation
     HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&g.dev12));
     if (FAILED(hr) || g.dev12 == nullptr)
     {
@@ -4689,6 +5046,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
             // D3D12: wait for the copies, evaluate, signal back. Unchanged machinery.
             g.queue->Wait(g.fence12_in, n);
+            CK("queue Wait(fence12_in)");
             bool done = false;
             if (!BeginCommands()) FeedFail("command list");
             else
@@ -4717,6 +5075,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                         dst.SubresourceIndex = 0;
                         Barrier(g.tex12[d.slot], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
                         g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                        CK(kSlotName[d.slot]);
                         Barrier(g.tex12[d.slot], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
                     }
                 }
@@ -4727,6 +5086,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 GuideProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                  g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                CK("input barriers");
 
                 NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
                 ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
@@ -4762,7 +5122,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                     re = static_cast<NVSDK_NGX_Result>(0x1);   // NVSDK_NGX_Result_Success
                 }
                 else
+                {
                     re = SafeEvaluateDLSS(&ep, &ecode);
+                    CK("NGX evaluate");
+                }
                 if (ecode != 0)
                 {
                     AbortCommands();  // never execute a list NGX crashed while recording
@@ -4790,6 +5153,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                         dst.PlacedFootprint.Offset = g.home_slice != 0 ? g.home_slice * (n & 1) : 0;
                         dst.PlacedFootprint.Footprint = { g.output_fmt, g.width, g.height, 1, g.home_pitch };
                         g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                        CK("copy home (output -> shared buffer)");
                         Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                     }
                     Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -4809,9 +5173,15 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 }
             }
             if (done)
+            {
                 g.queue->Signal(g.fence12_out, n);   // after the evaluate, GPU-ordered
+                CK("queue Signal(fence12_out)");
+            }
             else
+            {
                 g.fence12_out->Signal(n);            // CPU-signal so the game never hangs on us
+                CK("fence12_out CPU Signal");
+            }
 
             // The copy home lands on the fresh immediate list, which executes on the
             // game's queue after the wait below -- GPU-ordered, no CPU stall.
