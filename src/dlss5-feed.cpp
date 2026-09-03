@@ -175,6 +175,23 @@ static void WriteCrashDump(EXCEPTION_POINTERS *ep)
 }
 
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
+// An access violation carries two extra words, and they are the difference between "the
+// game read a null pointer" and "we wrote off the end of something". Free to log, and until
+// now only recoverable by opening the minidump by hand -- which is exactly what issue #44
+// (Bayonetta, the 32-bit twin of this filter) needed to establish that the fault was a read
+// of address 0 in the game's own code, before the add-on had fed a single frame.
+static void CrashAccessDetail(const EXCEPTION_RECORD *r, char *out, size_t out_size)
+{
+    out[0] = '\0';
+    if (r == nullptr || r->NumberParameters < 2) return;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION && r->ExceptionCode != EXCEPTION_IN_PAGE_ERROR) return;
+    const char *verb = r->ExceptionInformation[0] == 0 ? "reading"
+                     : r->ExceptionInformation[0] == 1 ? "writing"
+                     : r->ExceptionInformation[0] == 8 ? "executing" : "accessing";
+    _snprintf_s(out, out_size, _TRUNCATE, " (%s address %p)", verb,
+                reinterpret_cast<void *>(r->ExceptionInformation[1]));
+}
+
 static volatile LONG g_crash_once;
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
@@ -193,8 +210,10 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            static_cast<LPCWSTR>(addr), &mod) && mod != nullptr)
         GetModuleFileNameW(mod, owner, MAX_PATH);
-    Log("### CRASH RECORDED ###  exception 0x%08X at %p in %ls; this add-on was last doing: %s%s "
-        "(later faults in this process are not recorded)", code, addr,
+    char access[64];
+    CrashAccessDetail(ep != nullptr ? ep->ExceptionRecord : nullptr, access, sizeof(access));
+    Log("### CRASH RECORDED ###  exception 0x%08X%s at %p in %ls; this add-on was last doing: %s%s "
+        "(later faults in this process are not recorded)", code, access, addr,
         owner, g_where, mod == g_self ? " (inside this add-on)" : "");
     WriteCrashDump(ep);
     return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
@@ -5521,6 +5540,7 @@ struct RuntimeSlot
     void                          *dev;         // native device, for the log
     char                           wclass[48];  // window class of the swapchain's HWND
     bool                           proxy;       // Smooth Motion's invisible proxy swapchain
+    ULONGLONG                      last_resolve; // GetTickCount64 of the last find_technique from the render path
 };
 static RuntimeSlot g_runtimes[6];
 static int         g_runtime_count;
@@ -5712,10 +5732,20 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 
 static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 {
+    // Log the destroy BEFORE the bound-runtime test. Only the bound one used to be
+    // reported, so a log could show three runtimes initialising and never once show the
+    // topology changing underneath -- which is what a churning multi-runtime game (issue
+    // #40) needs to be readable at all. Same cap and the same suppression notice as the
+    // init side, which had one and this did not.
+    const bool was_bound = rt == g.runtime;
     UntrackRuntime(rt);
-    if (rt != g.runtime) return;
     static int destroys = 0;
-    if (++destroys <= 8) Log("[feed] effect runtime %p destroyed", (void *)rt);
+    if (++destroys <= 8)
+        Log("[feed] effect runtime %p destroyed%s (%d runtime%s left)", (void *)rt,
+            was_bound ? " -- it was the bound one" : "", g_runtime_count, g_runtime_count == 1 ? "" : "s");
+    else if (destroys == 9)
+        Log("[feed] (further runtime init/destroy messages suppressed)");
+    if (!was_bound) return;
     // Same-device D3D12: feature and textures live on the GAME's device and survive runtime
     // churn -- keep them. D3D11 bridge: the shared textures live on the game's D3D11 device
     // and our private D3D12 device, neither of which dies with the ReShade runtime -- keep
@@ -5759,7 +5789,31 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
         // it (the same preset on the game's swapchain and Smooth Motion's proxy) and
         // flip-flopping between two devices every frame would rebuild the session each
         // time. The bound one keeps it then; the other is dropped, and says so once.
-        const RuntimeSlot *slot = FindRuntime(rt);
+        RuntimeSlot *slot = FindRuntime(rt);
+        // A slot's technique handle is only written by TrackRuntime, which runs on init and
+        // on reloaded-effects. A runtime whose handle changes without either reaching us
+        // stays stale for the rest of the session: adoption never fires and, until now, not
+        // one byte was logged -- the feed simply stopped, and only a swapchain re-init (an
+        // alt-tab) brought it back. That is issue #40's symptom exactly. Re-resolve here
+        // rather than giving up, at most once a second per runtime so a genuinely foreign
+        // technique does not cost a name lookup on every pass.
+        if (slot != nullptr && technique.handle != slot->technique.handle)
+        {
+            const ULONGLONG t = GetTickCount64();
+            if (t - slot->last_resolve >= 1000)
+            {
+                slot->last_resolve = t;
+                const reshade::api::effect_technique fresh = rt->find_technique(kEffectFile, kTechnique);
+                if (fresh.handle != slot->technique.handle)
+                {
+                    Log("[feed] effect runtime %p: DLSS5_Feed handle changed under us (%llu -> %llu); re-resolved",
+                        (void *)rt, (unsigned long long)slot->technique.handle, (unsigned long long)fresh.handle);
+                    slot->technique = fresh;
+                }
+            }
+        }
+        // Still not this runtime's DLSS5_Feed: it is one of the other techniques in the
+        // preset, which arrive here constantly and are nothing to report.
         if (slot == nullptr || slot->technique.handle == 0 || technique.handle != slot->technique.handle) return;
         const ULONGLONG now = GetTickCount64();
         if (g.technique.handle != 0 && now - g_bound_last_render < 1000)
@@ -5777,7 +5831,29 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
         g.need_reset = true;
         g.create_grace = 0;
     }
-    if (g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    if (g.technique.handle == 0 || technique.handle != g.technique.handle)
+    {
+        // Nearly every render arriving here is one of the OTHER techniques in the user's
+        // preset -- ordinary, and silent. The case worth catching is the same stale-handle
+        // hole one level up: g.technique no longer matching the bound runtime's DLSS5_Feed
+        // drops every one of ITS renders forever, with nothing in the frame path to
+        // re-resolve it. Ask ReShade at most once a second, and only speak when the fresh
+        // handle proves this render was ours after all.
+        const ULONGLONG t = GetTickCount64();
+        static ULONGLONG last_bound_resolve = 0;
+        if (rt == g.runtime && t - last_bound_resolve >= 1000)
+        {
+            last_bound_resolve = t;
+            const reshade::api::effect_technique fresh = rt->find_technique(kEffectFile, kTechnique);
+            if (fresh.handle == technique.handle && fresh.handle != g.technique.handle)
+            {
+                Log("[feed] bound runtime %p: DLSS5_Feed handle changed under us (%llu -> %llu); re-resolving",
+                    (void *)rt, (unsigned long long)g.technique.handle, (unsigned long long)fresh.handle);
+                ResolveHandles(rt);
+            }
+        }
+        if (g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    }
     g_bound_last_render = GetTickCount64();
     FeedFrame(rt, cl, rtv);
 }
