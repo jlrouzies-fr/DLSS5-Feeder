@@ -101,7 +101,13 @@ static void Warn(const char *fmt, ...)
     reshade::log::message(reshade::log::level::warning, tagged);
 }
 
-static const char *volatile g_where = "starting up";
+// The initial value has to read as "nothing has happened yet", not as a phase. It used to
+// say "starting up", which is what a crash line reports whenever no Breadcrumb has been
+// reached -- and every Breadcrumb is inside the feed path, so with the feed off, or before
+// the first shared-texture build, it can never say anything else. A reporter (and the
+// maintainer answering them) read that as evidence the crash happened during our startup,
+// which it is not: the useful half of the line is the faulting module (issue #44).
+static const char *volatile g_where = "nothing yet -- no feed work has run in this process";
 static void Breadcrumb(const char *what) { g_where = what; }
 
 // The 64-bit add-on has recorded crashes with a breadcrumb since 0.8; this side only
@@ -1060,7 +1066,11 @@ static void RestoreGameFocus()
 
 static void HostLost(const char *why)
 {
-    Log("[feed32] host lost: %s", why);
+    DWORD code = 0;
+    if (g.hproc != nullptr && GetExitCodeProcess(g.hproc, &code) && code != STILL_ACTIVE)
+        Log("[feed32] host lost: %s (exit code %lu)", why, code);
+    else
+        Log("[feed32] host lost: %s", why);
     HostClose();
     FeedDisable("the 64-bit host went away -- its own dlss5-feed-host.log (in host64\\) names the reason");
 }
@@ -1711,9 +1721,13 @@ static bool OnSetFullscreenState(reshade::api::swapchain *, bool fullscreen, voi
     return false;   // never interfere with the game's choice
 }
 
+// Defined far below with the other ReShade callbacks; OnPresent and DrawOverlay call it to
+// re-adopt the runtime when enabled goes 0 -> 1, since no event will fire again for it.
+static void OnInitEffectRuntime(reshade::api::effect_runtime *rt);
+
 static bool OnOpenOverlay(reshade::api::effect_runtime *rt, bool open, reshade::api::input_source)
 {
-    if (rt == g.runtime) g_game_overlay_open = open;
+    if (g_cfg.enabled && rt == g.runtime) g_game_overlay_open = open;
     return false;   // never veto
 }
 
@@ -1723,6 +1737,23 @@ static void OnPresent(reshade::api::effect_runtime *rt)
     // DLSS5_Feed technique renders, so with the effect missing or disabled, effects toggled
     // off, or mode=0, "Start the DLSS 5 host" would have done nothing at all -- and that is
     // exactly the state a user presses it in. This callback runs every frame regardless.
+    // Ahead of the enabled gate, and the only CfgReload that is: the other three are in the
+    // frame path, which enabled=0 never reaches, so a cfg file edited back to enabled=1
+    // could never be picked up -- only the overlay checkbox could undo it. Time-throttled
+    // rather than frame-counted, because the frame counter only advances when feeding.
+    {
+        static ULONGLONG next = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now >= next)
+        {
+            next = now + 1000;
+            const int was = g_cfg.enabled;
+            if (CfgReload() || was != g_cfg.enabled) g.built = false;
+            if (was == 0 && g_cfg.enabled != 0 && rt != nullptr)
+            { Log("[feed32] enabled=1 read back from dlss5-feed.cfg; re-adopting the effect runtime"); OnInitEffectRuntime(rt); }
+        }
+    }
+    if (!g_cfg.enabled) return;
     if (rt == g.runtime && HostRequestPending() && FeedEnter())
     {
         HostConsumeRequest();   // inside the lock: it tears down what a frame uses
@@ -1736,7 +1767,7 @@ static void OnPresent(reshade::api::effect_runtime *rt)
 // window. Drawn on the foreground list so it sits above the game's own ReShade overlay.
 static void OnOverlay(reshade::api::effect_runtime *rt)
 {
-    if (rt != g.runtime) return;
+    if (!g_cfg.enabled || rt != g.runtime) return;
     // ReShade's wheel delta is a per-frame value. This callback runs inside its GUI draw,
     // earlier in the frame than reshade_present where CastInput reads it, so take it here
     // too: if the delta has already been cleared by then, this is the copy that survives.
@@ -1962,7 +1993,10 @@ static bool HostWorkerConnect(HANDLE ev)
     }
     CloseHandle(pi.hThread);
     g_link.proc = pi.hProcess;
-    Log("[feed32] host spawned (pid %lu)", pi.dwProcessId);
+    // The command line, not just the pid: when the host exits at its usage line, this is
+    // the half of the evidence that survives -- the host truncates its own log on every
+    // launch, so a later manual run can erase the failing one (issue #46).
+    Log("[feed32] host spawned (pid %lu): %s", pi.dwProcessId, cmd);
 
     char name[128];
     sprintf_s(name, FEED_PIPE_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
@@ -1973,7 +2007,18 @@ static bool HostWorkerConnect(HANDLE ev)
                                FILE_FLAG_OVERLAPPED, nullptr);
         if (p != INVALID_HANDLE_VALUE) { g_link.pipe = p; break; }
         if (WaitForSingleObject(g_link.proc, 0) != WAIT_TIMEOUT)
-        { strcpy_s(g_link.why, "exited during startup"); return false; }
+        {
+            // The host's own return value said why (1 = it rejected its arguments, 3 = the
+            // device was removed); it used to be discarded, leaving "went away" as the
+            // whole story.
+            DWORD code = 0;
+            if (GetExitCodeProcess(g_link.proc, &code))
+                sprintf_s(g_link.why, "exited during startup with code %lu%s", code,
+                          code == 1 ? " (it rejected its own command line -- see dlss5-feed-host.log)" : "");
+            else
+                strcpy_s(g_link.why, "exited during startup");
+            return false;
+        }
         if (WaitForSingleObject(g_link.abort_event, 100) == WAIT_OBJECT_0)
         { strcpy_s(g_link.why, "cancelled while starting"); return false; }
     }
@@ -4404,8 +4449,13 @@ static bool RuntimeDeviceCompatible(const RuntimeSlot *slot)
            reinterpret_cast<ID3D11Device *>(slot->dev) == g.dev;
 }
 
+// enabled=0 means enabled=0. Everything below this line queries the runtime, reads files,
+// loads dbghelp, scans modules or draws -- none of which a user who set enabled=0 to take
+// this add-on out of the picture expects to still be happening (issue #44, and README's
+// "0 disables everything"). Only the overlay page stays, so the checkbox can undo it.
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
+    if (!g_cfg.enabled) return;
     RuntimeSlot *slot = TrackRuntime(rt);
     DetectSmoothMotion();   // a present interposer can arrive after this add-on did
     // Not in DllMain (LoadLibrary under the loader lock) and not in the exception filter
@@ -4452,6 +4502,7 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 
 static void OnReloadedEffects(reshade::api::effect_runtime *rt)
 {
+    if (!g_cfg.enabled) return;
     RuntimeSlot *slot = TrackRuntime(rt);
     if (rt == g.runtime || g.runtime == nullptr || (g.technique.handle == 0 && slot->technique.handle != 0))
     {
@@ -4470,6 +4521,7 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
                               reshade::api::command_list *cl, reshade::api::resource_view rtv,
                               reshade::api::resource_view /*rtv_srgb*/)
 {
+    if (!g_cfg.enabled) return;
     if (rt != g.runtime)
     {
         // Another runtime is rendering DLSS5_Feed. Adopt it -- unless the bound one rendered
@@ -4615,11 +4667,22 @@ static void HelpMarker(const char *desc)
     }
 }
 
-static void DrawOverlay(reshade::api::effect_runtime *)
+static void DrawOverlay(reshade::api::effect_runtime *rt)
 {
     bool dirty = false;
     bool enabled = g_cfg.enabled != 0;
-    if (ImGui::Checkbox("Enabled", &enabled)) { g_cfg.enabled = enabled ? 1 : 0; dirty = true; }
+    if (ImGui::Checkbox("Enabled", &enabled))
+    {
+        g_cfg.enabled = enabled ? 1 : 0;
+        dirty = true;
+        // Turning it back on has to re-adopt the runtime by hand. Every other adoption path
+        // is an event that has already fired for this runtime and will not fire again --
+        // init, an effect reload, a resolution change -- so without this the add-on would
+        // sit inert until one of those happened to come round.
+        if (enabled && rt != nullptr) { Log("[feed32] enabled from the overlay; re-adopting the effect runtime"); OnInitEffectRuntime(rt); }
+        else if (!enabled) Log("[feed32] disabled from the overlay: no frames are fed and nothing is queried. "
+                               "An already-installed Vulkan interop hook stays until the game exits.");
+    }
 
     ImGui::Separator();
     ImGui::TextUnformatted("Status");
@@ -4932,8 +4995,18 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 // extensions can still be added from in-process -- see feed_vk_hook.h.
 static bool OnCreateDevice(reshade::api::device_api api, uint32_t & /*api_version*/)
 {
+    // Gated on enabled: this is the one thing here that patches another module's code
+    // (MinHook trampolines over vulkan-1's exports) and appends extensions to every device
+    // the game creates. It used to run at enabled=0, which made "set enabled=0 and see if
+    // it still crashes" a test that proved nothing (issue #44). It cannot be installed
+    // later either -- the game's vkCreateDevice has been and gone -- so turning the add-on
+    // back on from the overlay needs a restart to get the Vulkan transport, and says so.
     if (api == reshade::api::device_api::vulkan)
-        FeedVkHookInstall();
+    {
+        if (g_cfg.enabled) FeedVkHookInstall();
+        else Log("[feed32] enabled=0: the Vulkan interop hook is NOT installed. Turning this add-on "
+                 "back on mid-session cannot install it -- a Vulkan game needs a restart with enabled=1.");
+    }
     return false;   // never change the requested API version
 }
 
@@ -4966,6 +5039,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         }
         CfgWriteDefault();
         CfgReload();
+        // Said once, plainly, because "enabled=0 but it still crashed" is only evidence if
+        // the reader knows what enabled=0 actually leaves behind (issue #44).
+        if (!g_cfg.enabled)
+            Log("[feed32] enabled=0: no frames are fed, no runtime is queried, no textures are created and "
+                "the Vulkan interop hook is not installed. The add-on stays registered so the overlay's "
+                "Enabled checkbox can undo this; nothing else runs.");
         DetectChickenHost();
 
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
