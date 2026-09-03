@@ -309,6 +309,45 @@ powershell -ExecutionPolicy Bypass -File .\Verify-DLSS5Feeder.ps1 -GamePath "C:\
 
 ![Verification script](Verify-DLSS5Feeder.png)
 
+## Install: the automated way
+
+`Install-DLSS5Feeder.ps1` (in `tools\`) does the whole install from one command. Drop it next to
+the game's real `.exe`, right-click ▸ **Run with PowerShell**, and confirm the executable it
+proposes. Or point it at the exe from anywhere:
+
+```
+powershell -ExecutionPolicy Bypass -File .\Install-DLSS5Feeder.ps1 "C:\path\to\game.exe"
+```
+
+It reads the architecture and render API out of the executable, then downloads (once, into a
+cache) and installs everything the manual sections below describe: ReShade 6.8+ with add-on
+support (a local DLL, or the machine-wide Vulkan layer plus the `ReShadeApps.ini` entry), the
+feeder from the latest release (`addon32` + `host64\` for a 32-bit game), the ReShade framework
+headers, LumeniteFX, Deep Fried Chicken, both NVIDIA runtimes, dgVoodoo2 for Direct3D 8/9 games
+(watermark off; `-DgVoodooWatermark` keeps it), and `ReShade.ini` / `ReShadePreset.ini` with the
+provider selected and both techniques enabled in the right order. Existing files are merged into
+and backed up, not replaced. It ends by running the verification script.
+
+Things to know:
+
+- **Windows Defender flags Deep Fried Chicken** (it hooks NVIDIA's NGX runtime with Detours,
+  which heuristics dislike). The script tries the plain install first; only if Defender removes
+  the file does it explain, ask, and add an exclusion for the game folder through a UAC prompt.
+  Nothing is excluded without your yes.
+- Vulkan games need one UAC prompt to register ReShade's layer and add the exe to
+  `ReShadeApps.ini`. `-NoElevate` turns every such step into printed instructions instead.
+- **It asks which neural consumer you want** before downloading anything: Deep Fried Chicken,
+  or Krish's RenoDX DLSS 5 add-on. Both are fetched automatically, only one is ever installed,
+  and if the other is already in the folder it offers to disable it. `-Consumer DFC` or
+  `-Consumer RenoDX` answers that in advance for an unattended run.
+- Pieces you already have go in a folder passed with `-LocalFiles`, or one at a time with
+  `-DfcZip`, `-RenoDxAddon`, `-DlssNrDll`, `-DlssDll`, `-FeederZip`, `-ReShadeSetup`,
+  `-LumeniteZip`, `-DgVoodooZip`.
+- `-Api D3D|Vulkan|OpenGL|D3D9|D3D8` overrides the detection (some engines, Max Payne 3 among
+  them, can run on either Direct3D 9 or 11; the script assumes 11 and says so).
+- The Discord download links inside the script expire; when one does, the script says so and
+  tells you which parameter takes a fresh link or file.
+
 ## Install for a 64-bit game
 
 1. Run **ReShade's installer** (https://reshade.me), point it at your game's `.exe`, choose
@@ -618,6 +657,15 @@ the pixel is flagged in a `DLSS5_Mask` texture the add-on passes to DLSS as its
 **bias-current-colour mask** — DLSS's own mechanism for "don't trust history for this pixel"
 (all three transports; the 32-bit add-on does not pass it yet). The defaults are the tuned ones.
 
+The static test is the one with a memory. Left to decide afresh every frame, it can win on one and
+lose the next over a low-contrast surface under a slow pan, so the vector alternates between the
+provider's and zero and DLSS alternately reprojects and does not — a flicker that comes and goes and
+that no consumer downstream can smooth away. **Static test: require two frames in a row**
+(`STATIC_HYSTERESIS`, on by default) only zeroes a vector where the test won twice; on the first win
+it keeps the vector and masks the pixel instead. Turn it off to compare against the old behaviour.
+Debug view *Validation tests over the image* marks in yellow what was actually zeroed, and in orange
+what the hysteresis held back, so a flip is visible rather than inferred.
+
 ## How it works
 
 * `DLSS5_Feed.fx` (companion effect) converts the selected provider's motion vectors (delta-UV,
@@ -675,6 +723,15 @@ NGX and the DLSS 5 add-on only exist as x64 code, and a 32-bit process cannot lo
   transport, no protocol change), and while the cursor is over it the game's mouse and keys —
   read through ReShade's add-on API and blocked from the game — are posted to the host window as
   ordinary `WM_*` messages, which is where the host's ReShade reads its input.
+* Everything that means *waiting on* the host — spawning it, the handshake, and each build request —
+  happens on a worker thread, and every pipe transfer has a deadline. The render thread hands a
+  build over and returns; the answer is picked up on a later frame. So the expensive part, a host
+  starting up (up to 15 s while it loads ReShade, NGX and the ~165 MB model) and every build after
+  a resolution or work-resolution change, no longer freezes the game at all. A host that *hangs*
+  rather than dies no longer freezes it either: the transfer times out and the add-on treats it as
+  a lost host. **Apply** and **Restart** still pause briefly — up to about four seconds — because
+  the old helper has to be given time to save its ReShade.ini before the replacement can claim the
+  pipe; the reconnect after it is free.
 * If the host process dies, the pipe breaks, the add-on notices and disables itself — the game keeps
   rendering normally.
 * Verified end to end with a deliberate split-screen test (`mode=1`): the host copies only the left
