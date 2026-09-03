@@ -75,6 +75,11 @@
 // FeedBuild::client_flags (v5+)
 #define FEED_BUILD_HOST_CREATES  1u   // tex[] are zero: the host creates the shared set and answers with handles
 #define FEED_BUILD_OUTPUT_NO_UAV 2u   // the game's device cannot bind UAVs: share the Output without one
+#define FEED_BUILD_ASYNC_HOME    4u   // the client copies home the PREVIOUS frame's result, so it is never
+                                      // blocked on the evaluate the host is running now. Tells the host it
+                                      // may spend a little of its OWN time getting a present slot rather
+                                      // than dropping the present (issue #15). An unset bit is the old
+                                      // behaviour on both sides, so this needs no FEED_IPC_VERSION bump.
 
 // FeedBuildAck::flags (v6+)
 #define FEED_ACK_SR_ACTIVE       1u   // the feature is DLSS Super Resolution work -> target (sr_quality says which preset)
@@ -86,6 +91,20 @@
 #define FEED_HELLO_V1_SIZE (3u * sizeof(uint32_t))
 
 enum FeedSlot { FEED_COLOR = 0, FEED_OUTPUT, FEED_DEPTH, FEED_MV, FEED_SLOTS };
+
+// For logs on both sides of the pipe: "tex 1" told a reporter nothing, and issue #43 turned
+// on knowing that slot 1 is the DLSS output.
+static inline const char *FeedSlotName(int slot)
+{
+    switch (slot)
+    {
+    case FEED_COLOR:  return "Color";
+    case FEED_OUTPUT: return "Output";
+    case FEED_DEPTH:  return "Depth";
+    case FEED_MV:     return "MV";
+    default:          return "?";
+    }
+}
 
 enum FeedClientKind { FEED_CLIENT_D3D11 = 0, FEED_CLIENT_GL = 1, FEED_CLIENT_VULKAN = 2 };
 

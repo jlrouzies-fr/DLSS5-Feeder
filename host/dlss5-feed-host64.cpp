@@ -64,6 +64,14 @@ static int  g_win_h = 1080;
 static UINT g_overlay_key = VK_HOME;
 static int  g_pump_count  = 0;
 
+// Present accounting (issue #15). The neural consumer wants one Present per evaluate; when
+// DWM holds every back buffer the per-evaluate Present cannot happen on the spot, and the
+// deficit is what makes it decline passes. A raw skip counter could not be compared against
+// anything, so count what it is a fraction OF, and how much is still owed.
+static unsigned long long g_present_forced  = 0;   // per-evaluate PumpPresent(true) calls
+static unsigned long long g_present_skipped = 0;   // ... that found no free back buffer
+static unsigned long long g_present_owed    = 0;   // ... still to be retired from the idle path
+
 static void Log(const char *fmt, ...);
 
 // Fit the 1920x1080 default into the primary monitor's work area (90% of it, 16:9 kept).
@@ -618,6 +626,9 @@ struct Host
     DXGI_FORMAT     color_fmt, output_fmt;
 
     HANDLE          latency_wait;  // the disguise swapchain's frame-latency waitable object
+    bool            async_home;    // FEED_BUILD_ASYNC_HOME: the client copies home the PREVIOUS frame's
+                                   // result, so it is never blocked behind the evaluate running now. Lets
+                                   // PumpPresent retire a skipped present instead of dropping it (#15).
 
     // v7: the panel texture -- the GAME's D3D11 texture (this driver refuses the other
     // direction), opened here, into which the frame this window just presented is copied
@@ -973,11 +984,13 @@ typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1_)(REFIID, void **);
 // per-frame state to Present (the v4.7 banner says "workset pool") -- letting several
 // evaluates land between presents made consecutive evaluates share state and the game
 // flicker. One cheap Present per evaluate keeps its world consistent.
-static void PumpPresent(bool force = false)
+// Returns true when a Present actually went through, which is what PumpRetireOwedPresents
+// needs in order to pay the debt down one at a time.
+static bool PumpPresent(bool force = false)
 {
     MSG msg;
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-    if (h.swap == nullptr) return;
+    if (h.swap == nullptr) return false;
 
     // Open ReShade's overlay for the user once the window is up: key down on one pump, key
     // up three pumps later, so ReShade sees a held key across a frame boundary (down and
@@ -995,21 +1008,36 @@ static void PumpPresent(bool force = false)
         }
     }
 
+    // Idle throttle: with no frames arriving there is nothing to show, so 30 Hz is plenty.
+    // An owed present is not idle work, though -- it is a frame the consumer is missing --
+    // so it goes as soon as a back buffer is free.
     static ULONGLONG last = 0;
     const ULONGLONG now = GetTickCount64();
-    if (!force && now - last < 33) return;
+    if (!force && g_present_owed == 0 && now - last < 33) return false;
     last = now;
 
-    // No free back buffer yet: skip this present rather than wait for DWM (see the
-    // swapchain creation for why). The DLSS 5 add-on keys per-frame state to Present, so
-    // a skipped present makes two evaluates share a frame on its side -- counted here so
-    // a log can show how often, and never more than DWM's own rhythm forces.
+    // No free back buffer yet. Never wait for DWM here -- this runs between "evaluate n is
+    // done" and "read the next frame message", so a wait would delay evaluate n+1 and pace
+    // the game at the compositor's rhythm all over again (the 33.5 ms plateau).
+    //
+    // But a dropped present is not free either: the neural consumer keys its per-frame
+    // state to Present, so two evaluates then share one frame of it and it declines a pass
+    // (issue #15's "toggling on and off"). So the present becomes a DEBT rather than a
+    // drop: g_present_owed is retired from the serve loop's idle path, which runs while we
+    // are waiting on the pipe anyway and where a Present costs the game nothing. Only under
+    // async_home, where the game is a frame ahead and is genuinely not waiting on us --
+    // with the same-frame contract there is no idle time to retire it in.
+    if (force) ++g_present_forced;   // counted here so "skipped of forced" is always consistent
     if (h.latency_wait != nullptr && WaitForSingleObject(h.latency_wait, 0) != WAIT_OBJECT_0)
     {
-        static unsigned skipped = 0;
-        if (++skipped == 1 || (skipped % 1800) == 0)
-            Log("[host] present skipped: DWM still holds the back buffer (%u so far; the game is never made to wait for it)", skipped);
-        return;
+        if (force) ++g_present_skipped;
+        if (force && h.async_home && g_present_owed < 4) ++g_present_owed;
+        if (g_present_skipped == 1 || (g_present_skipped % 1800) == 0)
+            Log("[host] present skipped: DWM still holds the back buffer (%llu of %llu per-evaluate presents, "
+                "%llu owed; the game is never made to wait for it)",
+                (unsigned long long)g_present_skipped, (unsigned long long)g_present_forced,
+                (unsigned long long)g_present_owed);
+        return false;
     }
 
     // Paint the banner into the backbuffer (ReShade's overlay composites on top at Present).
@@ -1049,9 +1077,27 @@ static void PumpPresent(bool force = false)
         static unsigned busy = 0;
         if (++busy == 1 || (busy % 1800) == 0)
             Log("[host] present skipped: DXGI was still drawing (%u so far)", busy);
+        return false;
     }
-    else if (SUCCEEDED(hr))
-        CopyPanel();
+    if (FAILED(hr)) return false;
+    CopyPanel();
+    return true;
+}
+
+// Retire presents the per-evaluate call could not make, from the serve loop's idle path.
+// The game is not waiting on us there -- we are blocked on its next frame message -- so a
+// present here is the one that costs nothing, and it is what keeps the neural consumer's
+// per-Present state at one frame per evaluate (issue #15). The debt is only paid down here:
+// a per-evaluate present is the frame THAT evaluate is entitled to, not a repayment.
+// Bounded by g_present_owed, so this can never present more often than evaluates asked for.
+static void PumpRetireOwedPresents()
+{
+    while (g_present_owed > 0 && h.swap != nullptr &&
+           (h.latency_wait == nullptr || WaitForSingleObject(h.latency_wait, 0) == WAIT_OBJECT_0))
+    {
+        if (!PumpPresent(false)) break;   // no buffer after all, or DXGI busy: try again later
+        --g_present_owed;
+    }
 }
 
 static bool InitDisguise()
@@ -1108,17 +1154,24 @@ static bool InitDisguise()
     sd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount      = 2;
+    // Three buffers, latency 2. Two-and-one frees the waitable object at most once per
+    // vblank, so above the desktop's refresh rate one present per evaluate is not merely
+    // unlikely, it is impossible -- a 72 fps game on a 60 Hz desktop must drop roughly one
+    // present in six no matter what. Each drop makes two evaluates share one frame of the
+    // neural consumer's per-Present state, and the consumer answers by declining a pass:
+    // the frame-by-frame "neural rendering toggling on and off" of issue #15. The third
+    // buffer is what makes one-per-evaluate reachable; it costs one window-sized surface.
+    sd.BufferCount      = 3;
     // SEQUENTIAL, not DISCARD: the buffer just presented must keep its contents so
     // CopyPanel can lift ReShade's overlay off it afterwards (the v7 panel texture).
     sd.SwapEffect       = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-    // Waitable, latency 1: Present on this chain must never block. It is called once per
-    // evaluate, and the game's next frame waits on fence_out behind that evaluate -- so
-    // a Present that DWM holds until the next vblank (the window is occluded by a
-    // fullscreen game, or the present queue is full) paced the GAME at the compositor's
-    // rhythm: the rigid 33.5 ms / 30 fps plateaus of issue #15 on 32-bit DXVK, with the
-    // feed's own CPU cost at 0.1 ms. PumpPresent checks the waitable object and skips
-    // the Present when a buffer is not free, and asks DXGI not to wait either way.
+    // Waitable: Present on this chain must never block. It is called once per evaluate, and
+    // the game's next frame waits on fence_out behind that evaluate -- so a Present that DWM
+    // holds until the next vblank (the window is occluded by a fullscreen game, or the
+    // present queue is full) paced the GAME at the compositor's rhythm: the rigid 33.5 ms /
+    // 30 fps plateaus of issue #15 on 32-bit DXVK, with the feed's own CPU cost at 0.1 ms.
+    // PumpPresent checks the waitable object and never waits on it, and asks DXGI not to
+    // wait either way.
     sd.Flags            = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     hr = factory->CreateSwapChainForHwnd(h.pump_queue, h.hwnd, &sd, nullptr, nullptr, &h.swap);
     if (SUCCEEDED(hr))
@@ -1126,7 +1179,7 @@ static bool InitDisguise()
         IDXGISwapChain2 *swap2 = nullptr;
         if (SUCCEEDED(h.swap->QueryInterface(__uuidof(IDXGISwapChain2), reinterpret_cast<void **>(&swap2))) && swap2 != nullptr)
         {
-            swap2->SetMaximumFrameLatency(1);
+            swap2->SetMaximumFrameLatency(2);
             h.latency_wait = swap2->GetFrameLatencyWaitableObject();
             swap2->Release();
         }
@@ -1393,6 +1446,8 @@ static ID3D12Resource *MakeSharedTexHost(UINT w, UINT h_, DXGI_FORMAT fmt, bool 
     rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     // ALLOW_RENDER_TARGET is what a D3D11 opener needs for its work-resolution resample
     // RTVs (D3D11 derives its bind flags from these); GL/Vulkan importers do not care.
+    // It also has to be set on any slot a D3D11 opener sees that carries no UAV either --
+    // see the FEED_SLOTS loop in Serve() and issue #43.
     rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
                           (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE) |
                           (render_target ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE);
@@ -1407,6 +1462,10 @@ static ID3D12Resource *MakeSharedTexHost(UINT w, UINT h_, DXGI_FORMAT fmt, bool 
         return nullptr;
     }
     *out_size = h.dev->GetResourceAllocationInfo(0, 1, &rd).SizeInBytes;
+    // One line per slot with the exact flags. Issue #43 came down to which of four
+    // otherwise identical textures was born without a bind flag, and no log said.
+    Log("[host]   shared %ux%u %s d3d12 flags=0x%X (%s%ssimultaneous)", w, h_, FeedFmtName(fmt),
+        static_cast<unsigned>(rd.Flags), uav ? "UAV " : "", render_target ? "RT " : "");
     return t;
 }
 
@@ -1627,7 +1686,10 @@ static int Serve(DWORD game_pid)
                 pending = true;
             }
             const DWORD r = MsgWaitForMultipleObjects(1, &ev_tag, FALSE, 100, QS_ALLINPUT);
-            if (r == WAIT_OBJECT_0 + 1 || r == WAIT_TIMEOUT) { PumpPresent(); continue; }
+            // Idle: the game has not sent the next frame yet, so it is not waiting on us.
+            // The one moment a Present costs it nothing -- pay off anything the
+            // per-evaluate call could not present (issue #15).
+            if (r == WAIT_OBJECT_0 + 1 || r == WAIT_TIMEOUT) { PumpRetireOwedPresents(); PumpPresent(); continue; }
             if (r != WAIT_OBJECT_0) break;
             DWORD got = 0;
             if (!GetOverlappedResult(pipe, &ov_tag, &got, FALSE) || got != 1) { pending = false; break; }
@@ -1672,6 +1734,18 @@ static int Serve(DWORD game_pid)
             const bool host_creates_b = host_creates || (b.client_flags & FEED_BUILD_HOST_CREATES) != 0;
             const bool no_uav         = host_creates_b && (b.client_flags & FEED_BUILD_OUTPUT_NO_UAV) != 0;
             const bool d3d11_opener   = host_creates_b && !host_creates;
+            // Whether the client copies home the previous frame's result. Decides whether a
+            // present the per-evaluate call could not make becomes a debt or a drop (#15).
+            const bool was_async = h.async_home;
+            h.async_home = (b.client_flags & FEED_BUILD_ASYNC_HOME) != 0;
+            static bool said_handoff = false;
+            if (h.async_home != was_async || !said_handoff)
+            {
+                said_handoff = true;
+                Log("[host] client handoff: %s", h.async_home
+                    ? "pipelined (async_home=1): a present DWM defers is retired from the idle path"
+                    : "same frame (async_home=0): a present DWM defers is dropped");
+            }
             if (d3d11_opener)
                 Log("[host] the game's D3D11 device could not create the shared set; creating it here%s",
                     no_uav ? " with the DLSS output's UAV kept on this side" : "");
@@ -1703,9 +1777,18 @@ static int Serve(DWORD game_pid)
                 for (int i = 0; i < FEED_SLOTS && ok; ++i)
                 {
                     HANDLE local = nullptr;
+                    // ALLOW_RENDER_TARGET on every slot a D3D11 opener will see -- the Output
+                    // included when its UAV has moved to the private scratch below (no_uav).
+                    // The old `i != FEED_OUTPUT` assumed the Output always carried the UAV
+                    // flag; with no_uav it carried neither, so it was the only resource in the
+                    // set born with SIMULTANEOUS_ACCESS and nothing else, and the only one a
+                    // feature-level 10_0 device refused to open (issue #43: Color opened, the
+                    // Output came back E_INVALIDARG at identical size and format). The game
+                    // never makes an RTV on the Output -- only the SRV it reads home from -- so
+                    // the extra bind is unused there, and free.
                     h.tex[i] = MakeSharedTexHost(i == FEED_OUTPUT ? out_w : b.width, i == FEED_OUTPUT ? out_h : b.height,
                                                  fmt[i], i == FEED_OUTPUT && !no_uav, &local, &tex_size[i],
-                                                 d3d11_opener && i != FEED_OUTPUT);
+                                                 d3d11_opener && (i != FEED_OUTPUT || no_uav));
                     if (h.tex[i] == nullptr) { ok = false; break; }
                     HANDLE remote = nullptr;
                     if (!DuplicateHandle(GetCurrentProcess(), local, hgame, &remote, 0, FALSE, DUPLICATE_SAME_ACCESS))
@@ -1719,8 +1802,11 @@ static int Serve(DWORD game_pid)
                 {
                     if (h.panel == nullptr)
                     {
+                        // Same rule as the slot loop: a D3D11 opener needs a bind flag on it,
+                        // or CastAdoptHostPanel11 would hit the issue-#43 wall the moment the
+                        // build got this far.
                         h.panel = MakeSharedTexHost(static_cast<UINT>(g_win_w), static_cast<UINT>(g_win_h), DXGI_FORMAT_R8G8B8A8_UNORM,
-                                                    false, &h.panel_local, &h.panel_size, false);
+                                                    false, &h.panel_local, &h.panel_size, d3d11_opener);
                         h.panel_host_owned = h.panel != nullptr;
                         if (h.panel != nullptr) Log("[host] panel texture created for the game (%dx%d): every presented frame is copied into it", g_win_w, g_win_h);
                     }
@@ -1964,7 +2050,9 @@ static int Serve(DWORD game_pid)
             }
 
             if (fm.n <= 3 || (fm.n % 1800) == 0)
-                Log("[host] frame %llu evaluated", (unsigned long long)fm.n);
+                Log("[host] frame %llu evaluated (%llu presents skipped so far, %llu owed)",
+                    (unsigned long long)fm.n, (unsigned long long)g_present_skipped,
+                    (unsigned long long)g_present_owed);
             PumpPresent(true);   // per evaluate, deliberately -- see PumpPresent
         }
         else
