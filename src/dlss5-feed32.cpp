@@ -51,7 +51,7 @@
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 
-#define FEED_VERSION "0.12.1-beta.1"
+#define FEED_VERSION "0.12.1-beta.3"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
