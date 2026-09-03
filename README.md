@@ -336,9 +336,13 @@ Things to know:
   Nothing is excluded without your yes.
 - Vulkan games need one UAC prompt to register ReShade's layer and add the exe to
   `ReShadeApps.ini`. `-NoElevate` turns every such step into printed instructions instead.
+- **It asks which neural consumer you want** before downloading anything: Deep Fried Chicken,
+  or Krish's RenoDX DLSS 5 add-on. Both are fetched automatically, only one is ever installed,
+  and if the other is already in the folder it offers to disable it. `-Consumer DFC` or
+  `-Consumer RenoDX` answers that in advance for an unattended run.
 - Pieces you already have go in a folder passed with `-LocalFiles`, or one at a time with
-  `-DfcZip`, `-DlssNrDll`, `-DlssDll`, `-FeederZip`, `-ReShadeSetup`, `-LumeniteZip`,
-  `-DgVoodooZip`. `-Consumer RenoDX -RenoDxAddon <file>` takes the RenoDX route instead.
+  `-DfcZip`, `-RenoDxAddon`, `-DlssNrDll`, `-DlssDll`, `-FeederZip`, `-ReShadeSetup`,
+  `-LumeniteZip`, `-DgVoodooZip`.
 - `-Api D3D|Vulkan|OpenGL|D3D9|D3D8` overrides the detection (some engines, Max Payne 3 among
   them, can run on either Direct3D 9 or 11; the script assumes 11 and says so).
 - The Discord download links inside the script expire; when one does, the script says so and

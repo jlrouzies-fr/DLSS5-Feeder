@@ -46,8 +46,9 @@
     D3D8 (both via dgVoodoo2). Default: Auto.
 
 .PARAMETER Consumer
-    DFC (Deep Fried Chicken, default) or RenoDX. RenoDX's add-on is not downloadable, so
-    that route needs -RenoDxAddon or a copy in -LocalFiles.
+    Which neural consumer does the DLSS 5 work: DFC (Deep Fried Chicken) or RenoDX (Krish's
+    renodx-dlss5 add-on). Both are downloaded automatically. Omitted, the script asks at the
+    start; with -Yes and no choice given it takes Deep Fried Chicken.
 
 .PARAMETER MvProvider
     DLSS5_MV_PROVIDER value: 3 (LumeniteFX Kernel, default) or 4 (LumeniteFX QuantMotion).
@@ -113,8 +114,8 @@ param(
     [ValidateSet('Auto', 'D3D', 'Vulkan', 'OpenGL', 'D3D9', 'D3D8')]
     [string] $Api = 'Auto',
 
-    [ValidateSet('DFC', 'RenoDX')]
-    [string] $Consumer = 'DFC',
+    [ValidateSet('Ask', 'DFC', 'RenoDX')]
+    [string] $Consumer = 'Ask',
 
     [ValidateSet(3, 4)]
     [int] $MvProvider = 3,
@@ -163,6 +164,7 @@ $Sources = @{
     Dfc             = 'https://cdn.discordapp.com/attachments/1543936250657120366/1544601537844879410/Deep-Fried-Chicken-v1.4.8-alpha.zip?ex=6a99c287&is=6a987107&hm=9460267dc5be8024653c5d1feb6fff6f5d00f55bf2ab0262ffcfd285e1b7d143&'
     DlssNr          = 'https://cdn.discordapp.com/attachments/1543976771920330884/1543982044797866107/nvngx_dlssnr.dll?ex=6a9a2495&is=6a98d315&hm=a0a12bd2e4d7ae4c7e915a21e1570c594af0e2cf2e15195d9dbf8a693f45ca99&'
     Dlss            = 'https://cdn.discordapp.com/attachments/1543348014691651676/1544918856697643089/nvngx_dlss.dll?ex=6a9a414e&is=6a98efce&hm=17a6973ef6de0d211b7b3fe00362d851685156e73aab3e38670e00563332b22a&'
+    RenoDxDlss5     = 'https://cdn.discordapp.com/attachments/1542647972695904317/1544338777399365762/renodx-dlss5.addon64?ex=6a9a1f50&is=6a98cdd0&hm=2a695add57b27c6d7fd1ad2a70e2d3c4f49586a3d5c30f84cc33be3513d41de8&'
     DfcDiscord      = 'https://discord.gg/g2v2XGqvR'
     RenoDxDiscord   = 'https://discord.com/invite/renodx'
 }
@@ -402,6 +404,25 @@ function Format-Size
     if ($Bytes -ge 1048576)    { return ('{0:N1} MB' -f ($Bytes / 1048576)) }
     if ($Bytes -ge 1024)       { return ('{0:N0} KB' -f ($Bytes / 1024)) }
     return ('{0} B' -f $Bytes)
+}
+
+# Scan a binary for an ASCII marker. Capped: never slurp a 160 MB NGX runtime.
+function Get-BinaryMarker
+{
+    param([string] $Path, [string] $Pattern, [int] $MaxBytes = 33554432)
+    if (-not (Test-FileHere $Path)) { return $null }
+    try {
+        $fi = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($fi.Length -gt $MaxBytes -or $fi.Length -eq 0) { return $null }
+        $bytes = [IO.File]::ReadAllBytes($Path)
+        $m = [regex]::Match([Text.Encoding]::ASCII.GetString($bytes), $Pattern)
+        if ($m.Success) {
+            if ($m.Groups.Count -gt 1 -and $m.Groups[1].Success) { return $m.Groups[1].Value }
+            return $m.Value
+        }
+    }
+    catch { }
+    return $null
 }
 
 function Get-Sha256
@@ -926,8 +947,8 @@ function Request-DefenderExclusion
     Write-Host ''
     Write-Chunk '  Windows Defender removed a file this install needs.' 'Yellow'
     Write-Chunk ('  ' + $Because) 'Yellow'
-    Write-Chunk '  This is a known false positive: Deep Fried Chicken hooks NVIDIA''s NGX runtime with' 'DarkGray'
-    Write-Chunk '  Microsoft Detours, which antivirus heuristics dislike. The fix is a Defender exclusion' 'DarkGray'
+    Write-Chunk '  This is a known false positive: a neural consumer interposes on NVIDIA''s NGX runtime,' 'DarkGray'
+    Write-Chunk '  which antivirus heuristics dislike. The fix is a Defender exclusion' 'DarkGray'
     Write-Chunk '  (Settings > Virus & threat protection > Exclusions) for:' 'DarkGray'
     foreach ($p in $todo) { Write-Chunk ('      ' + $p) 'White' }
     Write-Chunk '  Adding it needs administrator rights (a UAC prompt). Nothing else is changed.' 'DarkGray'
@@ -1058,6 +1079,33 @@ $script:Cache = $Downloads
 New-DirSafe $script:Cache
 Write-Chunk '  Cache   ' 'DarkGray' -NoNewline
 Write-Host $script:Cache
+
+# Which neural consumer? Asked here, before anything is downloaded, because the answer
+# decides what gets fetched and what must never be installed beside it.
+if ($Consumer -eq 'Ask') {
+    if ($Yes) {
+        $Consumer = 'DFC'
+    }
+    else {
+        Write-Host ''
+        Write-Chunk '  Neural consumer -- the add-on that turns the feed into neural rendering.' 'White'
+        Write-Chunk '   1. Deep Fried Chicken  ' 'Gray' -NoNewline
+        Write-Chunk 'recommended; negotiates with the feeder over its own interop ABI' 'DarkGray'
+        Write-Chunk '   2. RenoDX DLSS 5       ' 'Gray' -NoNewline
+        Write-Chunk 'Krish''s renodx-dlss5 add-on' 'DarkGray'
+        Write-Chunk '  Exactly one of them may be installed: each goes inert, or misbehaves, beside the other.' 'DarkGray'
+        Write-Chunk '  Which one? [1/2, Enter for 1] ' 'Cyan' -NoNewline
+        try { $a = Read-Host } catch { $a = '' }
+        switch ($a.Trim()) {
+            '2'      { $Consumer = 'RenoDX' }
+            'renodx' { $Consumer = 'RenoDX' }
+            default  { $Consumer = 'DFC' }
+        }
+    }
+}
+$consumerLabel = if ($Consumer -eq 'DFC') { 'Deep Fried Chicken' } else { 'RenoDX DLSS 5' }
+Write-Chunk '  Neural  ' 'DarkGray' -NoNewline
+Write-Host $consumerLabel
 if ($LocalFiles) {
     if (-not (Test-DirHere $LocalFiles)) { Stop-Install -Text ('-LocalFiles folder not found: ' + $LocalFiles) }
     Write-Chunk '  Local   ' 'DarkGray' -NoNewline
@@ -1328,9 +1376,10 @@ if ($Consumer -eq 'DFC') {
     }
 }
 else {
-    $renoPath = Resolve-Piece -Label 'RenoDX DLSS 5 add-on' -Explicit $RenoDxAddon -LocalPattern 'renodx-dlss5.addon64' -CacheName 'renodx-dlss5.addon64'
+    $renoPath = Resolve-Piece -Label 'RenoDX DLSS 5 add-on' -Explicit $RenoDxAddon -LocalPattern 'renodx-dlss5.addon64' `
+                              -DefaultUrl $Sources.RenoDxDlss5 -CacheName 'renodx-dlss5.addon64'
     if (-not $renoPath) {
-        Report -Status 'Fail' -Text 'renodx-dlss5.addon64 is not downloadable automatically.' `
+        Report -Status 'Fail' -Text 'renodx-dlss5.addon64 is not available.' `
                -Detail ('Get it from the RenoDX Discord (' + $Sources.RenoDxDiscord + ') or the RHI installer, and pass it with -RenoDxAddon or via -LocalFiles.')
     }
 }
@@ -1864,9 +1913,52 @@ if ($Consumer -eq 'DFC') {
 }
 else {
     Disable-Conflict -Path (Find-FileIn $consumerDir 'deep-fried-chicken.addon64') -Why 'exactly one neural consumer: you chose RenoDX'
+    Disable-Conflict -Path (Find-FileIn $consumerDir 'deep-fried-chicken-nvngx.dll') -Why 'Chicken''s private NGX bridge has no business beside the RenoDX add-on'
+
     if ($renoPath) {
-        try { Copy-Tracked -From $renoPath -To (Join-Safe $consumerDir 'renodx-dlss5.addon64'); Report -Status 'Done' -Text 'renodx-dlss5.addon64 installed.' -Detail ('in ' + $consumerDir) }
-        catch { Report -Status 'Fail' -Text 'renodx-dlss5.addon64 could not be copied.' -Detail $_.Exception.Message }
+        $to = Join-Safe $consumerDir 'renodx-dlss5.addon64'
+        $attempt = 0
+        while ($attempt -lt 2) {
+            $attempt++
+            $failed = $null
+            try {
+                Copy-Tracked -From $renoPath -To $to
+                # Same antivirus story as Chicken: an NGX interposer looks like a hooking tool.
+                Start-Sleep -Milliseconds 1000
+                if (-not (Test-FileHere $to)) { $failed = $to }
+            }
+            catch {
+                $msg = $_.Exception.Message
+                if ($msg -match '(?i)virus|potentially unwanted|0x800700E1') { $failed = $to }
+                else { Report -Status 'Fail' -Text 'renodx-dlss5.addon64 could not be copied.' -Detail $msg; break }
+            }
+
+            if (-not $failed) {
+                # Krish's builds all report the same file version resource, so the generation is
+                # only readable as the standalone banner literal the add-on prints at run time
+                # (the feeder reads the same string).
+                $banner = $null
+                if (Get-BinaryMarker -Path $to -Pattern 'RenoDX DLSS5 Generic') {
+                    $banner = Get-BinaryMarker -Path $to -Pattern "\x00(v\d+\.\d+)\x00"
+                }
+                $t = 'renodx-dlss5.addon64 installed'
+                if ($banner) { $t += ' (' + $banner + ')' }
+                Report -Status 'Done' -Text ($t + '.') -Detail ('in ' + $consumerWhere)
+                break
+            }
+
+            $det = Get-DefenderDetection $failed
+            $why = 'It removed ' + $failed
+            if ($det) { $why += ' (Defender log: ' + $det.InitialDetectionTime.ToString('HH:mm:ss') + ', threat id ' + $det.ThreatID + ')' } else { $why += ' right after it was copied in' }
+            $why += '.'
+            if ($attempt -ge 2) {
+                Report -Status 'Fail' -Text 'renodx-dlss5.addon64 was removed again after the exclusion was added.' `
+                       -Detail 'Check Windows Security > Protection history, restore the quarantined file, and confirm the exclusion covers the folder above.'
+                break
+            }
+            if (-not (Request-DefenderExclusion -Paths @($gameDir, $script:Cache) -Because $why)) { break }
+            Report -Status 'Info' -Text 'Retrying the RenoDX add-on copy.'
+        }
     }
 }
 
