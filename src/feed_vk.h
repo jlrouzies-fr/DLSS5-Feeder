@@ -56,12 +56,16 @@ template <typename H> static inline H FeedVkDispatch(uint64_t v)
     return reinterpret_cast<H>(static_cast<uintptr_t>(v));
 }
 
+static void Log(const char *fmt, ...);   // dlss5-feed.cpp
+
 struct FeedVk
 {
     HMODULE lib;
     VkDevice dev;
+    VkPhysicalDevice phys;   // may be VK_NULL_HANDLE; only used to choose a memory type
 
     PFN_vkGetDeviceProcAddr           GetDeviceProcAddr;
+    PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
     PFN_vkCreateSemaphore             CreateSemaphore;
     PFN_vkDestroySemaphore            DestroySemaphore;
     PFN_vkImportSemaphoreWin32HandleKHR ImportSemaphoreWin32HandleKHR;
@@ -93,14 +97,19 @@ struct FeedVk
 // Resolve everything from the game's VkDevice. Returns false if any entry is missing
 // (which, given the phase-0 probe already found the extensions present, should not
 // happen -- but it is logged by the caller if it does).
-static bool FeedVkLoad(FeedVk *vk, VkDevice device)
+static bool FeedVkLoad(FeedVk *vk, VkDevice device, VkPhysicalDevice phys = VK_NULL_HANDLE)
 {
     *vk = {};
     vk->dev = device;
+    vk->phys = phys;
     vk->lib = LoadLibraryW(L"vulkan-1.dll");
     if (vk->lib == nullptr) return false;
     vk->GetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(vk->lib, "vkGetDeviceProcAddr"));
     if (vk->GetDeviceProcAddr == nullptr) return false;
+    // Instance-level entry point, resolved through the loader's export. Optional:
+    // without it FeedVkImportImage falls back to the lowest allowed memory type.
+    vk->GetPhysicalDeviceMemoryProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+        GetProcAddress(vk->lib, "vkGetPhysicalDeviceMemoryProperties"));
 
     #define FEED_VK_GET(member, name) \
         vk->member = reinterpret_cast<PFN_vk##member>(vk->GetDeviceProcAddr(device, name)); \
@@ -198,8 +207,19 @@ static VkSemaphore FeedVkImportFence(FeedVk *vk, HANDLE d3d12_fence_handle)
 
 // Import a D3D12 shared texture (from CreateSharedHandle) as a VkImage backed by the
 // same memory. Dedicated allocation is required for imported D3D12 resources.
+// d3d12_size is the size D3D12 actually allocated for the shared resource
+// (GetResourceAllocationInfo). For a dedicated import of external memory the allocation
+// size has to describe that external allocation, not what Vulkan would have chosen for an
+// image of its own; the two can disagree, and the OpenGL path has always passed the D3D12
+// figure (FeedGlImportImage). Pass 0 to keep the old behaviour.
+//
+// Found while investigating the FP16 device removal documented in FP16-DEVICE-REMOVAL.md.
+// It was NOT the cause of that -- the cause was a hardcoded row pitch in the staleness
+// probe -- and changing this alone fixed nothing. It is committed because it is the
+// correct thing to pass, not because it fixed a bug.
 static bool FeedVkImportImage(FeedVk *vk, HANDLE d3d12_res_handle, UINT w, UINT h,
-                              VkFormat fmt, bool storage, VkImage *out_image, VkDeviceMemory *out_mem)
+                              VkFormat fmt, bool storage, VkImage *out_image, VkDeviceMemory *out_mem,
+                              VkDeviceSize d3d12_size = 0)
 {
     *out_image = VK_NULL_HANDLE;
     *out_mem   = VK_NULL_HANDLE;
@@ -229,8 +249,25 @@ static bool FeedVkImportImage(FeedVk *vk, HANDLE d3d12_res_handle, UINT w, UINT 
     // Imported D3D12 default-heap memory is device-local; the driver constrains the
     // acceptable bits, and the lowest set bit is a well-worn working choice.
     uint32_t type_index = 0;
-    for (uint32_t i = 0; i < 32; ++i)
-        if (req.memoryTypeBits & (1u << i)) { type_index = i; break; }
+    bool     type_found  = false;
+    if (vk->GetPhysicalDeviceMemoryProperties != nullptr && vk->phys != VK_NULL_HANDLE)
+    {
+        // Imported D3D12 default-heap memory is device-local. Prefer an allowed type that
+        // says so rather than trusting bit order.
+        VkPhysicalDeviceMemoryProperties mp = {};
+        vk->GetPhysicalDeviceMemoryProperties(vk->phys, &mp);
+        for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+        {
+            if ((req.memoryTypeBits & (1u << i)) == 0) continue;
+            if ((mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) continue;
+            type_index = i;
+            type_found = true;
+            break;
+        }
+    }
+    if (!type_found)
+        for (uint32_t i = 0; i < 32; ++i)
+            if (req.memoryTypeBits & (1u << i)) { type_index = i; break; }
 
     VkMemoryDedicatedAllocateInfo ded = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
     ded.image = *out_image;
@@ -240,7 +277,13 @@ static bool FeedVkImportImage(FeedVk *vk, HANDLE d3d12_res_handle, UINT w, UINT 
     imp.handle     = d3d12_res_handle;     // duplicated by the driver, not consumed
     VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     mai.pNext           = &imp;
-    mai.allocationSize  = req.size;
+    // Log both figures when they disagree: cheap, and it makes an import-size problem
+    // visible instead of leaving it to be inferred from a later fault.
+    if (d3d12_size != 0 && d3d12_size != req.size)
+        Log("[feed] import size: Vulkan wants %llu, D3D12 allocated %llu (using D3D12's) -- %ux%u vkfmt=%d",
+            static_cast<unsigned long long>(req.size), static_cast<unsigned long long>(d3d12_size),
+            w, h, static_cast<int>(fmt));
+    mai.allocationSize  = d3d12_size != 0 ? d3d12_size : req.size;
     mai.memoryTypeIndex = type_index;
     if (vk->AllocateMemory(vk->dev, &mai, nullptr, out_mem) != VK_SUCCESS)
     {

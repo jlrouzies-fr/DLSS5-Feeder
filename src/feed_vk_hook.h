@@ -53,6 +53,10 @@ static int                g_vk_hook_devices;          // how many vkCreateDevice
 // VK_QUEUE_FAMILY_EXTERNAL (FeedVkExternalTransfer) need its family index.
 // VK_QUEUE_FAMILY_IGNORED until a vkCreateDevice has been seen.
 static uint32_t g_vk_gfx_family = VK_QUEUE_FAMILY_IGNORED;
+// The physical device the game's VkDevice was created from. ReShade only hands out
+// the VkDevice, but importing D3D12 memory needs vkGetPhysicalDeviceMemoryProperties
+// to pick a memory type that is actually device-local (see FeedVkImportImage).
+static VkPhysicalDevice g_vk_phys = VK_NULL_HANDLE;
 
 // ---------------------------------------------------------------------------
 // vkQueuePresentKHR hook -- the pacer detector.
@@ -246,6 +250,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice ph
         Log("[feed]   %-40s %s", want,
             already(want) ? "(app)" : driver_has(want) ? "ADDED" : "unsupported by driver");
 
+    g_vk_phys = physicalDevice;
     VkResult r = g_vk_create_device_orig(physicalDevice, &ci, pAllocator, pDevice);
     if (r != VK_SUCCESS && (added > 0 || !have_timeline_feature))
     {
