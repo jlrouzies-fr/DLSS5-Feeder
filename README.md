@@ -26,7 +26,7 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 
 ## Before you install: three things
 
-None of this is hard, and the [install checker](#install-read-first) verifies most of it for you.
+None of this is hard, and the [automated installer](#install-the-automated-way) verifies most of it for you.
 
 ### 1. You might not need this project at all
 
@@ -201,7 +201,7 @@ a frame. Found during a Metro 2033 Redux run.
 
 - [Before you install: three things](#before-you-install-three-things)
 - [Status](#status)
-- [Install: read first](#install-read-first) — the installation verifier script
+- [Install: the automated way](#install-the-automated-way)
 - [Install for a 64-bit game](#install-for-a-64-bit-game)
   - [Deep Fried Chicken: first run](#deep-fried-chicken-first-run)
   - [Alternative: the RenoDX add-on](#alternative-the-renodx-add-on)
@@ -288,32 +288,22 @@ in fast motion, softness on thin moving geometry), and the HUD is processed alon
 > also used as render target`). ReShade still lists it as an enabled technique, so nothing looked
 > wrong — but it wrote nothing. This release detects that and says so in the overlay and the log.
 
-## Install: read first
-
-There is now a new script available to help you verify if everything is installed properly.
-
-1. Copy `Verify-DLSS5Feeder.ps1` (from `tools\`) next to your game executable — for a 32-bit game,
-   next to the game `.exe`, not into `host64\`; it looks in there itself.
-2. Right-click `Verify-DLSS5Feeder.ps1` ▸ **Run with PowerShell**.
-3. Read the output: every line is `[ OK ]`, `[WARN]` or `[FAIL]`, and the summary at the end lists the
-   fix for each failure.
-
-The script is read-only — it never changes a file. If Windows refuses to run it ("running scripts is
-disabled on this system"), run it from a PowerShell prompt instead, which needs no policy change:
-
-```
-powershell -ExecutionPolicy Bypass -File .\Verify-DLSS5Feeder.ps1 -GamePath "C:\path\to\game"
-```
-
-`-GamePath` also lets you check a game without copying the script next to it.
-
-![Verification script](Verify-DLSS5Feeder.png)
-
 ## Install: the automated way
 
-`Install-DLSS5Feeder.ps1` (in `tools\`) does the whole install from one command. Drop it next to
-the game's real `.exe`, right-click ▸ **Run with PowerShell**, and confirm the executable it
-proposes. Or point it at the exe from anywhere:
+`Install-DLSS5Feeder.ps1` does the whole install from one command:
+
+- Download [the script](tools/Install-DLSS5Feeder.ps1).
+- Drop the `.ps1` file next to your game's `.exe`.
+- Right-click in the folder ▸ **Open in Terminal**.
+- Paste this and press Enter:
+  ```
+  powershell.exe -ExecutionPolicy Bypass -File .\Install-DLSS5Feeder.ps1
+  ```
+- Confirm the executable it proposes.
+
+![Installer](dlss5-feeder-install-script.png)
+
+Or point it at the exe from anywhere:
 
 ```
 powershell -ExecutionPolicy Bypass -File .\Install-DLSS5Feeder.ps1 "C:\path\to\game.exe"
@@ -326,7 +316,8 @@ feeder from the latest release (`addon32` + `host64\` for a 32-bit game), the Re
 headers, LumeniteFX, Deep Fried Chicken, both NVIDIA runtimes, dgVoodoo2 for Direct3D 8/9 games
 (watermark off; `-DgVoodooWatermark` keeps it), and `ReShade.ini` / `ReShadePreset.ini` with the
 provider selected and both techniques enabled in the right order. Existing files are merged into
-and backed up, not replaced. It ends by running the verification script.
+and backed up, not replaced. It ends by running a read-only verification pass and prints the
+result — every line is `[ OK ]`, `[WARN]` or `[FAIL]`, with the fix for each failure.
 
 Things to know:
 
@@ -459,7 +450,7 @@ game-validated**.
 
 **Reporting a problem?** Send `dlss5-feed.log`, `deep-fried-chicken.log` and `ReShade.log` from the
 same run (plus `host64\dlss5-feed-host.log` for a 32-bit game), and the output of the
-[install checker](#install-read-first).
+[installer's verification output](#install-the-automated-way).
 
 ### Alternative: the RenoDX add-on
 
