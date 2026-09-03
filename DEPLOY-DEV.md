@@ -436,3 +436,38 @@ migrate), and early load is now automatic — on its first armed run Chicken app
 `[ADDON] LoadFromDllMain` in the sibling `ReShade.ini`, backs the original up beside it, and
 asks for one more full restart. Expect that extra restart on the first launch after installing
 it, and expect a `ReShade.ini.deep-fried-chicken-backup-*` file to appear next to it.
+
+## 10. Cutting a release
+
+Tag on the release branch (`v0.12.1-beta.1` and `-beta.2` are both tagged on `v0.12.1`, not
+on `main` — `gh release create --target <branch>`).
+
+**Every release carries the automatic-installation notice, in both places.** Most people
+land on the release page, not the README, and the manual sections are long enough that
+someone will follow them without ever learning the installer exists:
+
+1. `AUTOMATIC_INSTALLATION_AVAILABLE.txt` (repo root) uploaded as a **standalone asset**, so
+   it is visible in the assets list before anyone downloads the zip.
+2. The same thing, condensed, as a **blockquote at the very top of the release description**,
+   above the changelog.
+
+Keep the `.txt` in step with the README's "Install: the automated way" section — it restates
+the switches (`-Consumer`, `-LocalFiles`, `-NoElevate`, `-Api`, …), so a change there is a
+change here.
+
+The zip asset is the same 12-entry layout every time; build all four binaries first (step 2),
+never just the add-on:
+
+```
+READ-ME-FIRST.txt                      # what changed in THIS build, plain text, no markdown
+Verify-DLSS5Feeder.ps1                 # tools\
+dlss5-feed.addon64                     # build\
+dlss5-feed.addon32                     # build\
+host64/dlss5-feed-host64.exe           # host\
+layer-x64/VkLayer_feed_vk.{dll,json}, run-with-feed-layer.bat        # layer\
+layer-x86/VkLayer_feed_vk32.{dll,json}, run-with-feed-layer32.bat    # layer\x86\
+reshade-shaders/Shaders/DLSS5_Feed.fx  # shaders\
+```
+
+Bump `FEED_VERSION` in `src/dlss5-feed.cpp` before building — it is what `dlss5-feed.log`
+line 1 prints, and the release notes tell people to check it.
