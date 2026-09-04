@@ -70,8 +70,8 @@ static int  g_pump_count  = 0;
 // anything, so count what it is a fraction OF, and how much is still owed.
 static unsigned long long g_present_forced  = 0;   // per-evaluate PumpPresent(true) calls
 static unsigned long long g_present_skipped = 0;   // ... that found no free back buffer
-static unsigned long long g_present_owed    = 0;   // ... still to be retired from the idle path
-static unsigned long long g_present_debt_run = 0;  // consecutive skips with the debt already at its cap
+static unsigned long long g_present_owed    = 0;   // ... still owed; retired from the frame and idle paths
+static unsigned long long g_present_debt_run = 0;  // consecutive skips, whatever the client contract
 
 static void Log(const char *fmt, ...);
 
@@ -640,7 +640,9 @@ struct Host
     const char     *sr_quality_name;
     DXGI_FORMAT     color_fmt, output_fmt;
 
-    HANDLE          latency_wait;  // the disguise swapchain's frame-latency waitable object
+    HANDLE          latency_wait;  // the disguise swapchain's frame-latency waitable object.
+                                   // Held, never waited on: see PumpPresent for why waiting
+                                   // on it froze the window for good (issue #33).
     bool            async_home;    // FEED_BUILD_ASYNC_HOME: the client copies home the PREVIOUS frame's
                                    // result, so it is never blocked behind the evaluate running now. Lets
                                    // PumpPresent retire a skipped present instead of dropping it (#15).
@@ -1040,41 +1042,27 @@ static bool PumpPresent(bool force = false)
     if (!force && g_present_owed == 0 && now - last < 33) return false;
     last = now;
 
-    // No free back buffer yet. Never wait for DWM here -- this runs between "evaluate n is
-    // done" and "read the next frame message", so a wait would delay evaluate n+1 and pace
-    // the game at the compositor's rhythm all over again (the 33.5 ms plateau).
+    // Never wait for DWM here -- this runs between "evaluate n is done" and "read the next
+    // frame message", so a wait would delay evaluate n+1 and pace the game at the
+    // compositor's rhythm all over again (the 33.5 ms plateau).
     //
-    // But a dropped present is not free either: the neural consumer keys its per-frame
-    // state to Present, so two evaluates then share one frame of it and it declines a pass
-    // (issue #15's "toggling on and off"). So the present becomes a DEBT rather than a
-    // drop: g_present_owed is retired from the serve loop's idle path, which runs while we
-    // are waiting on the pipe anyway and where a Present costs the game nothing. Only under
-    // async_home, where the game is a frame ahead and is genuinely not waiting on us --
-    // with the same-frame contract there is no idle time to retire it in.
+    // This used to ask the frame-latency waitable object, with a zero timeout, whether a
+    // back buffer was free, and return early when it was not. That was a permanent-freeze
+    // bug (issue #33). The object is a SEMAPHORE: a successful wait takes a count, and the
+    // only thing that ever puts one back is a PRESENTED frame retiring. Both failure exits
+    // below returned after the count had already been taken, so each Present that did not
+    // go through spent a count that never came back -- and SetMaximumFrameLatency(2) means
+    // there are only two. Two failed presents over the life of the process drained it to
+    // zero for good, after which every check here failed, PumpRetireOwedPresents failed the
+    // same check, and the window never repainted again while the feed carried on evaluating.
+    // That is exactly the report: responsive window, frozen picture, healthy feed, forever.
+    //
+    // DXGI_PRESENT_DO_NOT_WAIT already gives us the non-blocking guarantee this needs, and
+    // answers DXGI_ERROR_WAS_STILL_DRAWING when there is no free buffer -- the same
+    // information, from the call itself, with nothing to leak. So we ask Present, not the
+    // semaphore. The waitable flag stays on the swapchain for its latency behaviour; the
+    // handle is simply never waited on.
     if (force) ++g_present_forced;   // counted here so "skipped of forced" is always consistent
-    if (h.latency_wait != nullptr && WaitForSingleObject(h.latency_wait, 0) != WAIT_OBJECT_0)
-    {
-        if (force) ++g_present_skipped;
-        if (force && h.async_home && g_present_owed < 4) ++g_present_owed;
-        if (g_present_skipped == 1 || (g_present_skipped % 1800) == 0)
-            Log("[host] present skipped: DWM still holds the back buffer (%llu of %llu per-evaluate presents, "
-                "%llu owed; the game is never made to wait for it)",
-                (unsigned long long)g_present_skipped, (unsigned long long)g_present_forced,
-                (unsigned long long)g_present_owed);
-        // A rising skip count on its own reads as benign, because it usually is. The debt
-        // sitting at its cap is the state that is not: from there every further skip is a
-        // frame the consumer will never get, and the window has stopped repainting. Say so
-        // once, rather than leaving a reader to infer it from two counters (issue #33).
-        if (force && h.async_home && g_present_owed >= 4)
-        {
-            if (++g_present_debt_run == 120)
-                Log("[host] the present debt has been at its cap for 120 evaluates: the back buffer is never "
-                    "free, so this window has stopped repainting and the consumer is missing frames. The feed "
-                    "itself is unaffected; a window that looks frozen from here is this, not a hang.");
-        }
-        else g_present_debt_run = 0;
-        return false;
-    }
 
     // Paint the banner into the backbuffer (ReShade's overlay composites on top at Present).
     if (g_banner != nullptr && g_pump_list != nullptr && g_swap3 != nullptr)
@@ -1108,14 +1096,63 @@ static bool PumpPresent(bool force = false)
         }
     }
     const HRESULT hr = h.swap->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
-    if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+    if (FAILED(hr))
     {
-        static unsigned busy = 0;
-        if (++busy == 1 || (busy % 1800) == 0)
-            Log("[host] present skipped: DXGI was still drawing (%u so far)", busy);
+        // One accounting for every reason a present did not go through. WAS_STILL_DRAWING
+        // is the ordinary one (DWM still holds every back buffer); anything else used to
+        // return here in complete silence, so a window frozen by a repeating INVALID_CALL
+        // or a device reset left nothing whatsoever in the log to read (issue #33).
+        if (force) ++g_present_skipped;
+        // A dropped present is not free: the neural consumer keys its per-frame state to
+        // Present, so two evaluates then share one frame of it and it declines a pass
+        // (issue #15's "toggling on and off"). It becomes a DEBT rather than a drop.
+        if (force && h.async_home && g_present_owed < 4) ++g_present_owed;
+
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+        {
+            if (g_present_skipped == 1 || (g_present_skipped % 1800) == 0)
+                Log("[host] present skipped: DWM still holds the back buffer (%llu of %llu per-evaluate "
+                    "presents, %llu owed; the game is never made to wait for it)",
+                    (unsigned long long)g_present_skipped, (unsigned long long)g_present_forced,
+                    (unsigned long long)g_present_owed);
+        }
+        else
+        {
+            static unsigned long long hard    = 0;
+            static HRESULT            last_hr = S_OK;
+            const bool                fresh   = (hr != last_hr);
+            last_hr = hr;
+            if (++hard == 1 || fresh || (hard % 1800) == 0)
+                Log("[host] Present failed 0x%08X (%llu so far). This window holds its last picture until "
+                    "one succeeds; the feed runs on a separate queue and is unaffected.",
+                    hr, (unsigned long long)hard);
+        }
+
+        // A rising skip count on its own reads as benign, because it usually is. A long
+        // UNBROKEN run is the state that is not: from there the window has stopped
+        // repainting and the consumer is missing frames. Counted for every client, not
+        // only the pipelined ones -- a same-frame client owes no debt, and so used to
+        // reach this state with fewer clues in its log rather than more (issue #33).
+        if (++g_present_debt_run == 120)
+            Log("[host] 120 presents in a row could not go through: this window has stopped repainting and "
+                "the consumer is missing frames. The feed itself is unaffected; a window that looks frozen "
+                "from here is this, not a hang.");
         return false;
     }
-    if (FAILED(hr)) return false;
+    // DXGI_STATUS_OCCLUDED is a SUCCESS code, so it falls through the test above: the
+    // present was accepted, but nothing of it reaches the screen. That is the normal state
+    // for a helper parked at HWND_BOTTOM under a fullscreen game, and worth naming once
+    // rather than leaving a reader to infer it from a picture that never changes.
+    if (hr == DXGI_STATUS_OCCLUDED)
+    {
+        static bool said_occluded = false;
+        if (!said_occluded)
+        {
+            said_occluded = true;
+            Log("[host] this window is occluded (the game is in front of it): presents are accepted but "
+                "nothing is drawn until it is raised. The feed is unaffected.");
+        }
+    }
     g_present_debt_run = 0;   // a present went through; the window is repainting again
     CopyPanel();
     return true;
@@ -1129,8 +1166,11 @@ static bool PumpPresent(bool force = false)
 // Bounded by g_present_owed, so this can never present more often than evaluates asked for.
 static void PumpRetireOwedPresents()
 {
-    while (g_present_owed > 0 && h.swap != nullptr &&
-           (h.latency_wait == nullptr || WaitForSingleObject(h.latency_wait, 0) == WAIT_OBJECT_0))
+    // No frame-latency wait here either, for the reason spelled out in PumpPresent: a wait
+    // that is not followed by a present spends a semaphore count nothing gives back, and
+    // this loop's whole job is to keep trying when presents are failing (issue #33).
+    // PumpPresent already returns false without blocking when there is no free buffer.
+    while (g_present_owed > 0 && h.swap != nullptr)
     {
         if (!PumpPresent(false)) break;   // no buffer after all, or DXGI busy: try again later
         --g_present_owed;
@@ -1207,8 +1247,10 @@ static bool InitDisguise()
     // holds until the next vblank (the window is occluded by a fullscreen game, or the
     // present queue is full) paced the GAME at the compositor's rhythm: the rigid 33.5 ms /
     // 30 fps plateaus of issue #15 on 32-bit DXVK, with the feed's own CPU cost at 0.1 ms.
-    // PumpPresent checks the waitable object and never waits on it, and asks DXGI not to
-    // wait either way.
+    // The flag is kept for that latency behaviour. PumpPresent does NOT wait on the object
+    // it produces, and no longer polls it either: DXGI_PRESENT_DO_NOT_WAIT is what actually
+    // guarantees the non-blocking present, and a zero-timeout poll spent semaphore counts
+    // that only a presented frame gives back -- which froze the window for good (issue #33).
     sd.Flags            = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     hr = factory->CreateSwapChainForHwnd(h.pump_queue, h.hwnd, &sd, nullptr, nullptr, &h.swap);
     if (SUCCEEDED(hr))
@@ -1220,7 +1262,9 @@ static bool InitDisguise()
             h.latency_wait = swap2->GetFrameLatencyWaitableObject();
             swap2->Release();
         }
-        if (h.latency_wait == nullptr) Log("[host] no frame-latency waitable object; Present may block on DWM");
+        if (h.latency_wait == nullptr)
+            Log("[host] no frame-latency waitable object; this chain queues presents the ordinary way "
+                "(DXGI_PRESENT_DO_NOT_WAIT still keeps them off the game's thread)");
     }
     // By default DXGI watches this window and may act on window/foreground changes -- which,
     // for a helper spawned behind a fullscreen game, can pull the game out of focus. We only
@@ -2213,6 +2257,13 @@ static int Serve(DWORD game_pid)
                 Log("[host] frame %llu evaluated (%llu presents skipped so far, %llu owed)",
                     (unsigned long long)fm.n, (unsigned long long)g_present_skipped,
                     (unsigned long long)g_present_owed);
+            // Pay off what earlier evaluates could not present BEFORE taking this one's own
+            // present. The idle branch of the tag wait above is the other repayment point,
+            // but it only runs when MsgWaitForMultipleObjects times out after 100 ms -- so
+            // in a game delivering frames every ~20 ms it never runs at all, and the debt
+            // sat at its cap for the whole session (issue #33). Here the game is already
+            // behind fence_out and is not waiting on us, which is the same argument.
+            PumpRetireOwedPresents();
             PumpPresent(true);   // per evaluate, deliberately -- see PumpPresent
         }
         else
