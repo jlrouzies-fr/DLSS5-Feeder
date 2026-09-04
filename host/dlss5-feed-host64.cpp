@@ -33,7 +33,9 @@
 
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
+#include <nvsdk_ngx_defs_dlssd.h>   // SuperSamplingDenoising.Available (DLSS Ray Reconstruction, nvngx_dlssd.dll)
 
+#include "../src/feed_ngx.h"  // NGX result names and DLL identity, shared with the add-on
 #include "../src/feed_ipc.h"
 #include "../src/feed_fmt.h"
 #include "../src/feed_dfc.h"   // Deep Fried Chicken interop ABI 1 (producer side, HostMode=1 here)
@@ -574,35 +576,6 @@ static void Log(const char *fmt, ...)
     }
 }
 
-static const char *NgxResultName(NVSDK_NGX_Result r)
-{
-    switch (static_cast<unsigned>(r))
-    {
-    // Kept in step with the add-on's copy. This table used to be the short one, so the
-    // single most-reported failure -- 0xBAD00001 from Init -- printed as "(?)" here while
-    // the add-on named it (issue #47, case C).
-    case 0x1:        return "Success";
-    case 0xBAD00001: return "FeatureNotSupported";
-    case 0xBAD00002: return "PlatformError";
-    case 0xBAD00003: return "FeatureAlreadyExists";
-    case 0xBAD00004: return "FeatureNotFound";
-    case 0xBAD00005: return "InvalidParameter";
-    case 0xBAD00006: return "ScratchBufferTooSmall";
-    case 0xBAD00007: return "NotInitialized";
-    case 0xBAD00008: return "UnsupportedInputFormat";
-    case 0xBAD00009: return "RWFlagMissing";
-    case 0xBAD0000A: return "MissingInput";
-    case 0xBAD0000B: return "UnableToInitializeFeature";
-    case 0xBAD0000C: return "OutOfDate";
-    case 0xBAD0000D: return "OutOfGPUMemory";
-    case 0xBAD0000E: return "UnsupportedFormat";
-    case 0xBAD0000F: return "UnableToWriteToAppDataPath";
-    case 0xBAD00010: return "UnsupportedParameter";
-    case 0xBAD00011: return "Denied";
-    case 0xBAD00012: return "NotImplemented";
-    default:         return "?";
-    }
-}
 
 // ---------------------------------------------------------------------------
 // State
@@ -1306,6 +1279,8 @@ static void LogHostAdapter()
     if (h.dev == nullptr) return;
     const LUID luid = h.dev->GetAdapterLuid();
     wchar_t desc[128] = L"(unnamed)";
+    UINT vendor = 0, device = 0;
+    char driver[32] = "?";
     IDXGIFactory1 *f = nullptr;
     // GetProcAddress like InitDisguise does: this exe carries no dxgi import, so that the
     // app-directory dxgi.dll (which is ReShade) is loaded in the order a real game gives it.
@@ -1321,13 +1296,50 @@ static void LogHostAdapter()
             DXGI_ADAPTER_DESC1 ad = {};
             a->GetDesc1(&ad);
             if (ad.AdapterLuid.LowPart == luid.LowPart && ad.AdapterLuid.HighPart == luid.HighPart)
-            { wcscpy_s(desc, ad.Description); a->Release(); break; }
+            {
+                wcscpy_s(desc, ad.Description);
+                vendor = ad.VendorId;
+                device = ad.DeviceId;
+                // Same decode as the add-on's LogAdapterIdentity: the last five digits of
+                // the quad's last two components are NVIDIA's branded version.
+                LARGE_INTEGER umd = {};
+                if (SUCCEEDED(a->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd)))
+                {
+                    const unsigned sub_v = HIWORD(umd.LowPart), bld = LOWORD(umd.LowPart);
+                    const unsigned n     = (sub_v * 10000u + bld) % 100000u;
+                    sprintf_s(driver, "%u.%02u", n / 100u, n % 100u);
+                }
+                a->Release();
+                break;
+            }
             a->Release();
         }
         f->Release();
     }
-    Log("[host] device adapter: %ls  LUID %08lX:%08lX (DXGI's default adapter)", desc,
-        (unsigned long)luid.HighPart, (unsigned long)luid.LowPart);
+    Log("[host] device adapter: %ls  LUID %08lX:%08lX  PCI %04X:%04X  driver %s (DXGI's default adapter)",
+        desc, (unsigned long)luid.HighPart, (unsigned long)luid.LowPart, vendor, device, driver);
+}
+
+// Ask NGX which of the adapter, the driver or the OS it is objecting to. Same question the
+// add-on asks through its own NgxAskWhy; kept symmetrical on purpose, because issue #47 is
+// built on comparing what the two sides report.
+static void NgxAskWhy(const wchar_t *data_path, const NVSDK_NGX_FeatureCommonInfo *info)
+{
+    if (h.dev == nullptr) return;
+    IDXGIAdapter  *ad = nullptr;
+    IDXGIFactory4 *f4 = nullptr;
+    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    auto make_factory = dxgi != nullptr
+        ? reinterpret_cast<PFN_CreateDXGIFactory1_>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+    if (make_factory != nullptr &&
+        SUCCEEDED(make_factory(__uuidof(IDXGIFactory4), reinterpret_cast<void **>(&f4))) && f4 != nullptr)
+    {
+        f4->EnumAdapterByLuid(h.dev->GetAdapterLuid(), __uuidof(IDXGIAdapter),
+                              reinterpret_cast<void **>(&ad));
+        f4->Release();
+    }
+    FeedLogNgxFeatureRequirements(&Log, "host", ad, data_path, info);
+    if (ad != nullptr) ad->Release();
 }
 
 static bool InitNgx()
@@ -1350,12 +1362,30 @@ static bool InitNgx()
         Log("[host] NGX application data path: %ls (%s)", data_path, writable ? "writable" : "NOT WRITABLE");
     }
 
-    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, h.dev, nullptr, NVSDK_NGX_Version_API);
+    {
+        char dir8[MAX_PATH] = {};
+        WideCharToMultiByte(CP_UTF8, 0, data_path, -1, dir8, MAX_PATH, nullptr, nullptr);
+        FeedLogNgxRuntimes(&Log, "host", dir8);
+    }
+
+    // A PathListInfo, which this side passed as nullptr while the add-on passed one. That
+    // was the last structural difference between the two call sites, and issue #47 is built
+    // entirely on comparing them -- so it should not be a difference at all.
+    const wchar_t *const search[1] = { data_path };
+    NVSDK_NGX_FeatureCommonInfo info = {};
+    info.PathListInfo.Path   = search;
+    info.PathListInfo.Length = 1;
+
+    // Before the attempt, not only after a failure: a machine where NGX works records what
+    // it answers here too, and the working cases are the control the failing ones need.
+    NgxAskWhy(data_path, &info);
+
+    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, h.dev, &info, NVSDK_NGX_Version_API);
     Log("[host] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))
     {
         r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                                                "1.0", data_path, h.dev, nullptr, NVSDK_NGX_Version_API);
+                                                "1.0", data_path, h.dev, &info, NVSDK_NGX_Version_API);
         Log("[host] Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
     }
     if (NVSDK_NGX_FAILED(r))
@@ -1388,6 +1418,7 @@ static bool InitNgx()
         }
         else
             Log("[host] NGX Core: the HKLM NGXCore key could not be opened -- the driver's NGX runtime may not be installed");
+
         return false;
     }
     h.ngx_inited = true;
@@ -1396,9 +1427,19 @@ static bool InitNgx()
     r = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
     if (NVSDK_NGX_SUCCEED(r) && caps != nullptr)
     {
-        int avail = 0;
+        int avail = 0, denoise = 0, needs_driver = 0, maj = 0, min_v = 0;
         caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
-        Log("[host] SuperSampling.Available=%d", avail);
+        caps->Get(NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &denoise);
+        caps->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);
+        caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &maj);
+        caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &min_v);
+        // SuperSamplingDenoising is DLSS Ray Reconstruction (nvngx_dlssd.dll), NOT the
+        // DLSS 5 neural rendering this project feeds -- that is NGX feature 18, backed by
+        // nvngx_dlssnr.dll, and no capability parameter reports on it. Kept as the cheapest
+        // way to see how much of the DLSS family NGX has here; feature 18 is asked about
+        // properly by FeedLogNgxFeatureRequirements on the failure path.
+        Log("[host] NGX capabilities: SuperSampling.Available=%d SuperSamplingDenoising.Available=%d "
+            "NeedsUpdatedDriver=%d MinDriver=%d.%d", avail, denoise, needs_driver, maj, min_v);
         if (!avail) return false;
     }
     r = NVSDK_NGX_D3D12_AllocateParameters(&h.params);

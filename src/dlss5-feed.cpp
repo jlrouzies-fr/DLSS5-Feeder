@@ -51,7 +51,9 @@
 
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
+#include <nvsdk_ngx_defs_dlssd.h>   // SuperSamplingDenoising.Available (DLSS Ray Reconstruction, nvngx_dlssd.dll)
 
+#include "feed_ngx.h"  // NGX result names and DLL identity, shared with host64
 #include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
@@ -1589,32 +1591,6 @@ static bool IsHdrFormat(DXGI_FORMAT typed)
     return typed == DXGI_FORMAT_R16G16B16A16_FLOAT || typed == DXGI_FORMAT_R11G11B10_FLOAT;
 }
 
-static const char *NgxResultName(NVSDK_NGX_Result r)
-{
-    switch (static_cast<unsigned>(r))
-    {
-    case 0x1:        return "Success";
-    case 0xBAD00001: return "FeatureNotSupported";
-    case 0xBAD00002: return "PlatformError";
-    case 0xBAD00003: return "FeatureAlreadyExists";
-    case 0xBAD00004: return "FeatureNotFound";
-    case 0xBAD00005: return "InvalidParameter";
-    case 0xBAD00006: return "ScratchBufferTooSmall";
-    case 0xBAD00007: return "NotInitialized";
-    case 0xBAD00008: return "UnsupportedInputFormat";
-    case 0xBAD00009: return "RWFlagMissing";
-    case 0xBAD0000A: return "MissingInput";
-    case 0xBAD0000B: return "UnableToInitializeFeature";
-    case 0xBAD0000C: return "OutOfDate";
-    case 0xBAD0000D: return "OutOfGPUMemory";
-    case 0xBAD0000E: return "UnsupportedFormat";
-    case 0xBAD0000F: return "UnableToWriteToAppDataPath";
-    case 0xBAD00010: return "UnsupportedParameter";
-    case 0xBAD00011: return "Denied";
-    case 0xBAD00012: return "NotImplemented";
-    default:         return "?";
-    }
-}
 
 // Kept for the overlay: "disabled (see dlss5-feed.log)" on its own sends the player
 // to a file to find out what happened, and Warn() only reaches the two logs.
@@ -1832,6 +1808,61 @@ static bool NgxPathWritable(const wchar_t *dir)
     return true;
 }
 
+// What NGX says it can do, in one place. The D3D11 path asked for the driver requirements
+// and the other three asked only "is SuperSampling available", so a session opened over
+// Vulkan, OpenGL or the game's own D3D12 device reported strictly less about the same
+// question, so nothing said how much of the DLSS family NGX actually has here.
+//
+// SuperSamplingDenoising is DLSS Ray Reconstruction (nvngx_dlssd.dll). It is NOT DLSS 5
+// neural rendering -- that is NGX feature 18, backed by nvngx_dlssnr.dll and only ever
+// created by the consumer add-on, so no parameter here reports on it. Verified on an
+// RTX 5090 where DLSS works and this reads 0. It earns its line anyway, as the cheapest
+// way to tell "NGX has only plain SuperSampling on this machine" from "NGX is complete";
+// the feature-18 question is asked properly by FeedLogNgxFeatureRequirements.
+// Ask NGX which of the adapter, the driver or the OS it is objecting to. Resolves the
+// device's own adapter by LUID, because GetFeatureRequirements takes an IDXGIAdapter and
+// the sessions here are opened on three different ones.
+static void NgxAskWhy(ID3D12Device *dev, const wchar_t *data_path)
+{
+    if (dev == nullptr) return;
+    wchar_t hostdir[MAX_PATH];
+    _snwprintf_s(hostdir, _TRUNCATE, L"%shost64\\", data_path);
+    const wchar_t *const search[2] = { data_path, hostdir };
+    NVSDK_NGX_FeatureCommonInfo info = {};
+    info.PathListInfo.Path   = search;
+    info.PathListInfo.Length = 2;
+
+    IDXGIAdapter  *ad = nullptr;
+    IDXGIFactory4 *f4 = nullptr;
+    typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1_)(REFIID, void **);
+    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    auto make_factory = dxgi != nullptr
+        ? reinterpret_cast<PFN_CreateDXGIFactory1_>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+    if (make_factory != nullptr &&
+        SUCCEEDED(make_factory(__uuidof(IDXGIFactory4), reinterpret_cast<void **>(&f4))) && f4 != nullptr)
+    {
+        f4->EnumAdapterByLuid(dev->GetAdapterLuid(), __uuidof(IDXGIAdapter),
+                              reinterpret_cast<void **>(&ad));
+        f4->Release();
+    }
+    FeedLogNgxFeatureRequirements(&Log, "feed", ad, data_path, &info);
+    if (ad != nullptr) ad->Release();
+}
+
+// Returns SuperSampling.Available; the caller decides what to do about it.
+static int LogNgxCaps(NVSDK_NGX_Parameter *caps, ID3D12Device *dev, const wchar_t *data_path)
+{
+    int avail = 0, denoise = 0, needs_driver = 0, maj = 0, min_v = 0;
+    caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
+    caps->Get(NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &denoise);
+    caps->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);
+    caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &maj);
+    caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &min_v);
+    Log("[feed] NGX capabilities: SuperSampling.Available=%d SuperSamplingDenoising.Available=%d "
+        "NeedsUpdatedDriver=%d MinDriver=%d.%d", avail, denoise, needs_driver, maj, min_v);
+    return avail;
+}
+
 // Everything a reader needs to tell "NGX is broken here" from "NGX was pointed somewhere
 // wrong". None of this was in the log when three machines reported FeatureNotSupported from
 // the in-process session while the same files initialised fine in the host64 helper.
@@ -1866,12 +1897,19 @@ static void LogNgxEnvironment()
 // The private device's adapter, by LUID as well as by name. The helper takes DXGI's default
 // adapter and the add-on takes the game's, and nothing said so, which left a hybrid or
 // multi-adapter split invisible in every report so far (issue #47).
+//
+// Also the PCI ids and the driver version. Both LUID walks already filled a
+// DXGI_ADAPTER_DESC1 and printed only the name, while issue #47's live hypothesis is a GPU
+// GENERATION split -- and no log on either side has ever carried a driver version, so "your
+// driver is too old" and a real bug were indistinguishable from a report.
 static void LogAdapterIdentity(const char *who, ID3D12Device *dev)
 {
     if (dev == nullptr) return;
     const LUID luid = dev->GetAdapterLuid();
     IDXGIFactory1 *f = nullptr;
     wchar_t desc[128] = L"(unnamed)";
+    UINT vendor = 0, device = 0;
+    char driver[32] = "?";
     // GetProcAddress, not a link-time import: this add-on deliberately carries no dxgi
     // import (the module is already in the process, loaded by ReShade or the game).
     typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1_)(REFIID, void **);
@@ -1887,13 +1925,29 @@ static void LogAdapterIdentity(const char *who, ID3D12Device *dev)
             DXGI_ADAPTER_DESC1 ad = {};
             a->GetDesc1(&ad);
             if (ad.AdapterLuid.LowPart == luid.LowPart && ad.AdapterLuid.HighPart == luid.HighPart)
-            { wcscpy_s(desc, ad.Description); a->Release(); break; }
+            {
+                wcscpy_s(desc, ad.Description);
+                vendor = ad.VendorId;
+                device = ad.DeviceId;
+                // The user-mode driver version, in the quad Windows reports (32.0.16.1656).
+                // NVIDIA's branded number is the last five digits of the last two
+                // components: 16 and 1656 -> 161656 -> 61656 -> 616.56.
+                LARGE_INTEGER umd = {};
+                if (SUCCEEDED(a->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd)))
+                {
+                    const unsigned sub_v = HIWORD(umd.LowPart), bld = LOWORD(umd.LowPart);
+                    const unsigned n     = (sub_v * 10000u + bld) % 100000u;
+                    sprintf_s(driver, "%u.%02u", n / 100u, n % 100u);
+                }
+                a->Release();
+                break;
+            }
             a->Release();
         }
         f->Release();
     }
-    Log("[feed] %s device adapter: %ls  LUID %08lX:%08lX", who, desc,
-        (unsigned long)luid.HighPart, (unsigned long)luid.LowPart);
+    Log("[feed] %s device adapter: %ls  LUID %08lX:%08lX  PCI %04X:%04X  driver %s", who, desc,
+        (unsigned long)luid.HighPart, (unsigned long)luid.LowPart, vendor, device, driver);
 }
 
 static NVSDK_NGX_Result SafeNgxInitOnce(const wchar_t *data_path, ID3D12Device *dev,
@@ -1950,6 +2004,18 @@ static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *de
     info.PathListInfo.Path   = search;
     info.PathListInfo.Length = 2;
 
+    // Which build of the neural model this process is about to hand to NGX. Logged before
+    // the first attempt, so a machine where init SUCCEEDS records it too -- the working
+    // cases are the control the failing ones in issue #47 need.
+    {
+        char dir8[MAX_PATH] = {};
+        WideCharToMultiByte(CP_UTF8, 0, data_path, -1, dir8, MAX_PATH, nullptr, nullptr);
+        FeedLogNgxRuntimes(&Log, "feed", dir8);
+    }
+    // And what NGX says it supports on this adapter, before the attempt rather than only
+    // after a failure -- a machine where init succeeds is the control the failing ones need.
+    NgxAskWhy(dev, data_path);
+
     NVSDK_NGX_Result r = NVSDK_NGX_Result_Fail;
     for (int i = 0; i < n; ++i)
     {
@@ -1965,6 +2031,7 @@ static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *de
         Log("[feed] NGX init attempt %d -> 0x%08X (%s)", i + 1, r, NgxResultName(r));
     }
     LogNgxEnvironment();
+
     return r;
 }
 
@@ -3363,13 +3430,7 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         r = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
         if (NVSDK_NGX_SUCCEED(r) && caps != nullptr)
         {
-            int avail = 0, needs_driver = 0, maj = 0, min = 0;
-            caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
-            caps->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);
-            caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &maj);
-            caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &min);
-            Log("[feed] NGX capabilities: SuperSampling.Available=%d NeedsUpdatedDriver=%d MinDriver=%d.%d", avail,
-                needs_driver, maj, min);
+            const int avail = LogNgxCaps(caps, g.dev12, data_path);
             if (!avail) { Log("[feed] DLSS super sampling is not available on this GPU/driver"); goto fail; }
         }
         else
@@ -3537,6 +3598,7 @@ static bool InitSession12(reshade::api::effect_runtime *rt)
     g.dev12_owned = false;
     queue->AddRef();
     g.queue = queue;
+    LogAdapterIdentity("same (the game's)", g.dev12);
 
     wchar_t data_path[MAX_PATH] = {};
     GetModuleFileNameW(g_self, data_path, MAX_PATH);
@@ -3562,9 +3624,7 @@ static bool InitSession12(reshade::api::effect_runtime *rt)
     r = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
     if (NVSDK_NGX_SUCCEED(r) && caps != nullptr)
     {
-        int avail = 0;
-        caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
-        Log("[feed] NGX capabilities: SuperSampling.Available=%d", avail);
+        const int avail = LogNgxCaps(caps, g.dev12, data_path);
         if (!avail)
         {
             ShutdownSession();
@@ -3723,6 +3783,7 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
         return false;
     }
     g.dev12_owned = true;
+    LogAdapterIdentity("private (DXGI's default)", g.dev12);
 
     wchar_t data_path[MAX_PATH] = {};
     GetModuleFileNameW(g_self, data_path, MAX_PATH);
@@ -3748,9 +3809,7 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
     r = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
     if (NVSDK_NGX_SUCCEED(r) && caps != nullptr)
     {
-        int avail = 0;
-        caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
-        Log("[feed] NGX capabilities: SuperSampling.Available=%d", avail);
+        const int avail = LogNgxCaps(caps, g.dev12, data_path);
         if (!avail)
         {
             ShutdownSession();
@@ -4111,6 +4170,7 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
         return false;
     }
     g.dev12_owned = true;
+    LogAdapterIdentity("private (DXGI's default)", g.dev12);
 
     wchar_t data_path[MAX_PATH] = {};
     GetModuleFileNameW(g_self, data_path, MAX_PATH);
@@ -4136,9 +4196,7 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
     r = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
     if (NVSDK_NGX_SUCCEED(r) && caps != nullptr)
     {
-        int avail = 0;
-        caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
-        Log("[feed] NGX capabilities: SuperSampling.Available=%d", avail);
+        const int avail = LogNgxCaps(caps, g.dev12, data_path);
         if (!avail)
         {
             ShutdownSession();
