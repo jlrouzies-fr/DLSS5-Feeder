@@ -593,7 +593,11 @@ function Get-ApiStringHints
         $bytes = [IO.File]::ReadAllBytes($Path)
         $ascii = [Text.Encoding]::ASCII.GetString($bytes)
         $wide  = [Text.Encoding]::Unicode.GetString($bytes)
-        foreach ($n in @('vulkan-1.dll', 'dxgi.dll', 'd3d12.dll', 'd3d11.dll', 'd3d10.dll', 'd3d9.dll', 'd3d8.dll', 'opengl32.dll')) {
+        # d3d10_1.dll earns its place: a Direct3D 10 game imports THAT, not d3d10.dll, and
+        # without it here a title like Devil May Cry 4 SE -- which also imports d3d9.dll for
+        # its D3DPERF markers -- was detected as Direct3D 9 and sent down the dgVoodoo2 route,
+        # which implements DirectX 1-9 and cannot touch Direct3D 10.
+        foreach ($n in @('vulkan-1.dll', 'dxgi.dll', 'd3d12.dll', 'd3d11.dll', 'd3d10_1.dll', 'd3d10.dll', 'd3d10core.dll', 'd3d9.dll', 'd3d8.dll', 'opengl32.dll')) {
             $re = '(?i)(?<![\w.])' + [regex]::Escape($n)
             $c = [regex]::Matches($ascii, $re).Count + [regex]::Matches($wide, $re).Count
             if ($c -gt 0) { $hits[$n] = $c }
@@ -1248,7 +1252,8 @@ if ($detected -eq 'Unknown') {
     if ($hints.Count -gt 0) {
         Report -Status 'Info' -Text ('API DLL names found inside ' + $hintSource + ': ' + (($hints.Keys | Sort-Object | ForEach-Object { $_ + ' x' + $hints[$_] }) -join ', '))
         $hVK  = $hints.ContainsKey('vulkan-1.dll')
-        $hDX  = $hints.ContainsKey('dxgi.dll') -or $hints.ContainsKey('d3d11.dll') -or $hints.ContainsKey('d3d12.dll') -or $hints.ContainsKey('d3d10.dll')
+        $hDX  = $hints.ContainsKey('dxgi.dll') -or $hints.ContainsKey('d3d11.dll') -or $hints.ContainsKey('d3d12.dll') -or
+                $hints.ContainsKey('d3d10.dll') -or $hints.ContainsKey('d3d10_1.dll') -or $hints.ContainsKey('d3d10core.dll')
         $hD9  = $hints.ContainsKey('d3d9.dll')
         $hD8  = $hints.ContainsKey('d3d8.dll')
         $hGL  = $hints.ContainsKey('opengl32.dll')

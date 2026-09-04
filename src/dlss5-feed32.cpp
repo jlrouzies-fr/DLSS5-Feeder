@@ -16,6 +16,11 @@
 //    import-only (there is no export in GL_EXT_external_objects_win32). The GL half
 //    is raw, through the very same src/feed_gl.h the 64-bit add-on uses, compiled
 //    x86; both directions are proven by spike/spike-gl32.exe. See PLAN-OPENGL §5.
+//  * D3D10: created here as well -- but by a PRIVATE D3D11 RELAY DEVICE, not by the
+//    game's. A D3D10.1 device has no NT-handle sharing, no fence and no UAV, so it
+//    cannot reach the host at all; it hands its frame to the relay over a legacy
+//    keyed-mutex texture (src/feed_d3d10.h) and from there this is the D3D11 client
+//    above, unchanged -- same client kind, same protocol version, same host.
 //  * Vulkan: created by the HOST too, because D3D12 cannot open what Vulkan exports.
 //    The transport is src/feed_vk.h -- again the 64-bit add-on's own header, compiled
 //    x86 -- with the queue signal/wait going through ReShade (an api::fence handle IS
@@ -49,13 +54,14 @@
 #include "feed_gl.h"   // raw-OpenGL interop, the same header the 64-bit add-on uses
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
+#include "feed_d3d10.h"     // D3D10.1 <-> D3D11 keyed-mutex bridge + the private relay device
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 
 #define FEED_VERSION "0.13.0-beta.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Feeds DLSS 5 neural rendering in 32-bit D3D11, OpenGL and Vulkan (DXVK) games without DLSS: ships the frame, depth and "
+    "Feeds DLSS 5 neural rendering in 32-bit D3D10, D3D11, OpenGL and Vulkan (DXVK) games without DLSS: ships the frame, depth and "
     "motion vectors to a 64-bit helper process (host64\\dlss5-feed-host64.exe) over cross-process "
     "shared GPU textures, and blits the neural result back. Needs DLSS5_Feed.fx and a motion-vector "
     "provider (DRME, qUINT, Launchpad, VORT or LumeniteFX; pick it with the DLSS5_MV_PROVIDER definition). "
@@ -712,6 +718,15 @@ struct Feed32
     bool                       vk_released;      // our images are released to VK_QUEUE_FAMILY_EXTERNAL
                                                  // (the host's D3D12 device owns them until the next acquire)
 
+    // D3D10 client: not really a client at all. A private D3D11 relay device (feed_d3d10.h)
+    // is what talks to the host, so g.dev, g.ctx4, g.tex[] and g.fence_* below are all the
+    // RELAY's -- everything from BuildShared down is the D3D11 path, byte for byte. The
+    // game's own D3D10.1 device only ever does CopyResource, into and out of the bridges.
+    bool            is_d3d10;
+    FeedD3D10       d10;
+    FeedD3D10Bridge d10_bridge[FEED_SLOTS];   // native-sized; FEED_OUTPUT is the one with an RTV
+    ID3D10Device1  *d10_dev;                  // not owned, and only for the log line
+
     bool        built;
     UINT        width, height;                  // the work resolution DLSS runs at
     UINT        output_width, output_height;    // the Output slot: == work (DLAA) or native (work_upscale=2)
@@ -1201,6 +1216,12 @@ static void CastReleasePanel()
 // Returns the handle value to put in FeedBuild::panel_tex (0 = none).
 static uint64_t CastMakePanel()
 {
+    // Not on D3D10. The panel is drawn by handing its shader resource view to the GAME's
+    // ReShade as an ImTextureID, and on a D3D10 game that ImGui backend wants an
+    // ID3D10ShaderResourceView -- ours would be a D3D11 view from the relay wearing the
+    // wrong vtable. Refusing here leaves CastPanelAvailable() false, which is what makes
+    // the cast fall back to the compositor thumbnail; see the note in CastLayout.
+    if (g.is_d3d10) return 0;
     if (g.dev == nullptr || g.panel_w == 0 || g.panel_h == 0) return 0;
     if (g.panel_handle != nullptr) return reinterpret_cast<uintptr_t>(g.panel_handle);
 
@@ -1275,7 +1296,8 @@ static void CastAdoptHostPanel11(ID3D11Device1 *dev1, const FeedBuildAck &ack)
 {
     if (ack.panel_tex == 0) return;
     HANDLE hnd = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex));
-    if (dev1 == nullptr || g.panel_w == 0) { CloseHandle(hnd); return; }
+    // Not on D3D10, for the reason CastMakePanel gives: the view would be the relay's.
+    if (dev1 == nullptr || g.panel_w == 0 || g.is_d3d10) { CloseHandle(hnd); return; }
 
     const UINT pw = g.panel_w, ph = g.panel_h;   // CastReleasePanel clears these; the size has not changed
     CastReleasePanel();
@@ -1443,7 +1465,9 @@ static bool CastLayout()
         g_cast_placed = true;
     }
 
-    const bool texture = g_cfg.cast_mode == 1;
+    // D3D10 has no texture mode -- the panel view cannot cross into the game's ImGui --
+    // so the cast is always the compositor thumbnail there.
+    const bool texture = g_cfg.cast_mode == 1 && !g.is_d3d10;
     if (texture != g_cast_texture)   // the mode changed while shown: start over in the other one
     {
         CastRelease();
@@ -1785,7 +1809,7 @@ static void OnOverlay(reshade::api::effect_runtime *rt)
     }
     ImDrawList *dl = ImGui::GetForegroundDrawList(nullptr);
     if (dl == nullptr) return;
-    if (g_cast_texture && g.panel_srv != nullptr && g.panel_w != 0)
+    if (g_cast_texture && !g.is_d3d10 && g.panel_srv != nullptr && g.panel_w != 0)
     {
         // ReShade's D3D11 ImGui backend takes the view pointer itself as the texture id
         // (the same convention as the rtv.handle casts in FeedFrame11).
@@ -1957,7 +1981,7 @@ static void ChickenCfgRefresh()
 
 static const char *HostClientKindName()
 {
-    return g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : "D3D11";
+    return g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : g.is_d3d10 ? "D3D10 (via a D3D11 relay)" : "D3D11";
 }
 
 // Worker side of JOB_CONNECT: spawn the helper, wait for its pipe, shake hands. Everything
@@ -2024,6 +2048,9 @@ static bool HostWorkerConnect(HANDLE ev)
     }
     if (g_link.pipe == nullptr) { strcpy_s(g_link.why, "pipe never appeared"); return false; }
 
+    // D3D10 is deliberately absent: by the time the host hears from us the frame is
+    // already on a D3D11 relay device, so it IS a D3D11 client -- same kind, same
+    // protocol version, nothing on the host side to change.
     const uint32_t kind = g.is_vulkan ? FEED_CLIENT_VULKAN : g.is_gl ? FEED_CLIENT_GL : FEED_CLIENT_D3D11;
     // Hand the host a handle to this process instead of making it OpenProcess(pid): a
     // protective DACL on the game (anti-cheat/DRM; seen on vanilla WoW) denies that with
@@ -2522,6 +2549,15 @@ static void ReleaseShared()
             if (g.gl_panel_tex != 0) { any = true; g.gl_panel_tex = 0; g.gl_panel_memobj = 0; }
             if (any) Log("[feed32] the GL context is not current here; the imported textures are left to the driver");
         }
+    }
+    // D3D10: the bridges are sized by the build, so they go out with it. Unbind first --
+    // the relay may still hold the Output's render target view or a guide SRV from the
+    // last frame, and a released view that is still bound is exactly what the debug layer
+    // catches and a release driver quietly tolerates until it does not.
+    if (g.d10.ok)
+    {
+        if (g.d10.relay_ctx != nullptr) { g.d10.relay_ctx->ClearState(); g.d10.relay_ctx->Flush(); }
+        for (int i = 0; i < FEED_SLOTS; ++i) FeedD3D10ReleaseBridge(&g.d10_bridge[i]);
     }
     SafeRelease(g.output_srv);
     g.sr_active = false;              // the next build decides again
@@ -4073,6 +4109,276 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     TimingTick(t0.QuadPart, t1.QuadPart);
 }
 
+static ID3D10Texture2D *AsTexture2D10(ID3D10Resource *res, D3D10_TEXTURE2D_DESC *desc)
+{
+    if (res == nullptr) return nullptr;
+    ID3D10Texture2D *tex = nullptr;
+    if (FAILED(res->QueryInterface(__uuidof(ID3D10Texture2D), reinterpret_cast<void **>(&tex))) || tex == nullptr)
+        return nullptr;
+    tex->GetDesc(desc);
+    return tex;
+}
+
+// The D3D10 bridges are native-sized -- the resample to the work resolution happens on
+// the relay, out of the Color bridge, exactly as it happens out of the game's own texture
+// on D3D11. Built after the shared set so a failure here backs off the same way.
+static bool BuildD3D10Bridges(UINT native_w, UINT native_h)
+{
+    for (int i = 0; i < FEED_SLOTS; ++i) FeedD3D10ReleaseBridge(&g.d10_bridge[i]);
+
+    const struct { int slot; DXGI_FORMAT fmt; bool rtv; } want[FEED_SLOTS] = {
+        { FEED_COLOR,  g.color_fmt,              false },
+        { FEED_OUTPUT, g.color_fmt,              true  },   // the blit chain draws into this one
+        { FEED_DEPTH,  DXGI_FORMAT_R32_FLOAT,    false },
+        { FEED_MV,     DXGI_FORMAT_R16G16_FLOAT, false },
+    };
+    for (int i = 0; i < FEED_SLOTS; ++i)
+    {
+        if (!FeedD3D10MakeBridge(&g.d10, &g.d10_bridge[want[i].slot], native_w, native_h, want[i].fmt, want[i].rtv))
+        {
+            Log("[feed32] D3D10 %s bridge failed at %s: 0x%08X",
+                FeedSlotName(want[i].slot), g.d10.where != nullptr ? g.d10.where : "?", g.d10.hr);
+            return false;
+        }
+    }
+
+    Log("[feed32] D3D10 bridges built: %ux%u, colour %s", native_w, native_h, FeedFmtName(g.color_fmt));
+    return true;
+}
+
+// The frame comes home in two hops. The relay draws the finished image into the Output
+// bridge -- the same blit chain every other client uses, scaling and FSR1 included --
+// and then the game's own device copies that bridge into its render target. The D3D10
+// side binds nothing: no shader, no viewport, no render target. That matters more here
+// than anywhere else in this file, because D3D10 has no ID3D10DeviceContext and state
+// lives directly on the device, so anything we set the game would silently inherit.
+static bool BlitHome10(ID3D10Resource *dst)
+{
+    FeedD3D10Bridge *out = &g.d10_bridge[FEED_OUTPUT];
+    if (out->rtv11 == nullptr) return false;
+    BlitOutputToBackbuffer(g.d10.relay_ctx, out->rtv11);
+    return FeedD3D10Collect(&g.d10, out, dst);   // drains the relay before the game copies
+}
+
+// The Direct3D 10 sibling of FeedFrameDispatch's D3D11 branch. Everything from
+// CopyOrResampleInputs onwards is that same client running on the private relay device;
+// what is new is only the two API crossings at either end. See src/feed_d3d10.h.
+static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource_view rtv)
+{
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+
+    reshade::api::device *dev_api = rt->get_device();
+
+    if (ApplyPendingWorkResolution()) g.built = false;
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+
+    // One-time: stand up the relay. This is the only place the game's own device is
+    // interrogated for anything but a copy, and it goes after the gate above so that
+    // mode=0 does not leave a private D3D11 device sitting in the game's process.
+    if (!g.d10.ok)
+    {
+        if (!FeedD3D10Open(&g.d10, reinterpret_cast<ID3D10Device *>(dev_api->get_native())))
+        {
+            char why[256];
+            _snprintf_s(why, sizeof(why), _TRUNCATE, "Direct3D 10: %s failed (0x%08X)",
+                        g.d10.where != nullptr ? g.d10.where : "?", g.d10.hr);
+            FeedDisable(why);
+            return;
+        }
+        g.d10_dev = g.d10.game;
+        g.dev     = g.d10.relay;   // not owned: g.d10 owns it, and FeedD3D10Close ends it
+        Log("[feed32] Direct3D 10.1 game: private D3D11 relay device created on adapter LUID %08lX:%08lX, "
+            "feature level %d_%d",
+            static_cast<unsigned long>(g.d10.luid.HighPart), static_cast<unsigned long>(g.d10.luid.LowPart),
+            (g.d10.relay_fl >> 12) & 0xF, (g.d10.relay_fl >> 8) & 0xF);
+        if (FAILED(g.d10.relay_ctx->QueryInterface(__uuidof(ID3D11DeviceContext4),
+                                                   reinterpret_cast<void **>(&g.ctx4))))
+        { FeedDisable("ID3D11DeviceContext4 unavailable on the relay device (Windows 10 1703+ required)"); return; }
+        // No ID3D11Multithread step, and no D3D10 equivalent of one: the relay is ours, it
+        // is only ever driven from the render thread inside FeedEnter/FeedLeave, and the
+        // game's device is free-threaded in D3D10 by definition.
+    }
+
+    ID3D11DeviceContext *ctx = g.d10.relay_ctx;
+
+    reshade::api::resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
+    if (g.mv_var.handle != 0)    rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
+    if (g.depth_var.handle != 0) rt->get_texture_binding(g.depth_var, &d_srv, &d_srgb);
+    if (mv_srv.handle == 0 || d_srv.handle == 0)
+    {
+        if (!g.missing_reported)
+        {
+            g.missing_reported = true;
+            Warn("DLSS5_Feed.fx textures not found. Install DLSS5_Feed.fx + a texMotionVectors provider and enable both.");
+        }
+        return;
+    }
+
+    auto *color_res = reinterpret_cast<ID3D10Resource *>(dev_api->get_resource_from_view(rtv).handle);
+    auto *mv_res    = reinterpret_cast<ID3D10Resource *>(dev_api->get_resource_from_view(mv_srv).handle);
+    auto *depth_res = reinterpret_cast<ID3D10Resource *>(dev_api->get_resource_from_view(d_srv).handle);
+
+    D3D10_TEXTURE2D_DESC cd = {}, md = {}, dd = {};
+    ID3D10Texture2D *color = AsTexture2D10(color_res, &cd);
+    ID3D10Texture2D *mv    = AsTexture2D10(mv_res, &md);
+    ID3D10Texture2D *depth = AsTexture2D10(depth_res, &dd);
+    if (color == nullptr || mv == nullptr || depth == nullptr)
+    { SafeRelease(color); SafeRelease(mv); SafeRelease(depth); return; }
+
+    bool ok = true;
+    if (cd.Width != md.Width || cd.Height != md.Height || cd.Width != dd.Width || cd.Height != dd.Height ||
+        cd.SampleDesc.Count != 1 || md.Format != DXGI_FORMAT_R16G16_FLOAT || dd.Format != DXGI_FORMAT_R32_FLOAT)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[feed32] input mismatch: color %ux%u fmt=%u samp=%u | mv %ux%u fmt=%u | depth %ux%u fmt=%u (D3D10)",
+                cd.Width, cd.Height, cd.Format, cd.SampleDesc.Count, md.Width, md.Height, md.Format,
+                dd.Width, dd.Height, dd.Format);
+        }
+        ok = false;
+    }
+
+    // Same rounding rule as the D3D11 path; see the note there.
+    const bool sr_wanted = g_cfg.work_upscale == 2 && g_cfg.mode == 2 && g_cfg.work_resolution < 100;
+    const UINT work_w = sr_wanted ? ScaledExtentUp(cd.Width,  g_cfg.work_resolution) : ScaledExtent(cd.Width,  g_cfg.work_resolution);
+    const UINT work_h = sr_wanted ? ScaledExtentUp(cd.Height, g_cfg.work_resolution) : ScaledExtent(cd.Height, g_cfg.work_resolution);
+    const bool size_changed = work_w != g.width || work_h != g.height ||
+                              cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height;
+    if (size_changed) g.sr_unavailable = false;
+    const bool want_sr = sr_wanted && !g.sr_unavailable && (work_w != cd.Width || work_h != cd.Height);
+    if (ok && (!g.built || size_changed || cd.Format != g.bb_fmt || want_sr != g.sr_requested))
+    {
+        if (GetTickCount64() < g_retry_at)
+            ok = false;
+        else
+        {
+            ok = BuildShared(work_w, work_h, cd.Width, cd.Height, cd.Format);
+            // BuildShared sets g.built on its own, so a bridge failure has to clear it or
+            // the next frame would sail past this block and copy out of null bridges.
+            if (ok && !BuildD3D10Bridges(cd.Width, cd.Height)) { g.built = false; ok = false; }
+            if (ok) g.consecutive_fails = 0;
+            else if (!g_build_pending && !g.disabled) FeedFail("shared build");
+        }
+    }
+
+    if (ok && g.built && g.d10_bridge[FEED_COLOR].tex11 != nullptr && g.d10_bridge[FEED_OUTPUT].rtv11 != nullptr)
+    {
+        if (!HostAlive()) { HostLost("process died"); }
+        else
+        {
+            const bool async_home = g_cfg.async_home != 0;
+            if (async_home && g.sent_n != 0)
+            {
+                Breadcrumb("waiting for the previous result");
+                g.ctx4->Wait(g.fence_out, g.sent_n);
+                g.fence_wait_queued = true;
+                g.wait_n            = g.sent_n;
+            }
+
+            if (g.sr_active)
+            {
+                if (g.need_reset || g_cfg.reset_every) g.jitter_index = 0;
+                HaltonJitter(g.jitter_index, g.jitter_phases, &g.jitter_x, &g.jitter_y);
+            }
+
+            // Cross into the relay's world. Queue all three copies on the game's device
+            // and then pay for ONE drain: with no fence to hand the relay, an event query
+            // is the only thing that can say the copies have landed, and it stops the
+            // whole device -- so doing it three times would cost three pipeline bubbles
+            // for one frame's worth of ordering.
+            Breadcrumb("handing the frame to the relay device");
+            FeedD3D10Deposit(&g.d10, &g.d10_bridge[FEED_COLOR], color_res);
+            FeedD3D10Deposit(&g.d10, &g.d10_bridge[FEED_MV],    mv_res);
+            FeedD3D10Deposit(&g.d10, &g.d10_bridge[FEED_DEPTH], depth_res);
+            const bool got = FeedD3D10SyncGame(&g.d10);
+
+            bool prepared = false;
+            if (got)
+            {
+                Breadcrumb("preparing work-resolution inputs");
+                prepared = CopyOrResampleInputs(ctx,
+                                                g.d10_bridge[FEED_COLOR].tex11,
+                                                g.d10_bridge[FEED_MV].tex11,
+                                                g.d10_bridge[FEED_DEPTH].tex11,
+                                                g.d10_bridge[FEED_MV].srv11,
+                                                g.d10_bridge[FEED_DEPTH].srv11,
+                                                cd.Width, cd.Height);
+            }
+            if (!got || !prepared)
+            {
+                FeedFail(got ? "work-resolution resample" : "D3D10 input sync");
+                SafeRelease(color); SafeRelease(mv); SafeRelease(depth);
+                QueryPerformanceCounter(&t1);
+                TimingTick(t0.QuadPart, t1.QuadPart);
+                return;
+            }
+
+            const UINT64 n = ++g.frame_n;
+            const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+            g.need_reset = false;
+
+            // As on D3D11, the blit home goes before the in-fence signal: the relay's
+            // context is in-order, so the host's permission to overwrite Output cannot
+            // pass our read of it.
+            const bool carried = async_home && g.out_valid;
+            bool home_ok = true;
+            if (carried) home_ok = BlitHome10(color_res);
+
+            g.ctx4->Signal(g.fence_in, n);
+            ctx->Flush();
+
+            const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset),
+                                      g.sr_active ? g.jitter_x : 0.0f, g.sr_active ? g.jitter_y : 0.0f };
+            const bool sent = PipeWriteFrame(fm);
+            if (sent && g.sr_active) ++g.jitter_index;
+            if (!sent)
+                HostLost("frame message failed");
+            else if (!home_ok)
+                FeedFail("D3D10 blit home");
+            else if (async_home)
+            {
+                g.sent_n    = n;
+                g.out_valid = true;
+                if (carried)
+                {
+                    const UINT64 done = ++g.frames_done;
+                    g.consecutive_fails = 0;
+                    if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                        Log("[feed32] frame %llu delivered (%ux%u, reset=%d, D3D10)", done, g.width, g.height, reset);
+                }
+            }
+            else
+            {
+                Breadcrumb("waiting for the host's result");
+                g.ctx4->Wait(g.fence_out, n);
+                g.fence_wait_queued = true;
+                g.wait_n            = n;
+                g.sent_n            = n;
+                if (!BlitHome10(color_res)) FeedFail("D3D10 blit home");
+                else
+                {
+                    g.out_valid = true;
+                    const UINT64 done = ++g.frames_done;
+                    g.consecutive_fails = 0;
+                    if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                        Log("[feed32] frame %llu delivered (%ux%u, reset=%d, D3D10)", done, g.width, g.height, reset);
+                }
+            }
+        }
+    }
+
+    SafeRelease(color);
+    SafeRelease(mv);
+    SafeRelease(depth);
+
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
 static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::command_list *cl,
                               reshade::api::resource_view rtv)
 {
@@ -4084,8 +4390,13 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
     { g.is_gl = true; FeedFrameGl(rt, rtv); return; }
     if (dev_api->get_api() == reshade::api::device_api::vulkan)
     { g.is_vulkan = true; FeedFrameVk(rt, cl, rtv); return; }
+    // D3D10 goes through a private D3D11 relay device and never touches cl: on this API
+    // ReShade's command list IS the device (there are no deferred contexts), so the cast
+    // below would be an ID3D10Device wearing a D3D11 vtable. Claim the frame first.
+    if (dev_api->get_api() == reshade::api::device_api::d3d10)
+    { g.is_d3d10 = true; FeedFrame10(rt, rtv); return; }
     if (dev_api->get_api() != reshade::api::device_api::d3d11)
-    { FeedDisable("only Direct3D 11, OpenGL and Vulkan games are supported by the 32-bit add-on"); return; }
+    { FeedDisable("only Direct3D 10, Direct3D 11, OpenGL and Vulkan games are supported by the 32-bit add-on"); return; }
 
     auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cl->get_native());
     if (ctx == nullptr || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
@@ -4445,8 +4756,11 @@ static void UntrackRuntime(reshade::api::effect_runtime *rt)
 // the other case rather than pretend it works.
 static bool RuntimeDeviceCompatible(const RuntimeSlot *slot)
 {
-    return g.dev == nullptr || slot == nullptr || slot->dev == nullptr ||
-           reinterpret_cast<ID3D11Device *>(slot->dev) == g.dev;
+    if (slot == nullptr || slot->dev == nullptr) return true;
+    // On D3D10 g.dev is the private relay, which no runtime will ever report as its own.
+    // The device that has to match is the game's -- the one the bridges were made on.
+    if (g.is_d3d10) return g.d10_dev == nullptr || slot->dev == static_cast<void *>(g.d10_dev);
+    return g.dev == nullptr || reinterpret_cast<ID3D11Device *>(slot->dev) == g.dev;
 }
 
 // enabled=0 means enabled=0. Everything below this line queries the runtime, reads files,
@@ -4608,7 +4922,9 @@ static void OnDestroyDevice(reshade::api::device *dev)
 {
     const bool ours = (g.dev != nullptr && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev) ||
                       (g.is_gl && dev->get_api() == reshade::api::device_api::opengl) ||
-                      (g.is_vulkan && dev == g.rs_dev);
+                      (g.is_vulkan && dev == g.rs_dev) ||
+                      // g.dev is the RELAY on D3D10, so it never matches the game's device
+                      (g.is_d3d10 && dev->get_api() == reshade::api::device_api::d3d10);
     if (!ours) return;
 
     Log("[feed32] game device destroyed; shutting down");
@@ -4644,6 +4960,11 @@ static void OnDestroyDevice(reshade::api::device *dev)
     SafeRelease(g.rcas_ps);
     SafeRelease(g.fsr_cb);
     g.fsr_ok = false;
+    // Last, because everything released above -- the blit shaders, the constant buffers,
+    // ctx4 -- was created on the relay and must not outlive it.
+    FeedD3D10Close(&g.d10);
+    g.d10_dev  = nullptr;
+    g.is_d3d10 = false;
     g.dev = nullptr;
 }
 
@@ -4689,7 +5010,9 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     ImGui::Text("Feed: %s", g.disabled ? "disabled" : g.built ? "built" : "not built");
     if (g.disabled && g_disable_why[0])
         ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "Stopped: %s", g_disable_why);
-    ImGui::Text("Render API: %s", g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : "Direct3D 11");
+    ImGui::Text("Render API: %s", g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" :
+                                  g.is_d3d10 ? "Direct3D 10.1 (through a private Direct3D 11 relay device)" :
+                                  "Direct3D 11");
     ImGui::Text("Handoff: %s", g_cfg.async_home ? "pipelined (+1 frame)" : "same frame");
     ImGui::Text("Host process: %s", HostAlive() ? "running" : "not running");
     if (g_chicken_host)
@@ -4821,15 +5144,23 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     }
     ImGui::SameLine(); HelpMarker("Drawn by the desktop compositor: windowed or borderless games only.");
     ImGui::SameLine();
+    // The texture mode hands a shader resource view to the GAME's ImGui backend, and on
+    // D3D10 that backend wants an ID3D10 view while ours is the relay's D3D11 one. There
+    // is no conversion to make: offer only the thumbnail there, and say why.
+    if (g.is_d3d10) ImGui::BeginDisabled();
     if (ImGui::Button(shown_tex ? "Hide the DLSS 5 panel " : "Show as texture (fullscreen too)"))
     {
         g_cast_wanted = !shown_tex;
         if (g_cfg.cast_mode != 1) { g_cfg.cast_mode = 1; dirty = true; }
         Log("[feed32] cast: %s (overlay, texture)", g_cast_wanted ? "shown" : "hidden");
     }
-    ImGui::SameLine(); HelpMarker("Drawn by this game's ReShade from a copy of the host's frame: works in exclusive "
-                                  "fullscreen and on any monitor. The panel appears once the feed has built (its "
-                                  "texture is set up with the first build).");
+    if (g.is_d3d10) ImGui::EndDisabled();
+    ImGui::SameLine(); HelpMarker(g.is_d3d10
+                                  ? "Not available on Direct3D 10: the panel would have to be handed to this game's "
+                                    "ReShade as a Direct3D 11 texture. Use the button on the left, or host_window=1."
+                                  : "Drawn by this game's ReShade from a copy of the host's frame: works in exclusive "
+                                    "fullscreen and on any monitor. The panel appears once the feed has built (its "
+                                    "texture is set up with the first build).");
     ImGui::TextDisabled("%s", g_cast_status);
     if (ImGui::SliderInt("Panel size (%)", &g_cfg.cast_scale, 25, 300)) dirty = true;
     ImGui::SameLine(); HelpMarker("Relative to the largest size that fits this window (the host's tab column at 1:1, "

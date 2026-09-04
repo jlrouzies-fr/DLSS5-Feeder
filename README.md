@@ -4,7 +4,7 @@
 
 ## Description
 
-**DLSS 5 neural rendering in games that ship without any DLSS — D3D11, D3D12, Vulkan, OpenGL, 32-bit, even DirectX 9.**
+**DLSS 5 neural rendering in games that ship without any DLSS — D3D11, D3D12, Vulkan, OpenGL, 32-bit, even DirectX 10 and DirectX 9.**
 
 DLSS 5's neural-rendering add-on only works by hooking a game's own DLSS calls. A game that has no
 DLSS never makes those calls, so the add-on sits idle. **DLSS5-Feeder makes the calls itself.** It
@@ -206,6 +206,7 @@ a frame. Found during a Metro 2033 Redux run.
   - [Deep Fried Chicken: first run](#deep-fried-chicken-first-run)
   - [Alternative: the RenoDX add-on](#alternative-the-renodx-add-on)
 - [Install for a 32-bit game](#install-for-a-32-bit-game-beta)
+- [Install for a DirectX 10 game](#install-for-a-directx-10-game-beta)
 - [Install for a DirectX 9 game](#install-for-a-directx-9-game-beta)
 - [Install for a Vulkan game](#install-for-a-vulkan-game)
   - [32-bit Vulkan (DXVK)](#32-bit-vulkan-dxvk)
@@ -213,6 +214,7 @@ a frame. Found during a Metro 2033 Redux run.
 - [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider)
 - [How it works](#how-it-works)
   - [The 32-bit path](#the-32-bit-path)
+  - [The DirectX 10 path](#the-directx-10-path)
   - [The DirectX 9 path](#the-directx-9-path)
   - [The Vulkan path](#the-vulkan-path)
   - [The OpenGL path](#the-opengl-path)
@@ -507,6 +509,41 @@ The helper's own window, with `host_window=1`:
 
 <img width="1880" height="1058" alt="image" src="https://github.com/user-attachments/assets/57abd732-94d2-401c-a524-6536006f3c86" />
 
+## Install for a DirectX 10 game (beta)
+
+Direct3D 10 games need **nothing extra installed** -- no translation layer, unlike the
+[DirectX 9 path](#install-for-a-directx-9-game-beta). Install exactly as for any other game of the
+same bitness ([64-bit](#install-for-a-64-bit-game), [32-bit](#install-for-a-32-bit-game-beta)):
+ReShade goes in as `dxgi.dll`, which is what its own installer picks for "DirectX 10/11/12".
+
+Three things are worth knowing before you start.
+
+**Direct3D 10 support lives in the 32-bit add-on** -- `dlss5-feed.addon32` plus the `host64\`
+folder -- because that is where the Direct3D 10 games are. A 64-bit D3D10 game is a rare enough
+animal that the 64-bit add-on has no D3D10 backend.
+
+**Choose a motion-vector provider that does not need compute.** ReShade compiles effects at shader
+model 4 on Direct3D 10, so a provider written around compute shaders will not build. LumeniteFX is
+the safe first choice -- it checks `__RENDERER__` and has a non-compute path -- and the older
+pixel-shader providers (qUINT, `dh_uber_motion`) predate compute entirely. See
+[Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider).
+
+**Only DLAA is on offer, and that is a property of the API rather than of this add-on.** A D3D10
+game publishes no NGX parameter block and no engine jitter, so what gets reconstructed is the
+finished frame plus whatever the motion-vector provider can infer from it. The DirectX 9 and
+32-bit Vulkan paths sit under exactly the same ceiling.
+
+Two smaller notes. The in-game panel's **Show as texture** button is unavailable here -- the panel
+would have to cross into the game's ReShade as a Direct3D 11 texture -- so use the compositor
+button next to it, or `host_window=1`.
+
+And the frame costs two GPU drains, because Direct3D 10 has no fence. The copies themselves are
+cheap (`spike\spike-d3d10client32.exe` measures hundredths of a millisecond at 1080p on an idle
+GPU), but that is a floor rather than a forecast: a drain waits for everything the device has
+outstanding, which in a real game includes the frame the game has just queued. The honest cost is
+lost CPU/GPU pipelining, and the only place to measure it is in the game, with the add-on's own
+GPU-cost figures on the overlay.
+
 ## Install for a DirectX 9 game (beta)
 
 D3D9 games need a translation layer first — **[dgVoodoo2](http://dege.freeweb.hu/dgVoodoo2/)** turns
@@ -729,6 +766,45 @@ NGX and the DLSS 5 add-on only exist as x64 code, and a 32-bit process cannot lo
   half of the frame back, so a visibly half-black screen proves the full round trip — game → shared
   texture → host → shared fence → game's backbuffer — actually reaches the display, not just the logs.
 
+### The DirectX 10 path
+
+Direct3D 10 cannot reach the helper on its own, and not for one reason but three. NT-handle
+sharing is Direct3D 11.1+, so the helper's D3D12 device can never open a texture a D3D10 device
+made. D3D10 has no fence of any kind, which is how every other client here says a frame is ready.
+And it has no UAVs, so the Output slot could not be written at all.
+
+So the add-on creates a **private D3D11 relay device** of its own, inside the game's process, on
+the game's adapter (matched by LUID). The game's D3D10 device copies colour, depth and motion
+vectors into legacy shared textures; the relay opens those same textures; and from there this is
+the 32-bit D3D11 client running unchanged -- the NT-handle shared set, the shared D3D12 fence, the
+blit chain, the pipe, the helper. **The host is never told the game was D3D10.** It is a
+`FEED_CLIENT_D3D11` on the same protocol version, and `host\dlss5-feed-host64.cpp` needed no
+change at all. The relay is created at feature level 11_0, so the `ID3D11Device1` /
+`ID3D11Device5` / `ID3D11DeviceContext4` queries the D3D11 client hard-fails on all succeed, and
+the game's own device is asked for nothing but copies.
+
+Two details are worth recording, because neither is what the design notes predicted.
+
+**Keyed mutexes do not work.** `LEGACY-API-ADAPTER.md` says D3D10.1 can synchronise the two
+devices with an `IDXGIKeyedMutex`. On real hardware it cannot: every `CreateTexture2D` carrying
+`D3D10_RESOURCE_MISC_SHARED_KEYEDMUTEX` comes back `E_INVALIDARG` -- every bind flag, every
+format, with or without `MISC_SHARED` alongside -- while the same call on a D3D11 device succeeds
+and plain legacy `MISC_SHARED` on the same D3D10 device succeeds. Modern drivers simply do not
+implement that legacy path. Both D3D10 versions therefore take the event-query route that document
+reserves for D3D10.0, and `spike\spike-d3d10client32.exe` keeps the check so that a driver which
+ever grows the capability shows up as a passing line rather than as folklore.
+
+**The frame comes home by `CopyResource`, not by a draw.** The relay runs the whole blit chain --
+scaling, FSR1 EASU/RCAS -- into a backbuffer-sized shared texture, and the game's device only
+copies that into its own render target. So the D3D10 side never binds a shader, a viewport or a
+render target. That matters more here than anywhere else in this project, because D3D10 has no
+`ID3D10DeviceContext`: state lives directly on the device, so anything the add-on set, the game
+would silently inherit.
+
+The price is two pipeline bubbles a frame, one per device, since an event query drains everything
+that device has outstanding. All three input copies share a single drain rather than paying for
+one each, and `spike\spike-d3d10client32.exe` measures the result.
+
 ### The DirectX 9 path
 
 dgVoodoo2 sits in front as `D3D9.dll` and translates the game's D3D9 calls onto its own D3D11 device.
@@ -834,7 +910,7 @@ memory objects are import-only and a GL process cannot export one. Both directio
 
 | Piece | Notes |
 | --- | --- |
-| D3D11, D3D12, Vulkan or OpenGL game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan works out of the box at both bitnesses (the add-on adds the interop extensions itself; a small bundled layer is the fallback — [64-bit](#install-for-a-vulkan-game), [32-bit/DXVK](#32-bit-vulkan-dxvk)); OpenGL needs nothing extra at all, but the game must be rendering on the NVIDIA GPU (see [Install for an OpenGL game](#install-for-an-opengl-game)). D3D10 is not supported. |
+| D3D10, D3D11, D3D12, Vulkan or OpenGL game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); D3D10 is native, through a private D3D11 relay device the add-on creates for itself ([Install for a DirectX 10 game](#install-for-a-directx-10-game-beta)); Vulkan works out of the box at both bitnesses (the add-on adds the interop extensions itself; a small bundled layer is the fallback — [64-bit](#install-for-a-vulkan-game), [32-bit/DXVK](#32-bit-vulkan-dxvk)); OpenGL needs nothing extra at all, but the game must be rendering on the NVIDIA GPU (see [Install for an OpenGL game](#install-for-an-opengl-game)). |
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
 | A neural consumer + `nvngx_dlssnr.dll` | **Deep Fried Chicken** (recommended — `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll`, `deep-fried-chicken.cfg`, from its Discord), or **Krish's `renodx-dlss5.addon64`** `#DLSS5` build as the alternative. Exactly one of them. Not ShortFuse's `renodx-dlss`, which is a different add-on that replaces this project rather than working with it (see [Before you install](#1-you-might-not-need-this-project-at-all)). Neither is included here, and neither bundles `nvngx_dlssnr.dll`. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
