@@ -95,7 +95,16 @@ $ErrorActionPreference = 'Stop'
 $script:CountOk   = 0
 $script:CountWarn = 0
 $script:CountFail = 0
+# DLSS5_MV_PROVIDER as the add-on itself resolved it in the last run, out of dlss5-feed.log.
+# Better evidence than any ini, because it is read after ReShade has done the overriding.
+$script:FeedLogProvider = $null
 $script:Actions   = New-Object System.Collections.ArrayList
+
+# The first NVIDIA driver that ships DLSS 5 neural rendering at all. Below it NGX answers
+# FeatureNotSupported (0xBAD00001) and nothing here works, so it is a hard failure -- see
+# issue #47, where a machine on 596.36 passed this script with 0 failures.
+$kMinDriver       = '616.56'
+$kMinDriverDigits = 61656
 
 # Does this host support colour at all? A transcript, a redirected stream or an exotic host
 # may not. Probe once and fall back to plain text rather than throwing per line.
@@ -425,6 +434,37 @@ function Read-LinesSafe
     $t = Read-TextSafe $Path
     if ($null -eq $t) { return $null }
     return ($t -split "`r?`n")
+}
+
+# Value of one key in one section of an ini. Pass '' for $Section to read the ROOT
+# (section-less) block at the top of the file, which is where ReShade keeps a preset's
+# Techniques= and its preset-wide PreprocessorDefinitions=. Last occurrence wins, as
+# ReShade's own parser does.
+function Get-IniValue
+{
+    param([string] $Path, [string] $Section, [string] $Key)
+    $lines = Read-LinesSafe $Path
+    if ($null -eq $lines) { return $null }
+    $cur   = ''
+    $value = $null
+    $rx    = '(?i)^' + [regex]::Escape($Key) + '\s*=\s*(.*)$'
+    foreach ($ln in $lines) {
+        $t = $ln.Trim()
+        if ($t -match '^\[(.+)\]$') { $cur = $Matches[1]; continue }
+        if (-not ($cur -ieq $Section)) { continue }
+        if ($t -match $rx) { $value = $Matches[1] }
+    }
+    return $value
+}
+
+# One NAME=VALUE out of a ReShade PreprocessorDefinitions list (comma separated).
+function Get-PreprocessorDefinition
+{
+    param([string] $Defs, [string] $Name)
+    if (-not $Defs) { return $null }
+    $m = [regex]::Match($Defs, '(?i)(?:^|[,;\s])' + [regex]::Escape($Name) + '\s*=\s*([^,;\s]+)')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return $null
 }
 
 function Format-Size
@@ -946,7 +986,20 @@ foreach ($n in @('nvngx_dlssnr.dll', 'nvngx_dlss.dll')) {
     if ($p) {
         $v = Get-FileVersionSafe $p
         if ($v) { $t = $n + ': ' + $v } else { $t = $n + ': present (no version info)' }
-        Report -Status 'Ok' -Text $t -Detail ('in ' + $consumerWhere)
+        # NVIDIA's own build and ShortFuse's .SF repack both carry file version 310.8.0.0,
+        # so the version alone cannot tell them apart -- and that is exactly the distinction
+        # issue #47 now turns on. The product/description strings do differ, so print them.
+        $d = ('in ' + $consumerWhere)
+        $pn = Get-ProductNameSafe $p
+        if ($pn) { $d = $d + "`n" + $pn }
+        # NVIDIA stamps its build's changelist into OriginalFilename ("CL 38718415"), which
+        # is the sharpest cheap tell that a file is or is not one of their own builds.
+        try {
+            $of = (Get-Item -LiteralPath $p -ErrorAction Stop).VersionInfo.OriginalFilename
+            if ($of) { $d = $d + "`nbuild: " + $of.Trim() }
+        }
+        catch { }
+        Report -Status 'Ok' -Text $t -Detail $d
     }
     else {
         if ($n -eq 'nvngx_dlssnr.dll') { $why = 'This is the neural-rendering model itself -- DLSS 5 cannot run without it.' }
@@ -1009,6 +1062,43 @@ else {
     $names = @($gpus | ForEach-Object { $_.Name }) -join '; '
     if ($rtx.Count -gt 0) {
         Report -Status 'Ok' -Text ('NVIDIA RTX adapter found: ' + (($rtx | ForEach-Object { $_.Name }) -join '; '))
+
+        # The driver version. Win32_VideoController already carries it, so this costs no
+        # extra query -- and without it "the driver is too old" and issue #47's NGX
+        # 0xBAD00001 are indistinguishable from this script's output. One reporter passed
+        # with 14 OK / 0 failures on 596.36, a configuration that cannot work at all.
+        # NVIDIA's branding is the last five digits of the Windows version, dotted.
+        $drv = @($rtx | ForEach-Object { $_.DriverVersion } | Where-Object { $_ })
+        if ($drv.Count -eq 0) {
+            Report -Status 'Warn' -Text 'The NVIDIA driver version could not be read.' `
+                   -Detail ('DLSS 5 neural rendering needs ' + $kMinDriver + ' or newer; check it in the NVIDIA app.')
+        }
+        else {
+            # Compare the five digits as an INTEGER, never as a decimal: [double] '616.56'
+            # goes through the current culture in PowerShell 5.1, and on a comma-decimal
+            # machine that silently reads as 61656 while the literal reads as 616.56.
+            $digits = ($drv[0] -replace '[^0-9]', '')
+            $shown  = $drv[0]
+            $num    = $null
+            if ($digits.Length -ge 5) {
+                $tail  = $digits.Substring($digits.Length - 5)
+                $shown = $tail.Substring(0, 3) + '.' + $tail.Substring(3)
+                $num   = [int]$tail
+            }
+            if ($null -eq $num) {
+                Report -Status 'Na' -Text ('NVIDIA driver: ' + $shown) `
+                       -Detail ('Could not compare against the ' + $kMinDriver + ' minimum; check it by hand.')
+            }
+            elseif ($num -lt $kMinDriverDigits) {
+                Report -Status 'Fail' -Text ('NVIDIA driver ' + $shown + ' is older than ' + $kMinDriver + '.') `
+                       -Detail 'DLSS 5 neural rendering ships in the driver, and NGX reports FeatureNotSupported (0xBAD00001) on older ones -- which looks exactly like a bug in this project.' `
+                       -Action ('Update the NVIDIA driver to ' + $kMinDriver + ' or newer, then re-run this script.')
+            }
+            else {
+                Report -Status 'Ok' -Text ('NVIDIA driver: ' + $shown) -Detail ('Minimum for neural rendering is ' + $kMinDriver + '.')
+            }
+        }
+
         if (@($gpus).Count -gt 1) {
             Report -Status 'Na' -Text ('Other adapters present: ' + $names) `
                    -Detail 'On a hybrid machine, confirm the game actually renders on the RTX GPU -- the interop extensions do not exist on an iGPU.'
@@ -1068,6 +1158,14 @@ function Report-FeedLog
     }
     else {
         Report -Status 'Warn' -Text ($Label + ': no "frame N delivered" line -- nothing was ever fed to the consumer.')
+    }
+
+    # The "[feed] effects:" line carries the provider the effect was actually COMPILED with,
+    # which is what section 9 should believe over any of the three ini levels (issue #50).
+    $effects = @($lines | Where-Object { $_ -match '(?i)DLSS5_MV_PROVIDER\s*=\s*\d' }) | Select-Object -Last 1
+    if ($effects) {
+        $m = [regex]::Match($effects, '(?i)DLSS5_MV_PROVIDER\s*=\s*(\d+)')
+        if ($m.Success -and -not $script:FeedLogProvider) { $script:FeedLogProvider = $m.Groups[1].Value }
     }
 
     $bad = @($lines | Where-Object { $_ -match '(?i)(WARNING|not loaded|disabl|TOO OLD|different releases|refus)' } |
@@ -1170,7 +1268,20 @@ $providerFx = @{
     '4' = 'lumenite_QuantMotion.fx'
 }
 
-$preset = Find-FileIn $gameDir 'ReShadePreset.ini'
+# Which preset is actually in use: ReShade.ini's [GENERAL] PresetPath names it, and it is
+# not required to be called ReShadePreset.ini or to sit next to the game (issue #50).
+$preset = $null
+if ($reshadeIni) {
+    $presetPath = Get-IniValue $reshadeIni 'GENERAL' 'PresetPath'
+    if ($presetPath) {
+        $presetPath = $presetPath.Trim()
+        if (-not [System.IO.Path]::IsPathRooted($presetPath)) {
+            $presetPath = Join-Path (Split-Path -Parent $reshadeIni) $presetPath
+        }
+        if (Test-FileHere $presetPath) { $preset = (Resolve-Path -LiteralPath $presetPath).Path }
+    }
+}
+if (-not $preset) { $preset = Find-FileIn $gameDir 'ReShadePreset.ini' }
 if (-not $preset) {
     Report -Status 'Fail' -Text 'ReShadePreset.ini is missing.' `
            -Detail 'The motion-vector provider is stored there, per effect. Without it DLSS5_Feed.fx falls back to provider 0 and no technique is enabled.' `
@@ -1182,47 +1293,53 @@ else {
         Report -Status 'Warn' -Text 'ReShadePreset.ini could not be read.' -Detail $preset
     }
     else {
-        # Walk the ini by hand: we need the PreprocessorDefinitions that is inside the
-        # [DLSS5_Feed.fx] section specifically, not any other effect's.
-        $section = ''
-        $provider = $null
-        $techniques = $null
-        $sectionSeen = $false
-        foreach ($ln in $lines) {
-            $t = $ln.Trim()
-            if ($t -match '^\[(.+)\]$') { $section = $Matches[1]; if ($section -ieq 'DLSS5_Feed.fx') { $sectionSeen = $true }; continue }
-            if ($section -eq '' -and $t -match '(?i)^Techniques\s*=\s*(.*)$') { $techniques = $Matches[1] }
-            if ($section -ieq 'DLSS5_Feed.fx' -and $t -match '(?i)^PreprocessorDefinitions\s*=\s*(.*)$') {
-                $defs = $Matches[1]
-                $m = [regex]::Match($defs, '(?i)DLSS5_MV_PROVIDER\s*=\s*(\d+)')
-                if ($m.Success) { $provider = $m.Groups[1].Value }
-            }
-        }
+        $techniques = Get-IniValue $preset '' 'Techniques'
 
-        if (-not $sectionSeen) {
-            Report -Status 'Fail' -Text 'ReShadePreset.ini has no [DLSS5_Feed.fx] section.' `
-                   -Detail 'The effect has never been configured (or the preset in use is a different file).' `
-                   -Action 'Enable DLSS5_Feed in the ReShade overlay once, or copy the project''s preset template in.'
+        # ReShade assembles an effect's preprocessor definitions from THREE levels, in
+        # runtime.cpp's load_effect: ReShade.ini's [GENERAL] PreprocessorDefinitions is the
+        # base list, the preset's ROOT (section-less) PreprocessorDefinitions applies to
+        # every effect, and a per-effect [DLSS5_Feed.fx] section overrides both. This check
+        # used to read only the third, call a missing section a FAILURE and call the other
+        # two levels mistakes -- so it declared "this install will not work as it stands" on
+        # installs whose own add-on log read "-> Lumenite_Kernel (enabled)" (issue #50).
+        # Most specific first; all three are valid places to set it.
+        $mvLevels = @(
+            @{ Where = 'the [DLSS5_Feed.fx] section of the preset'
+               Value = (Get-PreprocessorDefinition (Get-IniValue $preset 'DLSS5_Feed.fx' 'PreprocessorDefinitions') 'DLSS5_MV_PROVIDER') },
+            @{ Where = "the preset's root PreprocessorDefinitions (applies to every effect)"
+               Value = (Get-PreprocessorDefinition (Get-IniValue $preset '' 'PreprocessorDefinitions') 'DLSS5_MV_PROVIDER') },
+            @{ Where = "ReShade.ini's [GENERAL] PreprocessorDefinitions (the base list)"
+               Value = $(if ($reshadeIni) { Get-PreprocessorDefinition (Get-IniValue $reshadeIni 'GENERAL' 'PreprocessorDefinitions') 'DLSS5_MV_PROVIDER' } else { $null }) }
+        )
+        $set      = @($mvLevels | Where-Object { $_.Value })
+        $provider = $null
+        $mvWhere  = $null
+        if ($set.Count -gt 0) { $provider = $set[0].Value; $mvWhere = $set[0].Where }
+
+        # The add-on's own log is better evidence than any of the three: it reports what
+        # ReShade actually resolved at compile time, after all the overriding is done.
+        if ($script:FeedLogProvider -and $script:FeedLogProvider -ne $provider) {
+            Report -Status 'Na' -Text ('dlss5-feed.log resolved DLSS5_MV_PROVIDER=' + $script:FeedLogProvider + ' at compile time.') `
+                   -Detail 'That is what the effect was actually built with in the last run. Where it disagrees with the ini files, believe the log.'
+            $provider = $script:FeedLogProvider
+            $mvWhere  = 'the add-on''s own log line from the last run'
         }
 
         if ($provider) {
             if ($providerNames.ContainsKey($provider)) { $pn = $providerNames[$provider] } else { $pn = 'unknown provider id' }
-            Report -Status 'Ok' -Text ('DLSS5_MV_PROVIDER=' + $provider + ' -- ' + $pn) `
-                   -Detail 'Read from the [DLSS5_Feed.fx] section, which is where ReShade actually stores it.'
-        }
-        elseif ($sectionSeen) {
-            Report -Status 'Warn' -Text 'No DLSS5_MV_PROVIDER in the [DLSS5_Feed.fx] section -- the effect defaults to provider 0.' `
-                   -Detail 'Provider 0 reads the shared texMotionVectors texture, so it only works if another effect (DRME, qUINT, dh_uber_motion) writes it. The recommended setting is DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel).'
-            $provider = '0'
-        }
-
-        # The classic mistake: setting it globally in ReShade.ini, where it does nothing.
-        if ($reshadeIni) {
-            $riText = Read-TextSafe $reshadeIni
-            if ($riText -and $riText -match '(?i)DLSS5_MV_PROVIDER') {
-                Report -Status 'Warn' -Text 'DLSS5_MV_PROVIDER also appears in ReShade.ini.' `
-                       -Detail 'It is a PER-EFFECT key. Setting it in ReShade.ini''s [GENERAL] PreprocessorDefinitions does nothing for this effect -- only the [DLSS5_Feed.fx] section of ReShadePreset.ini counts.'
+            Report -Status 'Ok' -Text ('DLSS5_MV_PROVIDER=' + $provider + ' -- ' + $pn) -Detail ('Read from ' + $mvWhere + '.')
+            # More than one level carrying a value is legal, and the most specific wins --
+            # but it is worth naming, because editing the losing one changes nothing.
+            if ($set.Count -gt 1) {
+                $shadowed = @($set | Select-Object -Skip 1 | ForEach-Object { $_.Where + ' = ' + $_.Value }) -join '; '
+                Report -Status 'Na' -Text 'DLSS5_MV_PROVIDER is set at more than one level.' `
+                       -Detail ('The most specific wins, so ' + $mvWhere + ' is the one in force. Also set, and overridden: ' + $shadowed)
             }
+        }
+        else {
+            Report -Status 'Warn' -Text 'DLSS5_MV_PROVIDER is not set anywhere -- the effect defaults to provider 0.' `
+                   -Detail 'Checked the [DLSS5_Feed.fx] section of the preset, the preset''s root PreprocessorDefinitions and ReShade.ini''s [GENERAL] PreprocessorDefinitions; any of the three is valid. Provider 0 reads the shared texMotionVectors texture, so it only works if another effect (DRME, qUINT, dh_uber_motion) writes it. The recommended setting is DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel).'
+            $provider = '0'
         }
 
         # Techniques= line: is DLSS5_Feed on, and is the provider's own effect on too?
