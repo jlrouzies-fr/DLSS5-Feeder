@@ -1197,11 +1197,56 @@ if ($detected -eq 'Unknown') {
 
 # Second level: engines that LoadLibrary their API at run time (Max Payne 3, many RAGE /
 # in-house engines) import nothing. Look for the DLL names as strings in the exe instead.
+#
+# And where the exe is a small launcher shim that only starts the real engine -- Watch Dogs
+# ships a 136 KB Watch_Dogs.exe next to the Disrupt binaries -- the exe contains no such
+# string either, and scanning it alone found nothing at all. So fall through to the DLLs
+# beside it, largest first, since the renderer lives in the big one.
 $ambiguous = $false
 if ($detected -eq 'Unknown') {
+    $hintSource = 'the executable'
     $hints = Get-ApiStringHints $exePath
+    if ($hints.Count -eq 0) {
+        # Two things make this harder than "read the biggest DLL". A graphics RUNTIME or
+        # proxy sitting in the folder answers with its own name -- ReShade's dxgi.dll, DXVK,
+        # dgVoodoo2, or the NGX runtimes this very installer puts there on an earlier run
+        # (nvngx_dlssnr.dll is 165 MB, so it sorts first and says Vulkan). And a game can
+        # ship a GPU-detection helper that names every API it has ever heard of: Watch Dogs'
+        # systemdetection64.dll claims OpenGL and Direct3D 9 while the engine is D3D11.
+        #
+        # So: skip anything that IS a graphics runtime, read the rest, and add the counts up
+        # rather than trusting whichever file happened to be largest. The precedence below
+        # then resolves a folder that mentions several.
+        $skipExact = @('dxgi.dll','d3d8.dll','d3d9.dll','d3d10.dll','d3d10_1.dll','d3d11.dll','d3d12.dll',
+                       'opengl32.dll','vulkan-1.dll','ddraw.dll','dinput8.dll','winmm.dll','version.dll')
+        $skipLike  = @('nvngx_*','reshade*','deep-fried-chicken*','*dlss5*','alexs-toolkit*','dxvk*',
+                       'd3dcompiler*','nvapi*','amd_ags*','_nvngx*')
+        $scanned = @()
+        try {
+            $scanned = @(Get-ChildItem -LiteralPath $gameDir -File -Filter '*.dll' -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Length -gt 262144 } |
+                         Where-Object { $skipExact -notcontains $_.Name.ToLowerInvariant() } |
+                         Where-Object { $n = $_.Name; -not (@($skipLike | Where-Object { $n -like $_ }).Count) } |
+                         Sort-Object Length -Descending | Select-Object -First 8)
+        }
+        catch { }
+        $from = @()
+        foreach ($nb in $scanned) {
+            $h2 = Get-ApiStringHints $nb.FullName
+            if ($h2.Count -eq 0) { continue }
+            $from += $nb.Name
+            foreach ($k in $h2.Keys) {
+                if ($hints.ContainsKey($k)) { $hints[$k] = $hints[$k] + $h2[$k] } else { $hints[$k] = $h2[$k] }
+            }
+        }
+        if ($hints.Count -gt 0) {
+            $hintSource = ($from -join ' + ')
+            Report -Status 'Info' -Text ('The executable names no graphics API; read it out of ' + $hintSource + ' instead.') `
+                   -Detail 'A small launcher exe that starts the real engine carries no API strings of its own.'
+        }
+    }
     if ($hints.Count -gt 0) {
-        Report -Status 'Info' -Text ('API DLL names found inside the exe: ' + (($hints.Keys | Sort-Object | ForEach-Object { $_ + ' x' + $hints[$_] }) -join ', '))
+        Report -Status 'Info' -Text ('API DLL names found inside ' + $hintSource + ': ' + (($hints.Keys | Sort-Object | ForEach-Object { $_ + ' x' + $hints[$_] }) -join ', '))
         $hVK  = $hints.ContainsKey('vulkan-1.dll')
         $hDX  = $hints.ContainsKey('dxgi.dll') -or $hints.ContainsKey('d3d11.dll') -or $hints.ContainsKey('d3d12.dll') -or $hints.ContainsKey('d3d10.dll')
         $hD9  = $hints.ContainsKey('d3d9.dll')
@@ -1214,8 +1259,8 @@ if ($detected -eq 'Unknown') {
         elseif ($hGL) { $detected = 'OpenGL' }
         if ($detected -ne 'Unknown') {
             $d = 'This is a guess from strings, not from the import table.'
-            if ($ambiguous) { $d += "`nThe exe names both Direct3D 9 and 10/11/12: the game can run either. Direct3D 10/11/12 is assumed (ReShade makes the same choice); if the game is set to DirectX 9, re-run with -Api D3D9." }
-            Report -Status 'Warn' -Text ('Render API guessed as ' + $detected + ' from strings in the executable.') -Detail $d
+            if ($ambiguous) { $d += "`nBoth Direct3D 9 and 10/11/12 are named there: the game can run either. Direct3D 10/11/12 is assumed (ReShade makes the same choice); if the game is set to DirectX 9, re-run with -Api D3D9." }
+            Report -Status 'Warn' -Text ('Render API guessed as ' + $detected + ' from strings in ' + $hintSource + '.') -Detail $d
         }
     }
 }
@@ -1231,6 +1276,35 @@ if ($Api -ne 'Auto') {
 }
 else {
     $useApi = $detected
+}
+
+# Still nothing. This script already asks which executable and which neural consumer, so
+# stopping dead here -- and making the user re-run the whole thing with -Api -- was the one
+# unanswerable question in an otherwise interactive install. Ask it instead.
+if ($useApi -eq 'Unknown' -and -not $Yes) {
+    Write-Host ''
+    Write-Chunk '  Which render API does this game use?' 'White'
+    Write-Chunk '  Nothing in the executable or the files beside it says, which usually means the engine' 'DarkGray'
+    Write-Chunk '  loads it at run time. If you are not sure: almost every 64-bit game of the last decade' 'DarkGray'
+    Write-Chunk '  is Direct3D 10/11/12, and the game''s own graphics options usually name it.' 'DarkGray'
+    Write-Chunk '   1. Direct3D 10/11/12' 'Gray'
+    Write-Chunk '   2. Vulkan' 'Gray'
+    Write-Chunk '   3. OpenGL' 'Gray'
+    Write-Chunk '   4. Direct3D 9   ' 'Gray' -NoNewline
+    Write-Chunk '(installed through dgVoodoo2)' 'DarkGray'
+    Write-Chunk '   5. Direct3D 8   ' 'Gray' -NoNewline
+    Write-Chunk '(installed through dgVoodoo2)' 'DarkGray'
+    Write-Chunk '  Which one? [1-5, Enter for 1] ' 'Cyan' -NoNewline
+    try { $a = Read-Host } catch { $a = '' }
+    $useApi = switch ($a.Trim()) {
+        '2'      { 'Vulkan' }
+        '3'      { 'OpenGL' }
+        '4'      { 'D3D9' }
+        '5'      { 'D3D8' }
+        default  { 'D3D' }
+    }
+    Report -Status 'Info' -Text ('Render API set to ' + $useApi + ' by hand.') `
+           -Detail 'If the install completes but the game shows no ReShade overlay, this was the wrong answer -- re-run with -Api and the right one.'
 }
 
 switch ($useApi) {
