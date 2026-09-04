@@ -354,9 +354,26 @@ Deploy exactly as sections 3-6, with these differences:
 deep-fried-chicken.addon64        # instead of renodx-dlss5.addon64
 deep-fried-chicken-nvngx.dll      # its private NGX bridge (3 KB, not a copy of NVIDIA's)
 deep-fried-chicken.cfg            # ships with arm=1, one pass, Texture Boost off = the
-                                  # recommended first-test config; no edits needed
+                                  # recommended first-test config; no edits needed EXCEPT
+                                  # safe_neutral_start (see below) -- set that to 0
 nvngx_dlssnr.dll, nvngx_dlss.dll  # still required, same as always
 ```
+
+**`safe_neutral_start=1` throws away tuning every launch (found 2026-09-04, Chicken
+1.4.13-alpha, not documented in any vendored `external/deepfried/*` release notes up to
+1.4.8 -- this key is newer than what is vendored here).** With it at the shipped default of
+`1`, `deep-fried-chicken.log` says so plainly on every start: `SAFE_NEUTRAL_START=1; reset
+to one pass, native 100% work scale, model Automatic Mask, adaptive scene white, and no
+optional stack experiments; control-plane settings retained`. Only `arm` / `enabled` /
+the hotkey (the "control plane") survive a restart; every tuning knob -- layers, Texture
+Boost, Clean Fry, Motion Stability, per-layer presets/strengths -- silently reverts to
+default each time the game is relaunched, even though `deep-fried-chicken.cfg` on disk
+still has the values you set last session (Chicken re-saves it with `legacy config/
+provider-arm schema -> current schema: saved atomically` right after, which looks like a
+schema migration but is actually this reset being written back). Reads as "none of my
+Deep Fried Chicken settings are saved" when what is actually happening is a deliberate
+safe-start behavior overriding a config that *is* saved correctly. Set `safe_neutral_start=0`
+in `deep-fried-chicken.cfg` to keep tuned settings across restarts.
 
 **Exactly one neural provider.** Retire `renodx-dlss5.addon64` **and**
 `alexs-toolkit.addon64` (section 8) — Chicken stays inert for the whole process if a Reno

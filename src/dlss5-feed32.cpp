@@ -2384,6 +2384,33 @@ static void HostIniPath(char *out)
         strcpy_s(s + 1, MAX_PATH - (s + 1 - out), "host64\\ReShade.ini");
 }
 
+// The host's own window size (host/dlss5-feed-host64.cpp's FitWindowToWorkArea): a real
+// resize of its window, swapchain and the panel texture this add-on casts, not just the
+// scaled-picture "Panel size (%)" slider below. Same [DLSS5Host] keys the host itself
+// reads and writes defaults for, so editing here and editing the ini by hand are the same
+// thing. Takes effect the next time the host (re)starts -- it only sizes its window once,
+// at startup -- so this is a plain read/write on the file, no IPC round trip.
+static int  g_host_win_w = 620, g_host_win_h;   // 0 = auto (fill the work area), the host's own default
+static bool g_host_win_loaded;
+
+static void ReadHostWindowSize()
+{
+    char p[MAX_PATH];
+    HostIniPath(p);
+    g_host_win_w = GetPrivateProfileIntA("DLSS5Host", "WindowWidth", 620, p);
+    g_host_win_h = GetPrivateProfileIntA("DLSS5Host", "WindowHeight", 0, p);
+}
+
+static void WriteHostWindowSize()
+{
+    char p[MAX_PATH], buf[16];
+    HostIniPath(p);
+    sprintf_s(buf, "%d", g_host_win_w);
+    WritePrivateProfileStringA("DLSS5Host", "WindowWidth", buf, p);
+    sprintf_s(buf, "%d", g_host_win_h);
+    WritePrivateProfileStringA("DLSS5Host", "WindowHeight", buf, p);
+}
+
 // Cache of the host's settings, shown and edited on the ReShade overlay page (Add-ons
 // tab -> DLSS 5 Feed). Loaded from the host's ini on first resolve so the panel always
 // starts from what is actually active, never a stale default.
@@ -5183,6 +5210,20 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     if (ImGui::Checkbox("Show the DLSS 5 host window", &show_host_window)) { g_cfg.host_window = show_host_window ? 1 : 0; dirty = true; }
     ImGui::SameLine(); HelpMarker("The helper process's own separate window, the old way in. Not needed for the "
                                   "in-game panel above. Takes effect when the host is next started.");
+
+    if (!g_host_win_loaded) { ReadHostWindowSize(); g_host_win_loaded = true; }
+    bool win_size_touched = false;
+    if (ImGui::SliderInt("Host window width", &g_host_win_w, 300, 2000)) win_size_touched = true;
+    ImGui::SameLine(); HelpMarker("A REAL resize of the host window, its swapchain and the panel texture cast "
+                                  "above -- ReShade's own tab column actually gets more room to lay out in, "
+                                  "not just a bigger-drawn copy of the same pixels like \"Panel size (%)\" "
+                                  "below. Written straight into host64\\ReShade.ini's [DLSS5Host] section; "
+                                  "takes effect the next time the host (re)starts.");
+    if (ImGui::SliderInt("Host window height (0 = auto, full screen)", &g_host_win_h, 0, 3000)) win_size_touched = true;
+    ImGui::SameLine(); HelpMarker("0 fills the primary monitor's work area (the default). This window is "
+                                  "normally hidden behind the game, never shown on the desktop at OS size, so "
+                                  "taller than the screen is fine if you want more room and less scrolling.");
+    if (win_size_touched) WriteHostWindowSize();
 
     if (ImGui::CollapsingHeader("Advanced"))
     {
