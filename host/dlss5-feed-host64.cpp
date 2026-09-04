@@ -52,11 +52,13 @@ static bool g_show_window = false;   // visible host window = the user's door to
 // the Z-order. The game's add-on positions it under the game window and forwards the
 // user's clicks to it. Banner and auto-Home run as for a visible window.
 static bool g_behind = false;
-// Client area of the host window and its swapchain. Twice the original 960x540 -- the
-// neural consumer's whole tuning panel lives in this window, and at 4K a 960x540 overlay
-// was unreadable -- capped to the primary work area (16:9 kept). Set once in InitDisguise;
-// the banner and the swapchain both size themselves from it.
-static int  g_win_w = 1920;
+// Client area of the host window and its swapchain: TALL and narrow, not a 16:9 landscape
+// shape. The cast panel (dlss5-feed32's CastLayout) is right-aligned and fit to the game
+// window's height, so a tall source scales up to fill the game's vertical space and stays
+// a modest fraction of its width -- a menu column down the right edge, not a large overlay
+// eating the middle of the screen. Set once in InitDisguise; the banner and the swapchain
+// both size themselves from it.
+static int  g_win_w = 620;
 static int  g_win_h = 1080;
 
 // ReShade's overlay toggle key in the host's ReShade.ini ([INPUT] KeyOverlay, Home by
@@ -77,19 +79,57 @@ static unsigned long long g_present_debt_run = 0;  // consecutive skips, whateve
 
 static void Log(const char *fmt, ...);
 
-// Fit the 1920x1080 default into the primary monitor's work area (90% of it, 16:9 kept).
-// Runs before PrepareHostOverlay, which sizes the overlay layout from the result.
-static void FitWindowToWorkArea()
+// Height goes to (almost) the full primary monitor work area by default -- a menu column
+// benefits from vertical room more than the old 16:9 shape ever gave it, and this window is
+// normally parked behind the game and never seen at OS size, only cast into it (see the
+// comment on g_win_w/g_win_h above). Width stays fixed by default: a settings column
+// doesn't get more useful past a few hundred px, and a fixed width keeps this from
+// ballooning sideways on an ultrawide monitor.
+//
+// Either dimension can be overridden in the host's own ReShade.ini -- [DLSS5Host]
+// WindowWidth / WindowHeight, pixels, 0 (height only) meaning the default above. This is
+// a REAL resize: the swapchain and the panel texture the 32-bit add-on casts are both this
+// size, so ReShade's own UI actually gets more room to lay out in, not just a bigger-drawn
+// copy of the same pixels -- unlike the cast panel's own "Panel size" slider, which only
+// scales the picture. WindowHeight is not clamped to the monitor's height: this window is
+// normally hidden behind the game (never composited on screen at OS size), so taller than
+// the screen is a legitimate way to ask for more vertical room without more scrolling.
+// Keys are written back with their in-use values when unset, so they show up in the ini
+// for a user to find and edit without needing to know this. Runs before PrepareHostOverlay,
+// which sizes the overlay layout from the result -- pass it the ini path so both functions
+// don't each resolve the module's own directory.
+static void FitWindowToWorkArea(const char *ini)
 {
     RECT wa = {};
-    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0))
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0) && wa.bottom > wa.top)
     {
-        const int max_w = (wa.right - wa.left) * 9 / 10, max_h = (wa.bottom - wa.top) * 9 / 10;
-        if (g_win_w > max_w) { g_win_w = max_w; g_win_h = max_w * 9 / 16; }
-        if (g_win_h > max_h) { g_win_h = max_h; g_win_w = max_h * 16 / 9; }
+        // The height computed here becomes a client rect; CreateWindowExW's caller
+        // (InitDisguise) runs it through AdjustWindowRect for WS_OVERLAPPEDWINDOW before
+        // sizing the actual window, so the outer window stays on screen in the rare case
+        // this window is shown directly (not parked behind a game) -- reserve that
+        // caption+border overhead here rather than after the fact.
+        RECT deco = {};
+        AdjustWindowRect(&deco, WS_OVERLAPPEDWINDOW, FALSE);
+        g_win_h = (wa.bottom - wa.top) - (deco.bottom - deco.top);
     }
-    if (g_win_w < 960) { g_win_w = 960; g_win_h = 540; }
+    if (g_win_h < 540) g_win_h = 540;
+
+    const int cfg_w = GetPrivateProfileIntA("DLSS5Host", "WindowWidth", 0, ini);
+    const int cfg_h = GetPrivateProfileIntA("DLSS5Host", "WindowHeight", 0, ini);
+    if (cfg_w > 0) g_win_w = cfg_w < 300 ? 300 : cfg_w > 4000 ? 4000 : cfg_w;
+    if (cfg_h > 0) g_win_h = cfg_h < 300 ? 300 : cfg_h > 8000 ? 8000 : cfg_h;
     g_win_w &= ~1; g_win_h &= ~1;
+
+    char buf[16];
+    if (GetPrivateProfileStringA("DLSS5Host", "WindowWidth", "", buf, sizeof(buf), ini) == 0)
+    {
+        sprintf_s(buf, "%d", g_win_w);
+        WritePrivateProfileStringA("DLSS5Host", "WindowWidth", buf, ini);
+    }
+    if (GetPrivateProfileStringA("DLSS5Host", "WindowHeight", "", buf, sizeof(buf), ini) == 0)
+        WritePrivateProfileStringA("DLSS5Host", "WindowHeight", "0", ini);   // 0 = auto (fill the work area)
+    Log("[host] window size: %dx%d (from [DLSS5Host] WindowWidth/WindowHeight in ReShade.ini; "
+        "WindowHeight=0 there means auto -- fill the work area)", g_win_w, g_win_h);
 }
 
 // Once ReShade's overlay is docked, its tabs (Home / Add-ons -- where the neural
@@ -97,11 +137,12 @@ static void FitWindowToWorkArea()
 // window nobody edits shaders, so the tab column gets almost the whole width.
 static void PrepareHostOverlay()
 {
-    FitWindowToWorkArea();
     char dir[MAX_PATH], ini[MAX_PATH];
     GetModuleFileNameA(nullptr, dir, MAX_PATH);
     if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
     sprintf_s(ini, "%sReShade.ini", dir);
+
+    FitWindowToWorkArea(ini);
 
     char buf[64] = {};
     GetPrivateProfileStringA("INPUT", "KeyOverlay", "36", buf, sizeof(buf), ini);
@@ -1259,7 +1300,7 @@ static bool InitDisguise()
                              WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                              frame.right - frame.left, frame.bottom - frame.top,
                              nullptr, nullptr, wc.hInstance, nullptr);
-    Log("[host] window: %dx%d client (2x the original 960x540, capped to the work area)%s", g_win_w, g_win_h,
+    Log("[host] window: %dx%d client (tall and narrow, fit to the work area height)%s", g_win_w, g_win_h,
         g_behind ? ", behind the game (tool window, no taskbar button)" : "");
     if (h.hwnd == nullptr) { Log("[host] window creation failed"); return false; }
     if (g_show_window) ShowWindow(h.hwnd, SW_SHOWNOACTIVATE);   // never steal the game's focus

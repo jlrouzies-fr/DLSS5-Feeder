@@ -290,6 +290,17 @@ follow step 6 above for the DLSS5-Feeder side. Also point them at `host64\`'s "3
 Feeder" window (Home key in it) — the DLSS 5 add-on's full panel lives there, not in the
 game's own overlay.
 
+**Host window size** (since 2026-09-04): the host window defaults to tall and narrow — full
+work-area height, 620 px wide — so the cast panel sits as a slim column down the right edge
+of the game rather than a wide overlay. Override it in `host64\ReShade.ini`'s `[DLSS5Host]`
+section (`WindowWidth` / `WindowHeight`, pixels; `WindowHeight=0` means auto/full height —
+both keys are written with their in-use values on first run, so they're there to edit even
+if you never read this). This is a real resize of the window/swapchain/panel texture, so
+ReShade's own UI gets more layout room, not just a bigger-drawn copy of the same pixels —
+unlike the cast panel's own in-game "Panel size (%)" slider, which only scales the picture.
+`WindowHeight` can exceed the monitor's height on purpose: the window is normally hidden
+behind the game, never composited on screen at OS size.
+
 ## 8. Optional: Alex's Toolkit (multi-pass DLSS 5 cascade)
 
 `deploy/alexs-toolkit.addon64` is a **third-party, optional** ReShade add-on that makes
