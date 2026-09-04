@@ -1289,6 +1289,15 @@ struct Feed
     ID3D12CommandAllocator    *alloc[kFrames];
     UINT64                     alloc_fence[kFrames];
     int                        frame_slot;
+    // GPU time for the work this add-on submits. Two timestamps per ring slot, resolved
+    // into a readback buffer and collected a full ring later, when the slot's fence says
+    // the GPU is finished with it -- so nothing here ever waits (issue #52).
+    ID3D12QueryHeap           *ts_heap;
+    ID3D12Resource            *ts_read;
+    UINT64                     ts_freq;     // ticks per second on the submitting queue
+    bool                       ts_failed;   // asked once, refused; do not ask every frame
+    double                     ts_sum_ms;   // GPU ms accumulated in this 600-frame window
+    unsigned                   ts_n;        // samples behind ts_sum_ms
     HANDLE                     fence_event;
     ID3D12Fence               *fence12;
     ID3D11Fence               *fence11;
@@ -1652,6 +1661,78 @@ static void FeedFail(const char *what)
 // D3D12 command submission (allocator ring + shared fence), from the bridge
 // ---------------------------------------------------------------------------
 
+// The query heap and its readback buffer, made on first use rather than at each of the
+// four session-init sites. A queue that refuses timestamps costs one log line and then
+// nothing: the feed does not depend on this.
+static void TimingEnsure()
+{
+    if (g.ts_heap != nullptr || g.ts_failed) return;
+    if (g.dev12 == nullptr || g.queue == nullptr) return;
+
+    // The frequency belongs to the QUEUE, and on the same-device D3D12 path that is the
+    // game's queue, not ours -- reading it off the wrong one would silently scale the
+    // whole measurement.
+    if (FAILED(g.queue->GetTimestampFrequency(&g.ts_freq)) || g.ts_freq == 0)
+    {
+        Log("[feed] GPU timing unavailable: this queue does not report a timestamp frequency");
+        g.ts_failed = true;
+        return;
+    }
+
+    D3D12_QUERY_HEAP_DESC qd = {};
+    qd.Type  = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qd.Count = Feed::kFrames * 2;
+    if (FAILED(g.dev12->CreateQueryHeap(&qd, __uuidof(ID3D12QueryHeap),
+                                        reinterpret_cast<void **>(&g.ts_heap))) || g.ts_heap == nullptr)
+    {
+        Log("[feed] GPU timing unavailable: the timestamp query heap could not be created");
+        g.ts_failed = true;
+        return;
+    }
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width            = Feed::kFrames * 2 * sizeof(UINT64);
+    rd.Height           = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = DXGI_FORMAT_UNKNOWN;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    // A readback resource lives in COPY_DEST for its whole life; it never transitions.
+    if (FAILED(g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                nullptr, __uuidof(ID3D12Resource),
+                                                reinterpret_cast<void **>(&g.ts_read))) || g.ts_read == nullptr)
+    {
+        Log("[feed] GPU timing unavailable: the timestamp readback buffer could not be created");
+        SafeRelease(g.ts_heap);
+        g.ts_failed = true;
+        return;
+    }
+    Log("[feed] GPU timing on (queue timestamp frequency %llu Hz)", (unsigned long long)g.ts_freq);
+}
+
+// Collect slot's pair. Only ever called once the slot's fence has retired, so the values
+// are there and the map cannot block.
+static void TimingCollect(int slot)
+{
+    if (g.ts_read == nullptr) return;
+    const size_t base = static_cast<size_t>(slot) * 2;
+    D3D12_RANGE  want = { base * sizeof(UINT64), (base + 2) * sizeof(UINT64) };
+    void        *p    = nullptr;
+    if (FAILED(g.ts_read->Map(0, &want, &p)) || p == nullptr) return;
+    const UINT64 *t = static_cast<const UINT64 *>(p);
+    if (t[base + 1] > t[base])
+    {
+        g.ts_sum_ms += 1000.0 * double(t[base + 1] - t[base]) / double(g.ts_freq);
+        ++g.ts_n;
+    }
+    const D3D12_RANGE wrote = { 0, 0 };   // read-only map
+    g.ts_read->Unmap(0, &wrote);
+}
+
 static bool BeginCommands()
 {
     // Notice a removal promptly: without this the first symptom is a rebuild failing
@@ -1714,8 +1795,14 @@ static bool BeginCommands()
         }
     }
     if (g.alloc[slot] == nullptr) return false;
+    // Past the fence wait: whatever this slot submitted last time is finished, so its
+    // timestamps are readable and this costs no synchronisation at all.
+    if (g.alloc_fence[slot] != 0) TimingCollect(slot);
     if (FAILED(g.alloc[slot]->Reset())) return false;
-    return SUCCEEDED(g.list->Reset(g.alloc[slot], nullptr));
+    if (FAILED(g.list->Reset(g.alloc[slot], nullptr))) return false;
+    TimingEnsure();
+    if (g.ts_heap != nullptr) g.list->EndQuery(g.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
+    return true;
 }
 
 static UINT64 EndCommands()
@@ -1725,6 +1812,12 @@ static UINT64 EndCommands()
     // close is in an error state, and ExecuteCommandLists on it is an invalid call: the
     // runtime removes the device with DXGI_ERROR_INVALID_CALL and, because nothing ever
     // reached the GPU, DRED has nothing to report. Dropping the frame is always better.
+    if (g.ts_heap != nullptr)
+    {
+        g.list->EndQuery(g.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, g.frame_slot * 2 + 1);
+        g.list->ResolveQueryData(g.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, g.frame_slot * 2, 2, g.ts_read,
+                                 static_cast<UINT64>(g.frame_slot) * 2 * sizeof(UINT64));
+    }
     const HRESULT closed = g.list->Close();
     if (FAILED(closed))
     {
@@ -3529,6 +3622,12 @@ static void ShutdownSession()
     SafeRelease(g.fence12);
     if (g.fence_event != nullptr) { CloseHandle(g.fence_event); g.fence_event = nullptr; }
     SafeRelease(g.list);
+    SafeRelease(g.ts_read);
+    SafeRelease(g.ts_heap);
+    g.ts_freq = 0;
+    g.ts_failed = false;
+    g.ts_sum_ms = 0.0;
+    g.ts_n = 0;
     for (int i = 0; i < Feed::kFrames; ++i) SafeRelease(g.alloc[i]);
     GuideProbeShutdown();
     SafeRelease(g.queue);
@@ -4687,9 +4786,18 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
     const double span_ms = 1000.0 * double(exit - g.span_start) / double(g.qpf);
     const double cpu_ms  = 1000.0 * double(g.cpu_ticks) / double(g.qpf);
     const double n       = double(g.timed_frames);
-    Log("[feed] 600 frames: feed CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) | feed is %.0f%% of the frame "
-        "| worst frame %.1f ms (feed %.2f, evaluate %.2f) | stalls %llu",
-        cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms,
+    // The GPU figure is the one that answers "why did my frame rate halve" (issue #52).
+    // The CPU number next to it is the present thread's own time and is routinely under
+    // 1%, which reads as "the feed is nearly free" -- while DLAA plus a neural pass runs
+    // on the GPU every frame at full resolution and is not free at all. Both are printed,
+    // and the wording says which is which.
+    char gpu_part[96] = " | GPU time not measured";
+    if (g.ts_n > 0)
+        sprintf_s(gpu_part, " | feed GPU %.2f ms/frame (%.0f%% of the frame)",
+                  g.ts_sum_ms / double(g.ts_n), 100.0 * (g.ts_sum_ms / double(g.ts_n)) / (span_ms / n));
+    Log("[feed] 600 frames: feed CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) | feed CPU is %.0f%% of the frame"
+        "%s | worst frame %.1f ms (feed %.2f, evaluate %.2f) | stalls %llu",
+        cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms, gpu_part,
         double(g.win_max_interval) * to_ms, double(g.win_max_total) * to_ms, double(g.win_max_eval) * to_ms,
         static_cast<unsigned long long>(g.win_stalls));
     if (g.win_stalls > g.win_stalls_logged)
@@ -4697,6 +4805,8 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
             static_cast<unsigned long long>(g.win_stalls - g.win_stalls_logged));
     g.cpu_ticks = 0;
     g.timed_frames = 0;
+    g.ts_sum_ms = 0.0;
+    g.ts_n = 0;
     g.span_start = exit;
     g.win_max_interval = g.win_max_total = g.win_max_eval = 0;
     g.win_stalls = g.win_stalls_logged = 0;

@@ -593,6 +593,15 @@ struct Host
     ID3D12CommandAllocator    *alloc[kFrames];
     UINT64                     alloc_fence[kFrames];
     int                        frame_slot;
+    // GPU time for the DLSS work this helper submits. Same shape as the add-on's: two
+    // timestamps per ring slot, collected a full ring later when the fence says the slot
+    // is finished, so nothing ever waits for it (issue #52).
+    ID3D12QueryHeap           *ts_heap;
+    ID3D12Resource            *ts_read;
+    UINT64                     ts_freq;
+    bool                       ts_failed;
+    double                     ts_sum_ms;
+    unsigned                   ts_n;
     ID3D12Fence               *fence;      // internal (allocator ring)
     HANDLE                     fence_event;
     UINT64                     fence_value;
@@ -637,6 +646,64 @@ static Host h;
 // Command submission (allocator ring), same shape as the add-on
 // ---------------------------------------------------------------------------
 
+// Created on first use. A queue that refuses timestamps costs one log line and nothing
+// else: the feed does not depend on this.
+static void TimingEnsure()
+{
+    if (h.ts_heap != nullptr || h.ts_failed) return;
+    if (h.dev == nullptr || h.queue == nullptr) return;
+    if (FAILED(h.queue->GetTimestampFrequency(&h.ts_freq)) || h.ts_freq == 0)
+    { Log("[host] GPU timing unavailable: this queue reports no timestamp frequency"); h.ts_failed = true; return; }
+
+    D3D12_QUERY_HEAP_DESC qd = {};
+    qd.Type  = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qd.Count = Host::kFrames * 2;
+    if (FAILED(h.dev->CreateQueryHeap(&qd, __uuidof(ID3D12QueryHeap),
+                                      reinterpret_cast<void **>(&h.ts_heap))) || h.ts_heap == nullptr)
+    { Log("[host] GPU timing unavailable: no timestamp query heap"); h.ts_failed = true; return; }
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width            = Host::kFrames * 2 * sizeof(UINT64);
+    rd.Height           = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = DXGI_FORMAT_UNKNOWN;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    // A readback resource stays in COPY_DEST for its whole life.
+    if (FAILED(h.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                              nullptr, __uuidof(ID3D12Resource),
+                                              reinterpret_cast<void **>(&h.ts_read))) || h.ts_read == nullptr)
+    {
+        Log("[host] GPU timing unavailable: no timestamp readback buffer");
+        if (h.ts_heap != nullptr) { h.ts_heap->Release(); h.ts_heap = nullptr; }
+        h.ts_failed = true;
+        return;
+    }
+    Log("[host] GPU timing on (queue timestamp frequency %llu Hz)", (unsigned long long)h.ts_freq);
+}
+
+// Only called once the slot's fence has retired, so the map cannot block.
+static void TimingCollect(int slot)
+{
+    if (h.ts_read == nullptr) return;
+    const size_t base = static_cast<size_t>(slot) * 2;
+    D3D12_RANGE  want = { base * sizeof(UINT64), (base + 2) * sizeof(UINT64) };
+    void        *p    = nullptr;
+    if (FAILED(h.ts_read->Map(0, &want, &p)) || p == nullptr) return;
+    const UINT64 *t = static_cast<const UINT64 *>(p);
+    if (t[base + 1] > t[base])
+    {
+        h.ts_sum_ms += 1000.0 * double(t[base + 1] - t[base]) / double(h.ts_freq);
+        ++h.ts_n;
+    }
+    const D3D12_RANGE wrote = { 0, 0 };
+    h.ts_read->Unmap(0, &wrote);
+}
+
 static bool BeginCommands()
 {
     // AbortCommands releases the list and tries to make a new one; if that create failed --
@@ -664,12 +731,24 @@ static bool BeginCommands()
             h.fence->GetCompletedValue() < retire)
         { Log("[host] GPU did not retire allocator slot %d", slot); return false; }
     }
+    // Past the fence wait: this slot's previous submission is finished, so its timestamps
+    // are readable and reading them costs no synchronisation.
+    if (h.alloc_fence[slot] != 0) TimingCollect(slot);
     if (FAILED(h.alloc[slot]->Reset())) return false;
-    return SUCCEEDED(h.list->Reset(h.alloc[slot], nullptr));
+    if (FAILED(h.list->Reset(h.alloc[slot], nullptr))) return false;
+    TimingEnsure();
+    if (h.ts_heap != nullptr) h.list->EndQuery(h.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
+    return true;
 }
 
 static UINT64 EndCommands()
 {
+    if (h.ts_heap != nullptr)
+    {
+        h.list->EndQuery(h.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, h.frame_slot * 2 + 1);
+        h.list->ResolveQueryData(h.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, h.frame_slot * 2, 2, h.ts_read,
+                                 static_cast<UINT64>(h.frame_slot) * 2 * sizeof(UINT64));
+    }
     h.list->Close();
     ID3D12CommandList *lists[] = { h.list };
     h.queue->ExecuteCommandLists(1, lists);
@@ -1707,6 +1786,13 @@ static int RunTest()
         }
     }
     Log("[host] --test finished: %d/300 evaluates succeeded", good);
+    // What those evaluates actually cost on the GPU. The rig is the one place this can be
+    // checked against a known workload before anyone reads it in a bug report (issue #52).
+    if (h.ts_n > 0)
+        Log("[host] --test: DLSS GPU %.2f ms/frame over %u timed frames at %dx%d",
+            h.ts_sum_ms / double(h.ts_n), h.ts_n, W, H);
+    else
+        Log("[host] --test: no GPU timing was collected");
     Log("[host] check the host's ReShade.log for 'feature 18 created' / 'evaluation succeeded'");
     return good >= 250 ? 0 : 1;
 }
@@ -2295,9 +2381,20 @@ static int Serve(DWORD game_pid)
             }
 
             if (fm.n <= 3 || (fm.n % 1800) == 0)
-                Log("[host] frame %llu evaluated (%llu presents skipped so far, %llu owed)",
+            {
+                // The GPU cost of the DLSS work, which is the number a "performance loss"
+                // report actually needs and which nothing here used to measure (issue #52).
+                char gpu_part[64] = "";
+                if (h.ts_n > 0)
+                {
+                    sprintf_s(gpu_part, ", DLSS GPU %.2f ms/frame", h.ts_sum_ms / double(h.ts_n));
+                    h.ts_sum_ms = 0.0;
+                    h.ts_n = 0;
+                }
+                Log("[host] frame %llu evaluated (%llu presents skipped so far, %llu owed%s)",
                     (unsigned long long)fm.n, (unsigned long long)g_present_skipped,
-                    (unsigned long long)g_present_owed);
+                    (unsigned long long)g_present_owed, gpu_part);
+            }
             // Pay off what earlier evaluates could not present BEFORE taking this one's own
             // present. The idle branch of the tag wait above is the other repayment point,
             // but it only runs when MsgWaitForMultipleObjects times out after 100 ms -- so
