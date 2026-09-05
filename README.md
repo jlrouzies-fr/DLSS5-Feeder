@@ -2,9 +2,95 @@
 
 [![AI-DECLARATION: copilot](https://img.shields.io/badge/䷼%20AI--DECLARATION-copilot-fee2e2?labelColor=fee2e2)](AI-DECLARATION.md)
 
+> ## ⚠️ Read this before you install: it is usually the *combination*, not the game
+>
+> This project is a bridge between three things it does not control — **your NVIDIA driver**, the
+> **NVIDIA NGX runtimes** (`nvngx_dlssnr.dll`, `nvngx_dlss.dll`) and a third-party **neural
+> consumer** (`renodx-dlss5.addon64` or Deep Fried Chicken). Most reports here are not "game X does
+> not work"; they are one of those three not getting on with another. The tables below are what has
+> actually been measured, and what has not.
+>
+> **Check your own combination in about fifteen seconds, with no game running:**
+> ```
+> host64\dlss5-feed-host64.exe --test          (32-bit games; the helper is in host64\)
+> ```
+> `--test finished: 300/300 evaluates succeeded` means the driver, the runtimes and the consumer all
+> work together. Anything less prints the fault and the module chain that produced it.
+>
+> ### 1. Driver × neural consumer
+>
+> Measured with `--test` on one RTX 5090, same files throughout, changing only the consumer —
+> **through the 64-bit helper**, i.e. the 32-bit game path. A 64-bit game runs the consumer's detour
+> in-process through the same code and is expected to behave the same, but has **not** been measured.
+> **Blank cells are not claims** — they are combinations nobody has run.
+>
+> | neural consumer | driver **616.56** | driver **616.64** |
+> |---|---|---|
+> | *(none — DLAA only, no neural pass)* | — | ✅ 300/300 |
+> | **Deep Fried Chicken** 1.4.8-alpha | — | ✅ 300/300 |
+> | `renodx-dlss5` **v4.55** (classic engine) | — | ✅ 300/300 |
+> | `renodx-dlss5` **"latest"** (classic engine) | — | ✅ 300/300 |
+> | `renodx-dlss5` **v4.6** (lazy-adoption engine) | — | ❌ 1/300 |
+> | `renodx-dlss5` **v4.7** (lazy-adoption engine) | ✅ 300/300 | ❌ 0/300 |
+>
+> **The one row measured on both drivers is v4.7, and it flips.** That is what pins the driver
+> rather than the machine. One real-game log on **616.86** shows the same v4.7 failure, so it is not
+> fixed there — but 616.86 has only that one data point. On 616.64+ the neural evaluate faults
+> inside NVIDIA's own NGX runtime:
+>
+> ```
+> evaluate raised 0xC0000005 in D3D12Core.dll
+>     D3D12Core.dll <- nvngx_dlssnr.dll <- _nvngx.dll <- renodx-dlss5.addon64 <- dlss5-feed-host64.exe
+> ```
+>
+> Nothing on this side is in that chain past the call itself. 616.64 also changed what NGX answers
+> about the feature that path creates (`NotImplemented` on 616.56 → `supported` on 616.64), so the
+> driver moved and the v4.6+ engine did not survive it. **Any one of these works:** Deep Fried
+> Chicken, a classic-engine `renodx-dlss5` build, or driver 616.56. See
+> [#54](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/54).
+>
+> ### 2. The NGX runtimes
+>
+> | file | what it is | builds seen in reports |
+> |---|---|---|
+> | `nvngx_dlssnr.dll` | the neural-rendering model — **DLSS 5 cannot run without it** | NVIDIA `310.8.0.0`, NVIDIA `310.8.2.0`, ShortFuse repack `310.8.SF.0` |
+> | `nvngx_dlss.dll` | the DLSS super-resolution runtime | `310.8.0.0`, `310.9.0.0`, and older DLSS **v3** builds such as `3.8.10.0` |
+>
+> **Telling NVIDIA's build from ShortFuse's repack:** not by the version number and not by
+> `OriginalFilename` — both report `310.8.0.0` and both carry `CL 38718415`. The field that differs
+> is the *stated* **FileVersion** string: `310,8,0,0` (NVIDIA) versus `310.8.SF.0` (ShortFuse).
+> 0.14.0-beta.2 logs it, and `Verify-DLSS5Feeder.ps1` prints it.
+>
+> **The `.SF` repack is not known to break anything.** It was the leading hypothesis in
+> [#47](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/47) and was then eliminated by
+> counter-example. Do not swap runtimes on the strength of that thread alone.
+>
+> A `3.x` `nvngx_dlss.dll` beside a `310.x` `nvngx_dlssnr.dll` has been seen in reports. Whether the
+> mismatch matters is **unknown** — no test has isolated it. If yours are mismatched, it is worth
+> mentioning when you report.
+>
+> ### 3. Known-open, and not caused by your install
+>
+> | symptom | where | status |
+> |---|---|---|
+> | `NVSDK_NGX_D3D12_Init -> 0xBAD00001` on a 64-bit game, while the same files succeed for 32-bit games | [#47](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/47) | Open, **per-game**. GPU architecture, driver, data path, adapter, model build and game provenance have each been eliminated by counter-example. |
+> | Works for minutes, then the neural pass stops; log says `device removed … 0x887A0006` | [#57](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/57) | Open. A GPU hang; 0.14.0-beta.2 arms the D3D12 breadcrumb recorder on the D3D11 path, which was missing. |
+> | Severe flicker or a frozen image on 64-bit **Vulkan** | [#13](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/13) | Open. Narrowed: the transport is clean, the depth guide reaching NGX is a constant. |
+>
+> ### 4. If you report something
+>
+> Attach `dlss5-feed.log`, `ReShade.log`, and for a 32-bit game `host64\dlss5-feed-host.log` — from
+> the **same run**. Run `Verify-DLSS5Feeder.ps1` in the game folder and paste its output; it prints
+> the driver, both runtime identities, the consumer and its engine generation, which is most of the
+> above in one go. A report without the host log cannot usually be answered.
+>
+> Use **0.14.0-beta.2 or newer**: builds before 0.14.0 logged every C++ crash identically as
+> `KERNELBASE.dll` with no way to name the thrower, and beta.2 fixes the crash that followed the
+> driver fault.
+
 ## Description
 
-**DLSS 5 neural rendering in games that ship without any DLSS — D3D11, D3D12, Vulkan, OpenGL, 32-bit, even DirectX 9.**
+**DLSS 5 neural rendering in games that ship without any DLSS — D3D11, D3D12, Vulkan, OpenGL, 32-bit, even DirectX 10 and DirectX 9.**
 
 DLSS 5's neural-rendering add-on only works by hooking a game's own DLSS calls. A game that has no
 DLSS never makes those calls, so the add-on sits idle. **DLSS5-Feeder makes the calls itself.** It
@@ -206,6 +292,7 @@ a frame. Found during a Metro 2033 Redux run.
   - [Deep Fried Chicken: first run](#deep-fried-chicken-first-run)
   - [Alternative: the RenoDX add-on](#alternative-the-renodx-add-on)
 - [Install for a 32-bit game](#install-for-a-32-bit-game-beta)
+- [Install for a DirectX 10 game](#install-for-a-directx-10-game-beta)
 - [Install for a DirectX 9 game](#install-for-a-directx-9-game-beta)
 - [Install for a Vulkan game](#install-for-a-vulkan-game)
   - [32-bit Vulkan (DXVK)](#32-bit-vulkan-dxvk)
@@ -213,6 +300,7 @@ a frame. Found during a Metro 2033 Redux run.
 - [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider)
 - [How it works](#how-it-works)
   - [The 32-bit path](#the-32-bit-path)
+  - [The DirectX 10 path](#the-directx-10-path)
   - [The DirectX 9 path](#the-directx-9-path)
   - [The Vulkan path](#the-vulkan-path)
   - [The OpenGL path](#the-opengl-path)
@@ -242,6 +330,7 @@ Proven working in seven games covering every supported path:
 | **Guild Wars Reforged** | 32-bit **Vulkan** via DXVK | User-reported (#32): 3440x1440, 55 fps on an RTX 4070 (350+ without) |
 | **World of Warcraft 3.3.5a** | 32-bit **Vulkan** via DXVK | User-reported (#15): 4K on an RTX 5080/5090; the working `dxvk.conf` is in the DXVK section |
 | **Star Wars: KOTOR** | 32-bit **OpenGL** | User-reported (#31): RTX 2060, fixed in 0.9.0 (capped `GL_EXTENSIONS` string) |
+| **MX Bikes** | 64-bit **OpenGL** | User-reported (#5): the in-process OpenGL path, confirmed working |
 
 In each, the DLSS 5 add-on reports `feature 18 created … inline feature 18 evaluation succeeded`,
 driven entirely by ReShade depth + estimated motion vectors.
@@ -259,7 +348,8 @@ silent log never ruled it out here. **If you hit this: check "Smooth Motion - De
 (DLSS/NGX, renodx NR, HDR and format detection, cross-API memory coherence, queue-family
 ownership) all came back clean — full investigation in [`PLAN-DETROIT.md`](PLAN-DETROIT.md).
 
-**32-bit Vulkan (DXVK) is implemented but has no game row yet** (issue #15). The transport is the
+**32-bit Vulkan (DXVK) is implemented and user-confirmed** — see the World of Warcraft 3.3.5a row
+above (issue #15). The transport is the
 same `src/feed_vk.h` the 64-bit Vulkan path uses, compiled x86, with the host creating the shared
 textures the way the OpenGL path already does; the cross-bitness half is proven end-to-end on this
 hardware by `spike\spike-vkhost64.exe` + `spike\spike-vkclient32.exe`. Treat it as untested in a
@@ -268,8 +358,8 @@ real game until a row appears above. See [`PLAN-VULKAN32.md`](PLAN-VULKAN32.md).
 **The OpenGL path is verified 32-bit-first**, which is the harder of its two halves: Worms Ultimate
 Mayhem runs the full cross-process route — the host creates the shared textures (GL memory objects
 are import-only), the game imports them raw and answers on a shared D3D12 fence. The 64-bit
-in-process OpenGL path shares that same `src/feed_gl.h` transport and is proven by
-`spike\spike-gl64.exe`, but has no game row of its own yet. See
+in-process OpenGL path shares that same `src/feed_gl.h` transport, is proven by
+`spike\spike-gl64.exe`, and is user-confirmed in MX Bikes (#5). See
 [The OpenGL path](#the-opengl-path) and [`PLAN-OPENGL.md`](PLAN-OPENGL.md).
 
 **This is beta software.** Expect the temporal quality of *estimated* motion vectors (some ghosting
@@ -507,6 +597,41 @@ The helper's own window, with `host_window=1`:
 
 <img width="1880" height="1058" alt="image" src="https://github.com/user-attachments/assets/57abd732-94d2-401c-a524-6536006f3c86" />
 
+## Install for a DirectX 10 game (beta)
+
+Direct3D 10 games need **nothing extra installed** -- no translation layer, unlike the
+[DirectX 9 path](#install-for-a-directx-9-game-beta). Install exactly as for any other game of the
+same bitness ([64-bit](#install-for-a-64-bit-game), [32-bit](#install-for-a-32-bit-game-beta)):
+ReShade goes in as `dxgi.dll`, which is what its own installer picks for "DirectX 10/11/12".
+
+Three things are worth knowing before you start.
+
+**Direct3D 10 support lives in the 32-bit add-on** -- `dlss5-feed.addon32` plus the `host64\`
+folder -- because that is where the Direct3D 10 games are. A 64-bit D3D10 game is a rare enough
+animal that the 64-bit add-on has no D3D10 backend.
+
+**Choose a motion-vector provider that does not need compute.** ReShade compiles effects at shader
+model 4 on Direct3D 10, so a provider written around compute shaders will not build. LumeniteFX is
+the safe first choice -- it checks `__RENDERER__` and has a non-compute path -- and the older
+pixel-shader providers (qUINT, `dh_uber_motion`) predate compute entirely. See
+[Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider).
+
+**Only DLAA is on offer, and that is a property of the API rather than of this add-on.** A D3D10
+game publishes no NGX parameter block and no engine jitter, so what gets reconstructed is the
+finished frame plus whatever the motion-vector provider can infer from it. The DirectX 9 and
+32-bit Vulkan paths sit under exactly the same ceiling.
+
+Two smaller notes. The in-game panel's **Show as texture** button is unavailable here -- the panel
+would have to cross into the game's ReShade as a Direct3D 11 texture -- so use the compositor
+button next to it, or `host_window=1`.
+
+And the frame costs two GPU drains, because Direct3D 10 has no fence. The copies themselves are
+cheap (`spike\spike-d3d10client32.exe` measures hundredths of a millisecond at 1080p on an idle
+GPU), but that is a floor rather than a forecast: a drain waits for everything the device has
+outstanding, which in a real game includes the frame the game has just queued. The honest cost is
+lost CPU/GPU pipelining, and the only place to measure it is in the game, with the add-on's own
+GPU-cost figures on the overlay.
+
 ## Install for a DirectX 9 game (beta)
 
 D3D9 games need a translation layer first — **[dgVoodoo2](http://dege.freeweb.hu/dgVoodoo2/)** turns
@@ -538,9 +663,18 @@ D3D9 into D3D11, and everything after that is a normal 32-bit install.
 
 Same pieces as a 64-bit game — with two differences.
 
-1. Run ReShade's installer, point it at your game's `.exe`, and choose **Vulkan**.
+1. Run ReShade's installer, point it at your game's `.exe`, choose **Vulkan**, and tick
+   **"Enable loading of add-ons"**.
 2. Add `AddonPath=.\` under `[ADDON]` in the game's `ReShade.ini` (next to the exe).
 3. Everything else is identical to the [64-bit instructions](#install-for-a-64-bit-game).
+
+> **The add-on tick matters more on Vulkan than anywhere else.** The Vulkan layer is
+> machine-wide (`C:\ProgramData\ReShade\ReShade64.dll`), so it is shared by every Vulkan game
+> on the PC: one plain, no-add-on install done for some other game years ago is reused here,
+> and nothing complains — ReShade loads, the overlay appears, and `dlss5-feed.addon64` is
+> simply never looked for. The two builds carry the same version number and the same product
+> name, so they are indistinguishable by eye (issue #53). `Verify-DLSS5Feeder.ps1` now checks
+> this directly and the installer replaces a plain layer automatically.
 
 Most Vulkan games don't enable the extensions this needs — **the add-on adds them automatically**,
 so there's nothing else to configure. See [The Vulkan path](#the-vulkan-path) for the mechanism.
@@ -729,6 +863,45 @@ NGX and the DLSS 5 add-on only exist as x64 code, and a 32-bit process cannot lo
   half of the frame back, so a visibly half-black screen proves the full round trip — game → shared
   texture → host → shared fence → game's backbuffer — actually reaches the display, not just the logs.
 
+### The DirectX 10 path
+
+Direct3D 10 cannot reach the helper on its own, and not for one reason but three. NT-handle
+sharing is Direct3D 11.1+, so the helper's D3D12 device can never open a texture a D3D10 device
+made. D3D10 has no fence of any kind, which is how every other client here says a frame is ready.
+And it has no UAVs, so the Output slot could not be written at all.
+
+So the add-on creates a **private D3D11 relay device** of its own, inside the game's process, on
+the game's adapter (matched by LUID). The game's D3D10 device copies colour, depth and motion
+vectors into legacy shared textures; the relay opens those same textures; and from there this is
+the 32-bit D3D11 client running unchanged -- the NT-handle shared set, the shared D3D12 fence, the
+blit chain, the pipe, the helper. **The host is never told the game was D3D10.** It is a
+`FEED_CLIENT_D3D11` on the same protocol version, and `host\dlss5-feed-host64.cpp` needed no
+change at all. The relay is created at feature level 11_0, so the `ID3D11Device1` /
+`ID3D11Device5` / `ID3D11DeviceContext4` queries the D3D11 client hard-fails on all succeed, and
+the game's own device is asked for nothing but copies.
+
+Two details are worth recording, because neither is what the design notes predicted.
+
+**Keyed mutexes do not work.** `LEGACY-API-ADAPTER.md` says D3D10.1 can synchronise the two
+devices with an `IDXGIKeyedMutex`. On real hardware it cannot: every `CreateTexture2D` carrying
+`D3D10_RESOURCE_MISC_SHARED_KEYEDMUTEX` comes back `E_INVALIDARG` -- every bind flag, every
+format, with or without `MISC_SHARED` alongside -- while the same call on a D3D11 device succeeds
+and plain legacy `MISC_SHARED` on the same D3D10 device succeeds. Modern drivers simply do not
+implement that legacy path. Both D3D10 versions therefore take the event-query route that document
+reserves for D3D10.0, and `spike\spike-d3d10client32.exe` keeps the check so that a driver which
+ever grows the capability shows up as a passing line rather than as folklore.
+
+**The frame comes home by `CopyResource`, not by a draw.** The relay runs the whole blit chain --
+scaling, FSR1 EASU/RCAS -- into a backbuffer-sized shared texture, and the game's device only
+copies that into its own render target. So the D3D10 side never binds a shader, a viewport or a
+render target. That matters more here than anywhere else in this project, because D3D10 has no
+`ID3D10DeviceContext`: state lives directly on the device, so anything the add-on set, the game
+would silently inherit.
+
+The price is two pipeline bubbles a frame, one per device, since an event query drains everything
+that device has outstanding. All three input copies share a single drain rather than paying for
+one each, and `spike\spike-d3d10client32.exe` measures the result.
+
 ### The DirectX 9 path
 
 dgVoodoo2 sits in front as `D3D9.dll` and translates the game's D3D9 calls onto its own D3D11 device.
@@ -834,7 +1007,7 @@ memory objects are import-only and a GL process cannot export one. Both directio
 
 | Piece | Notes |
 | --- | --- |
-| D3D11, D3D12, Vulkan or OpenGL game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan works out of the box at both bitnesses (the add-on adds the interop extensions itself; a small bundled layer is the fallback — [64-bit](#install-for-a-vulkan-game), [32-bit/DXVK](#32-bit-vulkan-dxvk)); OpenGL needs nothing extra at all, but the game must be rendering on the NVIDIA GPU (see [Install for an OpenGL game](#install-for-an-opengl-game)). D3D10 is not supported. |
+| D3D10, D3D11, D3D12, Vulkan or OpenGL game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); D3D10 is native, through a private D3D11 relay device the add-on creates for itself ([Install for a DirectX 10 game](#install-for-a-directx-10-game-beta)); Vulkan works out of the box at both bitnesses (the add-on adds the interop extensions itself; a small bundled layer is the fallback — [64-bit](#install-for-a-vulkan-game), [32-bit/DXVK](#32-bit-vulkan-dxvk)); OpenGL needs nothing extra at all, but the game must be rendering on the NVIDIA GPU (see [Install for an OpenGL game](#install-for-an-opengl-game)). |
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
 | A neural consumer + `nvngx_dlssnr.dll` | **Deep Fried Chicken** (recommended — `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll`, `deep-fried-chicken.cfg`, from its Discord), or **Krish's `renodx-dlss5.addon64`** `#DLSS5` build as the alternative. Exactly one of them. Not ShortFuse's `renodx-dlss`, which is a different add-on that replaces this project rather than working with it (see [Before you install](#1-you-might-not-need-this-project-at-all)). Neither is included here, and neither bundles `nvngx_dlssnr.dll`. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
@@ -857,7 +1030,7 @@ if you prefer editing the file directly:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | 1 | 0 disables everything. |
+| `enabled` | 1 | `0` disables everything, and from 0.13.0-beta.1 it means it: no frames are fed, no effect runtime is queried, no textures are created, and the Vulkan interop hook is not installed. Only the overlay page stays, so the **Enabled** checkbox can undo it. Two consequences worth knowing when using it as an A/B: a Vulkan game needs a **restart** with `enabled=1` (the hook can only be installed before the game's `vkCreateDevice`, which has already happened by the time you tick the box), and on a Vulkan game already running with `enabled=1` the hook stays installed until the game exits even after you untick it. Before 0.13.0-beta.1 this switch only stopped the per-frame feed, so "it still crashes with `enabled=0`" did not clear the add-on. |
 | `mode` | 2 | 0 inert · 1 transport test (no NGX; on 32-bit it copies only the left half, so a split screen proves the round trip) · 2 full DLSS path. |
 | `work_resolution` | 100 | **D3D11 only (64-bit and 32-bit).** 50–100% of each backbuffer axis for the private DLAA + Neural Rendering work textures. The Add-ons overlay slider applies once 400 ms after dragging stops. Other paths remain at 100%. A cost knob, not DLSS upscaling — below 100% the image is downsampled, processed, and expanded back (see the troubleshooting FAQ). |
 | `work_upscale` | 0 | **D3D11 only.** How the work-size output is expanded back over the backbuffer: `0` bilinear stretch · `1` AMD FSR 1 (EASU + RCAS), visibly crisper at 50–75% than the stretch · `2` **cfg-only experiment, not recommended:** DLSS Super Resolution on synthetic jitter — measured to cost as much as 100% and to shimmer (see the FAQ); on a 32-bit game the helper creates the SR feature (IPC v6: add-on and helper must be from the same build). Overlay checkbox "FSR 1 expand-back" toggles between 0 and 1. Better filters for `work_resolution`, not DLSS Quality: the result can never exceed the native frame. If the FSR shaders fail to compile the log says so and the spatial path stays bilinear. |
@@ -965,6 +1138,46 @@ Common cases:
 * **32-bit game: "the host64\ folder is from a different release"** — the add-on and the helper
   speak a versioned protocol (v2 added the OpenGL client kind, v3 the Vulkan one). Reinstall both
   halves from the same release rather than mixing them.
+* **NVIDIA driver 616.64: the helper runs but no neural frame ever arrives** (issue
+  [#54](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/54)) — with `renodx-dlss5.addon64`
+  **v4.6 or v4.7** as the neural consumer, every DLSS evaluate faults inside the driver's own NGX
+  runtime on this driver. `host64\dlss5-feed-host.log` names it exactly:
+
+  ```
+  [host] evaluate raised 0xC0000005 (reading address FFFFFFFFFFFFFFFF) in D3D12Core.dll
+  [host] evaluate fault stack, by module (innermost first):
+         D3D12Core.dll <- nvngx_dlssnr.dll <- _nvngx.dll <- renodx-dlss5.addon64 <- dlss5-feed-host64.exe
+  ```
+
+  The faulting address differs from run to run (`-1` above, `0xC` on the next), which is what an
+  uninitialised pointer looks like. Nothing on this side is in that chain past the call itself, and
+  0.14.0-beta.1 says so up front when it sees the combination. Measured here with
+  `dlss5-feed-host64.exe --test` on an RTX 5090, same files throughout, changing only the consumer:
+
+  | neural consumer in `host64\` | driver 616.56 | driver 616.64 |
+  |---|---|---|
+  | none | — | **300/300** |
+  | Deep Fried Chicken 1.4.8-alpha | — | **300/300** |
+  | `renodx-dlss5` v4.55 (classic engine) | — | **300/300** |
+  | `renodx-dlss5` "latest" (classic engine) | — | **300/300** |
+  | `renodx-dlss5` v4.6 | — | 1/300 |
+  | `renodx-dlss5` v4.7 | **300/300** | 0/300 |
+
+  A dash is *not* a pass — it is a combination nobody has run. Only v4.7 was measured on both
+  drivers, and it is the row that flips, which is what pins the driver rather than the machine.
+  (616.56 was this machine's driver until 2026-09-04; it cannot be re-measured here now. One real-game
+  log on 616.86 reproduces the v4.7 failure; nothing else has been run on 616.86.)
+
+  616.64 also changed what NGX says about the feature that path creates: the requirements query for
+  feature 18 answered `NotImplemented` (`0xBAD00012`) on 616.56 and answers `supported` on 616.64.
+  So the driver moved and the v4.6+ engine is what does not survive the move. **Three fixes, any
+  one of them:** use Deep Fried Chicken as the neural consumer, use a classic-engine
+  `renodx-dlss5` build, or roll the driver back to 616.56. Run
+  `host64\dlss5-feed-host64.exe --test` to check your own combination in about fifteen seconds.
+* **32-bit game: `dlss5-feed.addon64` in `host64\`** — it does not belong there and 0.14.0-beta.1
+  refuses to run when it finds itself in the helper. `host64\` takes `dlss5-feed-host64.exe`, a
+  64-bit ReShade `dxgi.dll`, the neural consumer and the `nvngx_*` runtimes; the game's own folder
+  keeps `dlss5-feed.addon32`. Delete the stray file — `Verify-DLSS5Feeder.ps1` flags it too.
 * **DLSS 5 panel stuck in STANDBY** (RenoDX add-on) — it missed the first create; the built-in
   warm-up re-creates the feature a few seconds in, which normally clears it.
 * **Deep Fried Chicken's tab says `DISARMED`, `CONFLICT` or `FAILED`** — `DISARMED` is `arm=0` in
