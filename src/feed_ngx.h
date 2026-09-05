@@ -58,12 +58,25 @@ static const char *NgxResultName(NVSDK_NGX_Result r)
 // The version number alone does not identify an NGX runtime. NVIDIA's own nvngx_dlssnr.dll
 // and ShortFuse's .SF repack of it both report file version 310.8.0.0, and issue #47 turns
 // on telling them apart: three machines that fail NGX init are all loading the repack, and
-// two that succeed are not. NVIDIA stamps the build's changelist into OriginalFilename
-// ("CL 38718415"), which is the sharpest cheap tell there is.
+// two that succeed are not.
+//
+// This used to read three fields and call OriginalFilename ("CL 38718415") the sharpest tell
+// there is. Issue #50's reporter says that is backwards -- the changelist is identical on
+// both builds, and what differs is the FileVersion STRING in the version resource: NVIDIA
+// writes "310,8,0,0" there, the repack writes "310.8.SF.0". That string is a different thing
+// from the VS_FIXEDFILEINFO quad below it, an author can put anything in it, and this code
+// was reading only the quad -- so the one field that reportedly separates the two builds was
+// the one field never looked at.
+//
+// So report both and assert neither. The measured NVIDIA runtime is
+//   FileVersion string "310,8,0,0", quad 310.8.0.0, OriginalFilename "CL 38718415"
+// and a log that carries all three settles the question for whoever reads it next, without
+// this file having to be right about which one wins.
 // ---------------------------------------------------------------------------------------
 struct FeedFileIdent
 {
     char version[48];   // "310.8.0.0" from VS_FIXEDFILEINFO, or ""
+    char file_ver[64];  // the FileVersion STRING -- "310,8,0,0" / "310.8.SF.0" -- or ""
     char product[192];  // "ProductName | FileDescription", or ""
     char build[128];    // OriginalFilename -- NVIDIA's changelist lives here, or ""
 };
@@ -113,6 +126,27 @@ static bool FeedReadFileIdent(const char *path, FeedFileIdent *out)
             any = true;
         }
 
+        // The string, not the quad -- see the note above. Kept only when it says something
+        // the quad does not, because on every stock NVIDIA runtime it is just the quad with
+        // commas and repeating it in the log would train people to skip the line.
+        char file_ver[64] = {};
+        if (FeedVerString(vdata, "FileVersion", file_ver, sizeof(file_ver)))
+        {
+            char   normalised[64];
+            size_t n = 0;
+            for (const char *s = file_ver; *s != '\0' && n + 1 < sizeof(normalised); ++s)
+            {
+                if (*s == ' ') continue;              // "310, 8, 0, 0"
+                normalised[n++] = (*s == ',') ? '.' : *s;
+            }
+            normalised[n] = '\0';
+            if (strcmp(normalised, out->version) != 0)
+            {
+                strncpy_s(out->file_ver, file_ver, _TRUNCATE);
+                any = true;
+            }
+        }
+
         char product[96] = {}, desc[96] = {};
         FeedVerString(vdata, "ProductName", product, sizeof(product));
         FeedVerString(vdata, "FileDescription", desc, sizeof(desc));
@@ -127,19 +161,23 @@ static bool FeedReadFileIdent(const char *path, FeedFileIdent *out)
     return any;
 }
 
-// One log line's worth: "310.8.0.0, NVIDIA DLSSNR | ... , build CL 38718415". Always
-// returns something printable, so callers never have to branch on emptiness.
+// One log line's worth: "310.8.0.0, NVIDIA DLSSNR | ... , build CL 38718415". The stated
+// FileVersion only appears when it disagrees with the quad -- on a repack that is the whole
+// point of the line, and on a stock runtime it would be noise. Always returns something
+// printable, so callers never have to branch on emptiness.
 static void FeedFormatFileIdent(const FeedFileIdent &id, char *out, size_t out_size)
 {
-    if (id.version[0] == '\0' && id.product[0] == '\0' && id.build[0] == '\0')
+    if (id.version[0] == '\0' && id.file_ver[0] == '\0' && id.product[0] == '\0' && id.build[0] == '\0')
     {
         strncpy_s(out, out_size, "no version resource", _TRUNCATE);
         return;
     }
-    sprintf_s(out, out_size, "%s%s%s%s%s",
-              id.version[0] != '\0' ? id.version : "version ?",
-              id.product[0] != '\0' ? ", " : "", id.product,
-              id.build[0]   != '\0' ? ", build " : "", id.build);
+    sprintf_s(out, out_size, "%s%s%s%s%s%s%s%s",
+              id.version[0]  != '\0' ? id.version : "version ?",
+              id.file_ver[0] != '\0' ? " (stated FileVersion \"" : "", id.file_ver,
+              id.file_ver[0] != '\0' ? "\")" : "",
+              id.product[0]  != '\0' ? ", " : "", id.product,
+              id.build[0]    != '\0' ? ", build " : "", id.build);
 }
 
 // ---------------------------------------------------------------------------------------

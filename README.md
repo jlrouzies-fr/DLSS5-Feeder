@@ -261,7 +261,8 @@ silent log never ruled it out here. **If you hit this: check "Smooth Motion - De
 (DLSS/NGX, renodx NR, HDR and format detection, cross-API memory coherence, queue-family
 ownership) all came back clean — full investigation in [`PLAN-DETROIT.md`](PLAN-DETROIT.md).
 
-**32-bit Vulkan (DXVK) is implemented but has no game row yet** (issue #15). The transport is the
+**32-bit Vulkan (DXVK) is implemented and user-confirmed** — see the World of Warcraft 3.3.5a row
+above (issue #15). The transport is the
 same `src/feed_vk.h` the 64-bit Vulkan path uses, compiled x86, with the host creating the shared
 textures the way the OpenGL path already does; the cross-bitness half is proven end-to-end on this
 hardware by `spike\spike-vkhost64.exe` + `spike\spike-vkclient32.exe`. Treat it as untested in a
@@ -575,9 +576,18 @@ D3D9 into D3D11, and everything after that is a normal 32-bit install.
 
 Same pieces as a 64-bit game — with two differences.
 
-1. Run ReShade's installer, point it at your game's `.exe`, and choose **Vulkan**.
+1. Run ReShade's installer, point it at your game's `.exe`, choose **Vulkan**, and tick
+   **"Enable loading of add-ons"**.
 2. Add `AddonPath=.\` under `[ADDON]` in the game's `ReShade.ini` (next to the exe).
 3. Everything else is identical to the [64-bit instructions](#install-for-a-64-bit-game).
+
+> **The add-on tick matters more on Vulkan than anywhere else.** The Vulkan layer is
+> machine-wide (`C:\ProgramData\ReShade\ReShade64.dll`), so it is shared by every Vulkan game
+> on the PC: one plain, no-add-on install done for some other game years ago is reused here,
+> and nothing complains — ReShade loads, the overlay appears, and `dlss5-feed.addon64` is
+> simply never looked for. The two builds carry the same version number and the same product
+> name, so they are indistinguishable by eye (issue #53). `Verify-DLSS5Feeder.ps1` now checks
+> this directly and the installer replaces a plain layer automatically.
 
 Most Vulkan games don't enable the extensions this needs — **the add-on adds them automatically**,
 so there's nothing else to configure. See [The Vulkan path](#the-vulkan-path) for the mechanism.

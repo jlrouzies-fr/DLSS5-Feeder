@@ -217,6 +217,10 @@ static void PrepareHostOverlay()
     }
 }
 static bool g_renodx_present = false;   // renodx-dlss5.addon64 sits next to this exe
+// Its actual file name, which is not always the canonical one: a browser that downloaded the
+// file twice leaves "renodx-dlss5(2).addon64", and a real 616.86 log has exactly that. Needed
+// to recognise the consumer's own frames on a faulting stack (see NoteNgxFault).
+static char g_renodx_file[MAX_PATH] = "";
 static bool g_renodx_lazy = false;   // DLSS 5 add-on is v45+ (per-present rescan, lazy adoption)
 static bool g_renodx_v46  = false;   // DLSS 5 add-on is v4.6+ (global hotkeys, upscaling latch)
 static bool g_renodx_v47  = false;   // DLSS 5 add-on is v4.7+ (reversible colour bridge, workset pool)
@@ -320,6 +324,7 @@ static void DetectRenodxAddon()
     if (f == INVALID_HANDLE_VALUE) { Log("[host] %s is here but could not be opened (error %lu)", name, GetLastError()); return; }
     Log("[host] DLSS 5 add-on file: %s", name);
     g_renodx_present = true;
+    strcpy_s(g_renodx_file, name);
     const DWORD size = GetFileSize(f, nullptr);
     DWORD got = 0;
     char *buf = (size > 0 && size < 8u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
@@ -870,8 +875,18 @@ struct HostFault
     char  detail[640];       // " (reading address 0x...)" / " (C++ exception: ...)"
     char  where[MAX_PATH];   // the module the faulting instruction is in
     char  stack[512];        // the module chain that led there
+    bool  via_consumer;      // the neural consumer's own code is on that chain
 };
 static HostFault g_ngx_fault;
+
+static bool ContainsNoCase(const char *hay, const char *needle)
+{
+    if (hay == nullptr || needle == nullptr || needle[0] == '\0') return false;
+    const size_t n = strlen(needle);
+    for (const char *p = hay; *p != '\0'; ++p)
+        if (_strnicmp(p, needle, n) == 0) return true;
+    return false;
+}
 
 static int NoteNgxFault(EXCEPTION_POINTERS *ep)
 {
@@ -881,7 +896,53 @@ static int NoteNgxFault(EXCEPTION_POINTERS *ep)
     FeedCrashModuleOf(ep != nullptr && ep->ExceptionRecord != nullptr ? ep->ExceptionRecord->ExceptionAddress : nullptr,
                       g_ngx_fault.where, sizeof(g_ngx_fault.where));
     FeedCrashStackModules(ep != nullptr ? ep->ContextRecord : nullptr, g_ngx_fault.stack, sizeof(g_ngx_fault.stack));
+    g_ngx_fault.via_consumer = ContainsNoCase(g_ngx_fault.stack, g_renodx_file) ||
+                               ContainsNoCase(g_ngx_fault.stack, DFC_ADDON_FILENAME);
     return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// ---------------------------------------------------------------------------------------
+// Why a caught fault is not the end of it.
+//
+// This file is built /EHsc, and so is the neural consumer. Under /EHsc an SEH __except
+// unwinds the frames between the throw and the handler WITHOUT running C++ destructors in
+// them -- that is the whole difference between /EHsc and /EHa. So when the evaluate faults
+// inside NGX, every std::lock_guard the consumer took on the way in is skipped over: the
+// mutex is never released, and the consumer is left permanently locked by a thread that has
+// already walked away.
+//
+// The next call into it is then fatal, and not in a way that looks related. From a real
+// 616.86 run (Tomb Raider Anniversary), 5 ms after the caught fault:
+//
+//   evaluate raised 0xC0000005 (reading address FFFFFFFFFFFFFFFF) in D3D12Core.dll
+//       ... <- nvngx_dlssnr.dll <- _nvngx.dll <- renodx-dlss5.addon64 <- dlss5-feed-host64.exe
+//   ### CRASH RECORDED ###  exception 0xE06D7363
+//       (C++ exception: std::system_error -- "resource deadlock would occur")
+//       KERNELBASE.dll <- renodx-dlss5.addon64 <- dxgi.dll <- dlss5-feed-host64.exe
+//
+// std::mutex::lock() throws exactly that when the calling thread already owns the mutex.
+// Nobody catches it, and the process dies -- which is how this arrived as "the new driver
+// crashes the 32-bit path" rather than as "the neural pass is unavailable".
+//
+// So catching the fault and carrying on is what kills the process. Once a fault has come
+// back up through the consumer's own code, stop calling into it: the game keeps rendering,
+// the log says why, and nothing crashes.
+// ---------------------------------------------------------------------------------------
+static bool g_ngx_poisoned = false;
+
+static bool NgxRefuse(const char *what)
+{
+    if (!g_ngx_poisoned) return false;
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        Log("[host] not calling %s again: the neural consumer's own code was on the faulting stack, so its "
+            "internal locks were skipped by the unwind and are still held. Calling back in throws "
+            "\"resource deadlock would occur\" and takes the process with it. The feed stops here; the game "
+            "renders normally, and a restart is needed to try again.", what);
+    }
+    return true;
 }
 
 // An evaluate that faults faults again on the very next frame, and a log with the same two
@@ -903,6 +964,9 @@ static void LogNgxFault(const char *what)
             Log("[host] the fault is inside the call, not in the code around it -- the module chain on the "
                 "line above says whose. Further occurrences are summarised rather than repeated.");
     }
+    // See NgxRefuse: an unwind through the consumer's frames leaves its locks held, and the
+    // next call in is what actually kills the process.
+    if (g_ngx_fault.via_consumer) g_ngx_poisoned = true;
 }
 
 static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
@@ -1698,6 +1762,7 @@ static bool PickSrQuality(UINT w, UINT h_, UINT out_w, UINT out_h)
 // PickSrQuality chose; the caller made sure it did.
 static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r, UINT target_w = 0, UINT target_h = 0)
 {
+    if (NgxRefuse("CreateFeature")) return false;
     const bool sr = target_w != 0 && target_h != 0 && (target_w != w || target_h != h_);
     NVSDK_NGX_DLSS_Create_Params cp = {};
     cp.Feature.InWidth            = w;
@@ -1746,6 +1811,7 @@ static bool ReinitNgx()
 static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resource *depth, ID3D12Resource *mv,
                      UINT w, UINT h_, int reset, float mvsx, float mvsy, float jitter_x = 0.0f, float jitter_y = 0.0f)
 {
+    if (NgxRefuse("evaluate")) return false;
     if (!BeginCommands()) return false;
 
     NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};

@@ -353,6 +353,143 @@ function Get-PeInfo
     }
 }
 
+# RVA -> file offset, given a PE's section table. Split out from the reader below so the
+# lookup does not depend on PowerShell's nested-function scoping.
+function Convert-RvaToOffset
+{
+    param($Sections, [uint32] $Rva, [long] $Length)
+    foreach ($s in $Sections) {
+        if ($Rva -ge $s.V -and $Rva -lt ($s.V + $s.Span)) {
+            $o = [long]$s.Raw + ([long]$Rva - [long]$s.V)
+            if ($o -ge 0 -and $o -lt $Length) { return [long]$o }
+            return [long](-1)
+        }
+    }
+    return [long](-1)
+}
+
+# The names in a PE's export directory. $null when the file is not a readable PE; an empty
+# array when it is one and exports nothing.
+function Get-PeExportNames
+{
+    param([string] $Path, [int] $Max = 8192)
+    if (-not (Test-FileHere $Path)) { return $null }
+
+    $fs = $null
+    $br = $null
+    try {
+        $fs = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        if ($fs.Length -lt 0x40) { return $null }
+        $br = New-Object IO.BinaryReader($fs)
+
+        if ($br.ReadUInt16() -ne 0x5A4D) { return $null }            # 'MZ'
+        $fs.Position = 0x3C
+        $peOff = $br.ReadInt32()
+        if ($peOff -le 0 -or ($peOff + 24) -ge $fs.Length) { return $null }
+
+        $fs.Position = $peOff
+        if ($br.ReadUInt32() -ne 0x00004550) { return $null }        # 'PE\0\0'
+        $null      = $br.ReadUInt16()                                # Machine
+        $nSections = $br.ReadUInt16()
+        $null      = $br.ReadUInt32()                                # TimeDateStamp
+        $null      = $br.ReadUInt32()                                # PointerToSymbolTable
+        $null      = $br.ReadUInt32()                                # NumberOfSymbols
+        $optSize   = $br.ReadUInt16()
+        $null      = $br.ReadUInt16()                                # Characteristics
+
+        $optOff = [long]$peOff + 24
+        if ($optSize -lt 96 -or ($optOff + $optSize) -gt $fs.Length) { return $null }
+        $fs.Position = $optOff
+        $magic = $br.ReadUInt16()
+        # The data directories follow the optional header's fixed part: 96 bytes for PE32,
+        # 112 for PE32+ (four fields widened to 64-bit).
+        if     ($magic -eq 0x20B) { $dirOff = $optOff + 112 }
+        elseif ($magic -eq 0x10B) { $dirOff = $optOff + 96 }
+        else                      { return $null }
+        if (($dirOff + 8) -gt $fs.Length) { return $null }
+        $fs.Position = $dirOff
+        $expRva = $br.ReadUInt32()                                   # DataDirectory[0] = exports
+        $null   = $br.ReadUInt32()                                   # its size
+        if ($expRva -eq 0) { return ,([string[]] @()) }
+
+        $secOff = $optOff + $optSize
+        $sections = @()
+        for ($i = 0; $i -lt $nSections; $i++) {
+            $p = $secOff + ([long]$i * 40)
+            if (($p + 40) -gt $fs.Length) { break }
+            $fs.Position = $p + 8                                    # past the 8-byte name
+            $vsize = $br.ReadUInt32()
+            $vaddr = $br.ReadUInt32()
+            $rsize = $br.ReadUInt32()
+            $raw   = $br.ReadUInt32()
+            $span  = if ($vsize -gt 0) { $vsize } else { $rsize }
+            $sections += New-Object psobject -Property @{ V = $vaddr; Span = $span; Raw = $raw }
+        }
+        if ($sections.Count -eq 0) { return $null }
+
+        $eo = Convert-RvaToOffset $sections $expRva $fs.Length
+        if ($eo -lt 0 -or ($eo + 40) -gt $fs.Length) { return $null }
+
+        # IMAGE_EXPORT_DIRECTORY: NumberOfFunctions +20, NumberOfNames +24,
+        # AddressOfFunctions +28, AddressOfNames +32.
+        $fs.Position = $eo + 20
+        $null     = $br.ReadUInt32()
+        $nNames   = $br.ReadUInt32()
+        $null     = $br.ReadUInt32()
+        $namesRva = $br.ReadUInt32()
+        if ($nNames -eq 0 -or $namesRva -eq 0) { return ,([string[]] @()) }
+        if ($nNames -gt $Max) { $nNames = $Max }
+
+        $no = Convert-RvaToOffset $sections $namesRva $fs.Length
+        if ($no -lt 0) { return $null }
+
+        $names = New-Object 'System.Collections.Generic.List[string]'
+        for ($i = 0; $i -lt $nNames; $i++) {
+            $p = $no + ([long]$i * 4)
+            if (($p + 4) -gt $fs.Length) { break }
+            $fs.Position = $p
+            $so = Convert-RvaToOffset $sections ($br.ReadUInt32()) $fs.Length
+            if ($so -lt 0) { continue }
+            $fs.Position = $so
+            $sb = New-Object Text.StringBuilder
+            for ($k = 0; $k -lt 256; $k++) {
+                $b = $fs.ReadByte()
+                if ($b -le 0) { break }
+                $null = $sb.Append([char]$b)
+            }
+            if ($sb.Length -gt 0) { $null = $names.Add($sb.ToString()) }
+        }
+        return ,([string[]] $names.ToArray())
+    }
+    catch { return $null }
+    finally {
+        if ($br) { try { $br.Close() } catch { } }
+        if ($fs) { try { $fs.Dispose() } catch { } }
+    }
+}
+
+# Does this ReShade build support add-ons?
+#
+# ReShade ships two builds. They carry the same version number and the same ProductName, so
+# nothing this script checked could tell them apart -- and an install with the wrong one looks
+# perfectly healthy while the add-on is never loaded at all (issue #53). It bites hardest on
+# Vulkan, where the layer is machine-wide: anyone who has ever run ReShade's plain setup for
+# any Vulkan game already has one, and it is reused for every game after that.
+#
+# The exports settle it, and not by inference: ReShade's own add-on API finds the ReShade
+# module in a process by testing GetProcAddress for exactly "ReShadeRegisterAddon" and
+# "ReShadeUnregisterAddon" (reshade.hpp). A build that does not export those two cannot load
+# an add-on, because that is the mechanism by which add-ons find it.
+#
+# $null means the file could not be read -- never report that as a failure.
+function Test-ReShadeHasAddons
+{
+    param([string] $Path)
+    $names = Get-PeExportNames $Path
+    if ($null -eq $names) { return $null }
+    return [bool](($names -contains 'ReShadeRegisterAddon') -and ($names -contains 'ReShadeUnregisterAddon'))
+}
+
 # Scan a binary for an ASCII marker string. Deliberately capped: the NGX DLLs are 160 MB and
 # there is never a reason to slurp one.
 function Get-BinaryMarker
@@ -670,9 +807,22 @@ function Report-ReShadeDll
                -Detail $Path
         return
     }
+    # Add-on support first: a new-enough ReShade WITHOUT it is the more confusing failure,
+    # because every other check passes and nothing in any log says the add-on was refused --
+    # it is simply never looked for (issue #53).
+    $addons = Test-ReShadeHasAddons $Path
+    if ($addons -eq $false) {
+        Report -Status 'Fail' -Text ($Label + ': ' + $ver + ' -- built WITHOUT add-on support') `
+               -Detail ('This is ReShade''s plain build. It does not export ReShadeRegisterAddon, which is how an add-on finds ReShade, so dlss5-feed is never loaded and nothing anywhere says so. The version number and ProductName are identical to the add-on build, which is why this is easy to miss. On Vulkan the layer is machine-wide, so one plain install from any earlier game is reused for every game after it.') `
+               -Action ('Re-run the ReShade installer over ' + $Path + ' and tick "Enable loading of add-ons" (the ReShade_Setup_*_Addon.exe download).')
+        return
+    }
+
     $ok = Test-ReShadeVersion $ver
     if ($ok -eq $true) {
-        Report -Status 'Ok' -Text ($Label + ': ' + $ver) -Detail $Path
+        $d = $Path
+        if ($null -eq $addons) { $d = $Path + "`nAdd-on support could not be read from this file; assuming it is present." }
+        Report -Status 'Ok' -Text ($Label + ': ' + $ver + $(if ($addons -eq $true) { ' (add-on build)' } else { '' })) -Detail $d
     }
     elseif ($ok -eq $false) {
         Report -Status 'Fail' -Text ($Label + ': ' + $ver + ' -- too old') `
@@ -999,17 +1149,27 @@ foreach ($n in @('nvngx_dlssnr.dll', 'nvngx_dlss.dll')) {
     if ($p) {
         $v = Get-FileVersionSafe $p
         if ($v) { $t = $n + ': ' + $v } else { $t = $n + ': present (no version info)' }
-        # NVIDIA's own build and ShortFuse's .SF repack both carry file version 310.8.0.0,
-        # so the version alone cannot tell them apart -- and that is exactly the distinction
-        # issue #47 now turns on. The product/description strings do differ, so print them.
+        # NVIDIA's own build and ShortFuse's .SF repack both carry file version 310.8.0.0, so
+        # the version alone cannot tell them apart -- and that is exactly the distinction
+        # issue #47 turns on. The product/description strings do differ, so print them.
         $d = ('in ' + $consumerWhere)
         $pn = Get-ProductNameSafe $p
         if ($pn) { $d = $d + "`n" + $pn }
-        # NVIDIA stamps its build's changelist into OriginalFilename ("CL 38718415"), which
-        # is the sharpest cheap tell that a file is or is not one of their own builds.
+        # Two more fields, and neither is asserted to be decisive. This used to call
+        # OriginalFilename ("CL 38718415") the sharpest tell there is; #50's reporter says the
+        # changelist is identical on both builds and what differs is the stated FileVersion
+        # STRING -- "310,8,0,0" from NVIDIA, "310.8.SF.0" from the repack. That string is a
+        # separate field from the version quad above and was never being read. Print both and
+        # let whoever compares two machines decide.
         try {
-            $of = (Get-Item -LiteralPath $p -ErrorAction Stop).VersionInfo.OriginalFilename
-            if ($of) { $d = $d + "`nbuild: " + $of.Trim() }
+            $vi = (Get-Item -LiteralPath $p -ErrorAction Stop).VersionInfo
+            if ($vi.OriginalFilename) { $d = $d + "`nbuild: " + $vi.OriginalFilename.Trim() }
+            # Only when it disagrees with the quad: on a stock runtime it is the same numbers
+            # with commas, and repeating it would train people to skip the line.
+            if ($vi.FileVersion) {
+                $stated = ($vi.FileVersion -replace '\s', '') -replace ',', '.'
+                if ($stated -and $stated -ne $v) { $d = $d + "`nstated FileVersion: " + $vi.FileVersion.Trim() }
+            }
         }
         catch { }
         Report -Status 'Ok' -Text $t -Detail $d

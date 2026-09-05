@@ -58,7 +58,7 @@
 #include "feed_d3d10.h"     // D3D10.1 <-> D3D11 keyed-mutex bridge + the private relay device
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 
-#define FEED_VERSION "0.14.0-beta.1"
+#define FEED_VERSION "0.14.0-beta.2"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =

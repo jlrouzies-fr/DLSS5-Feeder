@@ -61,7 +61,7 @@
 #include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 
-#define FEED_VERSION "0.14.0-beta.1"
+#define FEED_VERSION "0.14.0-beta.2"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -2127,15 +2127,83 @@ static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *de
 static LONGLONG g_last_eval_ticks;
 static LONGLONG g_last_create_ticks;
 
+// ---------------------------------------------------------------------------
+// Why a caught NGX fault is not the end of it.
+//
+// This add-on is built /EHsc, and so is the neural consumer whose detour runs inside
+// these calls. Under /EHsc an SEH __except unwinds the frames between the fault and the
+// handler WITHOUT running C++ destructors in them -- that is precisely what separates
+// /EHsc from /EHa. So every std::lock_guard the consumer took on the way in is stepped
+// over: its mutexes are never released and it is left locked by a thread that has gone.
+//
+// The next call into it is then fatal, and not in a way that looks connected. From a real
+// 616.86 run through the 64-bit helper, 5 ms after the caught fault:
+//
+//   evaluate raised 0xC0000005 in D3D12Core.dll
+//       ... <- nvngx_dlssnr.dll <- _nvngx.dll <- renodx-dlss5.addon64 <- (caller)
+//   ### CRASH RECORDED ###  exception 0xE06D7363
+//       (C++ exception: std::system_error -- "resource deadlock would occur")
+//       KERNELBASE.dll <- renodx-dlss5.addon64 <- dxgi.dll <- (caller)
+//
+// std::mutex::lock() throws exactly that when the calling thread already holds the mutex.
+// Nothing catches it and the process dies -- so catching the fault and carrying on is what
+// kills the game. Once a fault has come back up through the consumer's own code, stop
+// calling into it: the game renders normally and the log says why.
+//
+// Only when the consumer is on the faulting stack. A fault inside NGX with nothing of the
+// consumer's between us and it leaves no locks of its held, and the existing retry path
+// (OnCreateFeatureFailed, ReinitNgx) has recovered real cases -- that stays.
+// ---------------------------------------------------------------------------
+static bool g_ngx_poisoned = false;
+
+static bool ContainsNoCase(const char *hay, const char *needle)
+{
+    if (hay == nullptr || needle == nullptr || needle[0] == '\0') return false;
+    const size_t n = strlen(needle);
+    for (const char *p = hay; *p != '\0'; ++p)
+        if (_strnicmp(p, needle, n) == 0) return true;
+    return false;
+}
+
+// Called from the __except handlers with the faulting context still intact.
+static void NoteNgxFault(const char *what, EXCEPTION_POINTERS *ep)
+{
+    char detail[640], stack[512];
+    FeedCrashDescribe(ep != nullptr ? ep->ExceptionRecord : nullptr, detail, sizeof(detail));
+    FeedCrashStackModules(ep != nullptr ? ep->ContextRecord : nullptr, stack, sizeof(stack));
+    const DWORD code = ep != nullptr && ep->ExceptionRecord != nullptr ? ep->ExceptionRecord->ExceptionCode : 0;
+    Log("[feed] %s raised 0x%08X%s (caught; nothing submitted)", what, code, detail);
+    if (stack[0] != '\0') Log("[feed] %s fault stack, by module (innermost first): %s", what, stack);
+    if (ContainsNoCase(stack, g_renodx_file) || ContainsNoCase(stack, DFC_ADDON_FILENAME))
+        g_ngx_poisoned = true;
+}
+
+static bool NgxRefuse(const char *what)
+{
+    if (!g_ngx_poisoned) return false;
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        Warn("not calling %s again: the neural consumer's own code was on the faulting stack, so its internal "
+             "locks were skipped by the unwind and are still held. Calling back in throws \"resource deadlock "
+             "would occur\" and takes the game with it. The feed stops here; the game renders normally, and a "
+             "restart is needed to try again.", what);
+    }
+    return true;
+}
+
 static NVSDK_NGX_Result CreateDLSSGuarded(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
 {
     __try { return NGX_D3D12_CREATE_DLSS_EXT(g.list, 1, 1, &g.feature, g.params, cp); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+    __except (NoteNgxFault("CreateFeature", GetExceptionInformation()), EXCEPTION_EXECUTE_HANDLER)
+    { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
 }
 
 static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
 {
     *code = 0;
+    if (NgxRefuse("CreateFeature")) return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF);
     ChickenPoll();
     g_chicken_created_unarmed = g_chicken_present && g_chicken_state != DFC_STATE_ARMED;
     PublishDfcInterop();
@@ -2179,12 +2247,14 @@ static bool WarmupRebuildDue(UINT64 n)
 static NVSDK_NGX_Result EvaluateDLSSGuarded(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, DWORD *code)
 {
     __try { return NGX_D3D12_EVALUATE_DLSS_EXT(g.list, g.feature, g.params, ep); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+    __except (NoteNgxFault("evaluate", GetExceptionInformation()), EXCEPTION_EXECUTE_HANDLER)
+    { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
 }
 
 static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, DWORD *code)
 {
     *code = 0;
+    if (NgxRefuse("evaluate")) return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF);
     PublishDfcInterop();
     LARGE_INTEGER a, b;
     QueryPerformanceCounter(&a);
@@ -3486,6 +3556,15 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
     HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
     auto create_device = d3d12 ? reinterpret_cast<PFN_D3D12CreateDevice_>(GetProcAddress(d3d12, "D3D12CreateDevice")) : nullptr;
     if (create_device == nullptr) { Log("[feed] no D3D12CreateDevice"); goto fail; }
+
+    // Must precede device creation -- and for a year it did not happen here at all. DRED
+    // arrived with the FP16 device removal, which was found on Vulkan, so it was wired into
+    // the Vulkan and OpenGL session openers and missed on this one: the D3D11 path, which is
+    // the one most games take. The cost was exact. Issue #57 is a device removed with
+    // DXGI_ERROR_DEVICE_HUNG after 9800 frames on this very path, and the only thing its log
+    // could say about it was "GetAutoBreadcrumbsOutput1 failed 0x887A0004" -- breadcrumbs
+    // were never armed, so the one report that needed the trail is the one that has none.
+    FeedEnableDred();
 
     {
         HRESULT hr = create_device(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&g.dev12));

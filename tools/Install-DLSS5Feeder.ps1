@@ -581,6 +581,143 @@ function Get-PeInfo
     }
 }
 
+# RVA -> file offset, given a PE's section table. Split out from the reader below so the
+# lookup does not depend on PowerShell's nested-function scoping.
+function Convert-RvaToOffset
+{
+    param($Sections, [uint32] $Rva, [long] $Length)
+    foreach ($s in $Sections) {
+        if ($Rva -ge $s.V -and $Rva -lt ($s.V + $s.Span)) {
+            $o = [long]$s.Raw + ([long]$Rva - [long]$s.V)
+            if ($o -ge 0 -and $o -lt $Length) { return [long]$o }
+            return [long](-1)
+        }
+    }
+    return [long](-1)
+}
+
+# The names in a PE's export directory. $null when the file is not a readable PE; an empty
+# array when it is one and exports nothing.
+function Get-PeExportNames
+{
+    param([string] $Path, [int] $Max = 8192)
+    if (-not (Test-FileHere $Path)) { return $null }
+
+    $fs = $null
+    $br = $null
+    try {
+        $fs = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        if ($fs.Length -lt 0x40) { return $null }
+        $br = New-Object IO.BinaryReader($fs)
+
+        if ($br.ReadUInt16() -ne 0x5A4D) { return $null }            # 'MZ'
+        $fs.Position = 0x3C
+        $peOff = $br.ReadInt32()
+        if ($peOff -le 0 -or ($peOff + 24) -ge $fs.Length) { return $null }
+
+        $fs.Position = $peOff
+        if ($br.ReadUInt32() -ne 0x00004550) { return $null }        # 'PE\0\0'
+        $null      = $br.ReadUInt16()                                # Machine
+        $nSections = $br.ReadUInt16()
+        $null      = $br.ReadUInt32()                                # TimeDateStamp
+        $null      = $br.ReadUInt32()                                # PointerToSymbolTable
+        $null      = $br.ReadUInt32()                                # NumberOfSymbols
+        $optSize   = $br.ReadUInt16()
+        $null      = $br.ReadUInt16()                                # Characteristics
+
+        $optOff = [long]$peOff + 24
+        if ($optSize -lt 96 -or ($optOff + $optSize) -gt $fs.Length) { return $null }
+        $fs.Position = $optOff
+        $magic = $br.ReadUInt16()
+        # The data directories follow the optional header's fixed part: 96 bytes for PE32,
+        # 112 for PE32+ (four fields widened to 64-bit).
+        if     ($magic -eq 0x20B) { $dirOff = $optOff + 112 }
+        elseif ($magic -eq 0x10B) { $dirOff = $optOff + 96 }
+        else                      { return $null }
+        if (($dirOff + 8) -gt $fs.Length) { return $null }
+        $fs.Position = $dirOff
+        $expRva = $br.ReadUInt32()                                   # DataDirectory[0] = exports
+        $null   = $br.ReadUInt32()                                   # its size
+        if ($expRva -eq 0) { return ,([string[]] @()) }
+
+        $secOff = $optOff + $optSize
+        $sections = @()
+        for ($i = 0; $i -lt $nSections; $i++) {
+            $p = $secOff + ([long]$i * 40)
+            if (($p + 40) -gt $fs.Length) { break }
+            $fs.Position = $p + 8                                    # past the 8-byte name
+            $vsize = $br.ReadUInt32()
+            $vaddr = $br.ReadUInt32()
+            $rsize = $br.ReadUInt32()
+            $raw   = $br.ReadUInt32()
+            $span  = if ($vsize -gt 0) { $vsize } else { $rsize }
+            $sections += New-Object psobject -Property @{ V = $vaddr; Span = $span; Raw = $raw }
+        }
+        if ($sections.Count -eq 0) { return $null }
+
+        $eo = Convert-RvaToOffset $sections $expRva $fs.Length
+        if ($eo -lt 0 -or ($eo + 40) -gt $fs.Length) { return $null }
+
+        # IMAGE_EXPORT_DIRECTORY: NumberOfFunctions +20, NumberOfNames +24,
+        # AddressOfFunctions +28, AddressOfNames +32.
+        $fs.Position = $eo + 20
+        $null     = $br.ReadUInt32()
+        $nNames   = $br.ReadUInt32()
+        $null     = $br.ReadUInt32()
+        $namesRva = $br.ReadUInt32()
+        if ($nNames -eq 0 -or $namesRva -eq 0) { return ,([string[]] @()) }
+        if ($nNames -gt $Max) { $nNames = $Max }
+
+        $no = Convert-RvaToOffset $sections $namesRva $fs.Length
+        if ($no -lt 0) { return $null }
+
+        $names = New-Object 'System.Collections.Generic.List[string]'
+        for ($i = 0; $i -lt $nNames; $i++) {
+            $p = $no + ([long]$i * 4)
+            if (($p + 4) -gt $fs.Length) { break }
+            $fs.Position = $p
+            $so = Convert-RvaToOffset $sections ($br.ReadUInt32()) $fs.Length
+            if ($so -lt 0) { continue }
+            $fs.Position = $so
+            $sb = New-Object Text.StringBuilder
+            for ($k = 0; $k -lt 256; $k++) {
+                $b = $fs.ReadByte()
+                if ($b -le 0) { break }
+                $null = $sb.Append([char]$b)
+            }
+            if ($sb.Length -gt 0) { $null = $names.Add($sb.ToString()) }
+        }
+        return ,([string[]] $names.ToArray())
+    }
+    catch { return $null }
+    finally {
+        if ($br) { try { $br.Close() } catch { } }
+        if ($fs) { try { $fs.Dispose() } catch { } }
+    }
+}
+
+# Does this ReShade build support add-ons?
+#
+# ReShade ships two builds. They carry the same version number and the same ProductName, so
+# nothing here could tell them apart -- and this script only ever asked "is it new enough?",
+# which meant a plain build already on the machine was kept and reported as fine while the
+# add-on was never loaded (issue #53). The setup this script DOWNLOADS is always the right
+# one; the hole was in what it accepted as already present.
+#
+# The exports settle it, and not by inference: ReShade's own add-on API finds the ReShade
+# module in a process by testing GetProcAddress for exactly "ReShadeRegisterAddon" and
+# "ReShadeUnregisterAddon" (reshade.hpp). A build that does not export those two cannot load
+# an add-on, because that is the mechanism by which add-ons find it.
+#
+# $null means the file could not be read -- treat that as "assume it is fine", never as a fault.
+function Test-ReShadeHasAddons
+{
+    param([string] $Path)
+    $names = Get-PeExportNames $Path
+    if ($null -eq $names) { return $null }
+    return [bool](($names -contains 'ReShadeRegisterAddon') -and ($names -contains 'ReShadeUnregisterAddon'))
+}
+
 # Counts occurrences of the graphics-API DLL names (ASCII and UTF-16) inside a binary.
 # Only used when the import table says nothing. Capped at 256 MB.
 function Get-ApiStringHints
@@ -1178,7 +1315,13 @@ foreach ($n in @('d3d9.dll', 'dxgi.dll', 'd3d11.dll', 'd3d10core.dll')) {
     $p = Find-FileIn $gameDir $n
     if ($p -and ((Get-ProductNameSafe $p) -match '(?i)dxvk')) { $dxvk = $true }
 }
-$dgVoodooPresent = [bool]((Find-FileIn $gameDir 'dgVoodoo.conf') -and (Find-FileIn $gameDir 'd3d9.dll'))
+# Either wrapper counts. dgVoodoo goes in as D3D9.dll for a Direct3D 9 game and D3D8.dll for a
+# Direct3D 8 one, but this only ever looked for the D3D9 name -- so a correctly installed D3D8
+# game read as "not present" on every run: the zip was re-downloaded, and the "files kept"
+# branch below never fired, which quietly overwrote the user's edited dgVoodoo.conf each time
+# (it is backed up first, but nobody expects to need the backup). Found while checking #56.
+$dgVoodooPresent = [bool]((Find-FileIn $gameDir 'dgVoodoo.conf') -and
+                          ((Find-FileIn $gameDir 'd3d9.dll') -or (Find-FileIn $gameDir 'd3d8.dll')))
 
 $detected = 'Unknown'
 if ($compat) {
@@ -1554,8 +1697,17 @@ function Install-ReShadeDll
         if (Test-IsReShade $To) {
             $v = Get-FileVersionSafe $To
             $ok = Test-ReShadeVersionOk $v
-            if ($ok -eq $true -and -not $Force) { Report -Status 'Ok' -Text ($Label + ': ReShade ' + $v + ' already present, kept.') -Detail $To; return $true }
-            if ($ok -ne $true) { Report -Status 'Info' -Text ($Label + ': ReShade ' + $v + ' is too old (need ' + $ReShadeMinVersion + '+); replacing.') }
+            # Add-on support is checked before the version, and a build without it is replaced
+            # even though it is new enough: it is ReShade's plain build, which cannot load an
+            # add-on at all, and it is indistinguishable from the right one by version or
+            # ProductName (issue #53).
+            $addons = Test-ReShadeHasAddons $To
+            if ($addons -eq $false) {
+                Report -Status 'Info' -Text ($Label + ': ReShade ' + $v + ' is present but built WITHOUT add-on support; replacing.') `
+                       -Detail 'It does not export ReShadeRegisterAddon, so dlss5-feed would never be loaded and nothing would say so.'
+            }
+            elseif ($ok -eq $true -and -not $Force) { Report -Status 'Ok' -Text ($Label + ': ReShade ' + $v + ' already present, kept.') -Detail $To; return $true }
+            elseif ($ok -ne $true) { Report -Status 'Info' -Text ($Label + ': ReShade ' + $v + ' is too old (need ' + $ReShadeMinVersion + '+); replacing.') }
         }
         else {
             $what = Get-ProductNameSafe $To
@@ -1588,7 +1740,16 @@ if ($isVulkan) {
     $needDll = $true
     if (Test-FileHere $pdDll) {
         $v = Get-FileVersionSafe $pdDll
-        if ((Test-ReShadeVersionOk $v) -eq $true -and -not $Force) { $needDll = $false; Report -Status 'Ok' -Text ('Vulkan layer ' + $layerName + '.dll ' + $v + ' already installed.') -Detail $pdDll }
+        # This is the case issue #53 was actually reporting. The Vulkan layer is machine-wide,
+        # so one plain (no-add-on) ReShade install done for any earlier game is silently reused
+        # for every game after it -- the script said "already installed", the verifier said OK,
+        # and the add-on was never loaded. Keeping it only if it can actually load add-ons.
+        $pdAddons = Test-ReShadeHasAddons $pdDll
+        if ($pdAddons -eq $false) {
+            Report -Status 'Info' -Text ('Vulkan layer ' + $layerName + '.dll ' + $v + ' is built WITHOUT add-on support; replacing with ' + $reshadeSetupVersion + '.') `
+                   -Detail ($pdDll + "`nIt does not export ReShadeRegisterAddon. This layer is shared by every Vulkan game on the machine, so it was probably installed by ReShade's plain setup for some other game.")
+        }
+        elseif ((Test-ReShadeVersionOk $v) -eq $true -and -not $Force) { $needDll = $false; Report -Status 'Ok' -Text ('Vulkan layer ' + $layerName + '.dll ' + $v + ' already installed (add-on build).') -Detail $pdDll }
         else { Report -Status 'Info' -Text ('Vulkan layer ' + $layerName + '.dll is ' + $v + '; will replace with ' + $reshadeSetupVersion + '.') }
     }
     $needJson = -not (Test-FileHere $pdJson)
