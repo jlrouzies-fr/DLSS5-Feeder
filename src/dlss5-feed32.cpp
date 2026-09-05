@@ -49,6 +49,7 @@
 #include <reshade.hpp>
 
 #include "feed_ipc.h"
+#include "feed_crash.h" // naming a C++ throw, shared with the 64-bit add-on and the host
 #include "feed_fmt.h"  // the DXGI format decisions shared with the host
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 #include "feed_gl.h"   // raw-OpenGL interop, the same header the 64-bit add-on uses
@@ -57,7 +58,7 @@
 #include "feed_d3d10.h"     // D3D10.1 <-> D3D11 keyed-mutex bridge + the private relay device
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 
-#define FEED_VERSION "0.13.1-beta.1"
+#define FEED_VERSION "0.14.0-beta.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -164,23 +165,6 @@ static void WriteCrashDump(EXCEPTION_POINTERS *ep)
 
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
 static volatile LONG g_crash_once;
-// An access violation carries two extra words, and they are the difference between "the
-// game read a null pointer" and "we wrote off the end of something". Free to log, and until
-// now only recoverable by opening the minidump by hand -- which is exactly what issue #44
-// (Bayonetta) needed to establish that the fault was a read of address 0 in the game's own
-// code, before this add-on had fed a single frame.
-static void CrashAccessDetail(const EXCEPTION_RECORD *r, char *out, size_t out_size)
-{
-    out[0] = '\0';
-    if (r == nullptr || r->NumberParameters < 2) return;
-    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION && r->ExceptionCode != EXCEPTION_IN_PAGE_ERROR) return;
-    const char *verb = r->ExceptionInformation[0] == 0 ? "reading"
-                     : r->ExceptionInformation[0] == 1 ? "writing"
-                     : r->ExceptionInformation[0] == 8 ? "executing" : "accessing";
-    _snprintf_s(out, out_size, _TRUNCATE, " (%s address %p)", verb,
-                reinterpret_cast<void *>(r->ExceptionInformation[1]));
-}
-
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
     // One record per process, and only one thread may make it. Two ways this is reached
@@ -199,10 +183,13 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            static_cast<LPCWSTR>(addr), &mod) && mod != nullptr)
         GetModuleFileNameW(mod, owner, MAX_PATH);
-    char access[64];
-    CrashAccessDetail(ep != nullptr ? ep->ExceptionRecord : nullptr, access, sizeof(access));
+    // A C++ throw is raised from inside KERNELBASE, so `owner` above always names
+    // KERNELBASE.dll and `addr` is meaningless -- the thrown type is what identifies the
+    // thrower (feed_crash.h; the module chain needs x64 unwind tables, so not on this side).
+    char detail[640];
+    FeedCrashDescribe(ep != nullptr ? ep->ExceptionRecord : nullptr, detail, sizeof(detail));
     Log("### CRASH RECORDED ###  exception 0x%08X%s at %p in %ls; this add-on was last doing: %s%s "
-        "(later faults in this process are not recorded)", code, access, addr,
+        "(later faults in this process are not recorded)", code, detail, addr,
         owner, g_where, mod == g_self ? " (inside this add-on)" : "");
     WriteCrashDump(ep);
     return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
@@ -1954,6 +1941,32 @@ static void DetectChickenHost()
     if (GetFileAttributesA(stray) != INVALID_FILE_ATTRIBUTES)
         Warn("deep-fried-chicken.addon64 is next to the 32-bit game exe, where a 32-bit process cannot load it. "
              "It belongs in host64\\ (it is already there too). Remove the copy next to the game.");
+}
+
+// dlss5-feed.addon64 in host64\ -- the one wrong file that looks right.
+//
+// host64\ is a 64-bit ReShade install, so a 64-bit add-on dropped in it does load, and
+// "copy the whole release into host64\" is an easy way to get there. What loads is the
+// add-on for a 64-bit GAME, inside the helper that is already this add-on's server: it
+// opens a second NGX session on its own private device and detours nvngx over the neural
+// consumer's own hooks, in the one process where none of that has ever been tested.
+//
+// The 64-bit add-on now recognises the helper and stays inert (see dlss5-feed.cpp's
+// DllMain), but it says so in host64\dlss5-feed.log -- a file nobody thinks to open,
+// because it has the same name as the game-side log they are already reading. Say it here
+// too, in the log that actually gets attached to reports.
+static void DetectStrayHostAddon()
+{
+    char path[MAX_PATH];
+    GetModuleFileNameA(g_self, path, MAX_PATH);
+    if (char *s = strrchr(path, '\\')) *(s + 1) = '\0';
+    strcat_s(path, "host64\\dlss5-feed.addon64");
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return;
+    Warn("host64\\dlss5-feed.addon64 should not be there. That is the add-on for a 64-bit GAME, and the "
+         "helper's ReShade loads it into the helper process, where it can do nothing useful and gets in the "
+         "way of the neural consumer. host64\\ takes dlss5-feed-host64.exe, a 64-bit ReShade dxgi.dll, the "
+         "neural consumer (renodx-dlss5.addon64 or Deep Fried Chicken) and the nvngx runtimes -- delete "
+         "host64\\dlss5-feed.addon64.");
 }
 
 // Re-read the four headline keys at most every 2 s while the overlay is open.
@@ -5418,6 +5431,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
                 "the Vulkan interop hook is not installed. The add-on stays registered so the overlay's "
                 "Enabled checkbox can undo this; nothing else runs.");
         DetectChickenHost();
+        DetectStrayHostAddon();
 
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);

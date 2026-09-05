@@ -54,13 +54,14 @@
 #include <nvsdk_ngx_defs_dlssd.h>   // SuperSamplingDenoising.Available (DLSS Ray Reconstruction, nvngx_dlssd.dll)
 
 #include "feed_ngx.h"  // NGX result names and DLL identity, shared with host64
+#include "feed_crash.h" // naming a C++ throw and the modules it came through, shared with host64
 #include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
 #include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 
-#define FEED_VERSION "0.13.1-beta.1"
+#define FEED_VERSION "0.14.0-beta.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -77,6 +78,10 @@ extern "C" __declspec(dllexport) const char *DESCRIPTION =
 static HMODULE          g_self;
 static char             g_log_path[MAX_PATH];
 static CRITICAL_SECTION g_log_cs;
+// Registered, but deliberately doing nothing: set when this add-on has been loaded into a
+// process it does not belong in (see DllMain). Nothing is configured, no event handler is
+// registered and no session exists, so detach must not try to take any of that down.
+static bool             g_inert;
 
 static void Log(const char *fmt, ...)
 {
@@ -183,23 +188,6 @@ static void WriteCrashDump(EXCEPTION_POINTERS *ep)
 }
 
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
-// An access violation carries two extra words, and they are the difference between "the
-// game read a null pointer" and "we wrote off the end of something". Free to log, and until
-// now only recoverable by opening the minidump by hand -- which is exactly what issue #44
-// (Bayonetta, the 32-bit twin of this filter) needed to establish that the fault was a read
-// of address 0 in the game's own code, before the add-on had fed a single frame.
-static void CrashAccessDetail(const EXCEPTION_RECORD *r, char *out, size_t out_size)
-{
-    out[0] = '\0';
-    if (r == nullptr || r->NumberParameters < 2) return;
-    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION && r->ExceptionCode != EXCEPTION_IN_PAGE_ERROR) return;
-    const char *verb = r->ExceptionInformation[0] == 0 ? "reading"
-                     : r->ExceptionInformation[0] == 1 ? "writing"
-                     : r->ExceptionInformation[0] == 8 ? "executing" : "accessing";
-    _snprintf_s(out, out_size, _TRUNCATE, " (%s address %p)", verb,
-                reinterpret_cast<void *>(r->ExceptionInformation[1]));
-}
-
 static volatile LONG g_crash_once;
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
@@ -218,11 +206,17 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            static_cast<LPCWSTR>(addr), &mod) && mod != nullptr)
         GetModuleFileNameW(mod, owner, MAX_PATH);
-    char access[64];
-    CrashAccessDetail(ep != nullptr ? ep->ExceptionRecord : nullptr, access, sizeof(access));
+    // A C++ throw is raised from inside KERNELBASE, so `owner` above always names
+    // KERNELBASE.dll and `addr` is meaningless -- the thrown type, and the module chain the
+    // throw came through, are the only two things that identify the thrower (feed_crash.h).
+    char detail[640];
+    FeedCrashDescribe(ep != nullptr ? ep->ExceptionRecord : nullptr, detail, sizeof(detail));
     Log("### CRASH RECORDED ###  exception 0x%08X%s at %p in %ls; this add-on was last doing: %s%s "
-        "(later faults in this process are not recorded)", code, access, addr,
+        "(later faults in this process are not recorded)", code, detail, addr,
         owner, g_where, mod == g_self ? " (inside this add-on)" : "");
+    char stack[512];
+    FeedCrashStackModules(ep != nullptr ? ep->ContextRecord : nullptr, stack, sizeof(stack));
+    if (stack[0] != '\0') Log("[feed] crash stack, by module (innermost first): %s", stack);
     WriteCrashDump(ep);
     return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -6850,6 +6844,36 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             wchar_t exe[MAX_PATH] = {};
             GetModuleFileNameW(nullptr, exe, MAX_PATH);
             Log("  host: %ls", exe);
+
+            // This add-on is the GAME's 64-bit half. It has no business inside the 64-bit
+            // helper -- but the helper runs its own ReShade out of host64\, and ReShade
+            // loads every add-on it finds in its own folder, so one stray copy of this file
+            // in host64\ silently gets loaded into the helper and starts a SECOND feeder in
+            // the process that is already the first one's server: its own NGX session on its
+            // own private device, its own nvngx GetProcAddress detour over the one the
+            // neural consumer just installed, its own shared-texture set. Nothing about that
+            // arrangement is tested, and it cannot do anything useful either -- there is no
+            // game in that process to read a back buffer from, which is why the give-away in
+            // the log is this add-on complaining that DLSS5_Feed.fx is missing from a folder
+            // that was never meant to have it.
+            //
+            // Deploy layout: host64\ takes dlss5-feed-host64.exe, a 64-bit ReShade dxgi.dll,
+            // the neural consumer and the nvngx runtimes -- never dlss5-feed.addon64. Say so
+            // and stay inert rather than fail in a way that reads as a driver bug later.
+            const wchar_t *leaf = wcsrchr(exe, L'\\');
+            leaf = leaf != nullptr ? leaf + 1 : exe;
+            if (_wcsicmp(leaf, L"dlss5-feed-host64.exe") == 0)
+            {
+                g_inert = true;
+                Warn("this is dlss5-feed.addon64, the add-on for a 64-bit GAME, and it has been loaded into "
+                     "dlss5-feed-host64.exe -- the 64-bit helper for a 32-bit game. That means a copy of it is "
+                     "sitting in host64\\, where it does not belong: the helper's folder takes "
+                     "dlss5-feed-host64.exe, a 64-bit ReShade dxgi.dll, the neural consumer "
+                     "(renodx-dlss5.addon64 or Deep Fried Chicken) and the nvngx runtimes, and nothing else. "
+                     "Delete host64\\dlss5-feed.addon64; the game's own folder keeps dlss5-feed.addon32. This "
+                     "add-on has registered but will do nothing in this process.");
+                return TRUE;
+            }
         }
         CfgWriteDefault();
         CfgReload();
@@ -6882,6 +6906,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // leaving it installed means a later crash jumps into freed memory and the game's own
         // handler never sees the real fault.
         SetUnhandledExceptionFilter(g_prev_filter);
+        // Nothing was registered, hooked or opened in this process -- take down only what
+        // attach actually put up.
+        if (g_inert)
+        {
+            reshade::unregister_addon(module);
+            DeleteCriticalSection(&g_feed_cs);
+            DeleteCriticalSection(&g_log_cs);
+            return TRUE;
+        }
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);

@@ -914,6 +914,19 @@ if ($gameBits -eq 32) {
                    -Action ('Move ' + $n + ' into ' + $hostDir)
         }
     }
+    # And the mirror image of it: the feeder's own 64-bit add-on inside host64\. Unlike a
+    # stray consumer beside the exe this one does load -- host64\ is a 64-bit ReShade
+    # install, so the helper picks it up and runs the add-on meant for a 64-bit GAME inside
+    # the very process that is serving the 32-bit one. It opens a second NGX session on its
+    # own private device and detours nvngx over the consumer's hooks, in a process where
+    # none of that is tested. Recent builds recognise the helper and stay inert, but an
+    # older one does not, and either way the file should not be there.
+    $strayFeeder = Find-FileIn $hostDir 'dlss5-feed.addon64'
+    if ($strayFeeder) {
+        Report -Status 'Fail' -Text 'host64\dlss5-feed.addon64 should not be there.' `
+               -Detail 'That is the add-on for a 64-bit GAME. The helper''s own ReShade loads every add-on in host64\, so this one ends up inside the helper process, where it can do nothing useful and gets in the way of the neural consumer. host64\ takes dlss5-feed-host64.exe, a 64-bit ReShade dxgi.dll, the neural consumer and the nvngx runtimes -- nothing else.' `
+               -Action ('Delete ' + $strayFeeder)
+    }
     if (-not (Test-DirHere $hostDir)) {
         Report -Status 'Fail' -Text 'host64\ does not exist, so there is nowhere for the neural consumer to live.' `
                -Action 'Create host64\ and deploy the helper, the neural consumer and the NVIDIA DLLs into it.'

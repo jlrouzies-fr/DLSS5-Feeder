@@ -36,6 +36,7 @@
 #include <nvsdk_ngx_defs_dlssd.h>   // SuperSamplingDenoising.Available (DLSS Ray Reconstruction, nvngx_dlssd.dll)
 
 #include "../src/feed_ngx.h"  // NGX result names and DLL identity, shared with the add-on
+#include "../src/feed_crash.h" // naming a C++ throw and the modules it came through, likewise
 #include "../src/feed_ipc.h"
 #include "../src/feed_fmt.h"
 #include "../src/feed_dfc.h"   // Deep Fried Chicken interop ABI 1 (producer side, HostMode=1 here)
@@ -219,6 +220,10 @@ static bool g_renodx_present = false;   // renodx-dlss5.addon64 sits next to thi
 static bool g_renodx_lazy = false;   // DLSS 5 add-on is v45+ (per-present rescan, lazy adoption)
 static bool g_renodx_v46  = false;   // DLSS 5 add-on is v4.6+ (global hotkeys, upscaling latch)
 static bool g_renodx_v47  = false;   // DLSS 5 add-on is v4.7+ (reversible colour bridge, workset pool)
+// NVIDIA's branded driver version times 100 (616.64 -> 61664), 0 when it could not be read.
+// A driver number is not usually worth comparing against, but see LogHostAdapter: one
+// specific pairing of driver and neural consumer faults inside the driver every frame.
+static unsigned g_driver_x100 = 0;
 
 static void Log(const char *fmt, ...);
 
@@ -854,6 +859,52 @@ static void PublishDfcInterop()
     h.params->Set(DFC_KEY_EVALUATE_CADENCE, DFC_EVALUATE_CADENCE);
 }
 
+// A fault inside NGX used to reach the log as a bare exception code, and "evaluate raised
+// 0xC0000005" is true of every possible cause: the driver's NGX core, the neural consumer's
+// detour over it, the model runtime, or this file's own parameters. The exception record
+// says which, and the filter runs before the stack unwinds, so the module chain is still
+// there to be walked -- which is what separates "NVIDIA's problem" from "ours" in a report.
+struct HostFault
+{
+    DWORD code;
+    char  detail[640];       // " (reading address 0x...)" / " (C++ exception: ...)"
+    char  where[MAX_PATH];   // the module the faulting instruction is in
+    char  stack[512];        // the module chain that led there
+};
+static HostFault g_ngx_fault;
+
+static int NoteNgxFault(EXCEPTION_POINTERS *ep)
+{
+    g_ngx_fault = HostFault{};
+    g_ngx_fault.code = ep != nullptr && ep->ExceptionRecord != nullptr ? ep->ExceptionRecord->ExceptionCode : 0;
+    FeedCrashDescribe(ep != nullptr ? ep->ExceptionRecord : nullptr, g_ngx_fault.detail, sizeof(g_ngx_fault.detail));
+    FeedCrashModuleOf(ep != nullptr && ep->ExceptionRecord != nullptr ? ep->ExceptionRecord->ExceptionAddress : nullptr,
+                      g_ngx_fault.where, sizeof(g_ngx_fault.where));
+    FeedCrashStackModules(ep != nullptr ? ep->ContextRecord : nullptr, g_ngx_fault.stack, sizeof(g_ngx_fault.stack));
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// An evaluate that faults faults again on the very next frame, and a log with the same two
+// lines sixty times a second is a log nobody can read the start of -- which is where the
+// useful part is. Say it in full twice, then once every ten seconds of game frames with the
+// running total.
+static void LogNgxFault(const char *what)
+{
+    static unsigned n = 0;
+    ++n;
+    if (n <= 2 || n % 600 == 0)
+    {
+        Log("[host] %s raised 0x%08X%s in %s (caught; nothing submitted)", what, g_ngx_fault.code,
+            g_ngx_fault.detail, g_ngx_fault.where);
+        if (g_ngx_fault.stack[0] != '\0')
+            Log("[host] %s fault stack, by module (innermost first): %s", what, g_ngx_fault.stack);
+        if (n > 2) Log("[host] %s has now faulted %u times; the feed delivers nothing while this lasts", what, n);
+        else if (n == 2)
+            Log("[host] the fault is inside the call, not in the code around it -- the module chain on the "
+                "line above says whose. Further occurrences are summarised rather than repeated.");
+    }
+}
+
 static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
 {
     *code = 0;
@@ -861,7 +912,7 @@ static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *
     g_chicken_created_unarmed = g_chicken_present && g_chicken_state != DFC_STATE_ARMED;
     PublishDfcInterop();
     __try { return NGX_D3D12_CREATE_DLSS_EXT(h.list, 1, 1, &h.feature, h.params, cp); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+    __except (NoteNgxFault(GetExceptionInformation())) { *code = g_ngx_fault.code; return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
 }
 
 static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, DWORD *code)
@@ -869,7 +920,7 @@ static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, D
     *code = 0;
     PublishDfcInterop();
     __try { return NGX_D3D12_EVALUATE_DLSS_EXT(h.list, h.feature, h.params, ep); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+    __except (NoteNgxFault(GetExceptionInformation())) { *code = g_ngx_fault.code; return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
 }
 
 static void SafeReleaseFeature(NVSDK_NGX_Handle *f)
@@ -1438,6 +1489,44 @@ static void LogHostAdapter()
     }
     Log("[host] device adapter: %ls  LUID %08lX:%08lX  PCI %04X:%04X  driver %s (DXGI's default adapter)",
         desc, (unsigned long)luid.HighPart, (unsigned long)luid.LowPart, vendor, device, driver);
+    g_driver_x100 = driver[0] != '?' ? static_cast<unsigned>(atof(driver) * 100.0 + 0.5) : 0;
+
+    // 616.64 and the v4.6+ RenoDX engine: reproduced here, on this machine, in --test.
+    //
+    //   consumer                       driver 616.56   driver 616.64
+    //   none                           300/300         300/300
+    //   Deep Fried Chicken 1.4.8       300/300         300/300
+    //   renodx-dlss5 v4.55 (classic)   300/300         300/300
+    //   renodx-dlss5 v4.6              300/300         1/300
+    //   renodx-dlss5 v4.7              300/300         0/300
+    //
+    // The failures are all one fault, and the module chain names it: our evaluate goes into
+    // the consumer's NGX detour, on into the driver's _nvngx.dll and nvngx_dlssnr.dll, and
+    // then dereferences an uninitialised pointer inside D3D12Core.dll -- the address differs
+    // per run (-1 one time, 0xC the next), which is what an uninitialised one looks like.
+    // Nothing on this side is in that chain past the call itself, and the same call on the
+    // same files succeeds three other ways.
+    //
+    // 616.64 also changed what NGX says about the feature that path creates: the
+    // requirements query for feature 18 answered NotImplemented (0xBAD00012) on 616.56 and
+    // answers `supported` on 616.64. So the driver moved, and the v4.6+ engine is what does
+    // not survive the move.
+    //
+    // Said up front, because the alternative is a helper that runs, logs nothing alarming
+    // and delivers no neural frame -- which is exactly how this arrived as "the new driver
+    // broke the 32-bit path" (issue #54).
+    // The bound is >= 616.64 rather than == because there is no evidence a later driver
+    // fixes it, and a warning that stops the moment NVIDIA ships 616.70 would be worse than
+    // one that says plainly which driver it was measured on.
+    if (g_renodx_v46 && g_driver_x100 >= 61664)
+        Log("[host] WARNING: renodx-dlss5 %s with NVIDIA driver %s is a combination measured to fail (on "
+            "616.64 exactly; anything newer is untested here and assumed the same). The neural evaluate "
+            "faults inside the driver's own NGX runtime -- an access violation in D3D12Core.dll, reached "
+            "through nvngx_dlssnr.dll -- so DLSS 5 delivers nothing while everything else keeps working, "
+            "and there is nothing to fix on this side. Three things do work: Deep Fried Chicken as the "
+            "neural consumer, a classic-engine renodx-dlss5 build (v4.55 and the 'latest' build both pass "
+            "here), or driver 616.56. Run this helper with --test to check any combination in seconds.",
+            g_renodx_v47 ? "v4.7" : "v4.6", driver);
 }
 
 // Ask NGX which of the adapter, the driver or the OS it is objecting to. Same question the
@@ -1628,7 +1717,7 @@ static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r, U
         AbortCommands();
         // NGX may have partially written *OutHandle before the fault; never trust it.
         h.feature = nullptr;
-        Log("[host] CreateFeature raised 0x%08X (caught; nothing submitted)", ccode);
+        LogNgxFault("CreateFeature");
         return false;
     }
     const UINT64 v = EndCommands();
@@ -1676,7 +1765,7 @@ static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resour
 
     DWORD ecode = 0;
     NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
-    if (ecode != 0) { AbortCommands(); Log("[host] evaluate raised 0x%08X (caught; nothing submitted)", ecode); return false; }
+    if (ecode != 0) { AbortCommands(); LogNgxFault("evaluate"); return false; }
     if (NVSDK_NGX_SUCCEED(re) && output == h.out_scratch && h.out_scratch != nullptr)
     {
         // The game's device cannot open a UAV texture: NGX wrote the private scratch,
@@ -2498,8 +2587,15 @@ static void ShutdownDisguise()
 // Same shape as the add-ons' filter: the crash goes in the log with the faulting
 // module, and a minidump lands next to it (dbghelp loaded on demand).
 typedef BOOL (WINAPI *PFN_MiniDumpWriteDump_)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+static volatile LONG g_crash_once;
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
+    // One thread records; the rest go straight on. Both add-ons learned this from The Surge
+    // 2, where a GPU fault took out eight threads inside the driver at once and they raced
+    // for the same dump file -- seven sharing violations and no dump. This side never got
+    // the same guard, and it runs the identical driver stack.
+    if (InterlockedCompareExchange(&g_crash_once, 1, 0) != 0) return EXCEPTION_CONTINUE_SEARCH;
+
     const void *addr = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
     const DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
     wchar_t owner[MAX_PATH] = L"unknown";
@@ -2508,8 +2604,17 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            static_cast<LPCWSTR>(addr), &mod) && mod != nullptr)
         GetModuleFileNameW(mod, owner, MAX_PATH);
-    Log("### CRASH RECORDED ###  exception 0x%08X at %p in %ls%s", code, addr, owner,
+    // A C++ throw is raised from inside KERNELBASE, so `owner` always names KERNELBASE.dll
+    // and `addr` is meaningless. This process loads ReShade, the neural consumer and the
+    // whole NVIDIA user-mode driver stack, so "something in here threw" is not an answer:
+    // the thrown type and the module chain are (feed_crash.h).
+    char detail[640];
+    FeedCrashDescribe(ep != nullptr ? ep->ExceptionRecord : nullptr, detail, sizeof(detail));
+    Log("### CRASH RECORDED ###  exception 0x%08X%s at %p in %ls%s", code, detail, addr, owner,
         mod == GetModuleHandleW(nullptr) ? " (inside this host)" : "");
+    char stack[512];
+    FeedCrashStackModules(ep != nullptr ? ep->ContextRecord : nullptr, stack, sizeof(stack));
+    if (stack[0] != '\0') Log("[host] crash stack, by module (innermost first): %s", stack);
 
     char path[MAX_PATH];
     strcpy_s(path, g_log_path);

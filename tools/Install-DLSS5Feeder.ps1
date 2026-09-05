@@ -1911,6 +1911,12 @@ if ($is32) {
     foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5.addon64', 'alexs-toolkit.addon64')) {
         Disable-Conflict -Path (Find-FileIn $gameDir $n) -Why 'a 64-bit add-on beside a 32-bit exe is never loaded; the consumer belongs in host64\'
     }
+    # The reverse mistake, and the damaging one: this project's own 64-bit add-on inside
+    # host64\. It DOES load -- host64\ is a 64-bit ReShade install -- and what loads is the
+    # add-on for a 64-bit game, running inside the helper that is already serving the 32-bit
+    # one: a second NGX session on a second private device, and an nvngx detour over the
+    # neural consumer's own hooks.
+    Disable-Conflict -Path (Find-FileIn $hostDir 'dlss5-feed.addon64') -Why 'that is the add-on for a 64-bit GAME; inside the helper it starts a second feeder in the process serving the first'
 }
 
 if ($Consumer -eq 'DFC') {

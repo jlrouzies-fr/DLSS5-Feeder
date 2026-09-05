@@ -1041,6 +1041,40 @@ Common cases:
 * **32-bit game: "the host64\ folder is from a different release"** — the add-on and the helper
   speak a versioned protocol (v2 added the OpenGL client kind, v3 the Vulkan one). Reinstall both
   halves from the same release rather than mixing them.
+* **NVIDIA driver 616.64: the helper runs but no neural frame ever arrives** (issue
+  [#54](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/54)) — with `renodx-dlss5.addon64`
+  **v4.6 or v4.7** as the neural consumer, every DLSS evaluate faults inside the driver's own NGX
+  runtime on this driver. `host64\dlss5-feed-host.log` names it exactly:
+
+  ```
+  [host] evaluate raised 0xC0000005 (reading address FFFFFFFFFFFFFFFF) in D3D12Core.dll
+  [host] evaluate fault stack, by module (innermost first):
+         D3D12Core.dll <- nvngx_dlssnr.dll <- _nvngx.dll <- renodx-dlss5.addon64 <- dlss5-feed-host64.exe
+  ```
+
+  The faulting address differs from run to run (`-1` above, `0xC` on the next), which is what an
+  uninitialised pointer looks like. Nothing on this side is in that chain past the call itself, and
+  0.14.0-beta.1 says so up front when it sees the combination. Measured here with
+  `dlss5-feed-host64.exe --test` on an RTX 5090, same files throughout — 616.56 passes every row:
+
+  | neural consumer in `host64\` | driver 616.56 | driver 616.64 |
+  |---|---|---|
+  | none | 300/300 | 300/300 |
+  | Deep Fried Chicken 1.4.8-alpha | 300/300 | **300/300** |
+  | `renodx-dlss5` v4.55 (classic engine) | 300/300 | **300/300** |
+  | `renodx-dlss5` v4.6 | 300/300 | 1/300 |
+  | `renodx-dlss5` v4.7 | 300/300 | 0/300 |
+
+  616.64 also changed what NGX says about the feature that path creates: the requirements query for
+  feature 18 answered `NotImplemented` (`0xBAD00012`) on 616.56 and answers `supported` on 616.64.
+  So the driver moved and the v4.6+ engine is what does not survive the move. **Three fixes, any
+  one of them:** use Deep Fried Chicken as the neural consumer, use a classic-engine
+  `renodx-dlss5` build, or roll the driver back to 616.56. Run
+  `host64\dlss5-feed-host64.exe --test` to check your own combination in about fifteen seconds.
+* **32-bit game: `dlss5-feed.addon64` in `host64\`** — it does not belong there and 0.14.0-beta.1
+  refuses to run when it finds itself in the helper. `host64\` takes `dlss5-feed-host64.exe`, a
+  64-bit ReShade `dxgi.dll`, the neural consumer and the `nvngx_*` runtimes; the game's own folder
+  keeps `dlss5-feed.addon32`. Delete the stray file — `Verify-DLSS5Feeder.ps1` flags it too.
 * **DLSS 5 panel stuck in STANDBY** (RenoDX add-on) — it missed the first create; the built-in
   warm-up re-creates the feature a few seconds in, which normally clears it.
 * **Deep Fried Chicken's tab says `DISARMED`, `CONFLICT` or `FAILED`** — `DISARMED` is `arm=0` in
