@@ -19,10 +19,12 @@
 >
 > ### 1. Driver × neural consumer
 >
-> Measured with `--test` on one RTX 5090, same files throughout, changing only the consumer.
+> Measured with `--test` on one RTX 5090, same files throughout, changing only the consumer —
+> **through the 64-bit helper**, i.e. the 32-bit game path. A 64-bit game runs the consumer's detour
+> in-process through the same code and is expected to behave the same, but has **not** been measured.
 > **Blank cells are not claims** — they are combinations nobody has run.
 >
-> | neural consumer | driver **616.56** | driver **616.64 / 616.86** |
+> | neural consumer | driver **616.56** | driver **616.64** |
 > |---|---|---|
 > | *(none — DLAA only, no neural pass)* | — | ✅ 300/300 |
 > | **Deep Fried Chicken** 1.4.8-alpha | — | ✅ 300/300 |
@@ -32,7 +34,9 @@
 > | `renodx-dlss5` **v4.7** (lazy-adoption engine) | ✅ 300/300 | ❌ 0/300 |
 >
 > **The one row measured on both drivers is v4.7, and it flips.** That is what pins the driver
-> rather than the machine. On 616.64+ the neural evaluate faults inside NVIDIA's own NGX runtime:
+> rather than the machine. One real-game log on **616.86** shows the same v4.7 failure, so it is not
+> fixed there — but 616.86 has only that one data point. On 616.64+ the neural evaluate faults
+> inside NVIDIA's own NGX runtime:
 >
 > ```
 > evaluate raised 0xC0000005 in D3D12Core.dll
@@ -80,8 +84,9 @@
 > the driver, both runtime identities, the consumer and its engine generation, which is most of the
 > above in one go. A report without the host log cannot usually be answered.
 >
-> Use **0.14.0-beta.2 or newer**: earlier builds could not name the module behind a C++ crash, and
-> logged every one of them identically as `KERNELBASE.dll`.
+> Use **0.14.0-beta.2 or newer**: builds before 0.14.0 logged every C++ crash identically as
+> `KERNELBASE.dll` with no way to name the thrower, and beta.2 fixes the crash that followed the
+> driver fault.
 
 ## Description
 
@@ -1149,7 +1154,7 @@ Common cases:
   0.14.0-beta.1 says so up front when it sees the combination. Measured here with
   `dlss5-feed-host64.exe --test` on an RTX 5090, same files throughout, changing only the consumer:
 
-  | neural consumer in `host64\` | driver 616.56 | driver 616.64 / 616.86 |
+  | neural consumer in `host64\` | driver 616.56 | driver 616.64 |
   |---|---|---|
   | none | — | **300/300** |
   | Deep Fried Chicken 1.4.8-alpha | — | **300/300** |
@@ -1160,7 +1165,8 @@ Common cases:
 
   A dash is *not* a pass — it is a combination nobody has run. Only v4.7 was measured on both
   drivers, and it is the row that flips, which is what pins the driver rather than the machine.
-  (616.56 was this machine's driver until 2026-09-04; it cannot be re-measured here now.)
+  (616.56 was this machine's driver until 2026-09-04; it cannot be re-measured here now. One real-game
+  log on 616.86 reproduces the v4.7 failure; nothing else has been run on 616.86.)
 
   616.64 also changed what NGX says about the feature that path creates: the requirements query for
   feature 18 answered `NotImplemented` (`0xBAD00012`) on 616.56 and answers `supported` on 616.64.
