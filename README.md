@@ -244,6 +244,7 @@ Proven working in seven games covering every supported path:
 | **Guild Wars Reforged** | 32-bit **Vulkan** via DXVK | User-reported (#32): 3440x1440, 55 fps on an RTX 4070 (350+ without) |
 | **World of Warcraft 3.3.5a** | 32-bit **Vulkan** via DXVK | User-reported (#15): 4K on an RTX 5080/5090; the working `dxvk.conf` is in the DXVK section |
 | **Star Wars: KOTOR** | 32-bit **OpenGL** | User-reported (#31): RTX 2060, fixed in 0.9.0 (capped `GL_EXTENSIONS` string) |
+| **MX Bikes** | 64-bit **OpenGL** | User-reported (#5): the in-process OpenGL path, confirmed working |
 
 In each, the DLSS 5 add-on reports `feature 18 created … inline feature 18 evaluation succeeded`,
 driven entirely by ReShade depth + estimated motion vectors.
@@ -271,8 +272,8 @@ real game until a row appears above. See [`PLAN-VULKAN32.md`](PLAN-VULKAN32.md).
 **The OpenGL path is verified 32-bit-first**, which is the harder of its two halves: Worms Ultimate
 Mayhem runs the full cross-process route — the host creates the shared textures (GL memory objects
 are import-only), the game imports them raw and answers on a shared D3D12 fence. The 64-bit
-in-process OpenGL path shares that same `src/feed_gl.h` transport and is proven by
-`spike\spike-gl64.exe`, but has no game row of its own yet. See
+in-process OpenGL path shares that same `src/feed_gl.h` transport, is proven by
+`spike\spike-gl64.exe`, and is user-confirmed in MX Bikes (#5). See
 [The OpenGL path](#the-opengl-path) and [`PLAN-OPENGL.md`](PLAN-OPENGL.md).
 
 **This is beta software.** Expect the temporal quality of *estimated* motion vectors (some ghosting
