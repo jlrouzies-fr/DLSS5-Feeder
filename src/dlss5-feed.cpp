@@ -57,11 +57,12 @@
 #include "feed_crash.h" // naming a C++ throw and the modules it came through, shared with host64
 #include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
+#include "feed_vk_present64.h"
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
 #include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 
-#define FEED_VERSION "0.14.0-beta.2"
+#define FEED_VERSION "0.14.0-beta.2-detroit-sync.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -918,9 +919,11 @@ struct Cfg
                            // of a stable image on a static scene. Parse-only, not written back.
     int   jitter_phases;   // diagnostic for work_upscale=2: Halton sequence length, 0 = auto
                            // (8 * (native/work)^2, NVIDIA's guidance). Parse-only.
+    int   vk_present_sync; // 1: order early Vulkan submits against the game's present waits
+    int   vk_trace;        // per-frame identities + six-stage readbacks (diagnostic only)
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 0, 0.3f, 2000, 1, 0, 0, 0, 0, 1.0f, 1.0f, 50, 1, 0 };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 0, 0.3f, 2000, 1, 0, 0, 0, 0, 1.0f, 1.0f, 50, 1, 0, 1, 0 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -1006,6 +1009,8 @@ static bool CfgReload()
         else if (_stricmp(key, "sync_home")      == 0) next.sync_home      = iv;
         else if (_stricmp(key, "half_home")      == 0) next.half_home      = iv;
         else if (_stricmp(key, "passthrough")    == 0) next.passthrough    = iv;
+        else if (_stricmp(key, "vk_present_sync") == 0) next.vk_present_sync = iv;
+        else if (_stricmp(key, "vk_trace")        == 0) next.vk_trace = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
         else if (_stricmp(key, "stall_log_ms")   == 0) next.stall_log_ms   = iv;
@@ -2495,10 +2500,10 @@ static void GuideProbeRecord(ID3D12Resource *mv, D3D12_RESOURCE_STATES mv_state,
 // D3D12 view of the colour INPUT (exactly what the evaluate is about to read) and of
 // the OUTPUT (exactly what the evaluate just wrote) into a readback buffer, hash both
 // once the fence confirms completion, and log whether each changed since the previous
-// probe. When the screen freezes but every frame reports "delivered", this says WHICH
-// hop of the cross-API transport is stale: colour-in SAME = the Vulkan->D3D12 input
-// copy is not landing; colour-in CHANGED but output SAME = DLSS is producing a
-// constant; both CHANGED = the D3D12->Vulkan copy home is the stale hop.
+// probe. This samples only the centre AFTER evaluate; a constant centre does not
+// prove that the full input is stale. In particular, 5f9eb3fedcef8383 is also the
+// hash of a 64x64 opaque-black RGBA8/BGRA8 tile. Vulkan's opt-in six-stage probe
+// below reads three distributed tiles, including COLOR before evaluate.
 // ---------------------------------------------------------------------------
 
 static const UINT kStaleProbeSize = 64;
@@ -2565,13 +2570,17 @@ static void StaleProbeAnalyse()
     if (FAILED(g_stale_buf->Map(0, &read, &p)) || p == nullptr) return;
     const uint64_t hc = StaleProbeHash(static_cast<const uint8_t *>(p), g_stale_bytes[0]);
     const uint64_t ho = StaleProbeHash(static_cast<const uint8_t *>(p) + kStaleProbeBlock, g_stale_bytes[1]);
+    uint32_t first[2] = {};
+    memcpy(&first[0], p, sizeof(uint32_t));
+    memcpy(&first[1], static_cast<const uint8_t *>(p) + kStaleProbeBlock, sizeof(uint32_t));
     const D3D12_RANGE none = { 0, 0 };
     g_stale_buf->Unmap(0, &none);
     if (g_stale_have_hash)
-        Log("[feed] stale probe (frame %llu): colour-in %s (%016llx), output %s (%016llx)",
+        Log("[feed] stale probe (frame %llu): colour-in %s (%016llx), output %s (%016llx); centre64 first32=%08x/%08x fmt=%u/%u",
             static_cast<unsigned long long>(g_stale_capture_frame),
             hc == g_stale_hash[0] ? "SAME" : "changed", static_cast<unsigned long long>(hc),
-            ho == g_stale_hash[1] ? "SAME" : "changed", static_cast<unsigned long long>(ho));
+            ho == g_stale_hash[1] ? "SAME" : "changed", static_cast<unsigned long long>(ho),
+            first[0], first[1], static_cast<unsigned>(g.color_fmt), static_cast<unsigned>(g.output_fmt));
     g_stale_hash[0] = hc;
     g_stale_hash[1] = ho;
     g_stale_have_hash = true;
@@ -2636,6 +2645,8 @@ static void StaleProbeRecord(ID3D12Resource *color, D3D12_RESOURCE_STATES color_
     g_stale_fence = g.fence_value + 1;   // exactly what EndCommands() signals for this list
 }
 
+#include "feed_vk_probe64.h"
+
 static void GuideProbeAbort()
 {
     g_guide_probe_fence = 0;
@@ -2682,7 +2693,11 @@ static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOU
 
 static void ReleaseFrameResources()
 {
+    // The private fence retires D3D12 only. Vulkan may still have copy-home
+    // commands referencing these imports (including on the immediate list).
+    if (g.vk.ok && g.rs_queue && (g.vk_img[SLOT_COLOR] || g_vk_probe.dev)) g.rs_queue->wait_idle();
     DrainGpu();
+    FeedVkProbeRelease();
     // Vulkan transport: drop our raw VkImage imports (the memory is the D3D12 resource's;
     // freeing the import does not free the D3D12 resource, which SafeRelease(tex12) does).
     if (g.vk.ok)
@@ -5241,8 +5256,18 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         return;
     }
 
+    // Even a resource rebuild can flush the immediate list. Establish the game
+    // dependency before that, not just before the explicit per-frame flush.
+    if (g_cfg.vk_present_sync && !g_vk_frame_present_target) FeedVkFramePresentInstall(rt);
+    if (g_cfg.mode >= 2 && g_cfg.vk_present_sync && !FeedVkOrderPresent(rt, cl))
+    {
+        static bool reported = false;
+        if (!reported) { reported = true; Log("[feed] Vulkan: no usable present dependency context; skipping mode 2 to avoid an unordered early submit"); }
+        return;
+    }
     bool ok = true;
-    if (g.session_ready && g.rs_dev != nullptr && g.rs_dev != dev_api)
+    if (g.session_ready && g.rs_dev != nullptr &&
+        (g.rs_dev != dev_api || g.rs_queue != rt->get_command_queue()))
     {
         Log("[feed] the game recreated its device; rebuilding the session");
         ShutdownSession();
@@ -5275,7 +5300,14 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
     if (ok && g.frame_ready)
     {
+        if (g_cfg.passthrough && g_cfg.mode >= 2 && g.color_fmt != g.output_fmt)
+        {
+            FeedDisable("passthrough requires matching COLOR/OUTPUT formats; NGX was NOT called");
+            return;
+        }
+        FeedVkProbeBegin(rt, bb_res);
         VkCommandBuffer cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());
+        const uint64_t capture_cb = FeedVkValue(cb);
         VkImage bb_img = FeedVkHandle<VkImage>(bb_res.handle);
         VkImage mv_img = FeedVkHandle<VkImage>(mv_res.handle);
         VkImage dp_img = FeedVkHandle<VkImage>(depth_res.handle);
@@ -5336,6 +5368,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         }
         const bool staged_in = g_cfg.mode >= 2 && g.vk_in_buf[SLOT_COLOR] != VK_NULL_HANDLE;
         const UINT cbpp = HomeTexelBytes(g.color_fmt) != 0 ? HomeTexelBytes(g.color_fmt) : 4;
+        FeedVkProbeVk(cb, 0, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); // A: source before capture
         if (staged_in)
         {
             FeedVkCopyImageToBuffer(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_in_buf[SLOT_COLOR], w, h, g.in_pitch[SLOT_COLOR] / cbpp);
@@ -5347,6 +5380,21 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
             FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MV],    VK_IMAGE_LAYOUT_GENERAL, w, h);
             FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
+        }
+        if (g_vk_probe.active)
+        {
+            // Publish the capture to the B read, even though both use transfer commands.
+            if (staged_in)
+            {
+                VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+                barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                g.vk.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0, 1, &barrier, 0, nullptr, 0, nullptr);
+            }
+            else FeedVkBarrier(&g.vk, cb, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+            FeedVkProbeVk(cb, 1, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL,
+                staged_in ? g.vk_in_buf[SLOT_COLOR] : VK_NULL_HANDLE, g.in_pitch[SLOT_COLOR]);
         }
         if (g.mask_ok)
         {
@@ -5388,6 +5436,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 cl->barrier(1, res, from, to);
             }
             ++g.frames_done;
+            if (g_cfg.vk_trace)
+                FeedVkIdentity(rt, cl, rtv, bb_res, g.frames_done, capture_cb,
+                    FeedVkValue(g.vk_img[SLOT_COLOR]), FeedVkValue(g.vk_img[SLOT_OUTPUT]),
+                    g.tex12[SLOT_COLOR], g.tex12[SLOT_OUTPUT], 0, 0, true);
         }
         else
         {
@@ -5513,6 +5565,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 ep.InExposureScale   = 1.0f;
 
                 Breadcrumb("running the D3D12 evaluate (Vulkan transport)");
+                FeedVkProbeD12(false); // C: exact pInColor, before EvaluateFeature/CopyResource
                 DWORD ecode = 0;
                 NVSDK_NGX_Result re;
                 if (g_cfg.passthrough != 0 && g.color_fmt == g.output_fmt)
@@ -5542,6 +5595,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 }
                 else
                 {
+                    FeedVkProbeD12(true); // D: exact pInOutput, after EvaluateFeature/CopyResource
                     StaleProbeRecord(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                      g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                     if (g.home_buf12 != nullptr)
@@ -5595,6 +5649,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             if (one_submit)
             {
                 // Nothing more to record: the copy home already went out with the inputs.
+                if (g_cfg.vk_trace)
+                    FeedVkIdentity(rt, cl, rtv, bb_res, g.vk_frame, capture_cb,
+                        FeedVkValue(g.vk_img[SLOT_COLOR]), FeedVkValue(g.vk_img[SLOT_OUTPUT]),
+                        g.tex12[SLOT_COLOR], g.tex12[SLOT_OUTPUT], n, n > 1 ? n - 1 : 0, n > 1);
                 static bool said_one = false;
                 if (!said_one)
                 {
@@ -5646,6 +5704,13 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                     static_cast<unsigned long long>(FeedVkTimelineValue(&g.vk, g.vk_sem_out)));
             cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());  // fresh buffer after the flush
             done = done && home_ok;   // async_home frame 1: nothing to carry home yet
+            // A flush changes the native command buffer, not the RTV's owner. Do
+            // not silently redirect output to another image if that contract breaks.
+            if (dev_api->get_resource_from_view(rtv) != bb_res)
+            {
+                Log("[feed] Vulkan RTV mapping changed across flush; suppressing copy home");
+                done = false;
+            }
             // Take the images back from the D3D12 device: acquire from
             // VK_QUEUE_FAMILY_EXTERNAL, making the evaluate's output writes visible to
             // the copy home. This submit waits on the out-fence, so the acquire is
@@ -5663,6 +5728,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             g.vk_released = false;
             if (done)
             {
+                FeedVkProbeVk(cb, 2, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL, g.vk_home_buf, g.home_pitch); // E
                 // Prefer the raw copy. vkCmdBlitImage converts, and that conversion is
                 // sRGB-aware: blitting our linear-typed output into a VK_FORMAT_*_SRGB
                 // swapchain applies a linear->sRGB encode and the frame comes back much
@@ -5683,6 +5749,12 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 else
                     FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
                                     bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, wh, h);
+                if (g_vk_probe.active)
+                {
+                    cl->barrier(bb_res, resource_usage::copy_dest, resource_usage::copy_source);
+                    FeedVkProbeVk(cb, 3, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); // F: actual copy-home target
+                    cl->barrier(bb_res, resource_usage::copy_source, resource_usage::copy_dest);
+                }
             }
             {
                 const resource       res[1]  = { bb_res };
@@ -5690,6 +5762,12 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 const resource_usage to[1]   = { resource_usage::render_target };
                 cl->barrier(1, res, from, to);
             }
+
+            if (g_cfg.vk_trace)
+                FeedVkIdentity(rt, cl, rtv, bb_res, n, capture_cb,
+                    FeedVkValue(g.vk_img[SLOT_COLOR]), FeedVkValue(g.vk_img[SLOT_OUTPUT]),
+                    g.tex12[SLOT_COLOR], g.tex12[SLOT_OUTPUT], n, wait_n, done);
+            FeedVkProbeEnd(done);
 
             // sync_home: submit the copy home and block until the GPU has finished it,
             // before this callback returns and the game presents. Everything else in this
@@ -6468,6 +6546,7 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
 // Only the overlay page stays, so the checkbox can undo it.
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
+    if (g_cfg.enabled) FeedVkFramePresentInstall(rt);
     if (!g_cfg.enabled) return;
     RuntimeSlot *slot = TrackRuntime(rt);
     static int inits = 0;
@@ -6661,6 +6740,9 @@ static void OnDestroyDevice(reshade::api::device *dev)
     {
         Log("[feed] the game's Vulkan device is being destroyed; shutting the session down");
         g_ngx_dying = true;
+        // ReShade destroys its queue wrappers BEFORE emitting destroy_device.
+        // Vulkan requires the application to have retired work before this point.
+        g.rs_queue = nullptr;
         ShutdownSession();
     }
     else if (g.session_ready && dev->get_api() == reshade::api::device_api::opengl && dev == g.rs_dev)
@@ -7001,6 +7083,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        FeedVkFramePresentRemove();
         FeedVkHookRemove();   // before this code is unmapped -- ReShade reloads add-ons per Vulkan instance
         g_ngx_dying = true;   // process is exiting: never call back into NGX
         ShutdownSession();
