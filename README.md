@@ -632,12 +632,10 @@ work. Two folders to fill:
   - While the panel is up the mouse and keyboard belong to it. Escape away from it hides it, Alt+F4
     hides it and closes the game, and the X in its corner always closes it. **Panel size** scales it,
     and **Panel corner** moves it to any of the four corners of the game window.
-  - **Show / Hide ReShade in Host** shows or hides ReShade's overlay inside the helper window, which
-    is what the panel casts. The helper opens it by itself when it starts, so this is mostly for
-    getting it back after you close it. The key it sends is a toggle, so if the label ever disagrees
-    with what you see, press it once more. Pressing the helper's overlay key through the panel does
-    not work: the press and the release arrive in the same helper frame, and ReShade reads that as
-    never pressed.
+  - **Toggle ReShade in host** flips ReShade's overlay inside the helper window, which is what the
+    panel casts. The helper opens it by itself at startup; use this to get it back after you close
+    it. The panel is the readout: the helper's placeholder banner shows when the overlay is closed,
+    the tuning panel when it is open. One press flips it; press again if it went the wrong way.
 - `host_window=1` in `dlss5-feed.cfg` gives the helper a visible window of its own instead (Home opens
   the panel there).
 - **Host window width / height** on the overlay resize the helper's window for real -- its window,
