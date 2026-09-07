@@ -60,6 +60,7 @@
 #include "feed_vk_present64.h"
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
 #include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
+#include "feed_opti.h" // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 
 #define FEED_VERSION "0.14.0-beta.5"
@@ -595,6 +596,12 @@ static LONG  g_chicken_state       = DFC_STATE_UNKNOWN;   // last observed expor
 // NGX detours several seconds after claiming ownership, and a Create it did not see is never
 // adopted at Evaluate -- so WarmupRebuildDue() re-creates once when the state flips to ARMED.
 static bool  g_chicken_created_unarmed = false;
+
+// OptiScaler DLSS-NR, the third consumer -- the detection itself lives further down, next to
+// NoteNgxFault; these are declared here because SafeNgxInit12 reads them first.
+static OptiInfo    g_opti;
+static OptiBackend g_opti_backend;
+static UINT64      g_opti_evals;   // successful evaluates so far, for the one-time backend check
 
 // 'warmup_rebuild' is the configured value (g_cfg is declared further down).
 static void DetectChickenAddon(int warmup_rebuild)
@@ -2124,6 +2131,31 @@ static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *de
     // And what NGX says it supports on this adapter, before the attempt rather than only
     // after a failure -- a machine where init succeeds is the control the failing ones need.
     NgxAskWhy(dev, data_path);
+    // The probe above is the first NGX call of this session, so it is also where the NGX SDK
+    // resolved its implementation. With OptiScaler loaded, its answer says which one it got.
+    if (g_opti.present)
+    {
+        g_opti.routed = OptiRouted(g_ngx_verdict);
+        if (g_opti.routed)
+        {
+            Log("[feed] NGX calls are routed through %s (%s): the requirements probe carries its fingerprint "
+                "(MinHWArchitecture 0, MinOSVersion %s)", OPTI_LABEL, g_opti.module, OPTI_MIN_OS);
+            // OptiScaler forwards the feature-18 query to the driver core only while its own DLSS
+            // side is alive (nvngx_dlss.dll beside it, an NVIDIA GPU); without that it builds FSR
+            // 2.1.2 in place of DLSS and still reports Success. Measured in the host rig: the
+            // neural pass itself still ran, so this predicts the upscaler, not the pass.
+            if (NVSDK_NGX_FAILED(g_ngx_verdict.nr_query))
+                Warn("OptiScaler refused the feature-18 requirements query (0x%08X %s). It only forwards that to the "
+                     "driver while its DLSS side is up, which needs nvngx_dlss.dll beside %s and an NVIDIA GPU; it "
+                     "then builds FSR 2.1.2 in place of DLSS and still reports Success. OptiScaler.log names the "
+                     "upscaler that ran.", g_ngx_verdict.nr_query, NgxResultName(g_ngx_verdict.nr_query), g_opti.module);
+        }
+        else
+            Warn("%s is loaded but the DRIVER answered the NGX probe -- the NGX SDK in this add-on was not redirected, "
+                 "so OptiScaler sees nothing and its neural pass will not run. OptiScaler.ini: [Inputs] "
+                 "EnableDlssInputs must be true and [Hooks] HookOriginalNvngxOnly false; OptiScaler.log says whether "
+                 "its hooks came up (look for \"nvngx call: ..., returning this dll!\").", g_opti.module);
+    }
 
     NVSDK_NGX_Result r = NVSDK_NGX_Result_Fail;
     for (int i = 0; i < n; ++i)
@@ -2187,6 +2219,103 @@ static bool ContainsNoCase(const char *hay, const char *needle)
     return false;
 }
 
+// OptiScaler DLSS-NR beside this add-on -- the third neural consumer (see feed_opti.h; the host
+// carries the same section, keep the two in step). It is a proxy DLL the GAME imports (winmm.dll,
+// version.dll, ... -- OptiScaler's own setup picks the name), so by the time ReShade loads this
+// add-on it is in the process and its nvngx redirect is armed: nothing is loaded from this side.
+// What this does is name it, tell the DLSS-NR fork from upstream OptiScaler, read the ini keys
+// that decide whether the neural pass can run at all, and refuse to be quiet about a second
+// consumer -- or about a game that has DLSS of its own, which OptiScaler captures whole.
+static void DetectOptiScaler()
+{
+    g_opti = OptiInfo{};
+    g_opti.nr_enabled = g_opti.scan_exposure = g_opti.dlss_inputs = g_opti.hook_original_only = g_opti.overlay_menu = -1;
+    char dir[MAX_PATH];
+    GetModuleFileNameA(g_self, dir, MAX_PATH);
+    if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
+
+    if (!OptiFindModule(&g_opti))
+    {
+        // Not loaded. Is a copy sitting here under a name this game never imports? Then it can
+        // never redirect anything, and the user needs to know that the name is the problem.
+        for (const char *name : kOptiProxyNames)
+        {
+            if (_stricmp(name, "dxgi.dll") == 0) continue;   // that one is ReShade
+            char path[MAX_PATH];
+            sprintf_s(path, "%s%s", dir, name);
+            if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
+            if (!OptiFileHasLiteral(path, OPTI_FORWARDER) && !OptiFileHasLiteral(path, OPTI_INI)) continue;
+            Warn("%s is an OptiScaler build, but this game never loaded a DLL of that name, so it cannot take the "
+                 "NGX calls and no neural pass will run. Rename it to a DLL the game imports (OptiScaler's own "
+                 "setup_windows.bat offers the choices; winmm.dll or version.dll suit most games).", name);
+            return;
+        }
+        Log("[feed] OptiScaler: not present");
+        return;
+    }
+
+    g_opti.present = true;
+    g_opti.nr_fork = OptiFileHasLiteral(g_opti.path, OPTI_FORWARDER);
+    FeedReadFileIdent(g_opti.path, &g_opti.ident);
+    OptiReadIni(&g_opti);
+    char ver[400];
+    FeedFormatFileIdent(g_opti.ident, ver, sizeof(ver));
+    Log("[feed] %s loaded as %s (%s); OptiScaler.ini: [DlssNr] Enabled=%s ScanExposure=%s, [Upscalers] Dx12Upscaler=%s, "
+        "[Inputs] EnableDlssInputs=%s, [Hooks] HookOriginalNvngxOnly=%s",
+        g_opti.nr_fork ? OPTI_LABEL : "OptiScaler (upstream build, no neural pass)", g_opti.module, ver,
+        OptiTri(g_opti.nr_enabled, "auto (= false)"), OptiTri(g_opti.scan_exposure, "auto (= false)"), g_opti.upscaler,
+        OptiTri(g_opti.dlss_inputs, "auto (= true)"), OptiTri(g_opti.hook_original_only, "auto (= false)"));
+
+    if (!g_opti.nr_fork)
+        Warn("this OptiScaler (%s) is not the DLSS-NR fork: it will take the NGX calls and upscale, and no neural pass "
+             "will ever run. Use the Dagherbou/OptiScaler_DLSSNR build, or remove it and use Deep Fried Chicken or "
+             "renodx-dlss5 instead.", g_opti.module);
+    else
+    {
+        Log("[feed] %s is the neural consumer: the NGX calls this add-on makes are answered by it (its LoadLibrary hook "
+            "hands its own module to the NGX SDK), it runs its upscaler on the DLAA contract and then the neural model "
+            "in place on the output. Its menu is on Insert. No warm-up re-create: there is no hook to wait for.",
+            OPTI_LABEL);
+        if (g_opti.nr_enabled != 1)
+        {
+            Warn("[DlssNr] Enabled is %s in OptiScaler.ini -- the neural pass is OFF and OptiScaler only upscales. Turn "
+                 "it on in OptiScaler's menu (Insert), or set Enabled=true in OptiScaler.ini and restart.",
+                 g_opti.nr_enabled == 0 ? "false (user-set)" : "auto (= false)");
+            OptiIniDefault(&g_opti, "DlssNr", "Enabled", "true", "the neural pass is what this add-on exists for",
+                           &Log, "feed");
+        }
+        if (g_opti.scan_exposure != 0)
+            OptiIniDefault(&g_opti, "DlssNr", "ScanExposure", "false",
+                           "this add-on passes AutoExposure and owns no exposure buffer; the scan would only hook "
+                           "resource creation on its device", &Log, "feed");
+        if (g_opti.dlss_inputs == 0 || g_opti.hook_original_only == 1)
+            Warn("OptiScaler.ini has [Inputs] EnableDlssInputs=%s and [Hooks] HookOriginalNvngxOnly=%s -- with these the "
+                 "NGX SDK in this add-on is NOT redirected to OptiScaler and the driver answers instead (plain DLAA, no "
+                 "neural pass). Set EnableDlssInputs=true and HookOriginalNvngxOnly=false.",
+                 OptiTri(g_opti.dlss_inputs, "auto"), OptiTri(g_opti.hook_original_only, "auto"));
+    }
+
+    // One consumer. OptiScaler's redirect catches every nvngx load in the process, Chicken's own
+    // deep-fried-chicken-nvngx.dll and renodx's _nvngx.dll included, and OptiScaler's dlss backend
+    // calls the real core, where their detours would fire a second time.
+    if (g_chicken_present || g_renodx_present || g_toolkit_passes > 0 || g_toolkit_inert)
+        Warn("%s%s%sis ALSO next to this add-on, beside OptiScaler. OptiScaler captures every nvngx load in this "
+             "process, so a second consumer either talks to OptiScaler instead of the driver or runs its neural pass a "
+             "second time on top of OptiScaler's. Keep exactly one: remove the other consumer's files (or the "
+             "OptiScaler set), then fully restart the game.",
+             g_chicken_present ? "Deep Fried Chicken " : "", g_renodx_present ? "renodx-dlss5.addon64 " : "",
+             (g_toolkit_passes > 0 || g_toolkit_inert) ? "alexs-toolkit.addon64 " : "");
+
+    // A game with DLSS of its own is not this project's case, and with OptiScaler in the process
+    // it is a worse one: OptiScaler takes the game's NGX calls as well, and runs its neural pass
+    // on both. Streamline is the one sure sign visible this early; a plain NGX title shows later.
+    if (GetModuleHandleW(L"sl.interposer.dll") != nullptr || GetModuleHandleW(L"sl.dlss.dll") != nullptr)
+        Warn("this game runs NVIDIA Streamline (sl.interposer.dll): it has DLSS of its own. OptiScaler captures every "
+             "NGX call in the process, the game's included, so its neural pass would run on the game's DLSS AND on "
+             "this feed. This project is for games WITHOUT DLSS -- use the game's own DLSS with OptiScaler, and remove "
+             "dlss5-feed.addon64.");
+}
+
 // Called from the __except handlers with the faulting context still intact.
 static void NoteNgxFault(const char *what, EXCEPTION_POINTERS *ep)
 {
@@ -2196,7 +2325,8 @@ static void NoteNgxFault(const char *what, EXCEPTION_POINTERS *ep)
     const DWORD code = ep != nullptr && ep->ExceptionRecord != nullptr ? ep->ExceptionRecord->ExceptionCode : 0;
     Log("[feed] %s raised 0x%08X%s (caught; nothing submitted)", what, code, detail);
     if (stack[0] != '\0') Log("[feed] %s fault stack, by module (innermost first): %s", what, stack);
-    if (ContainsNoCase(stack, g_renodx_file) || ContainsNoCase(stack, DFC_ADDON_FILENAME))
+    if (ContainsNoCase(stack, g_renodx_file) || ContainsNoCase(stack, DFC_ADDON_FILENAME) ||
+        ContainsNoCase(stack, g_opti.module) || ContainsNoCase(stack, OPTI_FORWARDER))
         g_ngx_poisoned = true;
 }
 
@@ -2248,6 +2378,7 @@ static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *
 static bool WarmupRebuildDue(UINT64 n)
 {
     if (g.warmup_done) return false;
+    if (g_opti.routed) return false;   // OptiScaler is the callee: nothing arms late, nothing to re-create for
     if (g_chicken_present)
     {
         if (!g_chicken_created_unarmed) return false;   // Chicken saw the create
@@ -2283,6 +2414,10 @@ static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, D
     const NVSDK_NGX_Result r = EvaluateDLSSGuarded(ep, code);
     QueryPerformanceCounter(&b);
     g_last_eval_ticks = b.QuadPart - a.QuadPart;
+    // The neural pass loads its forwarder and creates feature 18 on the CPU inside the first
+    // evaluate; by the second one the modules are there if they ever will be.
+    if (*code == 0 && NVSDK_NGX_SUCCEED(r) && g_opti.routed && !g_opti_backend.checked && ++g_opti_evals == 2)
+        OptiBackendCheck(&Log, "feed", g_opti.upscaler, &g_opti_backend);
     return r;
 }
 
@@ -7203,6 +7338,28 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                "renodx-dlss5.addon64 is ALSO present -- Chicken stays inert while both are loaded.\n"
                                "Keep dlss5-feed.addon64, remove one neural provider, then fully restart.");
     }
+    if (g_opti.present)
+    {
+        const bool bad = !g_opti.nr_fork || (g.session_ready && !g_opti.routed) ||
+                         (g_opti_backend.checked && !g_opti_backend.nr_created) || g_opti.nr_enabled != 1 ||
+                         g_chicken_present || g_renodx_present;
+        char line[512];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "Neural consumer: %s (%s) -- %s%s%s",
+                    g_opti.nr_fork ? OPTI_LABEL : "OptiScaler WITHOUT the neural-rendering fork (no neural pass)",
+                    g_opti.module,
+                    !g.session_ready ? "session not started yet" : g_opti.routed ? "NGX routed through it"
+                                                                                  : "NOT ROUTED: the driver answered",
+                    !g_opti_backend.checked ? "" : g_opti_backend.nr_created ? "; neural model created"
+                                                   : "; NEURAL MODEL NOT CREATED (OptiScaler.log says why)",
+                    g_opti.nr_enabled == 1 ? "" : "; [DlssNr] Enabled is OFF in OptiScaler.ini");
+        if (bad) ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "%s", line);
+        else     ImGui::TextUnformatted(line);
+        if (g_chicken_present || g_renodx_present)
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
+                               "A second neural consumer is ALSO present -- OptiScaler captures its NGX calls too.\n"
+                               "Keep exactly one (remove the other's files, or the OptiScaler set), then fully restart.");
+        ImGui::TextDisabled("OptiScaler's own menu: Insert (its \"DLSS Neural Rendering\" section is the last one).");
+    }
     if (g_d3dcompiler_stale)
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
                            "d3dcompiler_47.dll is too old for Shader Model 5.1 -- NEURAL RENDERING IS DOING NOTHING.\n"
@@ -7422,6 +7579,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         DetectRenodxAddon();
         DetectToolkitAddon();
         DetectChickenAddon(g_cfg.warmup_rebuild);   // after DetectRenodxAddon: it needs g_renodx_present
+        DetectOptiScaler();                          // after all three: it warns when any of them is beside it
         // Usually too early to see it (the driver injects it around swapchain creation);
         // OnInitEffectRuntime re-checks. Worth one look here for the case where ReShade
         // itself was loaded late.

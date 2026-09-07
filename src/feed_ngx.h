@@ -304,6 +304,11 @@ struct FeedNgxVerdict
     NVSDK_NGX_Result nr_query;       // the feature-18 requirements query itself
     unsigned         nr_bits;        // FeatureSupported for 18, when the query answered
     unsigned         nr_min_arch;    // MinHWArchitecture for 18, when the query answered
+    // The SuperSampling answer's own fields. NVIDIA's core reports the real minimum architecture
+    // (0x160 here); an NGX implementation standing in for it answers differently, and that is how
+    // feed_opti.h tells that the calls were routed to OptiScaler rather than to the driver.
+    unsigned         ss_min_arch;
+    char             ss_min_os[32];
 };
 
 // NGX refused a pure capability question, before any device was involved. Not the GPU and
@@ -385,6 +390,11 @@ static void FeedLogNgxFeatureRequirements(void (*log)(const char *, ...), const 
         {
             out->nr_bits     = static_cast<unsigned>(req.FeatureSupported);
             out->nr_min_arch = req.MinHWArchitecture;
+        }
+        else if (out != nullptr)
+        {
+            out->ss_min_arch = req.MinHWArchitecture;
+            strncpy_s(out->ss_min_os, req.MinOSVersion, _TRUNCATE);
         }
         // Say the hardware verdict in words. The bits above are correct and nobody reads them:
         // a 2080 Ti owner sees "feature 18 create failed 0xBAD00001" and files a bug (#73),

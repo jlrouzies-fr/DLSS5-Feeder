@@ -1148,6 +1148,18 @@ $renoAddon  = Find-FileIn $consumerDir 'renodx-dlss5*.addon64'
 $toolkit    = Find-FileIn $consumerDir 'alexs-toolkit.addon64'
 $dx11Bridge = Find-FileIn $consumerDir 'dlss5-dx11-bridge.addon64'
 
+# OptiScaler, under any of the names it installs as. The DLSS-NR fork (Dagherbou/OptiScaler_DLSSNR)
+# is a supported consumer; stock OptiScaler is not -- it takes the feeder's NGX calls, upscales, and
+# never runs a neural pass. Told apart by the neural forwarder's file name, a literal only the fork has.
+$optiDll  = $null
+$optiFork = $false
+foreach ($n in @('winmm.dll', 'version.dll', 'dbghelp.dll', 'winhttp.dll', 'wininet.dll', 'd3d12.dll', 'OptiScaler.dll', 'OptiScaler.asi')) {
+    $p = Find-FileIn $consumerDir $n
+    if (-not $p) { continue }
+    if (Get-BinaryMarker -Path $p -Pattern 'nvngx\.dll_dlssnr\.dll') { $optiDll = $p; $optiFork = $true; break }
+    if (Get-BinaryMarker -Path $p -Pattern 'OptiScaler\.ini') { $optiDll = $p; break }
+}
+
 if ($gameBits -eq 32) {
     # A 64-bit add-on beside a 32-bit exe is the single most common 32-bit deploy mistake.
     foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5*.addon64', 'alexs-toolkit.addon64')) {
@@ -1158,6 +1170,12 @@ if ($gameBits -eq 32) {
                    -Detail 'This game is 32-bit, so the neural consumer must live in host64\ where the 64-bit helper process loads it. A 64-bit add-on beside an x86 exe is never loaded by anything.' `
                    -Action ('Move ' + $n + ' into ' + $hostDir)
         }
+    }
+    $strayOpti = Find-FileIn $gameDir 'OptiScaler.ini'
+    if ($strayOpti) {
+        Report -Status 'Fail' -Text 'The OptiScaler set is next to the 32-bit game exe -- wrong place.' `
+               -Detail 'OptiScaler is 64-bit. For a 32-bit game it goes into host64\ (OptiScaler.dll renamed winmm.dll beside dlss5-feed-host64.exe), where the DLSS work happens. A 64-bit winmm.dll or version.dll beside a 32-bit exe stops the game from starting at all.' `
+               -Action ('Move OptiScaler.ini, the OptiScaler DLL, nvngx.dll_dlssnr.dll and the OptiScaler\ folder into ' + $hostDir)
     }
     # And the mirror image of it: the feeder's own 64-bit add-on inside host64\. Unlike a
     # stray consumer beside the exe this one does load -- host64\ is a 64-bit ReShade
@@ -1178,10 +1196,96 @@ if ($gameBits -eq 32) {
     }
 }
 
-if ($dfcAddon -and $renoAddon) {
-    Report -Status 'Fail' -Text 'BOTH Deep Fried Chicken and the RenoDX DLSS 5 add-on are present.' `
-           -Detail 'Deep Fried Chicken goes completely inert for the whole process while a RenoDX neural provider is loaded. Everything still looks healthy -- frames are delivered, no errors -- and neural rendering does nothing.' `
-           -Action ('Remove one of them from ' + $consumerDir + ' (keep deep-fried-chicken.addon64 unless you specifically want RenoDX).')
+$consumers = @()
+if ($dfcAddon)  { $consumers += 'Deep Fried Chicken' }
+if ($renoAddon) { $consumers += 'RenoDX DLSS 5' }
+if ($optiDll)   { $consumers += ('OptiScaler (' + [IO.Path]::GetFileName($optiDll) + ')') }
+if ($consumers.Count -ge 2) {
+    if ($optiDll) {
+        $why = 'OptiScaler captures every nvngx load in the process: another consumer beside it either talks to OptiScaler instead of the driver (Chicken''s own deep-fried-chicken-nvngx.dll ends in nvngx.dll) or runs its neural pass a second time inside OptiScaler''s DLSS backend.'
+    }
+    else {
+        $why = 'Deep Fried Chicken goes completely inert for the whole process while a RenoDX neural provider is loaded. Everything still looks healthy -- frames are delivered, no errors -- and neural rendering does nothing.'
+    }
+    Report -Status 'Fail' -Text ('More than one neural consumer is present: ' + ($consumers -join ', ') + '.') `
+           -Detail $why `
+           -Action ('Keep exactly one in ' + $consumerDir + ' and remove or rename the rest.')
+}
+elseif ($optiDll) {
+    $optiName = [IO.Path]::GetFileName($optiDll)
+    if (-not $optiFork) {
+        Report -Status 'Fail' -Text ($optiName + ' is OptiScaler, but NOT the DLSS-NR fork.') `
+               -Detail 'Stock OptiScaler takes the feeder''s NGX calls and upscales, and no neural pass ever runs -- the picture never changes while every log reads healthy.' `
+               -Action 'Use the Dagherbou/OptiScaler_DLSSNR release, or remove OptiScaler and install Deep Fried Chicken.'
+    }
+    else {
+        Report -Status 'Ok' -Text ('OptiScaler DLSS-NR present as ' + $optiName + ' (supported alternative).') `
+               -Detail ('in ' + $consumerWhere + ' -- it answers the feeder''s NGX calls itself, upscales, then runs the neural pass in place. Its menu is on Insert.')
+        if ($gameBits -eq 32 -and $optiName -notmatch '(?i)^(winmm|version)\.dll$') {
+            Report -Status 'Fail' -Text ('host64\' + $optiName + ' is never loaded by the helper.') `
+                   -Detail 'dlss5-feed-host64.exe imports winmm.dll and version.dll at start; under any other name OptiScaler is not in the process when the first NGX call is made, and the driver answers instead.' `
+                   -Action ('Rename ' + $optiName + ' to winmm.dll in ' + $hostDir)
+        }
+        if (Find-FileIn $consumerDir 'nvngx.dll_dlssnr.dll') {
+            Report -Status 'Ok' -Text 'nvngx.dll_dlssnr.dll (the neural forwarder) present.'
+        }
+        else {
+            Report -Status 'Fail' -Text 'nvngx.dll_dlssnr.dll is missing.' `
+                   -Detail 'The neural model refuses any caller whose module path does not contain nvngx.dll; this 100 KB shim from the OptiScaler_DLSSNR zip is what satisfies it. Without it OptiScaler.log says "nvngx.dll_dlssnr.dll not found" and no neural pass runs.' `
+                   -Action ('Extract nvngx.dll_dlssnr.dll from the OptiScaler_DLSSNR zip into ' + $consumerDir)
+        }
+        if (-not (Test-DirHere (Join-Safe $consumerDir 'OptiScaler'))) {
+            Report -Status 'Warn' -Text 'The OptiScaler\ runtime folder is missing.' `
+                   -Detail 'It holds libxess, the FidelityFX runtimes and the Agility SDK. The dlss backend does not need them, but OptiScaler preloads them and logs their absence.'
+        }
+        $optiIni = Join-Safe $consumerDir 'OptiScaler.ini'
+        if (Test-FileHere $optiIni) {
+            $en = Get-IniValue -Path $optiIni -Section 'DlssNr' -Key 'Enabled'
+            if ($en -and $en.Trim() -imatch '^(true|1)$') {
+                Report -Status 'Ok' -Text 'OptiScaler.ini: [DlssNr] Enabled=true.'
+            }
+            else {
+                $shown = if ($en) { $en.Trim() } else { '(absent)' }
+                Report -Status 'Fail' -Text ('OptiScaler.ini: [DlssNr] Enabled=' + $shown + ' -- the neural pass is OFF.') `
+                       -Detail 'auto means false: the fork ships with the pass off. OptiScaler will take the feeder''s calls and only upscale.' `
+                       -Action 'Set Enabled=true under [DlssNr] in OptiScaler.ini (or tick it in OptiScaler''s menu, Insert) and restart.'
+            }
+            $up = Get-IniValue -Path $optiIni -Section 'Upscalers' -Key 'Dx12Upscaler'
+            $upShown = if ($up) { $up.Trim() } else { 'auto' }
+            Report -Status 'Na' -Text ('OptiScaler.ini: [Upscalers] Dx12Upscaler=' + $upShown + ' (dlss keeps the feed''s DLAA; auto picks DLSS on an RTX with nvngx_dlss.dll beside it).')
+            $se = Get-IniValue -Path $optiIni -Section 'DlssNr' -Key 'ScanExposure'
+            if ($se -and $se.Trim() -imatch '^(true|1)$') {
+                Report -Status 'Warn' -Text 'OptiScaler.ini: [DlssNr] ScanExposure=true.' `
+                       -Detail 'The scan hooks resource creation on the feeder''s device looking for an exposure buffer the feed never offers.' `
+                       -Action 'Set ScanExposure=false.'
+            }
+            $di = Get-IniValue -Path $optiIni -Section 'Inputs' -Key 'EnableDlssInputs'
+            $ho = Get-IniValue -Path $optiIni -Section 'Hooks' -Key 'HookOriginalNvngxOnly'
+            if (($di -and $di.Trim() -imatch '^(false|0)$') -or ($ho -and $ho.Trim() -imatch '^(true|1)$')) {
+                Report -Status 'Fail' -Text 'OptiScaler.ini defeats the nvngx redirect.' `
+                       -Detail ('[Inputs] EnableDlssInputs=' + $di + ', [Hooks] HookOriginalNvngxOnly=' + $ho + '. With these the feeder''s NGX calls reach the driver, not OptiScaler, and nothing neural happens.') `
+                       -Action 'Set EnableDlssInputs=true (or auto) and HookOriginalNvngxOnly=false (or auto).'
+            }
+        }
+        else {
+            Report -Status 'Fail' -Text 'OptiScaler.ini is missing beside OptiScaler.' `
+                   -Action ('Extract it from the zip into ' + $consumerDir + ' and set [DlssNr] Enabled=true.')
+        }
+        $dlssDllForSig = Find-FileIn $consumerDir 'nvngx_dlss.dll'
+        if ($dlssDllForSig) {
+            try {
+                $sig = Get-AuthenticodeSignature -LiteralPath $dlssDllForSig -ErrorAction Stop
+                if ($sig.Status -eq 'Valid') {
+                    Report -Status 'Ok' -Text 'nvngx_dlss.dll carries a valid signature (OptiScaler redirects the NGX SDK''s trust check to it).'
+                }
+                else {
+                    Report -Status 'Warn' -Text ('nvngx_dlss.dll signature: ' + $sig.Status + '.') `
+                           -Detail 'OptiScaler points the NGX SDK''s signature check at this file; an unsigned or tampered copy makes the SDK refuse the core ("failed to load NGXCore").'
+                }
+            }
+            catch { }
+        }
+    }
 }
 elseif ($dfcAddon) {
     $dfcVer = Get-BinaryMarker -Path $dfcAddon -Pattern 'Deep Fried Chicken (\d[\w.\-+]*)'
@@ -1217,7 +1321,7 @@ elseif ($renoAddon) {
 }
 else {
     Report -Status 'Fail' -Text 'No neural consumer found.' `
-           -Detail ('Expected deep-fried-chicken.addon64 (recommended) or renodx-dlss5.addon64 in ' + $consumerDir + '. The feeder publishes a synthetic DLSS contract; without a consumer, nothing acts on it.') `
+           -Detail ('Expected deep-fried-chicken.addon64 (recommended), renodx-dlss5.addon64, or the OptiScaler DLSS-NR set (winmm.dll + OptiScaler.ini + nvngx.dll_dlssnr.dll) in ' + $consumerDir + '. The feeder publishes a synthetic DLSS contract; without a consumer, nothing acts on it.') `
            -Action ('Copy deep-fried-chicken.addon64 (+ deep-fried-chicken-nvngx.dll and deep-fried-chicken.cfg) into ' + $consumerDir)
 }
 
@@ -1225,6 +1329,11 @@ if ($toolkit) {
     if ($dfcAddon) {
         Report -Status 'Warn' -Text 'alexs-toolkit.addon64 is present alongside Deep Fried Chicken.' `
                -Detail 'That is a third interposer on the same NGX module. Chicken''s own test notes ask for the toolkit to be removed -- do not combine them.'
+    }
+    elseif ($optiDll) {
+        Report -Status 'Warn' -Text 'alexs-toolkit.addon64 is present alongside OptiScaler.' `
+               -Detail 'The toolkit is a cascade over the RenoDX add-on. With OptiScaler as the consumer there is nothing for it to attach to, and it is one more interposer on the NGX module OptiScaler is redirecting.' `
+               -Action ('Remove alexs-toolkit.addon64 from ' + $consumerDir)
     }
     else {
         Report -Status 'Warn' -Text 'alexs-toolkit.addon64 is present (optional multi-pass cascade).' `
@@ -1511,7 +1620,13 @@ if (-not $anyLog) {
 }
 
 $dfcLog = Find-FileIn $consumerDir 'deep-fried-chicken.log'
-if ($dfcLog) {
+# A log left behind by a consumer that is no longer installed says nothing about this
+# install, and reading it out as [ OK ] is worse than saying nothing: switching consumers
+# leaves the old log in place, so the folder would report two of them working at once.
+if ($dfcLog -and -not $dfcAddon) {
+    Report -Status 'Na' -Text 'deep-fried-chicken.log is here but Deep Fried Chicken is not installed any more -- the log is from an earlier run and is not read.'
+}
+elseif ($dfcLog) {
     $lines = Read-LinesSafe $dfcLog
     if ($null -eq $lines) {
         Report -Status 'Warn' -Text 'deep-fried-chicken.log exists but could not be read.' -Detail $dfcLog
@@ -1546,6 +1661,77 @@ if ($dfcLog) {
 }
 elseif ($dfcAddon) {
     Report -Status 'Na' -Text 'No deep-fried-chicken.log yet -- Chicken has not run here.'
+}
+
+if ($optiDll) {
+    # Two lines in the feeder's own logs decide it: the probe fingerprint ("routed through
+    # OptiScaler") and the module check after the first evaluate ("neural model (feature 18)
+    # loaded"). OptiScaler.log beside the DLL then names the upscaler and the pass.
+    $ownLogs = @()
+    if ($feedLog) { $ownLogs += $feedLog }
+    if ($gameBits -eq 32) {
+        $hl = Find-FileIn $hostDir 'dlss5-feed-host.log'
+        if ($hl) { $ownLogs += $hl }
+    }
+    $routed = $null
+    $notRouted = $null
+    $model = $null
+    foreach ($lp in $ownLogs) {
+        $ls = Read-LinesSafe $lp
+        if ($null -eq $ls) { continue }
+        $r = @($ls | Where-Object { $_ -match 'routed through OptiScaler' }) | Select-Object -Last 1
+        if ($r) { $routed = $r }
+        $nr = @($ls | Where-Object { $_ -match 'DRIVER answered the NGX probe' }) | Select-Object -Last 1
+        if ($nr) { $notRouted = $nr }
+        $m = @($ls | Where-Object { $_ -match 'neural model \(feature 18\) (NOT )?loaded' }) | Select-Object -Last 1
+        if ($m) { $model = $m }
+    }
+    if ($routed) {
+        Report -Status 'Ok' -Text 'The feeder''s NGX calls were routed through OptiScaler (probe fingerprint).'
+    }
+    elseif ($notRouted) {
+        Report -Status 'Fail' -Text 'OptiScaler is loaded but the DRIVER answered the feeder''s NGX probe.' `
+               -Detail 'OptiScaler''s nvngx redirect did not take. See [Inputs] EnableDlssInputs / [Hooks] HookOriginalNvngxOnly above, and OptiScaler.log for "returning this dll!".'
+    }
+    elseif ($ownLogs.Count -gt 0) {
+        Report -Status 'Warn' -Text 'The feeder log has no OptiScaler routing line yet.' `
+               -Detail 'It is written when the NGX session opens. Run the game to gameplay and re-check.'
+    }
+    if ($model) {
+        if ($model -match 'NOT loaded') {
+            Report -Status 'Fail' -Text 'The neural model (feature 18) was never created inside OptiScaler.' `
+                   -Detail (($model -replace '^\s*[\d:.]+\s+', '').Trim()) `
+                   -Action 'OptiScaler.log says why. Check [DlssNr] Enabled=true, and nvngx_dlssnr.dll plus nvngx.dll_dlssnr.dll beside OptiScaler.'
+        }
+        else {
+            Report -Status 'Ok' -Text 'The neural model (feature 18) was created inside OptiScaler.'
+        }
+    }
+    $optiLog = Find-FileIn (Split-Path -Parent $optiDll) 'OptiScaler.log'
+    if ($optiLog) {
+        $ol = Read-LinesSafe $optiLog
+        if ($null -ne $ol) {
+            $strip = '^\[[^\]]*\]\s*\[\w\]\s*'
+            $run  = @($ol | Where-Object { $_ -match 'DLSS-NR running at' }) | Select-Object -Last 1
+            $bad  = @($ol | Where-Object { $_ -match 'DLSS-NR create failed|nvngx\.dll_dlssnr\.dll not found|DLSS-NR did not run|DLSS-NR unavailable' }) | Select-Object -Last 1
+            $noDl = @($ol | Where-Object { $_ -match 'nvngx_dlss\.dll not found, disabling DLSS' }) | Select-Object -Last 1
+            $ups  = @($ol | Where-Object { $_ -match 'Creating \S+ upscaler feature|Creating XeSS|Creating FSR' }) | Select-Object -Last 1
+            if ($run)  { Report -Status 'Ok'   -Text ('OptiScaler.log: ' + ($run -replace $strip, '').Trim()) }
+            if ($bad)  { Report -Status 'Fail' -Text ('OptiScaler.log: ' + ($bad -replace $strip, '').Trim()) }
+            if ($noDl) {
+                Report -Status 'Warn' -Text 'OptiScaler.log: nvngx_dlss.dll was not found, so OptiScaler disabled its DLSS side.' `
+                       -Detail 'It builds FSR 2.1.2 in place of DLSS and still reports success. Put nvngx_dlss.dll beside OptiScaler.'
+            }
+            if ($ups)  { Report -Status 'Na'   -Text ('OptiScaler.log: ' + ($ups -replace $strip, '').Trim()) }
+            if (-not $run -and -not $bad) {
+                Report -Status 'Warn' -Text 'OptiScaler.log has no DLSS-NR line yet.' `
+                       -Detail 'The pass logs "DLSS-NR running at WxH" on its first frame. Run the game to gameplay and re-check; the log tail can also be cut short when the helper exits.'
+            }
+        }
+    }
+    else {
+        Report -Status 'Na' -Text 'No OptiScaler.log yet beside OptiScaler ([Log] LogToFile=true writes one).'
+    }
 }
 
 # ---------------------------------------------------------------------------------------

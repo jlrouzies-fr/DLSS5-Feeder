@@ -57,6 +57,7 @@
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 #include "feed_d3d10.h"     // D3D10.1 <-> D3D11 keyed-mutex bridge + the private relay device
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
+#include "feed_opti.h"      // OptiScaler DLSS-NR: only the file scan and the ini reader are used here (it lives in host64 too)
 
 #define FEED_VERSION "0.14.0-beta.5"
 
@@ -2000,6 +2001,89 @@ static void DetectChickenHost()
     if (GetFileAttributesA(stray) != INVALID_FILE_ATTRIBUTES)
         Warn("deep-fried-chicken.addon64 is next to the 32-bit game exe, where a 32-bit process cannot load it. "
              "It belongs in host64\\ (it is already there too). Remove the copy next to the game.");
+}
+
+// OptiScaler DLSS-NR in host64\ -- the third neural consumer on the split path (see feed_opti.h).
+// It is a 64-bit proxy DLL the HOST imports (winmm.dll or version.dll), so it lives in host64\
+// like Chicken does, and the host does the detecting and the two fingerprints. This side only
+// needs to know it is there so the overlay stops mirroring RenoDX's keys, shows the [DlssNr]
+// headline keys read-only from host64\OptiScaler.ini, and points at OptiScaler's own menu
+// (Insert, in the host window -- reachable through the in-game cast).
+static bool   g_opti_host            = false;
+static bool   g_opti_host_nr         = false;   // the DLSS-NR fork, not upstream OptiScaler
+static char   g_opti_host_module[64] = "";
+static char   g_opti_ini_path[MAX_PATH];
+static UINT64 g_opti_ini_read_at     = 0;
+static char   g_opti_enabled[16], g_opti_preset[16], g_opti_style[16], g_opti_intensity[16],
+              g_opti_scale[16], g_opti_passes[16], g_opti_upscaler[32];
+
+static void DetectOptiHost()
+{
+    char dir[MAX_PATH];
+    GetModuleFileNameA(g_self, dir, MAX_PATH);
+    if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
+    char h64[MAX_PATH];
+    sprintf_s(h64, "%shost64\\", dir);
+    sprintf_s(g_opti_ini_path, "%s" OPTI_INI, h64);
+
+    for (const char *name : kOptiProxyNames)
+    {
+        if (_stricmp(name, "dxgi.dll") == 0) continue;   // host64\dxgi.dll is ReShade x64
+        char path[MAX_PATH];
+        sprintf_s(path, "%s%s", h64, name);
+        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
+        const bool fork = OptiFileHasLiteral(path, OPTI_FORWARDER);
+        if (!fork && !OptiFileHasLiteral(path, OPTI_INI)) continue;
+        g_opti_host        = true;
+        g_opti_host_nr     = fork;
+        strcpy_s(g_opti_host_module, name);
+        break;
+    }
+
+    // The whole set beside the 32-bit game exe instead: a 32-bit process cannot load any of it.
+    char stray[MAX_PATH];
+    sprintf_s(stray, "%s" OPTI_INI, dir);
+    if (GetFileAttributesA(stray) != INVALID_FILE_ATTRIBUTES)
+        Warn("OptiScaler.ini is next to the 32-bit game exe. OptiScaler is 64-bit and belongs in host64\\ (beside "
+             "dlss5-feed-host64.exe, renamed winmm.dll), where the DLSS work happens. A 32-bit game cannot load it, "
+             "and a 64-bit winmm.dll or version.dll beside a 32-bit exe stops the game from starting at all.");
+
+    if (!g_opti_host) { Log("[feed32] OptiScaler: not present in host64\\"); return; }
+    if (!g_opti_host_nr)
+        Warn("host64\\%s is OptiScaler, but not the DLSS-NR fork: the host's NGX calls go to it, it upscales, and no "
+             "neural pass ever runs. Use the Dagherbou/OptiScaler_DLSSNR build.", g_opti_host_module);
+    else
+        Log("[feed32] %s: present in host64\\ as %s -- it is the neural consumer; the host's NGX calls are answered by "
+            "it, and its menu is on Insert in the host window (through the in-game cast, or with host_window=1)",
+            OPTI_LABEL, g_opti_host_module);
+
+    // One consumer, and this side can at least see the files. The host says the rest.
+    char reno[MAX_PATH];
+    sprintf_s(reno, "%srenodx-dlss5*.addon64", h64);
+    WIN32_FIND_DATAA fd;
+    HANDLE f = FindFirstFileA(reno, &fd);
+    const bool renodx = f != INVALID_HANDLE_VALUE;
+    if (renodx) FindClose(f);
+    if (g_chicken_host || renodx)
+        Warn("host64\\ holds OptiScaler AND another neural consumer (%s). OptiScaler captures every NGX call in the "
+             "host, so the second one either talks to OptiScaler or runs its neural pass a second time. Keep exactly "
+             "one and restart the game.", g_chicken_host ? "Deep Fried Chicken" : "renodx-dlss5.addon64");
+}
+
+// Re-read the [DlssNr] headline keys at most every 2 s while the overlay is open. Raw strings:
+// "auto" means OptiScaler's compiled default, and that word is more honest than a guess.
+static void OptiHostCfgRefresh()
+{
+    const UINT64 now = GetTickCount64();
+    if (now - g_opti_ini_read_at < 2000) return;
+    g_opti_ini_read_at = now;
+    GetPrivateProfileStringA("DlssNr",    "Enabled",      "?", g_opti_enabled,   sizeof(g_opti_enabled),   g_opti_ini_path);
+    GetPrivateProfileStringA("DlssNr",    "Preset",       "?", g_opti_preset,    sizeof(g_opti_preset),    g_opti_ini_path);
+    GetPrivateProfileStringA("DlssNr",    "Style",        "?", g_opti_style,     sizeof(g_opti_style),     g_opti_ini_path);
+    GetPrivateProfileStringA("DlssNr",    "Intensity",    "?", g_opti_intensity, sizeof(g_opti_intensity), g_opti_ini_path);
+    GetPrivateProfileStringA("DlssNr",    "WorkingScale", "?", g_opti_scale,     sizeof(g_opti_scale),     g_opti_ini_path);
+    GetPrivateProfileStringA("DlssNr",    "Passes",       "?", g_opti_passes,    sizeof(g_opti_passes),    g_opti_ini_path);
+    GetPrivateProfileStringA("Upscalers", "Dx12Upscaler", "?", g_opti_upscaler,  sizeof(g_opti_upscaler),  g_opti_ini_path);
 }
 
 // dlss5-feed.addon64 in host64\ -- the one wrong file that looks right.
@@ -5179,6 +5263,16 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     ImGui::Text("Host process: %s", HostAlive() ? "running" : "not running");
     if (g_chicken_host)
         ImGui::Text("Neural consumer: Deep Fried Chicken %s (in host64\\)", g_chicken_host_ver);
+    if (g_opti_host)
+    {
+        if (g_opti_host_nr && !g_chicken_host)
+            ImGui::Text("Neural consumer: %s (host64\\%s)", OPTI_LABEL, g_opti_host_module);
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "Neural consumer: %s (host64\\%s)%s",
+                               g_opti_host_nr ? OPTI_LABEL : "OptiScaler WITHOUT the neural-rendering fork -- no neural pass",
+                               g_opti_host_module,
+                               g_chicken_host ? " -- Deep Fried Chicken is ALSO in host64\\; keep exactly one" : "");
+    }
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
     ImGui::TextWrapped("Motion vectors: %s", g_mv_status);
     if (g_mv_problem[0])
@@ -5382,7 +5476,28 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         if (ImGui::SliderInt("Log first N frames", &g_cfg.log_frames, 0, 20)) dirty = true;
     }
 
-    if (g_chicken_host)
+    if (g_opti_host)
+    {
+        // OptiScaler reads OptiScaler.ini, not [RenoDX.DLSS5]; mirroring that panel here would be a lie.
+        ImGui::Separator();
+        ImGui::TextUnformatted("OptiScaler DLSS-NR settings (on the host)");
+        ImGui::TextWrapped("OptiScaler has its own menu with every neural-rendering control (preset, style, intensity, "
+                           "local structure and tone, colour, white point, working scale, passes, captures). It opens "
+                           "with Insert in the host window: press \"Show the DLSS 5 panel in-game\" above and then "
+                           "Insert, or run with host_window=1. Its settings live in host64\\OptiScaler.ini; the "
+                           "headline ones are shown here read-only.");
+        OptiHostCfgRefresh();
+        ImGui::Text("Current (host64\\OptiScaler.ini): Enabled=%s  Preset=%s  Style=%s  Intensity=%s  WorkingScale=%s  "
+                    "Passes=%s  Dx12Upscaler=%s",
+                    g_opti_enabled, g_opti_preset, g_opti_style, g_opti_intensity, g_opti_scale, g_opti_passes,
+                    g_opti_upscaler);
+        if (_stricmp(g_opti_enabled, "true") != 0 && strcmp(g_opti_enabled, "1") != 0)
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f),
+                               "[DlssNr] Enabled is %s: the neural pass is OFF and OptiScaler only upscales. Turn it on in "
+                               "its menu (Insert), or set Enabled=true in host64\\OptiScaler.ini and restart the game.",
+                               g_opti_enabled);
+    }
+    else if (g_chicken_host)
     {
         // Chicken does not read [RenoDX.DLSS5]; mirroring that panel here would be a lie.
         ImGui::Separator();
@@ -5579,6 +5694,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
                 "the Vulkan interop hook is not installed. The add-on stays registered so the overlay's "
                 "Enabled checkbox can undo this; nothing else runs.");
         DetectChickenHost();
+        DetectOptiHost();       // after DetectChickenHost: it warns when both are in host64
         DetectStrayHostAddon();
 
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);

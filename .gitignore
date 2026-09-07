@@ -13,6 +13,9 @@ external/ngx/*.lib
 external/ngx/libs/
 # Upstream bridge sources are not re-hosted; see README credits
 external/bridge-1.0.19/
+# The OptiScaler DLSS-NR fork is a checkout of a third-party repository, kept here to read
+# and to build the consumer package from; it has its own history and is not re-hosted.
+external/OptiScaler_DLSSNR/
 release/
 deploy/
 spike/*.exe

@@ -46,9 +46,11 @@
     D3D8 (both via dgVoodoo2). Default: Auto.
 
 .PARAMETER Consumer
-    Which neural consumer does the DLSS 5 work: DFC (Deep Fried Chicken) or RenoDX (Krish's
-    renodx-dlss5 add-on). Both are downloaded automatically. Omitted, the script asks at the
-    start; with -Yes and no choice given it takes Deep Fried Chicken.
+    Which neural consumer does the DLSS 5 work: DFC (Deep Fried Chicken), RenoDX (Krish's
+    renodx-dlss5 add-on) or OptiScaler (the OptiScaler_DLSSNR fork, installed as winmm.dll
+    beside ReShade and set up to run its neural pass on the feed). All three are downloaded
+    automatically. Omitted, the script asks at the start; with -Yes and no choice given it
+    takes Deep Fried Chicken.
 
 .PARAMETER MvProvider
     DLSS5_MV_PROVIDER value: 3 (LumeniteFX Kernel, default) or 4 (LumeniteFX QuantMotion).
@@ -61,10 +63,10 @@
     A folder holding any of the pieces you already have; each is used instead of a
     download when found there (matched by name): DLSS5-Feeder-*.zip,
     ReShade_Setup_*_Addon.exe, Deep-Fried-Chicken*.zip, nvngx_dlssnr.dll, nvngx_dlss.dll,
-    renodx-dlss5*.addon64, LumeniteFX*.zip, dgVoodoo2_*.zip, ReShade.fxh, ReShadeUI.fxh,
-    DrawText.fxh.
+    renodx-dlss5*.addon64, OptiScaler-DLSSNR*.zip, LumeniteFX*.zip, dgVoodoo2_*.zip,
+    ReShade.fxh, ReShadeUI.fxh, DrawText.fxh.
 
-.PARAMETER FeederZip, DfcZip, DlssNrDll, DlssDll, RenoDxAddon, ReShadeSetup, LumeniteZip, DgVoodooZip
+.PARAMETER FeederZip, DfcZip, DlssNrDll, DlssDll, RenoDxAddon, OptiScalerZip, ReShadeSetup, LumeniteZip, DgVoodooZip
     Explicit path or URL for one piece, overriding both -LocalFiles and the defaults.
 
 .PARAMETER Prerelease
@@ -114,7 +116,7 @@ param(
     [ValidateSet('Auto', 'D3D', 'Vulkan', 'OpenGL', 'D3D9', 'D3D8')]
     [string] $Api = 'Auto',
 
-    [ValidateSet('Ask', 'DFC', 'RenoDX')]
+    [ValidateSet('Ask', 'DFC', 'RenoDX', 'OptiScaler')]
     [string] $Consumer = 'Ask',
 
     [ValidateSet(3, 4)]
@@ -128,6 +130,7 @@ param(
     [string] $DlssNrDll,
     [string] $DlssDll,
     [string] $RenoDxAddon,
+    [string] $OptiScalerZip,
     [string] $ReShadeSetup,
     [string] $LumeniteZip,
     [string] $DgVoodooZip,
@@ -165,6 +168,8 @@ $Sources = @{
     DlssNr          = 'https://cdn.discordapp.com/attachments/1543976771920330884/1543982044797866107/nvngx_dlssnr.dll?ex=6a9a2495&is=6a98d315&hm=a0a12bd2e4d7ae4c7e915a21e1570c594af0e2cf2e15195d9dbf8a693f45ca99&'
     Dlss            = 'https://cdn.discordapp.com/attachments/1543348014691651676/1544918856697643089/nvngx_dlss.dll?ex=6a9a414e&is=6a98efce&hm=17a6973ef6de0d211b7b3fe00362d851685156e73aab3e38670e00563332b22a&'
     RenoDxDlss5     = 'https://cdn.discordapp.com/attachments/1542647972695904317/1544338777399365762/renodx-dlss5.addon64?ex=6a9a1f50&is=6a98cdd0&hm=2a695add57b27c6d7fd1ad2a70e2d3c4f49586a3d5c30f84cc33be3513d41de8&'
+    OptiScalerReleases = 'https://api.github.com/repos/Dagherbou/OptiScaler_DLSSNR/releases'
+    OptiScalerHome     = 'https://github.com/Dagherbou/OptiScaler_DLSSNR/releases'
     DfcDiscord      = 'https://discord.gg/g2v2XGqvR'
     RenoDxDiscord   = 'https://discord.com/invite/renodx'
 }
@@ -773,6 +778,93 @@ function New-WebClient
     return $wc
 }
 
+# The DLL names in a PE's import directory, lowercased. $null when the file is not a readable PE;
+# an empty array when it imports nothing. Used to pick the name OptiScaler is renamed to: the
+# process has to import that name at start, or OptiScaler is never in it.
+function Get-PeImportNames
+{
+    param([string] $Path, [int] $Max = 512)
+    if (-not (Test-FileHere $Path)) { return $null }
+
+    $fs = $null
+    $br = $null
+    try {
+        $fs = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        if ($fs.Length -lt 0x40) { return $null }
+        $br = New-Object IO.BinaryReader($fs)
+
+        if ($br.ReadUInt16() -ne 0x5A4D) { return $null }            # 'MZ'
+        $fs.Position = 0x3C
+        $peOff = $br.ReadInt32()
+        if ($peOff -le 0 -or ($peOff + 24) -ge $fs.Length) { return $null }
+
+        $fs.Position = $peOff
+        if ($br.ReadUInt32() -ne 0x00004550) { return $null }        # 'PE\0\0'
+        $null      = $br.ReadUInt16()                                # Machine
+        $nSections = $br.ReadUInt16()
+        $null      = $br.ReadUInt32()                                # TimeDateStamp
+        $null      = $br.ReadUInt32()                                # PointerToSymbolTable
+        $null      = $br.ReadUInt32()                                # NumberOfSymbols
+        $optSize   = $br.ReadUInt16()
+        $null      = $br.ReadUInt16()                                # Characteristics
+
+        $optOff = [long]$peOff + 24
+        if ($optSize -lt 96 -or ($optOff + $optSize) -gt $fs.Length) { return $null }
+        $fs.Position = $optOff
+        $magic = $br.ReadUInt16()
+        if     ($magic -eq 0x20B) { $dirOff = $optOff + 112 }
+        elseif ($magic -eq 0x10B) { $dirOff = $optOff + 96 }
+        else                      { return $null }
+        if (($dirOff + 16) -gt $fs.Length) { return $null }
+        $fs.Position = $dirOff + 8                                   # DataDirectory[1] = imports
+        $impRva = $br.ReadUInt32()
+        if ($impRva -eq 0) { return ,([string[]] @()) }
+
+        $secOff = $optOff + $optSize
+        $sections = @()
+        for ($i = 0; $i -lt $nSections; $i++) {
+            $p = $secOff + ([long]$i * 40)
+            if (($p + 40) -gt $fs.Length) { break }
+            $fs.Position = $p + 8
+            $vsize = $br.ReadUInt32()
+            $vaddr = $br.ReadUInt32()
+            $rsize = $br.ReadUInt32()
+            $raw   = $br.ReadUInt32()
+            $span  = if ($vsize -gt 0) { $vsize } else { $rsize }
+            $sections += New-Object psobject -Property @{ V = $vaddr; Span = $span; Raw = $raw }
+        }
+        if ($sections.Count -eq 0) { return $null }
+
+        $io = Convert-RvaToOffset $sections $impRva $fs.Length
+        if ($io -lt 0) { return $null }
+
+        $names = New-Object 'System.Collections.Generic.List[string]'
+        for ($i = 0; $i -lt $Max; $i++) {
+            $p = $io + ([long]$i * 20)                               # IMAGE_IMPORT_DESCRIPTOR
+            if (($p + 20) -gt $fs.Length) { break }
+            $fs.Position = $p + 12                                   # Name RVA
+            $nameRva = $br.ReadUInt32()
+            if ($nameRva -eq 0) { break }
+            $no = Convert-RvaToOffset $sections $nameRva $fs.Length
+            if ($no -lt 0) { continue }
+            $fs.Position = $no
+            $sb = New-Object Text.StringBuilder
+            for ($k = 0; $k -lt 256; $k++) {
+                $b = $fs.ReadByte()
+                if ($b -le 0) { break }
+                $null = $sb.Append([char]$b)
+            }
+            if ($sb.Length -gt 0) { $null = $names.Add($sb.ToString().ToLowerInvariant()) }
+        }
+        return ,([string[]] $names.ToArray())
+    }
+    catch { return $null }
+    finally {
+        if ($br) { try { $br.Close() } catch { } }
+        if ($fs) { try { $fs.Dispose() } catch { } }
+    }
+}
+
 function Get-WebString
 {
     param([string] $Url)
@@ -1250,17 +1342,21 @@ if ($Consumer -eq 'Ask') {
         Write-Chunk 'recommended; negotiates with the feeder over its own interop ABI' 'DarkGray'
         Write-Chunk '   2. RenoDX DLSS 5       ' 'Gray' -NoNewline
         Write-Chunk 'Krish''s renodx-dlss5 add-on' 'DarkGray'
-        Write-Chunk '  Exactly one of them may be installed: each goes inert, or misbehaves, beside the other.' 'DarkGray'
-        Write-Chunk '  Which one? [1/2, Enter for 1] ' 'Cyan' -NoNewline
+        Write-Chunk '   3. OptiScaler DLSS-NR  ' 'Gray' -NoNewline
+        Write-Chunk 'the OptiScaler_DLSSNR fork: it takes the feed''s DLSS call, upscales, then runs the neural pass (menu on Insert)' 'DarkGray'
+        Write-Chunk '  Exactly one of them may be installed: each goes inert, or misbehaves, beside the others.' 'DarkGray'
+        Write-Chunk '  Which one? [1/2/3, Enter for 1] ' 'Cyan' -NoNewline
         try { $a = Read-Host } catch { $a = '' }
         switch ($a.Trim()) {
-            '2'      { $Consumer = 'RenoDX' }
-            'renodx' { $Consumer = 'RenoDX' }
-            default  { $Consumer = 'DFC' }
+            '2'          { $Consumer = 'RenoDX' }
+            'renodx'     { $Consumer = 'RenoDX' }
+            '3'          { $Consumer = 'OptiScaler' }
+            'optiscaler' { $Consumer = 'OptiScaler' }
+            default      { $Consumer = 'DFC' }
         }
     }
 }
-$consumerLabel = if ($Consumer -eq 'DFC') { 'Deep Fried Chicken' } else { 'RenoDX DLSS 5' }
+$consumerLabel = switch ($Consumer) { 'DFC' { 'Deep Fried Chicken' } 'RenoDX' { 'RenoDX DLSS 5' } default { 'OptiScaler DLSS-NR' } }
 Write-Chunk '  Neural  ' 'DarkGray' -NoNewline
 Write-Host $consumerLabel
 if ($LocalFiles) {
@@ -1597,6 +1693,7 @@ $lumenitePath = Resolve-Piece -Label 'LumeniteFX' -Explicit $LumeniteZip -LocalP
 # 3e. Consumer
 $dfcPath = $null
 $renoPath = $null
+$optiPath = $null
 if ($Consumer -eq 'DFC') {
     $dfcPath = Resolve-Piece -Label 'Deep Fried Chicken' -Explicit $DfcZip -LocalPattern 'Deep-Fried-Chicken*.zip' -DefaultUrl $Sources.Dfc -CacheName 'Deep-Fried-Chicken.zip'
     if (-not $dfcPath -and -not $DfcZip) {
@@ -1613,12 +1710,52 @@ if ($Consumer -eq 'DFC') {
                -Detail ('Get the zip from its Discord (' + $Sources.DfcDiscord + ') and pass it with -DfcZip, or drop it in -LocalFiles.')
     }
 }
-else {
+elseif ($Consumer -eq 'RenoDX') {
     $renoPath = Resolve-Piece -Label 'RenoDX DLSS 5 add-on' -Explicit $RenoDxAddon -LocalPattern 'renodx-dlss5*.addon64' `
                               -DefaultUrl $Sources.RenoDxDlss5 -CacheName 'renodx-dlss5.addon64'
     if (-not $renoPath) {
         Report -Status 'Fail' -Text 'renodx-dlss5.addon64 is not available.' `
                -Detail ('Get it from the RenoDX Discord (' + $Sources.RenoDxDiscord + ') or the RHI installer, and pass it with -RenoDxAddon or via -LocalFiles.')
+    }
+}
+else {
+    # OptiScaler_DLSSNR ships as a GitHub release (about 130 MB; nvngx_dlssnr.dll is not in it).
+    # Newest asset, the way the feeder's own release is found above; offline, the newest cached copy.
+    if ($OptiScalerZip) {
+        $optiPath = Resolve-Piece -Label 'OptiScaler DLSS-NR' -Explicit $OptiScalerZip -CacheName 'OptiScaler-DLSSNR-explicit.zip'
+    }
+    else {
+        if ($LocalFiles) {
+            $hit = Get-ChildItem -LiteralPath $LocalFiles -File -Filter 'OptiScaler-DLSSNR*.zip' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($hit) { $optiPath = $hit.FullName; Report -Status 'Ok' -Text ('OptiScaler DLSS-NR: using ' + $optiPath) }
+        }
+        if (-not $optiPath) {
+            $relJson = Get-WebString ($Sources.OptiScalerReleases + '/latest')
+            $assetUrl = $null
+            $assetName = $null
+            if ($relJson) {
+                try {
+                    $rel = $relJson | ConvertFrom-Json
+                    foreach ($a in @($rel.assets)) {
+                        if ($a.name -match '(?i)^OptiScaler-DLSSNR-.*\.zip$') { $assetUrl = $a.browser_download_url; $assetName = $a.name; break }
+                    }
+                    if ($assetUrl) { Report -Status 'Info' -Text ('OptiScaler DLSS-NR latest release: ' + $rel.tag_name + ' (' + $assetName + ')') }
+                }
+                catch { }
+            }
+            if ($assetUrl) {
+                $dest = Join-Safe $script:Cache $assetName
+                if (Get-Download -Url $assetUrl -Dest $dest -Label 'OptiScaler DLSS-NR') { $optiPath = $dest }
+            }
+            else {
+                $hit = Get-ChildItem -LiteralPath $script:Cache -File -Filter 'OptiScaler-DLSSNR*.zip' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                if ($hit) { $optiPath = $hit.FullName; Report -Status 'Warn' -Text ('GitHub unreachable; using the cached OptiScaler release ' + $hit.Name) }
+            }
+        }
+    }
+    if (-not $optiPath) {
+        Report -Status 'Fail' -Text 'OptiScaler DLSS-NR is not available.' `
+               -Detail ('Download OptiScaler-DLSSNR-<version>.zip from ' + $Sources.OptiScalerHome + ' and pass it with -OptiScalerZip, or drop it in -LocalFiles.')
     }
 }
 
@@ -2083,8 +2220,24 @@ function Disable-Conflict
     else { Report -Status 'Warn' -Text ($n + ' left in place.') -Detail $Why -Manual ('Remove ' + $Path + ' before playing.') }
 }
 
+# OptiScaler under any of the names it installs as (dxgi.dll excluded: that is ReShade). It captures
+# every nvngx load in the process, so beside another consumer it either takes that consumer's calls
+# or doubles the neural pass -- and beside a 32-bit exe a 64-bit winmm.dll stops the game starting.
+$OptiProxyNames = @('winmm.dll', 'version.dll', 'dbghelp.dll', 'winhttp.dll', 'wininet.dll', 'd3d12.dll', 'OptiScaler.dll', 'OptiScaler.asi')
+function Find-OptiScalerDll
+{
+    param([string] $Dir)
+    foreach ($n in $OptiProxyNames) {
+        $p = Find-FileIn $Dir $n
+        if (-not $p) { continue }
+        if ((Get-BinaryMarker -Path $p -Pattern 'nvngx\.dll_dlssnr\.dll') -or (Get-BinaryMarker -Path $p -Pattern 'OptiScaler\.ini')) { return $p }
+    }
+    return $null
+}
+
 Disable-Conflict -Path (Find-FileIn $consumerDir 'dlss5-dx11-bridge.addon64') -Why 'the DX11 bridge must never be combined with DLSS5-Feeder'
 if ($is32) {
+    Disable-Conflict -Path (Find-OptiScalerDll $gameDir) -Why 'a 64-bit OptiScaler beside a 32-bit exe stops the game from starting; for a 32-bit game it belongs in host64\'
     foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5*.addon64', 'alexs-toolkit.addon64')) {
         foreach ($f in (Find-FilesIn $gameDir $n)) {
             Disable-Conflict -Path $f.FullName -Why 'a 64-bit add-on beside a 32-bit exe is never loaded; the consumer belongs in host64\'
@@ -2104,6 +2257,7 @@ if ($Consumer -eq 'DFC') {
         Disable-Conflict -Path $f.FullName -Why 'Deep Fried Chicken stays inert while a RenoDX neural provider is loaded'
     }
     Disable-Conflict -Path (Find-FileIn $consumerDir 'alexs-toolkit.addon64') -Why 'a third interposer on the same NGX module; Chicken''s docs ask for it to be removed'
+    Disable-Conflict -Path (Find-OptiScalerDll $consumerDir) -Why 'OptiScaler captures every nvngx load in the process; beside Chicken it takes Chicken''s own calls or doubles the neural pass'
 
     if ($dfcPath) {
         $dfcFiles = @('deep-fried-chicken.addon64', 'deep-fried-chicken-nvngx.dll', 'deep-fried-chicken.cfg')
@@ -2178,9 +2332,10 @@ if ($Consumer -eq 'DFC') {
         }
     }
 }
-else {
+elseif ($Consumer -eq 'RenoDX') {
     Disable-Conflict -Path (Find-FileIn $consumerDir 'deep-fried-chicken.addon64') -Why 'exactly one neural consumer: you chose RenoDX'
     Disable-Conflict -Path (Find-FileIn $consumerDir 'deep-fried-chicken-nvngx.dll') -Why 'Chicken''s private NGX bridge has no business beside the RenoDX add-on'
+    Disable-Conflict -Path (Find-OptiScalerDll $consumerDir) -Why 'OptiScaler captures every nvngx load in the process; beside the RenoDX add-on it takes its calls or doubles the neural pass'
 
     if ($renoPath) {
         $to = Join-Safe $consumerDir 'renodx-dlss5.addon64'
@@ -2225,6 +2380,103 @@ else {
             }
             if (-not (Request-DefenderExclusion -Paths @($gameDir, $script:Cache) -Because $why)) { break }
             Report -Status 'Info' -Text 'Retrying the RenoDX add-on copy.'
+        }
+    }
+}
+else {
+    Disable-Conflict -Path (Find-FileIn $consumerDir 'deep-fried-chicken.addon64') -Why 'exactly one neural consumer: you chose OptiScaler, and it captures Chicken''s own nvngx loads'
+    Disable-Conflict -Path (Find-FileIn $consumerDir 'deep-fried-chicken-nvngx.dll') -Why 'Chicken''s private NGX bridge ends in nvngx.dll, and OptiScaler''s hook would hand it OptiScaler'
+    foreach ($f in (Find-FilesIn $consumerDir 'renodx-dlss5*.addon64')) {
+        Disable-Conflict -Path $f.FullName -Why 'exactly one neural consumer: you chose OptiScaler'
+    }
+    Disable-Conflict -Path (Find-FileIn $consumerDir 'alexs-toolkit.addon64') -Why 'a cascade over the RenoDX add-on; with OptiScaler there is nothing for it to attach to'
+
+    if ($optiPath) {
+        # The name OptiScaler is renamed to has to be one the process imports at start, and free.
+        # The 64-bit helper imports winmm.dll and version.dll; a game imports what it imports.
+        $optiName = $null
+        if ($is32) { $imports = @('winmm.dll', 'version.dll') }
+        else {
+            $imports = Get-PeImportNames $exePath
+            if ($null -eq $imports) { $imports = @() } else { $imports = @($imports) }
+        }
+        $candidates = @('winmm.dll', 'version.dll', 'dbghelp.dll', 'winhttp.dll', 'wininet.dll')
+        foreach ($n in $candidates) {
+            $existing = Find-FileIn $consumerDir $n
+            if ($existing -and -not (Get-BinaryMarker -Path $existing -Pattern 'OptiScaler\.ini')) { continue }   # taken by something else
+            if ($imports.Count -gt 0 -and -not ($imports -contains $n)) { continue }
+            $optiName = $n
+            break
+        }
+        if (-not $optiName) {
+            Report -Status 'Fail' -Text 'No DLL name for OptiScaler could be chosen.' `
+                   -Detail ('The process must import the name OptiScaler is renamed to, and that name must be free. Imports read from the exe: ' + $(if ($imports.Count -gt 0) { $imports -join ', ' } else { 'none' })) `
+                   -Action ('Pick a name by hand: rename OptiScaler.dll in ' + $consumerDir + ' to a DLL the game loads (OptiScaler''s own setup_windows.bat lists the choices; never dxgi.dll, which is ReShade).')
+        }
+        else {
+            if ($imports.Count -eq 0 -and -not $is32) { Report -Status 'Info' -Text ('Could not read the game''s imports; OptiScaler goes in as ' + $optiName + '. If OptiScaler.log never appears, rename it to a DLL the game does load.') }
+            try {
+                $z = Open-Zip $optiPath
+                try {
+                    $entries = @($z.Entries | Where-Object { $_.FullName -notmatch '[\\/]$' -and $_.Length -gt 0 })
+                    if (-not ($entries | Where-Object { $_.FullName -match '(?i)(^|[\\/])OptiScaler\.dll$' })) { throw 'OptiScaler.dll not found in the zip' }
+                    $iniKept = $false
+                    foreach ($e in $entries) {
+                        $rel = $e.FullName -replace '/', '\'
+                        if ($rel -match '(?i)^OptiScaler\.dll$') { $rel = $optiName }
+                        elseif ($rel -match '(?i)^OptiScaler\.ini$') {
+                            # An existing ini holds the user's settings (OptiScaler's menu saves into it).
+                            if ((Test-FileHere (Join-Safe $consumerDir 'OptiScaler.ini')) -and -not $Force) { $iniKept = $true; continue }
+                        }
+                        elseif ($rel -match '(?i)^(setup_windows\.bat|setup_linux\.sh|!! .*)$') { continue }   # OptiScaler's own installer; this script does its job
+                        Expand-ZipEntry -Entry $e -To (Join-Safe $consumerDir $rel)
+                    }
+                }
+                finally { $z.Dispose() }
+                Start-Sleep -Milliseconds 1000
+                $dll = Join-Safe $consumerDir $optiName
+                if (-not (Test-FileHere $dll)) { throw ($optiName + ' vanished right after extraction -- Defender? Check Windows Security > Protection history.') }
+                $t = 'OptiScaler DLSS-NR installed as ' + $optiName
+                if ($iniKept) { $t += ' (existing OptiScaler.ini kept)' }
+                Report -Status 'Done' -Text ($t + '.') -Detail ('in ' + $consumerWhere + '; the neural forwarder nvngx.dll_dlssnr.dll and the OptiScaler\ runtime folder beside it')
+
+                # The keys a bare NGX client needs. [DlssNr] Enabled is off in every release (the fork
+                # refuses to ship it on); the exposure scan hooks resource creation on the feeder's
+                # device for a buffer the feed never offers; the spoofs are for non-NVIDIA GPUs. A key
+                # the user has already set by hand (anything but "auto") is left alone.
+                $ini = Join-Safe $consumerDir 'OptiScaler.ini'
+                if (Test-FileHere $ini) {
+                    $text = [IO.File]::ReadAllText($ini)
+                    $wanted = @(
+                        @('DlssNr', 'Enabled', 'true'), @('DlssNr', 'ScanExposure', 'false'),
+                        @('Upscalers', 'Dx12Upscaler', 'dlss'),
+                        @('Log', 'LogToFile', 'true'), @('Log', 'LogLevel', '2'),
+                        @('Spoofing', 'Dxgi', 'false'), @('Spoofing', 'StreamlineSpoofing', 'false'),
+                        @('Inputs', 'EnableXeSSInputs', 'false'), @('Inputs', 'EnableFsr2Inputs', 'false'),
+                        @('Inputs', 'EnableFsr3Inputs', 'false'), @('Inputs', 'EnableFfxInputs', 'false'),
+                        @('Hotfix', 'CheckForUpdate', 'false'))
+                    $kept = @()
+                    foreach ($kv in $wanted) {
+                        $cur = Get-IniKey -Text $text -Section $kv[0] -Key $kv[1]
+                        if ($null -eq $cur -or $cur.Trim() -ieq 'auto' -or $cur.Trim() -ieq $kv[2]) { $text = Set-IniKey -Text $text -Section $kv[0] -Key $kv[1] -Value $kv[2] }
+                        else { $kept += ('[' + $kv[0] + '] ' + $kv[1] + '=' + $cur.Trim()) }
+                    }
+                    [IO.File]::WriteAllText($ini, $text, (New-Object Text.UTF8Encoding $false))
+                    $null = $script:Changed.Add($ini)
+                    $d = 'Keys you had set by hand are left alone'
+                    if ($kept.Count -gt 0) { $d += ': ' + ($kept -join ', ') }
+                    Report -Status 'Done' -Text 'OptiScaler.ini set up for the feed: [DlssNr] Enabled=true, ScanExposure=false, Dx12Upscaler=dlss, logging on, spoofing off.' -Detail ($d + '.')
+                    if ($kept | Where-Object { $_ -match '(?i)^\[DlssNr\] Enabled=' }) {
+                        Report -Status 'Warn' -Text 'OptiScaler.ini has [DlssNr] Enabled set to something other than true -- the neural pass is off until you turn it on in OptiScaler''s menu (Insert).'
+                    }
+                }
+                else {
+                    Report -Status 'Warn' -Text 'OptiScaler.ini is missing after the extraction.' -Action 'Extract OptiScaler.ini from the zip and set Enabled=true under [DlssNr].'
+                }
+            }
+            catch {
+                Report -Status 'Fail' -Text 'OptiScaler DLSS-NR could not be installed.' -Detail $_.Exception.Message
+            }
         }
     }
 }
@@ -2455,8 +2707,13 @@ if ($Consumer -eq 'DFC') {
     else { $steps += 'Turn on neural rendering in the Deep Fried Chicken tab of the overlay.' }
     $steps += 'On its first armed run Chicken registers itself for early load in ReShade.ini and asks for one more full restart. Do that restart.'
 }
-else {
+elseif ($Consumer -eq 'RenoDX') {
     $steps += 'Turn on neural rendering in the DLSS 5 Neural Rendering add-on panel.'
+}
+else {
+    if ($is32) { $steps += 'OptiScaler''s menu lives in the host64 helper: open the ReShade overlay > Add-ons > DLSS 5 Feed, press "Show the DLSS 5 panel in-game", then press Insert. "DLSS Neural Rendering" is its last section; the pass is already switched on.' }
+    else { $steps += 'Press Insert for OptiScaler''s menu; "DLSS Neural Rendering" is its last section, and the pass is already switched on.' }
+    $steps += 'dlss5-feed.log (host64\dlss5-feed-host.log for a 32-bit game) should say "NGX calls are routed through OptiScaler DLSS-NR" and, after the first frame, "neural model (feature 18) loaded".'
 }
 $steps += 'Turn the game''s MSAA/SSAA off.'
 if ($isDgV -and -not $DgVoodooWatermark) { $steps += 'dgVoodoo''s watermark is off. If nothing seems to happen, re-run with -DgVoodooWatermark to confirm dgVoodoo is active at all.' }
