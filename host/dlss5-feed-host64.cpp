@@ -73,6 +73,9 @@ static int  g_win_h = 1080;
 // the message queue, which is where ReShade's WH_GETMESSAGE input hook reads keys.
 static UINT g_overlay_key = VK_HOME;
 static int  g_pump_count  = 0;
+// The pump at which to post the overlay key, and again three pumps later. Startup opens the
+// overlay once at 90; tag 'O' (v9) re-arms it so the add-on's button can bring it back.
+static int  g_overlay_key_at = 90;
 
 // Present accounting (issue #15). The neural consumer wants one Present per evaluate; when
 // DWM holds every back buffer the per-evaluate Present cannot happen on the spot, and the
@@ -1498,9 +1501,9 @@ static bool PumpPresent(bool force = false)
     {
         ++g_pump_count;
         const UINT scan = MapVirtualKeyW(g_overlay_key, MAPVK_VK_TO_VSC);
-        if (g_pump_count == 90)
+        if (g_pump_count == g_overlay_key_at)
             PostMessageW(h.hwnd, WM_KEYDOWN, g_overlay_key, 1 | (scan << 16));
-        else if (g_pump_count == 93)
+        else if (g_pump_count == g_overlay_key_at + 3)
         {
             PostMessageW(h.hwnd, WM_KEYUP, g_overlay_key, 1 | (scan << 16) | (1u << 30) | (1u << 31));
             Log("[host] opened ReShade's overlay (key %u) so the neural consumer's panel is in view", g_overlay_key);
@@ -2874,6 +2877,14 @@ static int Serve(DWORD game_pid)
                 SetWindowPos(h.hwnd, nullptr, 0, 0, frame.right - frame.left, frame.bottom - frame.top,
                              SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
+        }
+        else if (tag == 'O')
+        {
+            // v9: the add-on's "Show ReShade in Host" button. Re-arm the startup sequence
+            // rather than posting here: the two edges have to land in different frames of
+            // THIS process, and the pump is what counts them.
+            g_overlay_key_at = g_pump_count + 2;
+            Log("[host] the game asked for ReShade's overlay: posting key %u to this window", g_overlay_key);
         }
         else if (tag == 'F')
         {

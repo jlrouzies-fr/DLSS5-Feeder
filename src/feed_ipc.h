@@ -70,7 +70,15 @@
 #include <cstdint>
 
 #define FEED_IPC_MAGIC   0x35534C44u  // 'DLS5'
-#define FEED_IPC_VERSION 8u
+#define FEED_IPC_VERSION 9u
+
+// Version 9 added the tag 'O', with no payload: "open ReShade's overlay in your own window".
+// The host does that for itself once at startup, and until v9 nothing could ask it again, so
+// closing that overlay left the consumer's panel unreachable for the rest of the session. It
+// has to be the HOST that posts the key: ReShade reads a key whose down and up land in one
+// frame as never pressed, and the cast forwards both edges of a keypress in the same frame,
+// so pressing the overlay key through the cast does nothing. The host spreads the two edges
+// across its own frames, which is the one thing the game cannot do for it.
 
 // FeedBuild::client_flags (v5+)
 #define FEED_BUILD_HOST_CREATES  1u   // tex[] are zero: the host creates the shared set and answers with handles

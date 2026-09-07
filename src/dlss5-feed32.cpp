@@ -2641,7 +2641,7 @@ static void HostClose();   // below
 // fences, tears down shared state and stops the worker -- none of which may happen beside a
 // frame that is using them. So the buttons only record what they want; FeedFrame consumes
 // it at the top of the next frame, inside the lock.
-enum { HOST_REQ_NONE = 0, HOST_REQ_RESTART, HOST_REQ_APPLY, HOST_REQ_WINSIZE };
+enum { HOST_REQ_NONE = 0, HOST_REQ_RESTART, HOST_REQ_APPLY, HOST_REQ_WINSIZE, HOST_REQ_OVERLAY };
 static volatile LONG g_host_request;
 static char          g_host_request_why[160];
 
@@ -2737,6 +2737,22 @@ static void HostApplyWindowSize()
     g_panel_poll_quiet_until = GetTickCount64() + 2500;
 }
 
+// v9: ask the running host to open ReShade's overlay in its own window -- the panel these
+// buttons cast into the game. The host opens it once when it starts and, before v9, nothing
+// could ask it again, so closing it made the consumer's panel unreachable for the session.
+//
+// It has to be the host that posts the key. CastPostKey forwards a press and its release in
+// the same frame, and ReShade reads a key that goes down and up inside one frame as never
+// pressed -- which is why pressing the overlay key over the cast does nothing. The host
+// spreads the two edges across its own pumps, the same sequence it uses at startup.
+static void HostShowOverlay()
+{
+    if (g.pipe == nullptr) { Warn("the DLSS 5 host is not running, so it has no overlay to show"); return; }
+    const BYTE tag = 'O';
+    if (!PipeWrite(&tag, sizeof(tag))) { HostLost("the overlay request could not be sent"); return; }
+    Log("[feed32] asked the host to open ReShade's overlay in its window");
+}
+
 static bool HostRequestPending() { return g_host_request != HOST_REQ_NONE; }
 
 // Called from OnPresent, on the render thread and inside the feed lock.
@@ -2746,6 +2762,7 @@ static void HostConsumeRequest()
     if (req == HOST_REQ_RESTART) HostRestart(g_host_request_why);
     else if (req == HOST_REQ_APPLY) HostApplySettings();
     else if (req == HOST_REQ_WINSIZE) HostApplyWindowSize();
+    else if (req == HOST_REQ_OVERLAY) HostShowOverlay();
 }
 
 // ---------------------------------------------------------------------------
@@ -5417,6 +5434,18 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                   : "Drawn by this game's ReShade from a copy of the host's frame: works in exclusive "
                                     "fullscreen and on any monitor. The panel appears once the feed has built (its "
                                     "texture is set up with the first build).");
+    // What the two buttons above cast is the host's ReShade overlay. The host opens it once
+    // when it starts; close it and there was no way back, because the overlay key does not
+    // survive the trip through the cast (see HostShowOverlay).
+    ImGui::SameLine();
+    if (!HostAlive()) ImGui::BeginDisabled();
+    if (ImGui::Button("Show ReShade in Host")) HostRequest(HOST_REQ_OVERLAY, nullptr);
+    if (!HostAlive()) ImGui::EndDisabled();
+    ImGui::SameLine(); HelpMarker("Re-opens ReShade's overlay inside the host window, which is what the panel above "
+                                  "shows. The host opens it by itself when it starts, so this is for getting it back "
+                                  "after you close it. Pressing the host's overlay key through the cast does not work: "
+                                  "the press and the release arrive in the same host frame, and ReShade reads that as "
+                                  "never pressed.");
     ImGui::TextDisabled("%s", g_cast_status);
     if (ImGui::SliderInt("Panel size (%)", &g_cfg.cast_scale, 25, 300)) dirty = true;
     ImGui::SameLine(); HelpMarker("Relative to the largest size that fits this window (the host's tab column at 1:1, "
