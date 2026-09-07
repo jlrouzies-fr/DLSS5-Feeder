@@ -862,6 +862,10 @@ static void FeedFail(const char *what)
 // ---------------------------------------------------------------------------
 
 enum { LINK_IDLE = 0, LINK_RUNNING, LINK_DONE, LINK_FAILED };
+
+// Whether ReShade's overlay is up in the HOST window. Declared here because the handshake
+// re-syncs it; the reasoning is at HostShowOverlay, which is the only thing that changes it.
+static bool g_host_overlay_shown = true;
 enum { JOB_CONNECT = 1, JOB_BUILD };
 
 struct HostLink
@@ -2235,6 +2239,8 @@ static bool HostWorkerConnect(HANDLE ev)
     }
     g_link.panel_w = ack.panel_width;   // v7: the size the panel texture has to be, if any
     g_link.panel_h = ack.panel_height;
+    // A fresh host presses its own overlay key once it is up, so the overlay starts shown.
+    g_host_overlay_shown = true;
     return true;
 }
 
@@ -2745,12 +2751,21 @@ static void HostApplyWindowSize()
 // the same frame, and ReShade reads a key that goes down and up inside one frame as never
 // pressed -- which is why pressing the overlay key over the cast does nothing. The host
 // spreads the two edges across its own pumps, the same sequence it uses at startup.
+// The host's overlay key is a TOGGLE, and the host presses it for itself once when it starts --
+// so the overlay is already up by the time anyone can ask, and a button that just sends the key
+// closes it. Measured: a helper standing on a fake client shows ReShade's overlay after the
+// startup press and the banner after the next one. So track it and label the button accordingly,
+// the way the two cast buttons above already do. The belief starts at "shown" because that is
+// what the host did, and it re-syncs on every reconnect; if it ever disagrees with the window
+// (someone pressed Home in the host window itself), one more press puts it right.
 static void HostShowOverlay()
 {
     if (g.pipe == nullptr) { Warn("the DLSS 5 host is not running, so it has no overlay to show"); return; }
     const BYTE tag = 'O';
     if (!PipeWrite(&tag, sizeof(tag))) { HostLost("the overlay request could not be sent"); return; }
-    Log("[feed32] asked the host to open ReShade's overlay in its window");
+    g_host_overlay_shown = !g_host_overlay_shown;
+    Log("[feed32] asked the host to %s ReShade's overlay in its window",
+        g_host_overlay_shown ? "show" : "hide");
 }
 
 static bool HostRequestPending() { return g_host_request != HOST_REQ_NONE; }
@@ -5439,13 +5454,15 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     // survive the trip through the cast (see HostShowOverlay).
     ImGui::SameLine();
     if (!HostAlive()) ImGui::BeginDisabled();
-    if (ImGui::Button("Show ReShade in Host")) HostRequest(HOST_REQ_OVERLAY, nullptr);
+    if (ImGui::Button(g_host_overlay_shown ? "Hide ReShade in Host" : "Show ReShade in Host"))
+        HostRequest(HOST_REQ_OVERLAY, nullptr);
     if (!HostAlive()) ImGui::EndDisabled();
-    ImGui::SameLine(); HelpMarker("Re-opens ReShade's overlay inside the host window, which is what the panel above "
-                                  "shows. The host opens it by itself when it starts, so this is for getting it back "
-                                  "after you close it. Pressing the host's overlay key through the cast does not work: "
-                                  "the press and the release arrive in the same host frame, and ReShade reads that as "
-                                  "never pressed.");
+    ImGui::SameLine(); HelpMarker("Shows or hides ReShade's overlay inside the host window -- the window the panel "
+                                  "above casts. The host opens it by itself when it starts, so this is mostly for "
+                                  "getting it back after you close it. The key it sends is a toggle, so if the label "
+                                  "ever disagrees with what you see, press it once more. Pressing the host's overlay "
+                                  "key through the cast does not work: the press and the release arrive in the same "
+                                  "host frame, and ReShade reads that as never pressed.");
     ImGui::TextDisabled("%s", g_cast_status);
     if (ImGui::SliderInt("Panel size (%)", &g_cfg.cast_scale, 25, 300)) dirty = true;
     ImGui::SameLine(); HelpMarker("Relative to the largest size that fits this window (the host's tab column at 1:1, "

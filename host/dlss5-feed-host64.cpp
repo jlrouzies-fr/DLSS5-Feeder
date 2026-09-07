@@ -2884,7 +2884,9 @@ static int Serve(DWORD game_pid)
             // rather than posting here: the two edges have to land in different frames of
             // THIS process, and the pump is what counts them.
             g_overlay_key_at = g_pump_count + 2;
-            Log("[host] the game asked for ReShade's overlay: posting key %u to this window", g_overlay_key);
+            // The key toggles, so this shows the overlay only if it is currently hidden. The
+            // add-on tracks that and labels its button show/hide; nothing here can query ReShade.
+            Log("[host] the game asked to toggle ReShade's overlay: posting key %u to this window", g_overlay_key);
         }
         else if (tag == 'F')
         {
