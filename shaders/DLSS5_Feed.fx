@@ -53,21 +53,40 @@
     A vector failing any test is zeroed (the surface is treated as static -- the right answer
     for a lit wall) and the pixel is flagged in DLSS5_Mask so DLSS trusts the current frame there.
 
+    PROVIDER CONFIDENCE MASK -- LumeniteFX Kernel / QuantMotion also publish a per-pixel
+    confidence map (tConfidence). Optical flow is least trustworthy on moving-object silhouettes,
+    which is where object ghosting comes from: a slightly wrong vector still warps history.
+    When confidence falls below a floor, DLSS5_Mask is raised so DLSS favours the current frame.
+    The contribution is motion-weighted: strong on moving pixels, mild on static low-confidence
+    noise, so textured walls are not over-masked. Providers without a confidence map are a no-op.
+
+    APPEARANCE RESIDUAL MASK -- optical flow can be confidently wrong. After applying the
+    candidate vector, reproject and score illumination-normalised structure (same PatchError as
+    the static hypothesis). A large residual raises DLSS5_Mask even when provider confidence is
+    high. Optional zero-MV on hard fail. All toggles live in the ReShade overlay.
+
+    LIGHTING / CHROMA RESIDUAL -- PatchError removes mean luma, so a calm lighting change on
+    fabric does not trip appearance. A separate mean-luma + chroma test catches "translucent
+    light layers" and hue shifts after reprojection.
+
+    DETAIL (HF) RESIDUAL -- mid-frequency texture smear inside sharp silhouettes: compare
+    high-pass luma (luma - 3x3 blur) current vs reprojected previous. Sub-pixel MV error that
+    still locks edges fails the HF phase match.
+
     The add-on runs DLSS + DLSS 5 neural rendering right after the "DLSS5_Feed" technique has
     rendered, so anything placed below it in the list is applied on top of the neural output.
+
+    TRAA COMPANION (optional) -- LumeniteFX "LUMENITE: TRAA" (lumenite_TRAA.fx):
+      Temporal reprojection AA on top of Feed helps flicker when DLSS history is short
+      (reset_every / OFA churn): it re-accumulates frames after the neural pass.
+      UI/text break because TRAA reprojects the same colour buffer as the HUD -- no real MV,
+      high-contrast glyphs, often drawn without depth. Keep TRAA BELOW DLSS5_Feed.
+      Prefer Edge Detection = Geometric (ignores flat UI in the DLAA prepass). DLSS5oneclick
+      patches TRAA to favour the current frame where DLSS5_Mask distrusts motion / HUD-like
+      luma edges without geometric depth. Optional: UIMask_Top above TRAA, UIMask_Bottom below.
 */
 
 #include "ReShade.fxh"
-
-// D3D9 is not a target. The add-on attaches to D3D10/11/12, OpenGL and Vulkan runtimes only,
-// so if ReShade is on its DirectX 9 backend the effect could never be fed anyway -- and the
-// geometric-fit solver below cannot compile there (SM3 has no tex2Dfetch and must unroll the
-// [loop]s over dynamically indexed arrays, which is the "error X3531: can't unroll loops
-// marked with loop attribute" of issue #56). Say which of those two facts the user is looking
-// at, because the compiler error alone sends people hunting through their shader list.
-#if __RENDERER__ < 0xA000
-    #error "DLSS5_Feed needs D3D10 or newer, and ReShade has loaded its DirectX 9 backend. For a D3D9 game the dgVoodoo2 wrapper must be in effect first (check DisableAndPassThru=false in dgVoodoo.conf); see the README's 'Install for a DirectX 9 game' section. A 64-bit D3D9 game does not need this add-on at all -- renodx-dlss handles those on its own."
-#endif
 
 // Expose ReShade's completed frame to the add-on as an SRV. The 64-bit D3D11 path
 // uses this only when its work-resolution control is below 100%; no extra pass or
@@ -224,8 +243,7 @@ uniform float GEOM_MASK_REJECTED <
     ui_label = "Mask strength on rejected flow";
     ui_tooltip = "Where the provider disagreed with the model but did not win the structure test (fire, smoke,\n"
                  "flicker), the geometric vector is used; this is how strongly DLSS is additionally asked to\n"
-                 "favour the current frame there. 0 = pure history (smoothest), 1 = mostly current frame.\n\n"
-                 "Also used by the static test's first frame when hysteresis holds its vector back.";
+                 "favour the current frame there. 0 = pure history (smoothest), 1 = mostly current frame.";
 > = 0.35;
 
 uniform bool MV_VALIDATE <
@@ -244,18 +262,6 @@ uniform bool VALIDATE_STATIC <
                  "flickering light does not count as motion. When 'did not move' wins, the vector is zeroed\n"
                  "and the pixel is NOT masked -- a static wall wants its full history, which is what smooths\n"
                  "the flicker. This is the test for the flickering-wall case.";
-> = true;
-
-uniform bool STATIC_HYSTERESIS <
-    ui_category = "Validation (flicker / flames / disocclusion)";
-    ui_label = "Static test: require two frames in a row";
-    ui_tooltip = "The static test has no memory: on a low-contrast surface under a slow pan it can win on\n"
-                 "one frame and lose on the next, so the vector alternates between the provider's and zero\n"
-                 "and DLSS alternately reprojects and does not -- a flicker/judder that comes and goes.\n"
-                 "With this on, the vector is only zeroed where the test won on this frame AND the last;\n"
-                 "on the first frame the provider's vector is kept and the pixel is masked instead, so\n"
-                 "DLSS leans on the current frame rather than reprojecting from nowhere.\n"
-                 "Turn it off to compare against the old (per-frame) behaviour.";
 > = true;
 
 uniform float STATIC_BIAS <
@@ -291,7 +297,7 @@ uniform float LUMA_TOLERANCE <
     ui_label = "Luma tolerance";
     ui_tooltip = "How far outside the current 3x3 neighbourhood's luma range the reprojected previous luma\n"
                  "may fall (relative to that range's maximum). Lower = stricter.";
-> = 0.25;
+> = 0.20;
 
 uniform bool VALIDATE_DEPTH <
     ui_category = "Validation (flicker / flames / disocclusion)";
@@ -332,6 +338,173 @@ uniform float MASK_STRENGTH <
                  "1 = fully; 0 = only zero the vector, do not mask.";
 > = 1.0;
 
+#if DLSS5_MV_LOWRES
+// LumeniteFX Kernel / QuantMotion publish tConfidence. Wiring it into DLSS5_Mask cuts object
+// ghosting where optical flow is unsure on silhouettes. See ProviderConfidence() / ConfidenceDistrust().
+uniform bool CONFIDENCE_MASK <
+    ui_category = "Provider confidence mask (object ghosting)";
+    ui_label = "Raise mask from low provider confidence";
+    ui_tooltip = "When the LumeniteFX confidence map falls below the floor, ask DLSS to favour the\n"
+                 "current frame (DLSS5_Mask). Targets moving-object trails from uncertain optical flow.\n"
+                 "Motion-weighted: strong on moving pixels, mild on static low-confidence noise.";
+> = true;
+
+uniform float CONFIDENCE_FLOOR <
+    ui_category = "Provider confidence mask (object ghosting)";
+    ui_type = "drag"; ui_min = 0.05; ui_max = 1.0; ui_step = 0.01;
+    ui_label = "Confidence floor";
+    ui_tooltip = "Confidence at or above this contributes nothing. Below it, distrust rises toward 1\n"
+                 "as confidence approaches 0. Raise if the mask eats too much detail; lower if trails remain.";
+> = 0.45;
+
+uniform float CONFIDENCE_MOTION_PX <
+    ui_category = "Provider confidence mask (object ghosting)";
+    ui_type = "drag"; ui_min = 0.25; ui_max = 8.0; ui_step = 0.05;
+    ui_label = "Motion weight starts at (px)";
+    ui_tooltip = "Provider flow magnitude (pixels) where the confidence contribution ramps from the\n"
+                 "static weight up to full / boosted strength. Keeps textured static walls from over-masking.";
+> = 1.5;
+
+uniform float CONFIDENCE_STATIC_WEIGHT <
+    ui_category = "Provider confidence mask (object ghosting)";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.05;
+    ui_label = "Weight on near-static pixels";
+    ui_tooltip = "Multiplier on the confidence-driven distrust when flow is below the motion threshold.\n"
+                 "0 = ignore low confidence on static pixels; 1 = treat them like moving silhouettes.";
+> = 0.20;
+
+uniform float CONFIDENCE_MOTION_BOOST <
+    ui_category = "Provider confidence mask (object ghosting)";
+    ui_type = "drag"; ui_min = 0.5; ui_max = 2.0; ui_step = 0.05;
+    ui_label = "Weight on moving pixels";
+    ui_tooltip = "Multiplier on the confidence-driven distrust when flow is well above the motion threshold.\n"
+                 "1 = full (floor - conf) / floor; above 1 saturates harder on silhouettes (clamped to 1 after).";
+> = 1.25;
+#endif
+
+// Catches "confidently wrong" optical flow: after reprojecting with the candidate MV, if the
+ // illumination-normalised appearance still disagrees, raise the bias mask (and optionally zero
+ // the vector). Independent of provider confidence -- that is why Shepard-style trails survive
+ // CONFIDENCE_MASK. Does not touch NR intensity.
+uniform bool APPEARANCE_MASK <
+    ui_category = "Appearance residual mask (object ghosting)";
+    ui_label = "Raise mask when reprojected appearance disagrees";
+    ui_tooltip = "Reprojects with the candidate motion vector and scores illumination-normalised structure.\n"
+                 "A large residual means the vector did not explain the pixel -- ask DLSS to favour the\n"
+                 "current frame even if the provider's confidence was high.";
+> = true;
+
+uniform float APPEARANCE_THRESHOLD <
+    ui_category = "Appearance residual mask (object ghosting)";
+    ui_type = "drag"; ui_min = 0.005; ui_max = 0.25; ui_step = 0.001;
+    ui_label = "Residual threshold";
+    ui_tooltip = "PatchError above this (after contrast floor) starts raising the mask.\n"
+                 "Lower = more aggressive anti-ghosting; higher = keep more temporal history.";
+> = 0.035;
+
+uniform float APPEARANCE_STRENGTH <
+    ui_category = "Appearance residual mask (object ghosting)";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 2.0; ui_step = 0.05;
+    ui_label = "Mask strength from residual";
+    ui_tooltip = "How hard a failed residual pushes DLSS5_Mask (before the global MASK_STRENGTH).\n"
+                 "1 = residual maps 1:1 into distrust once past the threshold.";
+> = 1.25;
+
+uniform bool APPEARANCE_ZERO_MV <
+    ui_category = "Appearance residual mask (object ghosting)";
+    ui_label = "Also zero the motion vector on residual fail";
+    ui_tooltip = "When the residual fails hard, treat the pixel as having no usable vector (history is\n"
+                 "not warped). Mask still applies. Off by default -- mask-only is usually enough.";
+> = false;
+
+uniform float APPEARANCE_MIN_CONTRAST <
+    ui_category = "Appearance residual mask (object ghosting)";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 0.1; ui_step = 0.001;
+    ui_label = "Minimum patch contrast";
+    ui_tooltip = "Below this 3x3 contrast the residual test abstains (no structure to judge).\n"
+                 "Same idea as the static-hypothesis contrast floor.";
+> = 0.010;
+
+// Lighting / chroma: catches illumination and hue changes that mean-removed PatchError ignores.
+uniform bool LIGHTING_MASK <
+    ui_category = "Lighting / chroma residual (detail ghosting)";
+    ui_label = "Raise mask on lighting / chroma mismatch";
+    ui_tooltip = "After reprojection, compare mean luma and chroma (rgb/luma) vs previous frame.\n"
+                 "Targets translucent-looking light layers on moving characters. Does not touch NR.";
+> = true;
+
+uniform float LIGHTING_THRESHOLD <
+    ui_category = "Lighting / chroma residual (detail ghosting)";
+    ui_type = "drag"; ui_min = 0.005; ui_max = 0.35; ui_step = 0.001;
+    ui_label = "Lighting / chroma threshold";
+    ui_tooltip = "Combined mean-luma + chroma residual above this starts raising the mask.\n"
+                 "Lower = more aggressive against lighting ghosting.";
+> = 0.040;
+
+uniform float LIGHTING_STRENGTH <
+    ui_category = "Lighting / chroma residual (detail ghosting)";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 2.0; ui_step = 0.05;
+    ui_label = "Lighting / chroma mask strength";
+> = 1.35;
+
+uniform float LIGHTING_CHROMA_WEIGHT <
+    ui_category = "Lighting / chroma residual (detail ghosting)";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 2.0; ui_step = 0.05;
+    ui_label = "Chroma vs luma weight";
+    ui_tooltip = "0 = only mean-luma delta; 1 = equal chroma + luma; above 1 emphasises hue shifts.";
+> = 1.0;
+
+// High-frequency detail: texture smear inside silhouettes when edges still look locked.
+uniform bool DETAIL_MASK <
+    ui_category = "Detail residual (texture smear)";
+    ui_label = "Raise mask on high-frequency texture mismatch";
+    ui_tooltip = "Compares high-pass luma (centre minus 3x3 blur) after reprojection.\n"
+                 "Catches shirt/face/floor texel smear when edges stay sharp. Does not touch NR.";
+> = true;
+
+uniform float DETAIL_THRESHOLD <
+    ui_category = "Detail residual (texture smear)";
+    ui_type = "drag"; ui_min = 0.002; ui_max = 0.20; ui_step = 0.001;
+    ui_label = "Detail residual threshold";
+    ui_tooltip = "HF mismatch above this starts raising the mask. Lower = sharper textures, more flicker risk.";
+> = 0.018;
+
+uniform float DETAIL_STRENGTH <
+    ui_category = "Detail residual (texture smear)";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 2.0; ui_step = 0.05;
+    ui_label = "Detail mask strength";
+> = 1.40;
+
+uniform float DETAIL_MIN_ENERGY <
+    ui_category = "Detail residual (texture smear)";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 0.08; ui_step = 0.001;
+    ui_label = "Minimum HF energy";
+    ui_tooltip = "Abstain on flat patches (no texture detail to protect).";
+> = 0.004;
+
+// Depth-derived normals: cheap screen-space gradients used only to boost OUR residual /
+// mask confidence on geometric edges. Does NOT invent an NGX normals input.
+uniform bool DEPTH_NORMAL_MASK <
+    ui_category = "Depth normal confidence";
+    ui_label = "Boost mask on depth-normal discontinuities";
+    ui_tooltip = "Estimates view-space normals from linearized depth (ddx/ddy).\n"
+                 "Raises distrust where the normal turns sharply (silhouettes / contact edges)\n"
+                 "so residual masks trust geometry more. No NGX normal buffer is written.";
+> = true;
+
+uniform float DEPTH_NORMAL_STRENGTH <
+    ui_category = "Depth normal confidence";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 1.5; ui_step = 0.05;
+    ui_label = "Depth-normal edge strength";
+> = 0.55;
+
+uniform float DEPTH_NORMAL_THRESHOLD <
+    ui_category = "Depth normal confidence";
+    ui_type = "drag"; ui_min = 0.02; ui_max = 0.6; ui_step = 0.01;
+    ui_label = "Depth-normal edge threshold";
+    ui_tooltip = "1 - |n·n_neighbor| above this starts contributing to the bias mask.";
+> = 0.18;
+
 uniform float2 MV_SIGN <
     ui_type = "drag";
     ui_min = -1.0; ui_max = 1.0; ui_step = 2.0;
@@ -354,10 +527,18 @@ uniform int DEBUG_VIEW <
                "Provider confidence (LumeniteFX only; white = confident)\0"
                "Validation mask (white = vector distrusted, DLSS uses current frame)\0"
                "Validation mask over the image\0"
-               "Validation tests over the image (red = luma, green = depth, blue = consistency, yellow = vector zeroed, orange = static held back)\0"
+               "Validation tests over the image (red = luma, green = depth, blue = consistency, yellow = static wins)\0"
                "Geometry model vectors (colour = direction, brightness = speed)\0"
                "Geometry decision over the image (green = model, red = provider won as moving object, blue = provider rejected)\0"
-               "Geometry fit quality (grey = inlier share; top strip = fit error, black 0 px .. white 8 px)\0";
+               "Geometry fit quality (grey = inlier share; top strip = fit error, black 0 px .. white 8 px)\0"
+               "Confidence → mask contribution (white = distrust raised by low confidence)\0"
+               "Appearance residual (white = high PatchError after reprojection)\0"
+               "Appearance → mask contribution (white = distrust from residual)\0"
+               "Lighting / chroma residual (white = high mismatch)\0"
+               "Lighting / chroma → mask contribution\0"
+               "Detail HF residual (white = texture phase mismatch)\0"
+               "Detail HF → mask contribution\0"
+               "Combined residual → mask (appearance + lighting + detail)\0";
     ui_label = "Debug view (DLSS5_Feed_Debug technique)";
 > = 0;
 
@@ -370,26 +551,17 @@ sampler sDLSS5_Depth { Texture = DLSS5_Depth; MinFilter = POINT; MagFilter = POI
 sampler sDLSS5_Mask  { Texture = DLSS5_Mask;  MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
 
 // Previous-frame history for validation (written at the end of the technique)
-texture DLSS5_PrevLuma  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R16F;  };
-texture DLSS5_PrevDepth { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R16F;  };
-texture DLSS5_PrevMV    { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F; };
+texture DLSS5_PrevLuma   { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R16F;   };
+texture DLSS5_PrevDepth  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R16F;   };
+texture DLSS5_PrevMV     { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F;  };
+// Chroma = (R/luma, B/luma); used by lighting/chroma residual (not mean-removed appearance).
+texture DLSS5_PrevChroma { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F;  };
 // Luma may be interpolated (a smooth quantity); depth and vectors must NOT be -- bilinear
 // across an object edge mixes two surfaces' values and fails the test on every edge in motion.
-sampler sDLSS5_PrevLuma  { Texture = DLSS5_PrevLuma;  AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
-sampler sDLSS5_PrevDepth { Texture = DLSS5_PrevDepth; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT;  MagFilter = POINT;  MipFilter = POINT; };
-sampler sDLSS5_PrevMV    { Texture = DLSS5_PrevMV;    AddressU = Clamp; AddressV = Clamp; MinFilter = POINT;  MagFilter = POINT;  MipFilter = POINT; };
-
-// The static-hypothesis decision, this frame and last. The test has no memory of its own,
-// so on a low-contrast surface under a slow pan it can win on one frame and lose on the
-// next; the vector then alternates between the provider's and zero, and DLSS alternately
-// reprojects and does not. That is a flicker/judder that no consumer can smooth out, and
-// it comes and goes with the surface (The Surge 2, 2026-09-02). Guides writes StaticNow,
-// History copies it into PrevStatic, and the next frame's Guides reads that -- a texture
-// cannot be sampled and written in the same pass, which is why it takes two of them.
-texture DLSS5_StaticNow  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R8; };
-texture DLSS5_PrevStatic { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R8; };
-sampler sDLSS5_StaticNow  { Texture = DLSS5_StaticNow;  AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
-sampler sDLSS5_PrevStatic { Texture = DLSS5_PrevStatic; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+sampler sDLSS5_PrevLuma   { Texture = DLSS5_PrevLuma;   AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
+sampler sDLSS5_PrevDepth  { Texture = DLSS5_PrevDepth;  AddressU = Clamp; AddressV = Clamp; MinFilter = POINT;  MagFilter = POINT;  MipFilter = POINT; };
+sampler sDLSS5_PrevMV     { Texture = DLSS5_PrevMV;     AddressU = Clamp; AddressV = Clamp; MinFilter = POINT;  MagFilter = POINT;  MipFilter = POINT; };
+sampler sDLSS5_PrevChroma { Texture = DLSS5_PrevChroma; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
 
 // Camera-model fit: a sparse sample grid of (x, y, w, valid | u, v), and the solved model as
 // six 1x1 RGBA32F texels (18 parameters + fit statistics).
@@ -425,6 +597,34 @@ float2 ProviderMV(float2 uv)
 #endif
 }
 
+#if DLSS5_MV_LOWRES
+float ProviderConfidence(float2 uv)
+{
+    return saturate(tex2Dlod(sDLSS5_ProviderConfidence, float4(uv, 0.0, 0.0)).x);
+}
+
+// Distrust in 0..1 from the provider confidence map, motion-weighted using the raw flow
+// magnitude (pixels). Returns 0 when the feature is off or confidence is at/above the floor.
+float ConfidenceDistrust(float2 uv, float2 flow_uv)
+{
+    if (!CONFIDENCE_MASK)
+        return 0.0;
+    const float conf = ProviderConfidence(uv);
+    const float fail = saturate((CONFIDENCE_FLOOR - conf) / max(CONFIDENCE_FLOOR, 1e-5));
+    if (fail <= 0.0)
+        return 0.0;
+    const float mv_px    = length(flow_uv * BUFFER_SCREEN_SIZE);
+    const float motion_w = saturate((mv_px - CONFIDENCE_MOTION_PX) / max(CONFIDENCE_MOTION_PX, 1e-3));
+    const float weight   = lerp(CONFIDENCE_STATIC_WEIGHT, CONFIDENCE_MOTION_BOOST, motion_w);
+    return saturate(fail * weight);
+}
+#else
+float ConfidenceDistrust(float2 uv, float2 flow_uv)
+{
+    return 0.0;
+}
+#endif
+
 float Luma(float2 uv)
 {
     return dot(tex2Dlod(sDLSS5_ColorInput, float4(uv, 0.0, 0.0)).rgb, float3(0.299, 0.587, 0.114));
@@ -457,6 +657,161 @@ float PatchError(float2 uv_cur, float2 uv_prev, out float contrast)
     }
     contrast /= 9.0;
     return err / 9.0;
+}
+
+// Appearance residual after reprojecting with candidate delta-UV mv.
+// Returns float2(raw_error_or_0_if_abstain, distrust_0_to_1).
+float2 AppearanceResidual(float2 uv, float2 mv_uv)
+{
+    if (!APPEARANCE_MASK)
+        return float2(0.0, 0.0);
+    const float2 puv = uv + mv_uv;
+    if (any(puv < 0.0) || any(puv > 1.0))
+        return float2(1.0, saturate(APPEARANCE_STRENGTH)); // off-screen: favour current frame
+    float contrast;
+    const float err = PatchError(uv, puv, contrast);
+    if (contrast < APPEARANCE_MIN_CONTRAST)
+        return float2(0.0, 0.0);
+    const float over = saturate((err - APPEARANCE_THRESHOLD) / max(APPEARANCE_THRESHOLD, 1e-5));
+    return float2(err, saturate(over * APPEARANCE_STRENGTH));
+}
+
+float2 EncodeChroma(float3 rgb)
+{
+    const float l = max(dot(rgb, float3(0.299, 0.587, 0.114)), 1e-3);
+    return rgb.rb / l;
+}
+
+float2 SampleChroma(float2 uv)
+{
+    return EncodeChroma(tex2Dlod(sDLSS5_ColorInput, float4(uv, 0.0, 0.0)).rgb);
+}
+
+// Mean-luma delta + mean-removed chroma structure after reprojection.
+// Returns float2(raw_combined_error, distrust).
+float2 LightingResidual(float2 uv, float2 mv_uv)
+{
+    if (!LIGHTING_MASK)
+        return float2(0.0, 0.0);
+    const float2 puv = uv + mv_uv;
+    if (any(puv < 0.0) || any(puv > 1.0))
+        return float2(1.0, saturate(LIGHTING_STRENGTH));
+
+    const float2 px = BUFFER_PIXEL_SIZE;
+    float mc = 0.0, mp = 0.0;
+    float2 cc[9], pc[9];
+    float2 mcc = 0.0, mpc = 0.0;
+    [unroll] for (int i = 0; i < 9; ++i)
+    {
+        const float2 o = float2(i % 3 - 1, i / 3 - 1) * px;
+        const float lc = Luma(uv + o);
+        const float lp = tex2Dlod(sDLSS5_PrevLuma, float4(puv + o, 0.0, 0.0)).x;
+        mc += lc; mp += lp;
+        cc[i] = SampleChroma(uv + o);
+        pc[i] = tex2Dlod(sDLSS5_PrevChroma, float4(puv + o, 0.0, 0.0)).xy;
+        mcc += cc[i]; mpc += pc[i];
+    }
+    mc /= 9.0; mp /= 9.0;
+    mcc /= 9.0; mpc /= 9.0;
+
+    const float luma_err = abs(mc - mp);
+    float chroma_err = 0.0;
+    [unroll] for (int j = 0; j < 9; ++j)
+        chroma_err += length((cc[j] - mcc) - (pc[j] - mpc));
+    chroma_err /= 9.0;
+
+    const float err = luma_err + LIGHTING_CHROMA_WEIGHT * chroma_err;
+    const float over = saturate((err - LIGHTING_THRESHOLD) / max(LIGHTING_THRESHOLD, 1e-5));
+    return float2(err, saturate(over * LIGHTING_STRENGTH));
+}
+
+float LumaHighPassCur(float2 uv)
+{
+    const float2 px = BUFFER_PIXEL_SIZE;
+    float mean = 0.0;
+    [unroll] for (int i = 0; i < 9; ++i)
+    {
+        const float2 o = float2(i % 3 - 1, i / 3 - 1) * px;
+        mean += Luma(uv + o);
+    }
+    return Luma(uv) - mean / 9.0;
+}
+
+float LumaHighPassPrev(float2 uv)
+{
+    const float2 px = BUFFER_PIXEL_SIZE;
+    float mean = 0.0;
+    [unroll] for (int i = 0; i < 9; ++i)
+    {
+        const float2 o = float2(i % 3 - 1, i / 3 - 1) * px;
+        mean += tex2Dlod(sDLSS5_PrevLuma, float4(uv + o, 0.0, 0.0)).x;
+    }
+    return tex2Dlod(sDLSS5_PrevLuma, float4(uv, 0.0, 0.0)).x - mean / 9.0;
+}
+
+// High-frequency texture phase match after reprojection.
+float2 DetailResidual(float2 uv, float2 mv_uv)
+{
+    if (!DETAIL_MASK)
+        return float2(0.0, 0.0);
+    const float2 puv = uv + mv_uv;
+    if (any(puv < 0.0) || any(puv > 1.0))
+        return float2(1.0, saturate(DETAIL_STRENGTH));
+
+    const float2 px = BUFFER_PIXEL_SIZE;
+    float err = 0.0, energy = 0.0;
+    [unroll] for (int i = 0; i < 9; ++i)
+    {
+        const float2 o = float2(i % 3 - 1, i / 3 - 1) * px;
+        const float hc = LumaHighPassCur(uv + o);
+        const float hp = LumaHighPassPrev(puv + o);
+        err += abs(hc - hp);
+        energy += abs(hc);
+    }
+    err /= 9.0;
+    energy /= 9.0;
+    if (energy < DETAIL_MIN_ENERGY)
+        return float2(0.0, 0.0);
+    const float over = saturate((err - DETAIL_THRESHOLD) / max(DETAIL_THRESHOLD, 1e-5));
+    return float2(err, saturate(over * DETAIL_STRENGTH));
+}
+
+// Combined residual distrust used by the feed pass and debug view 16.
+float CombinedResidualDistrust(float2 uv, float2 mv_uv)
+{
+    const float2 ar = AppearanceResidual(uv, mv_uv);
+    const float2 lr = LightingResidual(uv, mv_uv);
+    const float2 dr = DetailResidual(uv, mv_uv);
+    return max(ar.y, max(lr.y, dr.y));
+}
+
+// Screen-space normal from linearized depth gradients (for residual/mask only).
+float3 DepthNormalSS(float2 uv)
+{
+    const float2 px = BUFFER_PIXEL_SIZE;
+    const float zc = ReShade::GetLinearizedDepth(uv);
+    const float zx = ReShade::GetLinearizedDepth(uv + float2(px.x, 0.0));
+    const float zy = ReShade::GetLinearizedDepth(uv + float2(0.0, px.y));
+    // Approximate view-space positions with unit focal length; only relative orientation matters.
+    const float aspect = (float)BUFFER_WIDTH / max((float)BUFFER_HEIGHT, 1.0);
+    const float3 pc = float3((uv - 0.5) * float2(aspect, 1.0), 1.0) * max(zc, 1e-5);
+    const float3 pxp = float3((uv + float2(px.x, 0.0) - 0.5) * float2(aspect, 1.0), 1.0) * max(zx, 1e-5);
+    const float3 pyp = float3((uv + float2(0.0, px.y) - 0.5) * float2(aspect, 1.0), 1.0) * max(zy, 1e-5);
+    return normalize(cross(pxp - pc, pyp - pc));
+}
+
+// Extra distrust where depth normals disagree with a neighbour (geometric edge).
+float DepthNormalDistrust(float2 uv)
+{
+    if (!DEPTH_NORMAL_MASK)
+        return 0.0;
+    const float2 px = BUFFER_PIXEL_SIZE;
+    const float3 n0 = DepthNormalSS(uv);
+    const float3 nx = DepthNormalSS(uv + float2(px.x, 0.0));
+    const float3 ny = DepthNormalSS(uv + float2(0.0, px.y));
+    const float edge = max(1.0 - saturate(dot(n0, nx)), 1.0 - saturate(dot(n0, ny)));
+    const float over = saturate((edge - DEPTH_NORMAL_THRESHOLD) / max(DEPTH_NORMAL_THRESHOLD, 1e-4));
+    return saturate(over * DEPTH_NORMAL_STRENGTH);
 }
 
 // Per-test failure (0 = fine, 1 = failed, soft in between): x = luma, y = depth, z = consistency,
@@ -557,15 +912,8 @@ bool FitIsUsable()
 }
 
 // Pass 1: sample the provider's flow and the depth on a sparse grid.
-//
-// ReShade cannot skip a whole pass on a uniform, so both fit passes start by checking the
-// one uniform that decides whether anything downstream will ever read them. It matters:
-// PS_FitSolve is a ONE-pixel shader that runs 2 x 920 iterations with two fetches each and
-// a 9x9 Gauss-Jordan solve -- a long serial latency chain on a single lane, every frame,
-// for a result only GeometryDecide consumes. GEOM_ENABLE is off by default.
 void PS_FitSamples(float4 vpos : SV_Position, float2 uv : TEXCOORD, out float4 A : SV_Target0, out float4 B : SV_Target1)
 {
-    if (!GEOM_ENABLE) { A = 0.0; B = 0.0; return; }
     const float2 suv = (floor(vpos.xy) + 0.5) / float2(DLSS5_FIT_W, DLSS5_FIT_H);
     const float  d   = ReShade::GetLinearizedDepth(suv);
     const float2 mv  = ProviderMV(suv);
@@ -581,9 +929,6 @@ void PS_FitSolve(float4 vpos : SV_Position, float2 uv : TEXCOORD,
                  out float4 P0 : SV_Target0, out float4 P1 : SV_Target1, out float4 P2 : SV_Target2,
                  out float4 P3 : SV_Target3, out float4 P4 : SV_Target4, out float4 P5 : SV_Target5)
 {
-    // See PS_FitSamples. P5.z is the sample count FitIsUsable() tests against 40, so a zeroed
-    // P5 also reads as "no usable fit" for anything that looks at it anyway.
-    if (!GEOM_ENABLE) { P0 = 0.0; P1 = 0.0; P2 = 0.0; P3 = 0.0; P4 = 0.0; P5 = 0.0; return; }
     float p[18];
     [unroll] for (int z = 0; z < 18; ++z) p[z] = 0.0;
     float inlier = 0.0, rms = 0.0, used = 0.0;
@@ -719,14 +1064,13 @@ float RawDepth(float2 uv)
 
 void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
                       out float2 mv_out : SV_Target0, out float mask : SV_Target1,
-                      out float depth : SV_Target2, out float static_now : SV_Target3)
+                      out float depth : SV_Target2)
 {
     // Providers hand out "delta UV": previous position = uv + mv. DLSS wants the same
     // direction, in pixels.
     const float2 flow = ProviderMV(uv);
     float2 mv = flow;
     float  distrust = 0.0;
-    static_now = 0.0;   // the geometry path does not run the static test
 
     if (GEOM_ENABLE && FitIsUsable())
     {
@@ -750,45 +1094,55 @@ void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
     else if (MV_VALIDATE)
     {
         const float4 bad = ValidateTests(uv, flow);
-        static_now = bad.w;   // the raw decision, for next frame's hysteresis
-
-        // The static test may only zero the vector once it has won twice in a row. On the
-        // first win the provider's vector is kept and the pixel is masked instead: "prefer
-        // the current frame here" is a safe answer either way, where a zeroed vector on a
-        // pixel that really is moving smears and a full vector on a pixel that really is
-        // static flickers.
-        float static_zero = bad.w;
-        if (STATIC_HYSTERESIS && bad.w > 0.5)
-        {
-            const float won_before = tex2Dlod(sDLSS5_PrevStatic, float4(uv, 0.0, 0.0)).x;
-            if (won_before <= 0.5) { static_zero = 0.0; distrust = max(distrust, GEOM_MASK_REJECTED); }
-        }
-
-        // Hard decision, not a blend: half a vector points at neither where the pixel came
-        // from nor where it is, so DLSS would warp history in from a place that means
-        // nothing. The soft scores stay in the mask, which IS a continuous quantity.
-        const bool zero_vector = max(bad.y, max(bad.z, static_zero)) > 0.5;
-        distrust = max(distrust, max(bad.x, max(bad.y, bad.z)));   // appearance changed / wrong target
-        mv = zero_vector ? float2(0.0, 0.0) : flow;
+        const float  zero_vector = max(bad.y, max(bad.z, bad.w));   // wrong target, or static explains it: treat as static
+        distrust = max(bad.x, max(bad.y, bad.z));                    // appearance changed / wrong target: favour the current frame
+        mv = flow * (1.0 - zero_vector);
     }
 
+    // LumeniteFX confidence → bias mask (object-silhouette ghosting). Uses raw flow for the
+    // motion weight so a validation-zeroed vector still raises the mask on uncertain movers.
+    distrust = max(distrust, ConfidenceDistrust(uv, flow));
+
+    // Appearance residual: OF can be confidently wrong (Shepard face/suit). Score the
+    // reprojected patch; large residual raises the mask independent of provider confidence.
+    {
+        const float2 ar = AppearanceResidual(uv, mv);
+        distrust = max(distrust, ar.y);
+        if (APPEARANCE_ZERO_MV && ar.y > 0.5)
+            mv = 0.0;
+    }
+    // Lighting / chroma: mean-removed appearance ignores calm illumination shifts.
+    {
+        const float2 lr = LightingResidual(uv, mv);
+        distrust = max(distrust, lr.y);
+        if (APPEARANCE_ZERO_MV && lr.y > 0.5)
+            mv = 0.0;
+    }
+    // HF detail: texture smear inside silhouettes when edges still look locked.
+    {
+        const float2 dr = DetailResidual(uv, mv);
+        distrust = max(distrust, dr.y);
+        if (APPEARANCE_ZERO_MV && dr.y > 0.5)
+            mv = 0.0;
+    }
+    // Depth-derived normals → residual/mask confidence only (not an NGX normals input).
+    distrust = max(distrust, DepthNormalDistrust(uv));
+
     mv_out = mv * float2(BUFFER_WIDTH, BUFFER_HEIGHT) * MV_SIGN * MV_SCALE;
-    mask   = saturate(distrust) * MASK_STRENGTH;
+    mask   = distrust * MASK_STRENGTH;
     depth  = RawDepth(uv);
 }
 
 // End of the technique: this frame becomes next frame's history. The raw provider vector is
 // stored (not the validated one), so one distrusted frame does not poison the next test.
-// prev_static carries this frame's static decision over to the next (the Guides pass cannot
-// both sample and write one texture, so it lands here).
 void PS_StoreHistory(float4 vpos : SV_Position, float2 uv : TEXCOORD,
-                     out float luma : SV_Target0, out float depth : SV_Target1, out float2 mv : SV_Target2,
-                     out float prev_static : SV_Target3)
+                     out float luma : SV_Target0, out float depth : SV_Target1,
+                     out float2 mv : SV_Target2, out float2 chroma : SV_Target3)
 {
-    luma  = Luma(uv);
-    depth = ReShade::GetLinearizedDepth(uv);
-    mv    = ProviderMV(uv);
-    prev_static = tex2Dfetch(sDLSS5_StaticNow, int2(vpos.xy)).x;
+    luma   = Luma(uv);
+    depth  = ReShade::GetLinearizedDepth(uv);
+    mv     = ProviderMV(uv);
+    chroma = SampleChroma(uv);
 }
 
 float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
@@ -823,18 +1177,9 @@ float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     if (DEBUG_VIEW == 5)
     {
         // Recomputed here against the same history the feed pass used this frame.
-        const float2 flow = ProviderMV(uv);
-        const float4 bad  = ValidateTests(uv, flow);
-        const float3 img  = tex2Dlod(sDLSS5_ColorInput, float4(uv, 0.0, 0.0)).rgb * 0.5;
-        // Yellow is what the feed pass ACTUALLY did, not what the static test proposed: with
-        // hysteresis on, a test that won only this frame keeps its vector. Watch a slow pan
-        // over a flat surface -- yellow that blinks on and off frame by frame is the flicker.
-        const bool  moved  = length(flow * BUFFER_SCREEN_SIZE) > 0.5;
-        const bool  zeroed = moved && length(tex2Dlod(sDLSS5_MV, float4(uv, 0.0, 0.0)).xy) < 1e-4;
-        // Dim orange: the static test won this frame but hysteresis kept the vector (masked instead).
-        const bool  held   = moved && !zeroed && tex2Dlod(sDLSS5_StaticNow, float4(uv, 0.0, 0.0)).x > 0.5;
-        return saturate(img + bad.xyz * 0.9 + (zeroed ? float3(0.6, 0.6, 0.0) : float3(0.0, 0.0, 0.0))
-                                            + (held   ? float3(0.35, 0.18, 0.0) : float3(0.0, 0.0, 0.0)));
+        const float4 bad = ValidateTests(uv, ProviderMV(uv));
+        const float3 img = tex2Dlod(sDLSS5_ColorInput, float4(uv, 0.0, 0.0)).rgb * 0.5;
+        return saturate(img + bad.xyz * 0.9 + bad.w * float3(0.6, 0.6, 0.0));
     }
     if (DEBUG_VIEW == 6)
     {
@@ -857,6 +1202,37 @@ float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
         if (uv.y < 0.05) return saturate(s.y / 8.0).xxx;   // fit error strip
         return s.x.xxx;                                    // inlier share
     }
+    if (DEBUG_VIEW == 9)
+    {
+        // Same contribution PS_MotionVectors folds into distrust (before MASK_STRENGTH).
+        return ConfidenceDistrust(uv, ProviderMV(uv)).xxx;
+    }
+    if (DEBUG_VIEW == 10)
+    {
+        const float2 ar = AppearanceResidual(uv, ProviderMV(uv));
+        // Scale raw PatchError for visibility; abstain (0) stays black.
+        return saturate(ar.x / max(APPEARANCE_THRESHOLD * 4.0, 1e-4)).xxx;
+    }
+    if (DEBUG_VIEW == 11)
+    {
+        return AppearanceResidual(uv, ProviderMV(uv)).y.xxx;
+    }
+    if (DEBUG_VIEW == 12)
+    {
+        const float2 lr = LightingResidual(uv, ProviderMV(uv));
+        return saturate(lr.x / max(LIGHTING_THRESHOLD * 4.0, 1e-4)).xxx;
+    }
+    if (DEBUG_VIEW == 13)
+        return LightingResidual(uv, ProviderMV(uv)).y.xxx;
+    if (DEBUG_VIEW == 14)
+    {
+        const float2 dr = DetailResidual(uv, ProviderMV(uv));
+        return saturate(dr.x / max(DETAIL_THRESHOLD * 4.0, 1e-4)).xxx;
+    }
+    if (DEBUG_VIEW == 15)
+        return DetailResidual(uv, ProviderMV(uv)).y.xxx;
+    if (DEBUG_VIEW == 16)
+        return CombinedResidualDistrust(uv, ProviderMV(uv)).xxx;
     float2 mv = tex2Dlod(sDLSS5_MV, float4(uv, 0.0, 0.0)).xy; // pixels
     float angle = atan2(mv.y, mv.x);
     float speed = length(mv);
@@ -873,13 +1249,16 @@ technique DLSS5_Feed
                  "Provider: " DLSS5_MV_PROVIDER_NAME "\n"
                  "Change it with the DLSS5_MV_PROVIDER preprocessor definition (0 texMotionVectors,\n"
                  "1 Launchpad, 2 VORT, 3 LumeniteFX Kernel, 4 LumeniteFX QuantMotion) and enable\n"
-                 "that provider's technique ABOVE this one.";
+                 "that provider's technique ABOVE this one.\n\n"
+                 "Optional LUMENITE: TRAA -- place BELOW this effect (stabilises after neural).\n"
+                 "If UI/text smear: Edge Detection = Geometric; keep Protect UI / text on;\n"
+                 "or wrap TRAA with UIMask_Top / UIMask_Bottom. Do not put TRAA above Feed.";
 >
 {
     pass FitSamples    { VertexShader = PostProcessVS; PixelShader = PS_FitSamples;    RenderTarget0 = DLSS5_FitA; RenderTarget1 = DLSS5_FitB; }
     pass FitSolve      { VertexShader = PostProcessVS; PixelShader = PS_FitSolve;      RenderTarget0 = DLSS5_Cam0; RenderTarget1 = DLSS5_Cam1; RenderTarget2 = DLSS5_Cam2; RenderTarget3 = DLSS5_Cam3; RenderTarget4 = DLSS5_Cam4; RenderTarget5 = DLSS5_Cam5; }
-    pass Guides        { VertexShader = PostProcessVS; PixelShader = PS_MotionVectors; RenderTarget0 = DLSS5_MV; RenderTarget1 = DLSS5_Mask; RenderTarget2 = DLSS5_Depth; RenderTarget3 = DLSS5_StaticNow; }
-    pass History       { VertexShader = PostProcessVS; PixelShader = PS_StoreHistory;  RenderTarget0 = DLSS5_PrevLuma; RenderTarget1 = DLSS5_PrevDepth; RenderTarget2 = DLSS5_PrevMV; RenderTarget3 = DLSS5_PrevStatic; }
+    pass Guides        { VertexShader = PostProcessVS; PixelShader = PS_MotionVectors; RenderTarget0 = DLSS5_MV; RenderTarget1 = DLSS5_Mask; RenderTarget2 = DLSS5_Depth; }
+    pass History       { VertexShader = PostProcessVS; PixelShader = PS_StoreHistory;  RenderTarget0 = DLSS5_PrevLuma; RenderTarget1 = DLSS5_PrevDepth; RenderTarget2 = DLSS5_PrevMV; RenderTarget3 = DLSS5_PrevChroma; }
     DLSS5_MV_REQUEST_PASS   // Launchpad only: ask it to compute optical flow again next frame
 }
 
