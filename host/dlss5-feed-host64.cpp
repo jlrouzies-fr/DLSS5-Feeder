@@ -90,6 +90,20 @@ static unsigned long long g_present_skipped = 0;   // ... that found no free bac
 static unsigned long long g_present_owed    = 0;   // ... still owed; retired from the frame and idle paths
 static unsigned long long g_present_debt_run = 0;  // consecutive skips, whatever the client contract
 
+// Pacing accounting (issue #15, the rhythmic collapse under async_home=1).
+//
+// The thread has spent a long time reasoning about which of two stalls this is -- the host's
+// serve thread blocked in BeginCommands' allocator-retire wait, or the client's per-frame pipe
+// write blocked because this thread is not reading -- and neither has ever been measured. So
+// measure both. None of these gate anything; they only make the next log line able to answer
+// the question, which is the point of the release.
+static unsigned long long g_ring_waits    = 0;   // BeginCommands found the slot still busy
+static double             g_ring_wait_ms  = 0.0; // ... and this is what it cost the serve thread
+static unsigned long long g_pace_evals    = 0;   // evaluates since the last report
+static double             g_pace_span_ms  = 0.0; // wall time they spanned
+static unsigned long long g_pace_presents = 0;   // Presents ATTEMPTED across those evaluates
+static unsigned long long g_backlog_peak  = 0;   // frame messages the client had queued ahead of us
+
 static void Log(const char *fmt, ...);
 
 // Height goes to (almost) the full primary monitor work area by default -- a menu column
@@ -901,8 +915,17 @@ static bool BeginCommands()
         // dropping a frame.
         ResetEvent(h.fence_event);
         h.fence->SetEventOnCompletion(retire, h.fence_event);
-        if (WaitForSingleObject(h.fence_event, 2000) != WAIT_OBJECT_0 ||
-            h.fence->GetCompletedValue() < retire)
+        // Timed, because this is one of the two candidate stalls in #15 and nothing has ever
+        // measured it. This blocks the ONE thread that also reads the pipe, so any time spent
+        // here is time the client's next frame write cannot complete either.
+        LARGE_INTEGER rw0, rw1, rwf;
+        QueryPerformanceFrequency(&rwf);
+        QueryPerformanceCounter(&rw0);
+        const bool signaled = WaitForSingleObject(h.fence_event, 2000) == WAIT_OBJECT_0;
+        QueryPerformanceCounter(&rw1);
+        ++g_ring_waits;
+        g_ring_wait_ms += 1000.0 * double(rw1.QuadPart - rw0.QuadPart) / double(rwf.QuadPart);
+        if (!signaled || h.fence->GetCompletedValue() < retire)
         { Log("[host] GPU did not retire allocator slot %d", slot); return false; }
     }
     // Past the fence wait: this slot's previous submission is finished, so its timestamps
@@ -1658,16 +1681,21 @@ static bool PumpPresent(bool force = false)
 // per-Present state at one frame per evaluate (issue #15). The debt is only paid down here:
 // a per-evaluate present is the frame THAT evaluate is entitled to, not a repayment.
 // Bounded by g_present_owed, so this can never present more often than evaluates asked for.
-static void PumpRetireOwedPresents()
+// max_pay 0 = unbounded, which is what the idle path wants: there the game is not waiting on
+// us at all and a present costs nothing. The per-evaluate call passes 1, because there it is
+// competing with the next evaluate for this one thread -- see the call site (#15).
+static void PumpRetireOwedPresents(unsigned max_pay = 0)
 {
+    unsigned paid = 0;
     // No frame-latency wait here either, for the reason spelled out in PumpPresent: a wait
     // that is not followed by a present spends a semaphore count nothing gives back, and
     // this loop's whole job is to keep trying when presents are failing (issue #33).
     // PumpPresent already returns false without blocking when there is no free buffer.
-    while (g_present_owed > 0 && h.swap != nullptr)
+    while (g_present_owed > 0 && h.swap != nullptr && (max_pay == 0 || paid < max_pay))
     {
         if (!PumpPresent(false)) break;   // no buffer after all, or DXGI busy: try again later
         --g_present_owed;
+        ++paid;
     }
 }
 
@@ -1711,8 +1739,22 @@ static bool InitDisguise()
     // OptiScaler was installed beside the helper.
     //
     // The patch is milliseconds away when this happens, so wait for it rather than race it.
+    //
+    // Only worth waiting for when the dxgi.dll that answered is ReShade's. If Windows' own
+    // answered instead, ReShade is simply not installed beside this helper, nothing will ever
+    // hook anything, and a 2000 ms wait would only delay saying so.
+    wchar_t dxgi_path[MAX_PATH] = {}, sysdir[MAX_PATH] = {};
+    if (dxgi != nullptr) GetModuleFileNameW(dxgi, dxgi_path, MAX_PATH);
+    GetSystemDirectoryW(sysdir, MAX_PATH);
+    const bool reshade_dxgi = dxgi != nullptr && dxgi_path[0] != L'\0' && sysdir[0] != L'\0' &&
+                              CompareStringOrdinal(dxgi_path, static_cast<int>(wcslen(sysdir)),
+                                                   sysdir, -1, TRUE) != CSTR_EQUAL;
+
     FARPROC raw_create_device = d3d12 ? GetProcAddress(d3d12, "D3D12CreateDevice") : nullptr;
-    if (dxgi != nullptr && !ReShadeOwnsCreateDevice(d3d12, raw_create_device))
+    if (!reshade_dxgi)
+        Log("[host] WARNING: dxgi.dll here is Windows' own (%ls), not ReShade -- there is no overlay and no "
+            "add-on panel in this process at all. Put ReShade x64 beside this helper as dxgi.dll.", dxgi_path);
+    else if (!ReShadeOwnsCreateDevice(d3d12, raw_create_device))
     {
         const ULONGLONG t0 = GetTickCount64();
         while (GetTickCount64() - t0 < 2000)
@@ -2515,11 +2557,30 @@ static int Serve(DWORD game_pid)
 {
     char name[128];
     sprintf_s(name, FEED_PIPE_FMT, static_cast<unsigned long>(game_pid));
+    // The IN buffer (game -> host) is the client's run-ahead reservoir, and it is the
+    // mechanism behind #15's burst-then-collapse rhythm. Under async_home=1 the client's GPU
+    // waits on the frame before, but its CPU waits on nothing at all: it keeps signalling and
+    // writing frame messages until the kernel buffer is full. At 1024 bytes and 21 bytes per
+    // tagged frame message that is 48 frames -- roughly a quarter of a second at 185 fps -- so
+    // the game sprints while the reservoir fills and then walls while it drains, over and over.
+    //
+    // 256 bytes leaves 12 frames of run-ahead, still holds a whole FeedBuild (93 bytes) so the
+    // build path is untouched, and moves the blocking onto the client's PipeXfer write, which
+    // is already the designed, bounded, render-thread-safe path: a 2000 ms budget, the abort
+    // event in the wait set, and a CancelIoEx reap. Nothing new can hang.
+    //
+    // Deliberately here and not client-side: it changes no protocol bytes, no IPC version and
+    // no client build, so a reporter can A/B it by swapping this exe alone -- and it paces the
+    // OpenGL client too, which has no CPU-readable fence value and could never be gated from
+    // its own side. The OUT buffer stays 1024; FeedBuildAck is the biggest thing on it.
+    static const DWORD kPipeInBytes = 256;
     HANDLE pipe = CreateNamedPipeA(name, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                                   1, 1024, 1024, 0, nullptr);
+                                   1, 1024, kPipeInBytes, 0, nullptr);
     if (pipe == INVALID_HANDLE_VALUE) { Log("[host] CreateNamedPipe failed %lu", GetLastError()); return 1; }
-    Log("[host] serving on %s", name);
+    Log("[host] serving on %s (frame backlog bounded to %lu messages: the client is paced by this "
+        "pipe, not by a run-ahead reservoir)", name,
+        static_cast<unsigned long>(kPipeInBytes / (1 + sizeof(FeedFrameMsg))));
     {
         HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         OVERLAPPED ov = {};
@@ -2976,6 +3037,20 @@ static int Serve(DWORD game_pid)
         {
             FeedFrameMsg fm = {};
             if (!ReadFull(pipe, &fm, sizeof(fm))) break;
+
+            // How far ahead of us the client has run. Under async_home=1 nothing bounds its
+            // CPU: its GPU waits on the frame before, but the frame MESSAGES pile up in the
+            // pipe's kernel buffer until that buffer is full. That reservoir is the shape
+            // #15's burst-then-wall rhythm fits, and this is the number that proves or kills
+            // it. Non-blocking, and safe with an overlapped read pended.
+            {
+                DWORD avail = 0;
+                if (PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr))
+                {
+                    const unsigned long long queued = avail / (1 + sizeof(FeedFrameMsg));
+                    if (queued > g_backlog_peak) g_backlog_peak = queued;
+                }
+            }
             // No feature yet: release the game's wait and take the next frame. The pump
             // still has to run here. This loop's only other pumps are the per-evaluate
             // PumpPresent below and the idle branch of the tag wait, and with frames
@@ -3070,17 +3145,63 @@ static int Serve(DWORD game_pid)
                     h.ts_sum_ms = 0.0;
                     h.ts_n = 0;
                 }
-                Log("[host] frame %llu evaluated (%llu presents skipped so far, %llu owed%s)",
+                // The pacing block (issue #15). Everything here is per-window and reset below,
+                // so two consecutive lines can be compared directly: a steady ms/evaluate with
+                // a backlog near the pipe's capacity is the run-ahead reservoir, and a
+                // ring-wait total near zero is what retires the allocator-ring theory.
+                char pace[224] = "";
+                if (g_pace_evals > 0)
+                    sprintf_s(pace, " | pace: %.2f ms/evaluate (%.1f/s), %.2f presents per evaluate, "
+                                    "client queued up to %llu frames ahead, ring waited %.2f ms over %llu frames",
+                              g_pace_span_ms / double(g_pace_evals),
+                              g_pace_span_ms > 0.0 ? 1000.0 * double(g_pace_evals) / g_pace_span_ms : 0.0,
+                              double(g_pace_presents) / double(g_pace_evals),
+                              (unsigned long long)g_backlog_peak,
+                              g_ring_wait_ms, (unsigned long long)g_ring_waits);
+                Log("[host] frame %llu evaluated (%llu presents skipped so far, %llu owed%s)%s",
                     (unsigned long long)fm.n, (unsigned long long)g_present_skipped,
-                    (unsigned long long)g_present_owed, gpu_part);
+                    (unsigned long long)g_present_owed, gpu_part, pace);
+                g_pace_evals    = 0;
+                g_pace_span_ms  = 0.0;
+                g_pace_presents = 0;
+                g_backlog_peak  = 0;
+                g_ring_waits    = 0;
+                g_ring_wait_ms  = 0.0;
             }
+            // How fast evaluates are actually arriving, and how many Presents each one drives.
+            {
+                static LARGE_INTEGER prev = {}, freq = {};
+                if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                if (prev.QuadPart != 0)
+                {
+                    g_pace_span_ms += 1000.0 * double(now.QuadPart - prev.QuadPart) / double(freq.QuadPart);
+                    ++g_pace_evals;
+                }
+                prev = now;
+            }
+
             // Pay off what earlier evaluates could not present BEFORE taking this one's own
             // present. The idle branch of the tag wait above is the other repayment point,
             // but it only runs when MsgWaitForMultipleObjects times out after 100 ms -- so
             // in a game delivering frames every ~20 ms it never runs at all, and the debt
             // sat at its cap for the whole session (issue #33). Here the game is already
             // behind fence_out and is not waiting on us, which is the same argument.
-            PumpRetireOwedPresents();
+            //
+            // Bounded to ONE repayment, though. The debt caps at 4, so an unbounded repayment
+            // here let a single evaluate drive up to five Presents -- each one a full-window
+            // banner CopyResource, ReShade's whole Present hook (where the neural consumer's
+            // per-frame work lives) and CopyPanel. Above the desktop's refresh rate
+            // WAS_STILL_DRAWING is the steady state, so the debt pins at its cap and every
+            // evaluate pays the full five: present amplification is the one per-evaluate cost
+            // that differs between async_home=1 and =0, which is the split #15 reports. One
+            // repayment plus this evaluate's own present is two, the debt still exists, still
+            // caps at 4, and the idle path below still repays it without limit -- so #33's
+            // reasoning is untouched, and so is one-Present-per-evaluate.
+            const unsigned long long owed_before = g_present_owed;
+            PumpRetireOwedPresents(1);
+            g_pace_presents += 1 + (owed_before - g_present_owed);
             PumpPresent(true);   // per evaluate, deliberately -- see PumpPresent
         }
         else

@@ -302,6 +302,12 @@ struct Cfg
                            // tuning panel is cast INTO the game window on request (the overlay's "Show the
                            // DLSS 5 panel in-game" button / cast_key). 1 = the host's own visible window,
                            // the old way (press Home there). Read when the host is started.
+                           //
+                           // NOT a hide switch, and it has been read as one: 0 passes --behind, which is
+                           // still a shown, still a PRESENTED window -- only its z-order and extended
+                           // style differ. #15 used host_window as an A/B for "does the helper's present
+                           // cost anything", and both arms presented every evaluate, so it measured
+                           // nothing. Only --hide, which the add-on never passes, suppresses the window.
     int   work_resolution; // 50..100 percent of each backbuffer axis; the game stays native-sized
     int   work_upscale;    // expand-back of the work-size output: 0 = bilinear, 1 = AMD FSR 1
                            // (EASU + RCAS), 2 = DLSS Super Resolution on synthetic jitter (D3D11
@@ -1964,10 +1970,28 @@ static bool PipeWrite(const void *buf, DWORD len)
 struct FeedTaggedFrame { BYTE tag; FeedFrameMsg fm; };
 #pragma pack(pop)
 
+// What the per-frame write costs the render thread, over the current 600-frame window.
+//
+// This is the other candidate stall in #15, and the one the reporter's own numbers can already
+// settle: PipeWriteFrame runs INSIDE the window TimingTick measures, so a "feed CPU" in the
+// milliseconds means the render thread is blocking here -- the host is not reading, because it
+// is busy -- while a "feed CPU" still at 0.03 ms with a collapsed frame interval means the
+// stall is somewhere else entirely. Nothing measured it before.
+static double g_pipe_write_ms_sum;
+static double g_pipe_write_ms_max;
+
 static bool PipeWriteFrame(const FeedFrameMsg &fm)
 {
     const FeedTaggedFrame msg = { 'F', fm };
-    return PipeWrite(&msg, sizeof(msg));
+    LARGE_INTEGER w0, w1, wf;
+    QueryPerformanceFrequency(&wf);
+    QueryPerformanceCounter(&w0);
+    const bool ok = PipeWrite(&msg, sizeof(msg));
+    QueryPerformanceCounter(&w1);
+    const double ms = 1000.0 * double(w1.QuadPart - w0.QuadPart) / double(wf.QuadPart);
+    g_pipe_write_ms_sum += ms;
+    if (ms > g_pipe_write_ms_max) g_pipe_write_ms_max = ms;
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -3860,11 +3884,19 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
     const double span_ms = 1000.0 * double(exit - g.span_start) / double(g.qpf);
     const double cpu_ms  = 1000.0 * double(g.cpu_ticks) / double(g.qpf);
     const double n       = double(g.timed_frames);
-    Log("[feed32] 600 frames: feed CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) | feed is %.0f%% of the frame",
-        cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms);
+    // The pipe write is inside cpu_ms, so splitting it out is what separates "the feed is
+    // slow" from "the host is not reading, so our write is blocking" (#15). How far ahead of
+    // the host we actually are is the other half, and the host counts that itself -- see the
+    // "client queued up to N frames ahead" figure in dlss5-feed-host.log.
+    Log("[feed32] 600 frames: feed CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) | feed is %.0f%% "
+        "of the frame | pipe write %.2f ms mean, %.2f ms worst",
+        cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms,
+        g_pipe_write_ms_sum / n, g_pipe_write_ms_max);
     g.cpu_ticks = 0;
     g.timed_frames = 0;
     g.span_start = exit;
+    g_pipe_write_ms_sum = 0.0;
+    g_pipe_write_ms_max = 0.0;
 }
 
 static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *desc)
