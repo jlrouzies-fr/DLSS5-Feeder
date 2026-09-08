@@ -53,7 +53,13 @@ At session open, `dlss5-feed.log` gains a block like this:
 ```
 
 It creates throwaway devices, tries each combination, releases them, and then opens the session
-exactly as it always would. It changes nothing about how the game runs.
+exactly as it always would.
+
+One caveat, stated plainly: the devices are released, but the **NGX SDK is per-process** and the
+matrix has initialised and shut it down several times before the real session opens. That is not
+expected to disturb anything and does not here — but it is not nothing. **Always confirm a fix
+with `DLSS5_FEED_NGX_MATRIX` unset** before believing it, and if the session behaves differently
+with the matrix on than with it off, say so on the issue: that is itself a finding.
 
 ## 2. Read it
 

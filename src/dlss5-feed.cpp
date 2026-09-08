@@ -3982,6 +3982,13 @@ static void FeedNgxMatrix(PFN_D3D12CreateDevice_ create_device, IUnknown *game_a
     FeedEnableDred();
     Log("[feed] ===== NGX matrix done. A row that says Init 0x00000001 (Success) is the combination "
         "this machine wants; see DIAGNOSE-47.md for what to do with each outcome. =====");
+    // Honest about what this costs. The devices are gone, but the NGX SDK is per-PROCESS and has
+    // now resolved its implementation and been initialised and shut down several times over. That
+    // is not expected to disturb the session opened next, and does not here -- but it is not
+    // nothing either, so a fix must always be confirmed with the variable unset.
+    Log("[feed] matrix: those devices are released, but NGX state is per-process and has been "
+        "initialised several times just now. Treat this run as diagnosis only -- re-test any fix "
+        "with DLSS5_FEED_NGX_MATRIX unset before believing it.");
 }
 
 static const char *FeedDredOpName(D3D12_AUTO_BREADCRUMB_OP op)
