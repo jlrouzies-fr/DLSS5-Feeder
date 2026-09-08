@@ -73,7 +73,7 @@
 >
 > | symptom | where | status |
 > |---|---|---|
-> | `NVSDK_NGX_D3D12_Init -> 0xBAD00001` on a 64-bit game, while the same files succeed for 32-bit games | [#47](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/47) | Open, **per-game**. GPU architecture, driver, data path, adapter, model build and game provenance have each been eliminated by counter-example. |
+> | `NVSDK_NGX_D3D12_Init -> 0xBAD00001` on a 64-bit game, while the same files succeed for 32-bit games | [#47](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/47) | Open, **per-game**. GPU architecture, driver, data path, adapter, model build and game provenance have each been eliminated by counter-example. It does not reproduce on the maintainer's hardware, so from 0.14.0-beta.6 the instrument moves to you: set `DLSS5_FEED_NGX_MATRIX=1` and see **[DIAGNOSE-47.md](DIAGNOSE-47.md)**, which walks adapter × DRED × feature level in one run and says what each outcome means. |
 > | Works for minutes, then the neural pass stops; log says `device removed … 0x887A0006` | [#57](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/57), [#63](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/63) | Open. A GPU hang in **this project's own private queue** (three DRED nodes = the three-frame ring), with no page fault. 0.14.0-beta.5 names every D3D12 object and brackets the frame into `copy-in` / `ngx-evaluate` / `copy-home`, so the next breadcrumb says which phase hung. |
 > | `feature 18 create failed … 0xBAD00001` on a GTX/RTX 20-series card | [#73](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/73) | **Not a bug.** DLSS 5 neural rendering has a minimum GPU architecture that Turing and older are below. 0.14.0-beta.5 says so in the log instead of leaving you to read the support bits. |
 > | Severe flicker or a frozen image on 64-bit **Vulkan** | [#13](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/13) | Open. Narrowed: the transport is clean, the depth guide reaching NGX is a constant. |
@@ -111,7 +111,7 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 
 ---
 
-## Before you install: three things
+## Before you install: four things
 
 None of this is hard, and the [automated installer](#install-the-automated-way) verifies most of it for you.
 
@@ -287,9 +287,36 @@ a frame. Found during a Metro 2033 Redux run.
 
 </details>
 
+### 4. What this project actually ships, and antivirus warnings
+
+A release here contains exactly **two** files: `DLSS5-Feeder-<version>.zip` and
+`AUTOMATIC_INSTALLATION_AVAILABLE.txt`. Nothing else on the internet is a release of this
+project, whatever it is named.
+
+Several third-party installers repackage this project (and ReShade, and the neural consumers)
+into their own downloads. That is fine and often convenient — but if Windows Defender flags a
+file under **someone else's** download folder, that file is theirs, not ours, and only they can
+get it cleared. `Trojan:Win32/Kepavll!rfn` on a `shaders_*.zip` under `AppData\Local\<tool>\`
+is the common shape of this report; the path names the tool that downloaded it.
+
+For a warning on a file that really came from **this** repository:
+
+- Check it against the SHA-256 published on the [release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases) you downloaded it from
+  (`Get-FileHash <file>` in PowerShell). A hash that does not match means you did not get it
+  from here.
+- If it matches and Defender still objects, it is a false positive, and the useful thing to do
+  is submit it: <https://www.microsoft.com/en-us/wdsi/filesubmission>. That fixes it for
+  everyone rather than for one machine.
+- One known true-but-harmless case: **Deep Fried Chicken** hooks NVIDIA's NGX runtime with
+  Detours, which heuristics dislike. The [automated installer](#install-the-automated-way)
+  tries the plain install first and only asks about an exclusion if Defender removes it.
+
+This project asks for no exclusion you have not been shown the reason for, and never disables
+your antivirus.
+
 ## Contents
 
-- [Before you install: three things](#before-you-install-three-things)
+- [Before you install: four things](#before-you-install-four-things)
 - [Status](#status)
 - [Install: the automated way](#install-the-automated-way)
 - [Install for a 64-bit game](#install-for-a-64-bit-game)
@@ -1111,8 +1138,12 @@ if you prefer editing the file directly:
 | `gpu_timeout_ms` | 2000 | how long a frame waits for the GPU to retire a command allocator before that frame is abandoned. Three abandoned frames in a row stop the feed. Raise it on a heavily contended GPU; clamped to 100–60000. |
 | `mv_scale_x/y` | 1.0 | extra motion-vector multiplier. |
 | `stall_log_ms` | 50 | **Diagnostic.** Log a breakdown for any frame whose present-to-present interval exceeds this, in ms (0 = off). Each `STALL frame` line splits the interval into the time inside the NGX evaluate call — which is where the neural consumer's own work runs — the rest of this add-on's work, and everything outside it, then names which of the three dominated. The `600 frames:` summary also carries the worst frame and a stall count. Use it to tell "the feed is slow" apart from "the neural consumer is slow" apart from "neither, something else in the process stalled". |
+| `vk_present_sync` | 1 | **Vulkan (64-bit) only.** 1 orders the add-on's early submit against the game's own present waits, which ReShade 6.8 attaches only after effects return. It needs the technique callback to be running inside the hooked `vkQueuePresentKHR`, and on some installs it never is — before 0.14.0-beta.6 that meant `mode=2` never opened a session at all, silently and permanently. It now gives the context 120 frames and then turns itself off for the session, saying so. Set `0` to skip the ordering outright (what builds before 0.13.x did); set `mode=1` if the picture flickers with it off. |
+| `passthrough` | 0 | **Diagnostic, Vulkan (64-bit).** `1` runs the whole transport with the NGX evaluate replaced by a plain `CopyResource(OUTPUT <- COLOR)`: DLSS does not run, everything else does, so it separates "the transport lags" from "DLSS lags". A *live* capture makes this visually a no-op — if the picture freezes, the capture is stale, which is a real bug and not a passthrough one. `2` additionally skips the copy home: if the picture is then correct the fault is in the copy home, if it is still frozen the fault is in the capture. Needs matching COLOR/OUTPUT formats; the log says so and stops if they differ. |
+| `buffer_home` | 0 | **Diagnostic, Vulkan (64-bit).** Route the copy home through a staging buffer instead of an image-to-image copy, for layouts a raw copy cannot express. |
+| `sync_home` | 0 | **Diagnostic, Vulkan (64-bit).** 1 = flush and CPU-wait for the copy home before returning, which serialises the frame. For isolating ordering problems only; it costs frame time by design. |
 | `async_home` | 1 | **32-bit games only.** 1 = pipelined handoff: each frame carries the DLSS output of the frame *before* it, so the game never waits for the helper process inside a frame — this is what lifts the ~35 fps ceiling of the original same-frame contract (issue #15). Costs one frame of latency on the DLSS output, which the temporal history hides. 0 = the original same-frame behaviour. Also on the overlay as "Pipelined handoff". |
-| `host_window` | 0 | **32-bit games only.** 0 keeps the helper's window behind the game, off the taskbar, and lets the overlay's "Show the DLSS 5 panel in-game" button cast its tuning panel into the game window; 1 gives the helper its own visible window instead (press Home there). Read when the helper is started. |
+| `host_window` | 0 | **32-bit games only.** 0 keeps the helper's window behind the game, off the taskbar, and lets the overlay's "Show the DLSS 5 panel in-game" button cast its tuning panel into the game window; 1 gives the helper its own visible window instead (press Home there). Read when the helper is started. **Not a hide switch:** at 0 the window is still created, still shown and still presented on every evaluate — only its z-order and window style differ. So it is not an A/B for "does the helper's presenting cost anything"; only launching the helper by hand with `--hide` is. |
 | `cast_key` | 0 | **32-bit games only.** Virtual-key code that shows/hides the cast DLSS 5 panel in-game; 0 = none. Set it from the overlay page with "Set key" rather than by hand. |
 | `cast_scale` | 100 | **32-bit games only.** Size of the cast panel, 25..300 % of the largest size that fits the game window (above 100 % it may run past the window's edges). Also on the overlay as "Panel size". |
 | `cast_mode` | 0 | **32-bit games only.** How the cast panel is drawn: 0 = a desktop-compositor thumbnail of the helper's window (windowed / borderless games, any API); 1 = a shared copy of the helper's frame drawn by the game's ReShade or blitted onto its backbuffer (works in exclusive fullscreen; D3D11, OpenGL and Vulkan). The two overlay buttons set it. |

@@ -2111,8 +2111,38 @@ static NVSDK_NGX_Result SafeNgxInitOnce(const wchar_t *data_path, ID3D12Device *
 // add-on's. Rather than ask three reporters to run three builds, try each candidate here and
 // log every result, so one run names the answer. A machine where the first attempt already
 // succeeds is unaffected: it never reaches the second.
+// Who is about to call NGX, and on a device made how.
+//
+// Issue #47 has spent a very long thread comparing machines without ever recording the two
+// things that actually differ between the call that fails and the call that works: which
+// transport is running, and what adapter argument its device was created with. Only the D3D11
+// opener passes the game's own adapter; Vulkan, OpenGL and host64 all pass null. Every report
+// should carry that line whether it succeeded or failed -- the successes are the control.
+static char g_ngx_provenance[192] = "unknown transport";
+
+// The other two variables that line has to carry. Declared here rather than beside the code
+// that sets them, because SafeNgxInit12 -- which prints them -- comes first in this file.
+// g_debug_layer_on: DLSS5_FEED_D3D12_DEBUG=1, which is known to break the create by itself.
+// g_dred_armed: arming DRED before the create is the one thing host64 never does.
+static bool g_debug_layer_on = false;
+static bool g_dred_armed     = false;
+
+// DLSS5_FEED_NGX_MATRIX=1: run the issue #47 A/B at session open. Read once, at attach, so a
+// reporter sets it in the environment and gets one extra block in the log -- see FeedNgxMatrix.
+static bool g_ngx_matrix     = false;
+
+static void FeedSetNgxProvenance(const char *transport, const char *adapter_why)
+{
+    _snprintf_s(g_ngx_provenance, sizeof(g_ngx_provenance), _TRUNCATE,
+                "transport %s, device created with %s", transport, adapter_why);
+}
+
 static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *dev, DWORD *code)
 {
+    Log("[feed] NGX init: %s, DRED %s, D3D12 debug layer %s (#47: these are the variables that "
+        "differ between this call and the one host64 makes)",
+        g_ngx_provenance, g_dred_armed ? "armed" : "not armed", g_debug_layer_on ? "ON" : "off");
+
     wchar_t cand[3][MAX_PATH] = {};
     const char *why[3] = { "the add-on's folder (what every build before this one used)",
                            "host64\\, which is what the helper passes when it succeeds here",
@@ -3587,7 +3617,6 @@ typedef HRESULT (WINAPI *PFN_D3D12GetDebugInterface_)(REFIID, void **);
 // layer names such calls exactly. It must be enabled before device creation.
 // ---------------------------------------------------------------------------
 static ID3D12InfoQueue *g_info_queue = nullptr;
-static bool             g_debug_layer_on = false;
 
 static void FeedEnableD3D12DebugLayer()
 {
@@ -3736,6 +3765,7 @@ static void FeedEnableDred()
         dred1->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         dred1->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         dred1->Release();
+        g_dred_armed = true;
         Log("[feed] DRED: auto-breadcrumbs, breadcrumb contexts and page-fault reporting enabled");
         return;
     }
@@ -3747,6 +3777,7 @@ static void FeedEnableDred()
     dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
     dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
     dred->Release();
+    g_dred_armed = true;
     Log("[feed] DRED: auto-breadcrumbs and page-fault reporting enabled "
         "(no breadcrumb contexts on this runtime, so a dump cannot name the phase)");
 }
@@ -3772,6 +3803,7 @@ static void FeedDisableDred()
         dred1->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_OFF);
         dred1->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_OFF);
         dred1->Release();
+        g_dred_armed = false;
         return;
     }
 
@@ -3781,6 +3813,7 @@ static void FeedDisableDred()
     dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_OFF);
     dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_OFF);
     dred->Release();
+    g_dred_armed = false;
 }
 
 // A game-local D3D12\ folder is an Agility SDK redist path. If the game's exe exports
@@ -3886,6 +3919,69 @@ static HRESULT FeedCreatePrivateDevice(PFN_D3D12CreateDevice_ create_device, IUn
     }
     Log("[feed] the retry without DRED also failed 0x%08X (%s)", hr, FeedHrName(hr));
     return hr;
+}
+
+// DLSS5_FEED_NGX_MATRIX=1 -- the A/B for issue #47, run on the reporter's own machine.
+//
+// A dozen reports say NVSDK_NGX_D3D12_Init -> 0xBAD00001 in-process while the SAME files on
+// the SAME driver initialise inside host64. It does not reproduce here and no local hardware
+// matches, so the thread has been arguing about variables nobody has varied. The data path is
+// already covered -- SafeNgxInit12 sweeps three of them and logs each. What is NOT covered:
+//
+//   * the ADAPTER argument. The D3D11 opener passes the GAME's adapter; the Vulkan and OpenGL
+//     openers and host64 all pass null and take DXGI's default. That is the one structural
+//     difference between the path that fails and the path that works, and it is the opposite
+//     of what "Vulkan sidesteps it" would predict -- Vulkan uses the same function.
+//   * DRED. Arming it before the create is the other thing host64 does not do.
+//   * the feature level. Everything here asks for 11_0, unconditionally.
+//
+// So walk all eight, on throwaway devices, log each result, and release them. It runs once at
+// session open and changes nothing afterwards -- the caller opens the session normally after.
+static void FeedNgxMatrix(PFN_D3D12CreateDevice_ create_device, IUnknown *game_adapter,
+                          const wchar_t *data_path)
+{
+    Log("[feed] ===== NGX matrix (#47): adapter x DRED x feature level, on throwaway devices =====");
+    Log("[feed] matrix: the data path is NOT a variable here -- SafeNgxInit12 already sweeps all "
+        "three and reports which one took. This varies only what nothing has varied yet.");
+
+    struct { IUnknown *adapter; const char *adapter_why; } kAdapters[2] = {
+        { game_adapter, "the game's own adapter (what the D3D11 opener passes)" },
+        { nullptr,      "null = DXGI's default (what Vulkan, OpenGL and host64 pass)" },
+    };
+    const D3D_FEATURE_LEVEL kLevels[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_12_0 };
+    const char *kLevelName[2]          = { "11_0", "12_0" };
+
+    for (int a = 0; a < 2; ++a)
+    {
+        if (a == 0 && game_adapter == nullptr) continue;   // no game adapter on this transport
+        for (int dred = 1; dred >= 0; --dred)
+        {
+            if (dred) FeedEnableDred(); else FeedDisableDred();
+            for (int lvl = 0; lvl < 2; ++lvl)
+            {
+                ID3D12Device *dev = nullptr;
+                const HRESULT hr  = create_device(kAdapters[a].adapter, kLevels[lvl],
+                                                  __uuidof(ID3D12Device), reinterpret_cast<void **>(&dev));
+                if (FAILED(hr) || dev == nullptr)
+                {
+                    Log("[feed] matrix: adapter=%s DRED=%s FL=%s -> D3D12CreateDevice 0x%08X (%s)",
+                        kAdapters[a].adapter_why, dred ? "on" : "off", kLevelName[lvl], hr, FeedHrName(hr));
+                    continue;
+                }
+                DWORD code = 0;
+                const NVSDK_NGX_Result r = SafeNgxInit12(data_path, dev, &code);
+                Log("[feed] matrix: adapter=%s DRED=%s FL=%s -> device OK, NVSDK_NGX_D3D12_Init 0x%08X (%s)%s",
+                    kAdapters[a].adapter_why, dred ? "on" : "off", kLevelName[lvl],
+                    r, NgxResultName(r), code != 0 ? " [the call FAULTED]" : "");
+                if (code == 0 && NVSDK_NGX_SUCCEED(r)) NVSDK_NGX_D3D12_Shutdown1(dev);
+                dev->Release();
+            }
+        }
+    }
+    // Leave DRED as the session expects to find it; the opener arms it again either way.
+    FeedEnableDred();
+    Log("[feed] ===== NGX matrix done. A row that says Init 0x00000001 (Success) is the combination "
+        "this machine wants; see DIAGNOSE-47.md for what to do with each outcome. =====");
 }
 
 static const char *FeedDredOpName(D3D12_AUTO_BREADCRUMB_OP op)
@@ -4135,6 +4231,17 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
     // were never armed, so the one report that needed the trail is the one that has none.
     FeedEnableDred();
 
+    // DLSS5_FEED_NGX_MATRIX=1: run the #47 A/B first, on throwaway devices, then open the
+    // session normally. This opener is the one that passes the game's adapter, so it is the
+    // only place the matrix has both candidates to compare.
+    if (g_ngx_matrix)
+    {
+        wchar_t mp[MAX_PATH] = {};
+        GetModuleFileNameW(g_self, mp, MAX_PATH);
+        if (wchar_t *s = wcsrchr(mp, L'\\')) *(s + 1) = L'\0';
+        FeedNgxMatrix(create_device, adapter, mp);
+    }
+
     {
         HRESULT hr = FeedCreatePrivateDevice(create_device, adapter, &g.dev12);
         if (FAILED(hr) || g.dev12 == nullptr) goto fail;
@@ -4149,6 +4256,7 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
 
         Breadcrumb("initialising NGX on D3D12");
         LogAdapterIdentity("private", g.dev12);
+        FeedSetNgxProvenance("D3D11 cross-API", "the GAME's adapter (this opener is the only one that does)");
         DWORD ngx_code = 0;
         NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
         if (ngx_code != 0)
@@ -4347,6 +4455,7 @@ static bool InitSession12(reshade::api::effect_runtime *rt)
     if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
     Breadcrumb("initialising NGX on the game's device");
+    FeedSetNgxProvenance("same-device D3D12", "none -- this is the game's own device, not one we created");
     DWORD ngx_code = 0;
     NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
     if (ngx_code != 0)
@@ -4533,6 +4642,7 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
     if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
     Breadcrumb("initialising NGX (Vulkan transport)");
+    FeedSetNgxProvenance("Vulkan", "null = DXGI's default adapter (same as host64)");
     DWORD ngx_code = 0;
     NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
     if (ngx_code != 0)
@@ -4921,6 +5031,7 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
     if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
     Breadcrumb("initialising NGX (OpenGL transport)");
+    FeedSetNgxProvenance("OpenGL", "null = DXGI's default adapter (same as host64)");
     DWORD ngx_code = 0;
     NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
     if (ngx_code != 0)
@@ -7788,6 +7899,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 
         g_prev_filter = SetUnhandledExceptionFilter(&CrashFilter);
         Log("dlss5-feed %s (built %s %s) attached.", FEED_VERSION, __DATE__, __TIME__);
+        {
+            char mopt[8] = {};
+            g_ngx_matrix = GetEnvironmentVariableA("DLSS5_FEED_NGX_MATRIX", mopt, sizeof(mopt)) != 0 && mopt[0] == '1';
+            if (g_ngx_matrix)
+                Log("[feed] DLSS5_FEED_NGX_MATRIX=1: the issue #47 A/B will run once at session open "
+                    "(throwaway devices; the session itself is unchanged). See DIAGNOSE-47.md.");
+        }
         {
             wchar_t exe[MAX_PATH] = {};
             GetModuleFileNameW(nullptr, exe, MAX_PATH);
