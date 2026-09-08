@@ -976,7 +976,11 @@ if ($needVulkanCheck) {
             $m = [regex]::Match($appsText, '(?im)^\s*Apps\s*=\s*(.*)$')
             $entries = @()
             if ($m.Success) {
-                $entries = $m.Groups[1].Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+                # @() so a single surviving entry is still an array. Without it the pipeline
+                # unrolls to a bare String, and $entries.Count below is a hard error under the
+                # Set-StrictMode -Version 2.0 at the top of this script -- on the SUCCESS
+                # branch, so it only ever killed installs that were correct (#13).
+                $entries = @($m.Groups[1].Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
             }
             $listed = $false
             foreach ($e in $entries) {

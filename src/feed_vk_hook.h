@@ -93,6 +93,15 @@ static volatile LONG64       g_vk_feed_frames;
 // decaying to 1.01x as the honest 1:1 ratio outgrew the ~68-present head start).
 static volatile LONG64       g_vk_presents_base;
 
+// The other half of that base, and the reason #13 saw "1.25x" then "3.81x" on a machine with
+// Smooth Motion switched off. Presents are counted by a raw hook with no enable gate; frames
+// fed are counted only on the delivered-frame path, which every pause stops. So a pause runs
+// the numerator on and freezes the denominator, and the ratio climbs on its own until it
+// crosses the accusation threshold. Both ends have to be rebased when the feed comes back.
+static volatile LONG64       g_vk_fed_base;
+static ULONGLONG             g_vk_last_tick_ms;      // wall clock of the previous delivered frame
+static ULONGLONG             g_vk_pacer_grace_until; // no accusation until the ratio has re-earned it
+
 // ---------------------------------------------------------------------------
 // Keeping a trampoline alive while somebody is standing on it (#62).
 //
@@ -130,9 +139,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookQueuePresent(VkQueue queue, cons
 
     // The pacer signature. Only meaningful once the feed has run for a while, and
     // only said once: a real pacer keeps the ratio up for the whole session.
-    const LONG64 fed   = g_vk_feed_frames;
+    const LONG64 fed   = g_vk_feed_frames - g_vk_fed_base;
     const LONG64 since = presents - g_vk_presents_base;
-    if (!g_vk_pacer_warned && fed > 120 && since > fed + fed / 4)
+    if (!g_vk_pacer_warned && GetTickCount64() >= g_vk_pacer_grace_until &&
+        fed > 120 && since > fed + fed / 4)
     {
         g_vk_pacer_warned = true;
         Log("[feed] an external frame pacer is presenting this swapchain: %lld presents against %lld frames fed "
@@ -153,14 +163,33 @@ static void FeedVkPresentTick(unsigned long long fed_frames, int every)
     g_vk_feed_frames = static_cast<LONG64>(fed_frames);
     // The first frame the feed ever delivered starts the comparison: presents before it
     // belong to the game alone.
-    if (fed_frames == 1) g_vk_presents_base = g_vk_presents;
+    if (fed_frames == 1) { g_vk_presents_base = g_vk_presents; g_vk_fed_base = 0; }
+
+    // A gap between two delivered frames this long is a pause, not a slow frame -- the feed
+    // was off (enabled=0, the overlay tickbox, a disable) while the game kept presenting.
+    // Everything the game presented in that gap belongs to the game, exactly as the frames
+    // before the first fed one do, so rebase both ends rather than let the surplus accumulate
+    // into an accusation (#13).
+    const ULONGLONG now = GetTickCount64();
+    if (g_vk_last_tick_ms != 0 && now - g_vk_last_tick_ms > 250)
+    {
+        const ULONGLONG gap = now - g_vk_last_tick_ms;
+        g_vk_presents_base     = g_vk_presents;
+        g_vk_fed_base          = static_cast<LONG64>(fed_frames) - 1;
+        g_vk_pacer_grace_until = now + 2000;
+        Log("[feed] present probe rebased: the feed was paused for %llu ms and the game kept "
+            "presenting; those presents are not surplus", static_cast<unsigned long long>(gap));
+    }
+    g_vk_last_tick_ms = now;
+
     if (g_vk_present_orig == nullptr || every <= 0 || (fed_frames % static_cast<unsigned long long>(every)) != 0)
         return;
     const LONG64 since = g_vk_presents - g_vk_presents_base;
-    Log("[feed] present probe: %lld presents / %llu frames fed since the first fed frame (%.2fx), "
+    const LONG64 fed   = static_cast<LONG64>(fed_frames) - g_vk_fed_base;
+    Log("[feed] present probe: %lld presents / %lld frames fed since the last rebase (%.2fx), "
         "last swapchain image index %u",
-        static_cast<long long>(since), fed_frames,
-        fed_frames > 0 ? static_cast<double>(since) / static_cast<double>(fed_frames) : 0.0,
+        static_cast<long long>(since), static_cast<long long>(fed),
+        fed > 0 ? static_cast<double>(since) / static_cast<double>(fed) : 0.0,
         g_vk_last_image);
 }
 

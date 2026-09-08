@@ -15,6 +15,12 @@ static thread_local FeedVkPresentContext *g_vk_present_context;
 static PFN_vkQueuePresentKHR g_vk_frame_present_orig;
 static void *g_vk_frame_present_target;
 
+// Latched by the frame path when the context never appears at all. Some installs can never
+// satisfy the gate -- the technique callback is simply not nested inside the hooked present
+// there -- and before this the precaution meant "no session, ever" rather than "no ordering"
+// (#13). Session-scoped, never read from the config.
+static bool g_vk_present_sync_off;
+
 static VKAPI_ATTR VkResult VKAPI_CALL FeedVkFramePresent(VkQueue queue, const VkPresentInfoKHR *info)
 {
     FeedVkPresentContext context = { queue, info };

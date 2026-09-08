@@ -1177,6 +1177,13 @@ static const int   kMvModeCount  = static_cast<int>(sizeof(kMvModeName) / sizeof
 static char g_mv_status[192]  = "not checked yet";
 static char g_mv_problem[640] = "";
 
+// Whether DLSS5_Feed.fx has EVER resolved in this process, when it was first seen missing, and
+// whether we have already said so out loud. Split out of ResolveHandles because the decision
+// belongs on a timer rather than on the first look -- see FeedEffectMissingTick (#81).
+static bool      g_effect_ever_ok;
+static ULONGLONG g_effect_missing_since;
+static bool      g_effect_warned_missing;
+
 // ReShade keeps a technique of an effect that FAILED to compile in its list, and it can even
 // be "enabled" -- it just never runs. ReshadeMotionEstimation on ReShade 6.8 is the textbook
 // case ("cannot sample from texture that is also used as render target"): the feed then gets
@@ -1802,7 +1809,23 @@ static bool BeginCommands()
             // used to stop neural rendering permanently, with the overlay's Re-enable
             // button as the only way back. FeedFail's 3-strikes rule decides instead,
             // which is what the 32-bit host has always done.
-            Log("[feed] the GPU did not retire allocator slot %d within %u ms", slot, timeout);
+            // #63's log has one of these and then a device-removed 20 s later, and nothing
+            // in between says whether the GPU caught up or never did. The fence values do:
+            // a slot that is one submission behind and recovers is an ordinary contention
+            // blip, a slot still behind by the whole ring is a GPU that has stopped.
+            static unsigned timeouts = 0;
+            ++timeouts;
+            // One read: the value can move between calls, and a "behind by" computed from
+            // two of them can wrap.
+            const UINT64 done   = g.fence12->GetCompletedValue();
+            const UINT64 behind = retire > done ? retire - done : 0;
+            Log("[feed] the GPU did not retire allocator slot %d within %u ms "
+                "(waiting for fence %llu, completed %llu -- %llu submission(s) behind; %u timeout(s) this session)",
+                slot, timeout,
+                static_cast<unsigned long long>(retire),
+                static_cast<unsigned long long>(done),
+                static_cast<unsigned long long>(behind),
+                timeouts);
             return false;
         }
     }
@@ -3647,7 +3670,12 @@ static void FeedDrainInfoQueue(const char *when)
 // safe to call twice and safe with null members, which is what the openers rely on.
 static void FeedNameD3D12Objects()
 {
-    if (g.queue != nullptr) g.queue->SetName(L"dlss5-feed queue");
+    // The same-device D3D12 transport does not create a queue -- g.queue IS the game's own,
+    // AddRef'd from ReShade. Naming that "dlss5-feed queue" put the game's entire submission
+    // timeline under our name in every DRED dump, which is exactly the wrong answer to give
+    // someone reading a hang (#63). Say whose it is.
+    if (g.queue != nullptr)
+        g.queue->SetName(g.dev12_owned ? L"dlss5-feed queue" : L"dlss5-feed (the game's queue)");
     if (g.list  != nullptr) g.list->SetName(L"dlss5-feed command list");
     if (g.fence12 != nullptr) g.fence12->SetName(L"dlss5-feed fence");
     for (int i = 0; i < Feed::kFrames; ++i)
@@ -3694,14 +3722,33 @@ static void FeedEnableDred()
     auto get_debug = reinterpret_cast<PFN_D3D12GetDebugInterface_>(GetProcAddress(d3d12, "D3D12GetDebugInterface"));
     if (get_debug == nullptr) { Log("[feed] DRED: no D3D12GetDebugInterface"); return; }
 
+    // Settings1, not Settings: the breadcrumb CONTEXTS are what carry the phase names
+    // FeedBeginPhase records, and they are off by default. 0.14.0-beta.5 added the phase
+    // brackets and never turned this on, so every bracket it recorded was thrown away and the
+    // #63 dump still could not say which phase hung. Ask for Settings1 first and fall back to
+    // the base interface, which is all a pre-20H1 runtime has.
+    ID3D12DeviceRemovedExtendedDataSettings1 *dred1 = nullptr;
+    HRESULT hr = get_debug(__uuidof(ID3D12DeviceRemovedExtendedDataSettings1),
+                           reinterpret_cast<void **>(&dred1));
+    if (SUCCEEDED(hr) && dred1 != nullptr)
+    {
+        dred1->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        dred1->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        dred1->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        dred1->Release();
+        Log("[feed] DRED: auto-breadcrumbs, breadcrumb contexts and page-fault reporting enabled");
+        return;
+    }
+
     ID3D12DeviceRemovedExtendedDataSettings *dred = nullptr;
-    const HRESULT hr = get_debug(__uuidof(ID3D12DeviceRemovedExtendedDataSettings),
-                                 reinterpret_cast<void **>(&dred));
+    hr = get_debug(__uuidof(ID3D12DeviceRemovedExtendedDataSettings),
+                   reinterpret_cast<void **>(&dred));
     if (FAILED(hr) || dred == nullptr) { Log("[feed] DRED: settings unavailable 0x%08X", hr); return; }
     dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
     dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
     dred->Release();
-    Log("[feed] DRED: auto-breadcrumbs and page-fault reporting enabled");
+    Log("[feed] DRED: auto-breadcrumbs and page-fault reporting enabled "
+        "(no breadcrumb contexts on this runtime, so a dump cannot name the phase)");
 }
 
 typedef HRESULT (WINAPI *PFN_D3D12CreateDevice_)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
@@ -3716,6 +3763,17 @@ static void FeedDisableDred()
     if (d3d12 == nullptr) return;
     auto get_debug = reinterpret_cast<PFN_D3D12GetDebugInterface_>(GetProcAddress(d3d12, "D3D12GetDebugInterface"));
     if (get_debug == nullptr) return;
+
+    ID3D12DeviceRemovedExtendedDataSettings1 *dred1 = nullptr;
+    if (SUCCEEDED(get_debug(__uuidof(ID3D12DeviceRemovedExtendedDataSettings1),
+                            reinterpret_cast<void **>(&dred1))) && dred1 != nullptr)
+    {
+        dred1->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_OFF);
+        dred1->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_OFF);
+        dred1->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_OFF);
+        dred1->Release();
+        return;
+    }
 
     ID3D12DeviceRemovedExtendedDataSettings *dred = nullptr;
     if (FAILED(get_debug(__uuidof(ID3D12DeviceRemovedExtendedDataSettings),
@@ -3891,6 +3949,30 @@ static const char *FeedDredAllocName(D3D12_DRED_ALLOCATION_TYPE t)
     }
 }
 
+// Which phase bracket encloses breadcrumb op `i`.
+//
+// FeedBeginPhase records a BeginEvent, and with breadcrumb contexts armed DRED stores the
+// string against the op index of that BeginEvent. So the phase covering op i is the context
+// with the largest BreadcrumbIndex <= i -- and "no context at or before i" means the op is
+// outside every bracket, which is itself worth saying.
+static const wchar_t *FeedDredPhaseAt(const D3D12_AUTO_BREADCRUMB_NODE1 *node, UINT32 i)
+{
+    if (node->pBreadcrumbContexts == nullptr) return nullptr;
+    const wchar_t *best = nullptr;
+    UINT32         best_at = 0;
+    for (UINT32 c = 0; c < node->BreadcrumbContextsCount; ++c)
+    {
+        const D3D12_DRED_BREADCRUMB_CONTEXT &ctx = node->pBreadcrumbContexts[c];
+        if (ctx.BreadcrumbIndex > i) continue;
+        if (best == nullptr || ctx.BreadcrumbIndex >= best_at)
+        {
+            best    = ctx.pContextString;
+            best_at = ctx.BreadcrumbIndex;
+        }
+    }
+    return best;
+}
+
 // Dump whatever DRED captured. Safe to call more than once; logs once per removal.
 static void FeedDumpDred(HRESULT removed_reason)
 {
@@ -3899,6 +3981,13 @@ static void FeedDumpDred(HRESULT removed_reason)
     dumped = true;
 
     Log("[feed] ===== DRED: device removed, reason 0x%08X =====", removed_reason);
+    // #63 read its own dump as "all three nodes are ours" because every node said
+    // 'dlss5-feed queue'. On the same-device D3D12 transport that name is on the GAME's queue,
+    // which this add-on renamed -- so say whose queue it is before anyone reads the trail.
+    Log("[feed] DRED: transport %s; the queue named 'dlss5-feed queue' is %s",
+        g.dev12_owned ? "cross-API (our own private D3D12 device)" : "same-device D3D12 (the game's)",
+        g.dev12_owned ? "ours alone -- nothing the game submits appears on it"
+                      : "THE GAME'S OWN, renamed by this add-on: work on it is not necessarily ours");
     FeedDrainInfoQueue("at removal");
 
     ID3D12DeviceRemovedExtendedData1 *dred = nullptr;
@@ -3924,11 +4013,45 @@ static void FeedDumpDred(HRESULT removed_reason)
                 node->pCommandQueueDebugNameW ? node->pCommandQueueDebugNameW : L"(unnamed)",
                 node->pCommandListDebugNameW ? node->pCommandListDebugNameW : L"(unnamed)",
                 last, node->BreadcrumbCount);
-            // The op at index 'last' is the one that had not finished: the culprit.
-            const UINT32 first = last > 6 ? last - 6 : 0;
+
+            // The phase map, first: which op ranges are copy-in, ngx-evaluate and copy-home.
+            // "ours or NGX's" is the whole question in #63, and this answers it at a glance --
+            // everything inside ngx-evaluate that is not one of our five barriers is NGX's.
+            if (node->pBreadcrumbContexts != nullptr && node->BreadcrumbContextsCount > 0)
+            {
+                for (UINT32 c = 0; c < node->BreadcrumbContextsCount; ++c)
+                {
+                    const D3D12_DRED_BREADCRUMB_CONTEXT &ctx = node->pBreadcrumbContexts[c];
+                    UINT32 end = node->BreadcrumbCount;
+                    for (UINT32 o = 0; o < node->BreadcrumbContextsCount; ++o)
+                        if (node->pBreadcrumbContexts[o].BreadcrumbIndex > ctx.BreadcrumbIndex &&
+                            node->pBreadcrumbContexts[o].BreadcrumbIndex < end)
+                            end = node->pBreadcrumbContexts[o].BreadcrumbIndex;
+                    Log("[feed] DRED   phase ops[%u..%u] = '%ls'", ctx.BreadcrumbIndex, end - 1,
+                        ctx.pContextString ? ctx.pContextString : L"(no string)");
+                }
+            }
+            else
+            {
+                Log("[feed] DRED   (no breadcrumb contexts: this runtime or this build did not arm "
+                    "them, so the phase cannot be named)");
+            }
+
+            // The op at index 'last' is the one that had not finished: the culprit. Print the
+            // whole phase it fell in rather than a fixed 7-op window -- a window that small
+            // lands entirely inside NGX's own barrier run and says nothing.
+            const wchar_t *phase = FeedDredPhaseAt(node, last);
+            UINT32 first = last > 6 ? last - 6 : 0;
+            if (phase != nullptr)
+                for (UINT32 i = 0; i <= last; ++i)
+                    if (FeedDredPhaseAt(node, i) == phase) { first = i; break; }
+            if (last - first > 64) first = last - 64;   // a very long NGX phase is not worth 300 lines
             for (UINT32 i = first; i < node->BreadcrumbCount && i <= last; ++i)
-                Log("[feed] DRED   op[%u]%s %s", i, i == last ? " <== FAULTED HERE" : "",
-                    FeedDredOpName(node->pCommandHistory[i]));
+            {
+                const wchar_t *p = FeedDredPhaseAt(node, i);
+                Log("[feed] DRED   op[%u]%s %s [%ls]", i, i == last ? " <== FAULTED HERE" : "",
+                    FeedDredOpName(node->pCommandHistory[i]), p ? p : L"outside every phase");
+            }
         }
         if (bc.pHeadAutoBreadcrumbNode == nullptr)
             Log("[feed] DRED: no breadcrumb nodes (nothing was in flight on our queue)");
@@ -5692,13 +5815,38 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     }
 
     // Even a resource rebuild can flush the immediate list. Establish the game
-    // dependency before that, not just before the explicit per-frame flush.
-    if (g_cfg.vk_present_sync && !g_vk_frame_present_target) FeedVkFramePresentInstall(rt);
-    if (g_cfg.mode >= 2 && g_cfg.vk_present_sync && !FeedVkOrderPresent(rt, cl))
+    // dependency before that, not just before the explicit per-frame flush. That is why
+    // this gate cannot simply be moved below the session opener: relocating it reintroduces
+    // the unordered early submit it exists to prevent (the Detroit flicker).
+    if (g_cfg.vk_present_sync && !g_vk_present_sync_off && !g_vk_frame_present_target)
+        FeedVkFramePresentInstall(rt);
+    if (g_cfg.mode >= 2 && g_cfg.vk_present_sync && !g_vk_present_sync_off && !FeedVkOrderPresent(rt, cl))
     {
-        static bool reported = false;
-        if (!reported) { reported = true; Log("[feed] Vulkan: no usable present dependency context; skipping mode 2 to avoid an unordered early submit"); }
-        return;
+        // A precaution that is never satisfiable on a given install must not mean "no DLSS at
+        // all, silently, forever" -- which is what returning here did: this sits ABOVE
+        // InitSessionVk, so the session never opened and the overlay read "not started"
+        // indefinitely. Retail Detroit reached `feature ready` on 0.10.0-beta.2, which
+        // predates this gate, and the reporter's own `vk_present_sync=0` restores it (#13).
+        //
+        // So: give the context a fair number of frames to appear, then latch the precaution
+        // off for the session and carry on in exactly the state that used to work.
+        static bool     reported = false;
+        static unsigned waited   = 0;
+        if (!reported)
+        {
+            reported = true;
+            Log("[feed] Vulkan: no usable present dependency context; holding mode 2 back to avoid an "
+                "unordered early submit (present hook %s)",
+                g_vk_frame_present_target ? "is installed, but this frame is not nested inside it"
+                                          : "was NOT installed on this device");
+        }
+        if (++waited < 120) return;
+        g_vk_present_sync_off = true;
+        Log("[feed] Vulkan: the present dependency context never appeared in %u frames. Turning the "
+            "ordering precaution off for this session and running mode 2 without it -- this is what "
+            "builds before 0.13.x did, and what vk_present_sync=0 does. The trade is that the early "
+            "submit is unordered again, so if the picture flickers, set vk_present_sync=1 and mode=1 "
+            "in dlss5-feed.cfg to pin it the other way (#13).", waited);
     }
     bool ok = true;
     if (g.session_ready && g.rs_dev != nullptr &&
@@ -6173,10 +6321,58 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 // already encoded, so the bytes must go home untouched. The blit stays
                 // only for the layouts a raw copy genuinely cannot express.
                 const UINT wh = g_cfg.half_home != 0 ? w / 2 : w;   // half_home: leave the right half raw
-                if (g.vk_home_buf != VK_NULL_HANDLE)
+                // async_home reads the slot the evaluate is NOT writing this frame.
+                const VkDeviceSize slot = async_home ? g.home_slice * ((n - 1) & 1) : 0;
+
+                // #13: passthrough=1 froze the picture -- 121 consecutive identical colour-in
+                // AND output hashes over ~16,400 frames, with NGX not in the loop at all. A
+                // passthrough whose capture is live is visually a no-op, so a freeze says the
+                // capture is stale and this copy is re-stamping it over a fresh frame. These
+                // two lines are what tells capture from home write, and neither existed.
+                //   passthrough=2 = capture and transport run, the home write does NOT.
+                //     Picture correct  -> the fault is in this copy home.
+                //     Picture frozen   -> the fault is upstream, in the capture.
+                // How many DISTINCT swapchain images this add-on has seen since the last
+                // report. Capture and copy-home both use bb_img, so they cannot disagree
+                // within a frame -- but if ReShade hands us the SAME image every frame while
+                // the game presents the others, we are reading and writing one buffer out of
+                // three and the picture freezes exactly as reported. One is the bug; two or
+                // three is a healthy rotation.
                 {
-                    // async_home reads the slot the evaluate is NOT writing this frame.
-                    const VkDeviceSize slot = async_home ? g.home_slice * ((n - 1) & 1) : 0;
+                    static unsigned long long seen[4];
+                    static int                seen_n;
+                    const unsigned long long  img = static_cast<unsigned long long>(FeedVkValue(bb_img));
+                    bool known = false;
+                    for (int i = 0; i < seen_n; ++i) if (seen[i] == img) { known = true; break; }
+                    if (!known && seen_n < 4) seen[seen_n++] = img;
+                    if ((n % 120) == 0 || n <= 3)
+                    {
+                        Log("[feed] home: frame %llu writes OUTPUT -> backbuffer image %llu "
+                            "(%d distinct image(s) seen so far%s), home slot %llu of %llu, pitch %u",
+                            static_cast<unsigned long long>(n), img, seen_n,
+                            seen_n == 1 && n > 3 ? " -- ONE image only: we are reading and writing a "
+                                                   "single buffer while the game presents the others"
+                                                 : "",
+                            static_cast<unsigned long long>(slot),
+                            static_cast<unsigned long long>(g.home_slice),
+                            g.home_pitch);
+                        seen_n = 0;   // per-window, so a rotation that stops is visible
+                    }
+                }
+
+                if (g_cfg.passthrough == 2)
+                {
+                    static bool said_pass2 = false;
+                    if (!said_pass2)
+                    {
+                        said_pass2 = true;
+                        Log("[feed] passthrough=2: capture and transport run, the copy home does NOT. "
+                            "If the picture is correct now, the fault is in the copy home; if it is still "
+                            "frozen, the fault is in the capture (#13).");
+                    }
+                }
+                else if (g.vk_home_buf != VK_NULL_HANDLE)
+                {
                     FeedVkCopyBufferToImage(&g.vk, cb, g.vk_home_buf, bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                             wh, h, g.home_pitch / HomeTexelBytes(g.output_fmt), slot);
                 }
@@ -6854,6 +7050,47 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
     }
 }
 
+// "DLSS5_Feed.fx is not loaded" belongs on a clock, not on the first look.
+//
+// ResolveHandles only runs on a state change, so it cannot be the one to decide: the very
+// first look happens before ReShade has compiled a single effect, and if the shader really is
+// absent the state never changes again, so there is no second look either. Hence a tick: armed
+// by ResolveHandles when the handles are missing and the effect has never resolved, disarmed
+// the moment it does, and allowed to speak only after the compile has plainly had its chance.
+static void FeedEffectMissingTick(ULONGLONG now)
+{
+    if (g_effect_ever_ok || g_effect_warned_missing || g_effect_missing_since == 0) return;
+    if (now - g_effect_missing_since < 10000) return;
+    g_effect_warned_missing = true;
+    Warn("DLSS5_Feed.fx is not loaded (technique/textures missing) -- install it into reshade-shaders\\Shaders.");
+}
+
+// Re-read the config from ABOVE every enable gate.
+//
+// `enabled=0` written into the file used to be one-way: the only CfgReload calls were inside
+// the four transport functions, which sit below `if (!g_cfg.enabled) return`, so writing 0
+// killed the very poller that would have read a later 1 back. The overlay tickbox kept
+// working -- it writes the in-memory config -- which is why this survived so long (#13).
+//
+// Wall clock rather than `g.frames_done % 60`: that counter only advances on delivered frames,
+// so once the feed stops it freezes and the modulo is statically true or false for the rest of
+// the session -- the same bug wearing a different hat. Under g_feed_cs because a present-path
+// interposer can bring a second thread through here (see FeedEnter).
+static void FeedPollConfig()
+{
+    static ULONGLONG next_poll = 0;
+    const ULONGLONG  now       = GetTickCount64();
+    if (now < next_poll) return;
+    EnterCriticalSection(&g_feed_cs);
+    if (now >= next_poll)
+    {
+        next_poll = now + 500;
+        if (CfgReload()) g.frame_ready = false;
+        FeedEffectMissingTick(now);
+    }
+    LeaveCriticalSection(&g_feed_cs);
+}
+
 // The single entry point for every backend, and so the one place the whole feed is
 // serialized. Everything below this line assumes it owns the g struct, the allocator
 // ring and the shared textures for the duration of a frame -- true when Present is
@@ -7003,18 +7240,35 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
         g.mv_var.handle ? "found" : "MISSING",
         g.depth_var.handle ? "found" : "MISSING", g.mask_var.handle ? "found" : "absent (older shader: no bias mask)",
         g_mv_status, g.depth_reversed ? 1 : 0);
-    static bool effect_ever_ok = false;
-    if (g.handles_ok) effect_ever_ok = true;
+    if (g.handles_ok && !g_effect_ever_ok)
+    {
+        g_effect_ever_ok = true;
+        // The retraction. Without it a log that opened with "not loaded" carried that verdict
+        // to the end even though the shader resolved seconds later, and a reporter reading it
+        // reasonably concluded their install was broken (#81 opens with exactly that).
+        if (g_effect_warned_missing)
+            Log("[feed] DLSS5_Feed.fx is loaded after all -- the warning above was written before "
+                "ReShade finished compiling. Disregard it.");
+    }
     if (!g.handles_ok)
     {
         // Once the effect has resolved in this process, a MISSING transition is just a
         // reload in flight (games and add-ons can trigger those in bursts); re-warning
         // every time filled both logs (Space Engineers). The state-change log line above
         // still records each transition.
-        if (effect_ever_ok)
+        //
+        // The FIRST time, though, this runs before ReShade has compiled anything -- in #81's
+        // log the warning lands at 46.972 and the shader resolves at 51.321, with the compiles
+        // in between -- so the verdict is simply premature. FeedEffectMissingTick, on a timer,
+        // owns it now; this only arms the clock.
+        if (g_effect_ever_ok)
             Log("[feed] DLSS5_Feed.fx handles gone during an effect reload; waiting for the recompile");
-        else
-            Warn("DLSS5_Feed.fx is not loaded (technique/textures missing) -- install it into reshade-shaders\\Shaders.");
+        else if (g_effect_missing_since == 0)
+        {
+            g_effect_missing_since = GetTickCount64();
+            Log("[feed] %s has not resolved yet (ReShade may still be compiling); waiting 10 s "
+                "before calling it missing", kEffectFile);
+        }
     }
     else if (g.launchpad.handle == 0)
         _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
@@ -7142,6 +7396,7 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
                               reshade::api::command_list *cl, reshade::api::resource_view rtv,
                               reshade::api::resource_view /*rtv_srgb*/)
 {
+    FeedPollConfig();
     if (!g_cfg.enabled) return;
     if (rt != g.runtime)
     {
