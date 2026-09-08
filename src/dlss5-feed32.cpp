@@ -899,7 +899,16 @@ static HostLink g_link;
 // case is a survivable hitch rather than the indefinite freeze this replaced.
 static const DWORD kPipeHelloMs = 15000;
 static const DWORD kPipeBuildMs = 60000;
-static const DWORD kPipeFrameMs = 2000;
+// This one has an ordering constraint against the HOST, and it was violated the moment the
+// host's frame backlog was bounded (#15). The host's serve loop is single-threaded: the same
+// thread that reads this pipe can sit for up to 2000 ms inside BeginCommands waiting for the
+// GPU to retire an allocator slot. While it does, nothing is read, and a write that fills the
+// pipe blocks. At 2000 ms both sides had the SAME deadline, so the worst case was a coin flip
+// between "survivable hitch" and HostLost -- which tears the feed down for the whole session.
+// The 1024-byte pipe buffer used to hide that by absorbing 48 frames of backlog; bounding it
+// to 12 exposed it. So the client's patience must exceed the host's worst reader stall, with
+// room to spare. Raise BOTH together if the host's BeginCommands timeout ever changes.
+static const DWORD kPipeFrameMs = 4000;
 
 static bool HostLinkStop();   // below: abort and join the worker, from HostClose
 static bool g_detaching;      // DLL_PROCESS_DETACH: the loader lock is held, so never join

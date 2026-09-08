@@ -3968,12 +3968,26 @@ static void FeedNgxMatrix(PFN_D3D12CreateDevice_ create_device, IUnknown *game_a
                         kAdapters[a].adapter_why, dred ? "on" : "off", kLevelName[lvl], hr, FeedHrName(hr));
                     continue;
                 }
+                // Per row, or SafeNgxInit12's provenance banner reports whatever the last
+                // opener set -- which for eight rows running BEFORE any opener is nothing at
+                // all. The line this whole feature exists to produce would be wrong on every
+                // row it produces.
+                char row_why[128];
+                _snprintf_s(row_why, sizeof(row_why), _TRUNCATE, "%s, DRED %s, FL %s",
+                            kAdapters[a].adapter_why, dred ? "armed" : "off", kLevelName[lvl]);
+                FeedSetNgxProvenance("matrix probe (#47)", row_why);
+
                 DWORD code = 0;
                 const NVSDK_NGX_Result r = SafeNgxInit12(data_path, dev, &code);
                 Log("[feed] matrix: adapter=%s DRED=%s FL=%s -> device OK, NVSDK_NGX_D3D12_Init 0x%08X (%s)%s",
                     kAdapters[a].adapter_why, dred ? "on" : "off", kLevelName[lvl],
                     r, NgxResultName(r), code != 0 ? " [the call FAULTED]" : "");
-                if (code == 0 && NVSDK_NGX_SUCCEED(r)) NVSDK_NGX_D3D12_Shutdown1(dev);
+                // Unconditionally when the call did not fault, not only when it succeeded: a
+                // failed Init can still have taken references, and releasing the device out
+                // from under them is how a diagnostic ends up causing the fault it is
+                // measuring. A row that FAULTED is past helping -- nothing may be assumed
+                // about NGX's state there, which is what the closing caveat is for.
+                if (code == 0) NVSDK_NGX_D3D12_Shutdown1(dev);
                 dev->Release();
             }
         }
@@ -7511,11 +7525,23 @@ static void OnReloadedEffects(reshade::api::effect_runtime *rt)
     }
 }
 
+// The config poll and the missing-effect verdict, on an event that fires whatever happens.
+//
+// Both used to hang off reshade_render_technique, which only fires when ReShade actually
+// renders a technique -- so on the two installs that need them most they never ran at all: a
+// game with no effects enabled never re-read `enabled=1` back out of the file, and the install
+// where DLSS5_Feed.fx is genuinely absent (which is the whole point of the #81 warning) got no
+// warning either, because nothing was rendering to carry the timer forward. reshade_present
+// fires once per present per runtime regardless, which is what this needs.
+static void OnReShadePresent(reshade::api::effect_runtime * /*rt*/)
+{
+    FeedPollConfig();
+}
+
 static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::effect_technique technique,
                               reshade::api::command_list *cl, reshade::api::resource_view rtv,
                               reshade::api::resource_view /*rtv_srgb*/)
 {
-    FeedPollConfig();
     if (!g_cfg.enabled) return;
     if (rt != g.runtime)
     {
@@ -7971,6 +7997,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
+        reshade::register_event<reshade::addon_event::reshade_present>(OnReShadePresent);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         reshade::register_overlay(nullptr, DrawOverlay);
     }
@@ -7996,6 +8023,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
+        reshade::unregister_event<reshade::addon_event::reshade_present>(OnReShadePresent);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         FeedVkFramePresentRemove();
         FeedVkHookRemove();   // before this code is unmapped -- ReShade reloads add-ons per Vulkan instance

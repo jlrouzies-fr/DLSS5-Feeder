@@ -921,6 +921,11 @@ static bool BeginCommands()
         LARGE_INTEGER rw0, rw1, rwf;
         QueryPerformanceFrequency(&rwf);
         QueryPerformanceCounter(&rw0);
+        // 2000 ms is the host's worst reader stall, and the client's per-frame write budget
+        // (kPipeFrameMs in dlss5-feed32.cpp) must stay comfortably above it -- this thread is
+        // the only pipe reader, so every millisecond here is a millisecond the client's write
+        // cannot complete, and the client treats a timed-out write as a lost host. Raise both
+        // together or neither.
         const bool signaled = WaitForSingleObject(h.fence_event, 2000) == WAIT_OBJECT_0;
         QueryPerformanceCounter(&rw1);
         ++g_ring_waits;
@@ -1754,7 +1759,11 @@ static bool InitDisguise()
     if (!reshade_dxgi)
         Log("[host] WARNING: dxgi.dll here is Windows' own (%ls), not ReShade -- there is no overlay and no "
             "add-on panel in this process at all. Put ReShade x64 beside this helper as dxgi.dll.", dxgi_path);
-    else if (!ReShadeOwnsCreateDevice(d3d12, raw_create_device))
+    // d3d12 != nullptr guards the wait: with no d3d12.dll at all there is no export for
+    // ReShade to patch and nothing to wait for, and without this the loop below spends two
+    // seconds calling GetProcAddress(nullptr) two hundred times before the failure a few lines
+    // down reports the real problem.
+    else if (d3d12 != nullptr && !ReShadeOwnsCreateDevice(d3d12, raw_create_device))
     {
         const ULONGLONG t0 = GetTickCount64();
         while (GetTickCount64() - t0 < 2000)
