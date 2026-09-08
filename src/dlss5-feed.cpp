@@ -4130,7 +4130,8 @@ static void FeedDumpDred(HRESULT removed_reason)
                         if (node->pBreadcrumbContexts[o].BreadcrumbIndex > ctx.BreadcrumbIndex &&
                             node->pBreadcrumbContexts[o].BreadcrumbIndex < end)
                             end = node->pBreadcrumbContexts[o].BreadcrumbIndex;
-                    Log("[feed] DRED   phase ops[%u..%u] = '%ls'", ctx.BreadcrumbIndex, end - 1,
+                    Log("[feed] DRED   phase ops[%u..%u] = '%ls'", ctx.BreadcrumbIndex,
+                        end > ctx.BreadcrumbIndex ? end - 1 : ctx.BreadcrumbIndex,
                         ctx.pContextString ? ctx.pContextString : L"(no string)");
                 }
             }
