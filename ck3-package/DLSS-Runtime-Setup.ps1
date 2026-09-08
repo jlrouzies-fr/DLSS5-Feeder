@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('Configure', 'Status', 'OpenRHI')]
     [string]$Action = 'Configure',
@@ -404,34 +404,24 @@ function Get-RenoDxAddon([string]$CacheRoot, [string]$LocalPath) {
         return [pscustomobject]@{ Info = $info; Version = $info.FileVersion; Source = 'Pre-bundled or supplied local file' }
     }
 
-    # Windows PowerShell 5.1 exposes a top-level JSON array as one Object[] pipeline item.
-    # Wrapping this call in @() would therefore create a nested array.
-    $releases = Get-RemoteJson $script:RhiRepoReleases 'RHI''s RenoDX component releases'
-    $release = $releases |
-        Where-Object { -not $_.draft -and [string]$_.tag_name -like 'renodx-dlss5-*' } |
-        Sort-Object { [DateTime]$_.published_at } -Descending |
-        Select-Object -First 1
-    if (-not $release) { throw 'No RenoDX DLSS 5 component release was found in the RHI repository.' }
-    $asset = $release.assets |
-        Where-Object { $_.name -ieq 'renodx-dlss5.addon64' -or $_.name -match '(?i)^renodx-dlss5.*\.zip$' } |
-        Select-Object -First 1
-    if (-not $asset) { throw "RHI release '$($release.tag_name)' has no RenoDX DLSS 5 add-on asset." }
-
-    $version = ([string]$release.tag_name) -replace '^renodx-dlss5-', ''
-    $safeVersion = $version -replace '[^0-9A-Za-z._-]', '_'
-    $destination = Join-Path $CacheRoot "renodx-dlss5_$safeVersion.addon64"
-    if ($ForceDownload -or -not (Test-Path -LiteralPath $destination -PathType Leaf)) {
-        if ([string]$asset.name -match '(?i)\.zip$') {
-            $archive = Join-Path $CacheRoot "renodx-dlss5_$safeVersion.zip"
-            Save-Download ([string]$asset.browser_download_url) $archive "RenoDX DLSS 5 add-on $version from RHI"
-            Copy-ArchivePayload $archive 'renodx-dlss5.addon64' $destination 'RenoDX DLSS 5 add-on'
-        }
-        else {
-            Save-Download ([string]$asset.browser_download_url) $destination "RenoDX DLSS 5 add-on $version from RHI"
-        }
+    # Match Build-CK3-Complete-Test.ps1. Newer consumer engines are not a safe
+    # automatic upgrade: upstream #54 reports driver-dependent v4.6/v4.7 failures.
+    $version = '4.55'
+    $source = 'https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-4.55/renodx-dlss5_4.55.zip'
+    $archiveHash = '15481c492db76682e9a88917e7f78897351ecf088bfae9bca74a0c5b74ddd033'
+    $dllHash = '9150097cdee2953cdc9894d2e5606ea5100e6c8f95fc7bb1b407328b4391a07a'
+    $destination = Join-Path $CacheRoot "renodx-dlss5_$version.addon64"
+    $needDownload = $ForceDownload -or -not (Test-Path -LiteralPath $destination -PathType Leaf)
+    if (-not $needDownload) { $needDownload = (Get-Sha256 $destination) -ne $dllHash }
+    if ($needDownload) {
+        $archive = Join-Path $CacheRoot "renodx-dlss5_$version.zip"
+        Save-Download $source $archive "pinned RenoDX DLSS 5 add-on $version from RHI"
+        if ((Get-Sha256 $archive) -ne $archiveHash) { throw 'The RenoDX archive did not match its reviewed SHA-256.' }
+        Copy-ArchivePayload $archive 'renodx-dlss5.addon64' $destination 'RenoDX DLSS 5 add-on'
     }
+    if ((Get-Sha256 $destination) -ne $dllHash) { throw 'The RenoDX add-on did not match its reviewed SHA-256.' }
     $info = Assert-PeFile $destination 'RenoDX DLSS 5 add-on' $true $false $false
-    return [pscustomobject]@{ Info = $info; Version = $version; Source = [string]$asset.browser_download_url }
+    return [pscustomobject]@{ Info = $info; Version = $version; Source = $source }
 }
 
 function Get-ComponentRecord([object]$Component) {

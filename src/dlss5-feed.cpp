@@ -1,4 +1,4 @@
-﻿// dlss5-feed - ReShade add-on
+// dlss5-feed - ReShade add-on
 //
 // Makes DLSS 5 neural rendering work in a D3D11 or D3D12 game that has no DLSS of its own.
 //
@@ -45,9 +45,11 @@
 #include <nvsdk_ngx_helpers.h>
 
 #include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
+#include <MinHook.h>
+#include "feed_vk_present64.h"
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 
-#define FEED_VERSION "0.6.0-beta.1"
+#define FEED_VERSION "ck3-upstream-test.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -146,6 +148,8 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 static char g_renodx_ver[48] = "unknown";
 static bool g_renodx_present = false;
 static bool g_renodx_lazy    = false;
+static bool g_renodx_v46     = false;
+static bool g_renodx_v47     = false;
 
 // Set when the game's device (or the process) is being destroyed: from that moment,
 // never call back into NGX. The DLSS 5 add-on tears its hooks down during device
@@ -153,6 +157,19 @@ static bool g_renodx_lazy    = false;
 // on a foreign thread and wedges the quitting game (seen in DOOM: 0xE06D7363 in
 // KERNELBASE 18 ms after the add-on's vtable::Unhook). The OS reclaims it all anyway.
 static bool g_ngx_dying = false;
+
+static void RenodxDefault(const char *key, const char *value, const char *why)
+{
+    char v[16];
+    size_t n = sizeof(v);
+    if (!reshade::get_config_value(nullptr, "RenoDX.DLSS5", key, v, &n))
+    {
+        reshade::set_config_value(nullptr, "RenoDX.DLSS5", key, value);
+        Log("[feed] %s was unset; wrote %s=%s (%s)", key, key, value, why);
+    }
+    else
+        Log("[feed] %s=%s (user-set; leaving it alone)", key, v);
+}
 
 static void DetectRenodxAddon()
 {
@@ -164,19 +181,24 @@ static void DetectRenodxAddon()
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE)
     {
-        Log("[feed] DLSS 5 add-on: not installed; using standalone DLSS neural reconstruction (DLAA) without the DLSS 5 Neural Rendering extension");
+        Log("[feed] DLSS 5 add-on: not installed; using standalone DLSS neural reconstruction (DLAA)");
         return;
     }
     g_renodx_present = true;
-
     const DWORD size = GetFileSize(f, nullptr);
     DWORD got = 0;
     char *buf = (size > 0 && size < 8u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
     if (buf != nullptr && ReadFile(f, buf, size, &got, nullptr) && got == size)
-        for (DWORD i = 0; i + 11 < size; ++i)
-            if (memcmp(buf + i, "EnableHooks", 11) == 0) { g_renodx_lazy = true; break; }
+        for (DWORD i = 0; i + 11 <= size; ++i)   // v45/v46 markers: 11 bytes; v47: 12 bytes
+        {
+            if (!g_renodx_lazy && memcmp(buf + i, "EnableHooks", 11) == 0) g_renodx_lazy = true;
+            if (!g_renodx_v46  && memcmp(buf + i, "NRToggleKey", 11) == 0) g_renodx_v46  = true;
+            if (!g_renodx_v47 && i + 12 <= size && memcmp(buf + i, "NRGlobalTone", 12) == 0) g_renodx_v47 = true;
+        }
     free(buf);
     CloseHandle(f);
+    if (g_renodx_v47) g_renodx_v46 = true;
+    if (g_renodx_v46) g_renodx_lazy = true;   // v4.6 is a per-present-rescan engine too
 
     DWORD dummy = 0;
     const DWORD vsize = GetFileVersionInfoSizeA(path, &dummy);
@@ -193,24 +215,27 @@ static void DetectRenodxAddon()
     }
 
     Log("[feed] DLSS 5 add-on: renodx-dlss5.addon64 v%s -- %s engine", g_renodx_ver,
-        g_renodx_lazy ? "v45+ (per-present rescan, lazy feature adoption; warm-up re-create skipped)"
+        g_renodx_v47  ? "v4.7+ (colour bridge, lazy adoption)"
+      : g_renodx_v46  ? "v4.6+ (per-present rescan, lazy adoption, global hotkeys, upscaling latch)"
+      : g_renodx_lazy ? "v45+ (per-present rescan, lazy feature adoption; warm-up re-create skipped)"
                       : "classic (single hook pass; warm-up re-create stays on)");
 
-    if (g_renodx_lazy)
-    {
-        // Write EnableHooks=2 only when the user has not set it themselves.
-        char v[16];
-        size_t n = sizeof(v);
-        if (!reshade::get_config_value(nullptr, "RenoDX.DLSS5", "EnableHooks", v, &n))
-        {
-            reshade::set_config_value(nullptr, "RenoDX.DLSS5", "EnableHooks", "2");
-            Log("[feed] EnableHooks was unset; wrote EnableHooks=2 (NGX-only -- this feeder calls NGX directly, no Streamline)");
-        }
-        else
-            Log("[feed] EnableHooks=%s (user-set; leaving it alone)", v);
-    }
-}
+    if (g_renodx_v46)
+        Log("[feed] compatibility note: upstream reports v4.6/v4.7 neural evaluate faults with driver 616.64 and a v4.7 report on 616.86; CK3 downloads pin v4.55, this supplied build needs in-game validation");
 
+    if (g_renodx_lazy)
+        RenodxDefault("EnableHooks", "2", "NGX-only -- this feeder calls NGX directly, no Streamline");
+
+    // Every known add-on generation reads these two keys; make a fresh install
+    // deterministic. NeuralUplift on is the whole point of installing this feeder.
+    // NREnableUpscaling off matches the contract: this feeder always publishes 1:1
+    // DLAA at native resolution, so NR upscaling could never engage, and
+    // v4.6 pairs its WIP upscaling path with a rejection latch that parks NR on the
+    // native path for the rest of the run. A build too old to know a key never reads
+    // it, so both writes are inert on older generations.
+    RenodxDefault("NeuralUplift", "1", "neural rendering on");
+    RenodxDefault("NREnableUpscaling", "0", "upscaling off; this feeder publishes a complete 1:1 DLAA contract");
+}
 // ---------------------------------------------------------------------------
 // Configuration (dlss5-feed.cfg next to the add-on, re-read every 60 frames)
 // ---------------------------------------------------------------------------
@@ -230,9 +255,10 @@ struct Cfg
     int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F, 10=J, 11=K, 12=L, 13=M
     float mv_scale_x;      // multiplier applied to the motion vectors (the FX already outputs pixels)
     float mv_scale_y;
+    int   vk_present_sync;  // order early Vulkan submits against the game's present waits
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 1.0f, 1.0f, 1 };
 
 static void CfgPath(char *out)
 {
@@ -261,10 +287,10 @@ static void CfgWriteDefault()
             "create_delay=%d\n"
             "preset=%d\n"
             "mv_scale_x=%.3f\n"
-            "mv_scale_y=%.3f\n",
+            "mv_scale_y=%.3f\nvk_present_sync=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
-            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.vk_present_sync);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -298,11 +324,12 @@ static bool CfgReload()
         else if (_stricmp(key, "preset")         == 0) next.preset         = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
+        else if (_stricmp(key, "vk_present_sync") == 0) next.vk_present_sync = iv != 0;
     }
     fclose(f);
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
 
-    const bool rebuild = next.hdr != g_cfg.hdr || next.depth_inverted != g_cfg.depth_inverted ||
+    const bool rebuild = next.mode != g_cfg.mode || next.hdr != g_cfg.hdr || next.depth_inverted != g_cfg.depth_inverted ||
                          next.flags != g_cfg.flags || next.rebuild != g_cfg.rebuild ||
                          next.preset != g_cfg.preset;
     const bool changed = rebuild || memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
@@ -326,10 +353,10 @@ static void CfgSave()
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f,
             "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
-            "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+            "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\nvk_present_sync=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
-            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.vk_present_sync);
     fclose(f);
 }
 
@@ -566,8 +593,8 @@ static DXGI_FORMAT TypedColorFormat(DXGI_FORMAT f)
     }
 }
 
-// DLSS writes its Output through a UAV; BGRA/X8 variants are not reliably UAV-typed, so
-// they get an RGBA8 output and the copy-back blit takes care of the channel order.
+// Preserve channel order for a raw Vulkan copy home (upstream 671aa4e).
+// The frame is already encoded; an sRGB-aware blit would encode it again.
 static DXGI_FORMAT OutputFormatFor(DXGI_FORMAT color_typed)
 {
     switch (color_typed)
@@ -575,8 +602,57 @@ static DXGI_FORMAT OutputFormatFor(DXGI_FORMAT color_typed)
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
     case DXGI_FORMAT_R11G11B10_FLOAT:    return DXGI_FORMAT_R16G16B16A16_FLOAT;
     case DXGI_FORMAT_R10G10B10A2_UNORM:  return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:     return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_UNORM:     return DXGI_FORMAT_B8G8R8A8_UNORM;   // X8 has no alpha to preserve
     default:                             return DXGI_FORMAT_R8G8B8A8_UNORM;
     }
+}
+
+// Channel order and bit layout only, ignoring the transfer function: an _SRGB
+// backbuffer and our UNORM output ARE interchangeable for a raw copy, and copying
+// them raw is exactly the point -- the bytes must land unconverted.
+static int TexelLayoutFamily(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return 1;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return 2;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return 3;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return 4;
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+        return 5;
+    default:
+        return 0;   // unknown: never claim a raw copy is safe
+    }
+}
+
+static bool SameTexelLayout(DXGI_FORMAT a, DXGI_FORMAT b)
+{
+    const int fa = TexelLayoutFamily(a);
+    return fa != 0 && fa == TexelLayoutFamily(b);
+}
+
+// NGX writes the output through a UAV, and typed UAV *stores* to B8G8R8A8_UNORM are an
+// optional D3D12 feature. Where the device lacks it, fall back to RGBA and the
+// converting copy home -- wrong colours beat a feature that cannot be created at all.
+static DXGI_FORMAT ResolveOutputFormat(DXGI_FORMAT color_typed, ID3D12Device *dev12)
+{
+    const DXGI_FORMAT want = OutputFormatFor(color_typed);
+    if (want != DXGI_FORMAT_B8G8R8A8_UNORM || dev12 == nullptr) return want;
+
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {};
+    fs.Format = want;
+    const bool ok = SUCCEEDED(dev12->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
+                    (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0;
+    if (ok) return want;
+    Log("[feed] B8G8R8A8_UNORM has no typed UAV store on this device; output stays R8G8B8A8_UNORM "
+        "(the copy home converts, so expect the washed-out image of issue #11)");
+    return DXGI_FORMAT_R8G8B8A8_UNORM;
 }
 
 static bool IsHdrFormat(DXGI_FORMAT typed)
@@ -643,14 +719,28 @@ static bool BeginCommands()
             return false;
         }
     }
-    if (g.alloc[slot] == nullptr) return false;
+    if (g.alloc[slot] == nullptr || g.list == nullptr) return false;
     if (FAILED(g.alloc[slot]->Reset())) return false;
     return SUCCEEDED(g.list->Reset(g.alloc[slot], nullptr));
 }
 
+static void AbortCommands();
+
 static UINT64 EndCommands()
 {
-    g.list->Close();
+    const HRESULT closed = g.list->Close();
+    if (FAILED(closed))
+    {
+        Log("[feed] command list Close failed 0x%08X (%ux%u, color %s, output %s); not submitted",
+            closed, g.width, g.height, FormatName(g.color_fmt), FormatName(g.output_fmt));
+        // No submission means no new fence value or allocator retirement. Discard
+        // the invalid list and cancel any probe pending on its unsubmitted work.
+        AbortCommands();
+        g.frame_ready = false;
+        g.need_reset = true;
+        FeedFail("command list close");
+        return 0;
+    }
     ID3D12CommandList *lists[] = { g.list };
     g.queue->ExecuteCommandLists(1, lists);
     const UINT64 v = ++g.fence_value;
@@ -851,6 +941,10 @@ static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOU
 
 static void ReleaseFrameResources()
 {
+    // The D3D12 fence alone cannot retire the Vulkan copy home. Keep imported
+    // images alive until both sides are done before a resize or profile rebuild.
+    // On device destruction ReShade has already destroyed its queue wrappers.
+    if (g.vk.ok && g.rs_queue != nullptr && !g_ngx_dying) g.rs_queue->wait_idle();
     DrainGpu();
     // Vulkan transport: drop our raw VkImage imports (the memory is the D3D12 resource's;
     // freeing the import does not free the D3D12 resource, which SafeRelease(tex12) does).
@@ -1030,7 +1124,7 @@ static bool BuildResources(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     g.height     = h;
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = TypedColorFormat(bb_fmt);
-    g.output_fmt = OutputFormatFor(g.color_fmt);
+    g.output_fmt = ResolveOutputFormat(g.color_fmt, g.dev12);
     g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
 
@@ -1115,6 +1209,7 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
         return false;
     }
     const UINT64 v = EndCommands();
+    if (v == 0) return false;
     if (g.fence12->GetCompletedValue() < v)
     {
         g.fence12->SetEventOnCompletion(v, g.fence_event);
@@ -1672,7 +1767,8 @@ static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
         Log("[feed] %s: no VkFormat mapping for %s", kSlotName[slot], FormatName(fmt));
         return false;
     }
-    if (!FeedVkImportImage(&g.vk, g.tex_shared_vk[slot], w, h, vkf, uav, &g.vk_img[slot], &g.vk_mem[slot]))
+    if (!FeedVkImportImage(&g.vk, g.tex_shared_vk[slot], w, h, vkf, uav, &g.vk_img[slot], &g.vk_mem[slot],
+                           g.dev12->GetResourceAllocationInfo(0, 1, &rd).SizeInBytes))
     {
         Log("[feed] texture import FAILED: %s %ux%u %s (raw Vulkan external-memory import)", kSlotName[slot], w, h, FormatName(fmt));
         return false;
@@ -1694,7 +1790,10 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     g.height     = h;
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = TypedColorFormat(bb_fmt);
-    g.output_fmt = OutputFormatFor(g.color_fmt);
+    g.output_fmt = ResolveOutputFormat(g.color_fmt, g.dev12);
+    Log("[feed] Vulkan copy home: %s (%s -> %s)",
+        SameTexelLayout(g.output_fmt, bb_fmt) ? "raw copy" : "converting blit",
+        FormatName(g.output_fmt), FormatName(bb_fmt));
     g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
 
@@ -2010,10 +2109,11 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 Breadcrumb("running the same-device evaluate");
                 DWORD ecode = 0;
                 NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+                UINT64 submitted = 0;
                 if (ecode != 0)
                     AbortCommands();  // never execute a list NGX crashed while recording
                 else
-                    EndCommands();
+                    submitted = EndCommands();
 
                 if (ecode != 0)
                 {
@@ -2021,6 +2121,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                     FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
                     g.frame_ready = false;
                 }
+                else if (submitted == 0) { g.frame_ready = false; }
                 else if (NVSDK_NGX_FAILED(re))
                 {
                     Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
@@ -2179,6 +2280,15 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         else g.consecutive_fails = 0;
     }
 
+    // ReShade attaches present waits after effects return. Order them before our
+    // first early flush, or leave the original game frame alone (upstream 20d7bef).
+    if (ok && g.frame_ready && g_cfg.mode == 2 && g_cfg.vk_present_sync && !FeedVkOrderPresent(rt, cl))
+    {
+        static bool warned = false;
+        if (!warned) Log("[feed] Vulkan mode 2 skipped: no usable present dependency context; vk_present_sync=0 restores the old path for diagnosis");
+        warned = true;
+        return;
+    }
     if (ok && g.frame_ready)
     {
         VkCommandBuffer cb = reinterpret_cast<VkCommandBuffer>(cl->get_native());
@@ -2263,11 +2373,11 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             g.rs_queue->signal(g.rs_fence_in, n);
 
             // D3D12: wait for the copies, evaluate, signal back. Unchanged machinery.
-            g.queue->Wait(g.fence12_in, n);
             bool done = false;
             if (!BeginCommands()) FeedFail("command list");
             else
             {
+                g.queue->Wait(g.fence12_in, n);
                 Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -2309,8 +2419,9 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                     Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-                    EndCommands();
-                    if (NVSDK_NGX_FAILED(re))
+                    const UINT64 submitted = EndCommands();
+                    if (submitted == 0) { g.frame_ready = false; }
+                    else if (NVSDK_NGX_FAILED(re))
                     {
                         Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
                         FeedFail("evaluate");
@@ -2330,9 +2441,20 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             Breadcrumb("waiting for the result (Vulkan)");
             g.rs_queue->wait(g.rs_fence_out, n);
             cb = reinterpret_cast<VkCommandBuffer>(cl->get_native());  // fresh buffer after the flush
-            if (done)  // blit (not copy): handles an output/backbuffer channel-order or format diff
-                FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
-                                bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+            if (done && dev_api->get_resource_from_view(rtv) != bb_res)
+            {
+                Log("[feed] Vulkan RTV mapping changed across flush; suppressing copy home");
+                done = false;
+            }
+            if (done)
+            {
+                if (SameTexelLayout(g.output_fmt, g.bb_fmt))
+                    FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                else
+                    FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+            }
             {
                 const resource       res[1]  = { bb_res };
                 const resource_usage from[1] = { resource_usage::copy_dest };
@@ -2494,11 +2616,11 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
             const UINT64 v_in = ++g.fence_value;
             g.ctx4->Signal(g.fence11, v_in);
             ctx->Flush();
-            g.queue->Wait(g.fence12, v_in);
 
             if (!BeginCommands()) { FeedFail("command list"); ok = false; }
             else
             {
+                g.queue->Wait(g.fence12, v_in);
                 Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -2547,7 +2669,8 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
                 const UINT64 v_out = EndCommands();
 
-                if (NVSDK_NGX_FAILED(re))
+                if (v_out == 0) { g.frame_ready = false; ok = false; }
+                else if (NVSDK_NGX_FAILED(re))
                 {
                     Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
                     FeedFail("evaluate");
@@ -2688,6 +2811,7 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
 
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
+    FeedVkFramePresentInstall(rt);
     g.runtime = rt;
     ResolveHandles(rt);
     // A recreated runtime means the DLSS 5 add-on has re-armed its hooks on our private
@@ -2754,6 +2878,8 @@ static void OnDestroyDevice(reshade::api::device *dev)
     else if (g.session_ready && dev->get_api() == reshade::api::device_api::vulkan && dev == g.rs_dev)
     {
         Log("[feed] the game's Vulkan device is being destroyed; shutting the session down");
+        FeedVkFramePresentRemove();
+        g.rs_queue = nullptr; // ReShade queue wrappers have already been destroyed.
         g_ngx_dying = true;
         ShutdownSession();
     }
@@ -2923,6 +3049,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        FeedVkFramePresentRemove();
         FeedVkHookRemove();   // before this code is unmapped -- ReShade reloads add-ons per Vulkan instance
         g_ngx_dying = true;   // process is exiting: never call back into NGX
         ShutdownSession();

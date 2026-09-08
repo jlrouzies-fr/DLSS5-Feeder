@@ -18,6 +18,16 @@
 #include <vulkan/vulkan_core.h>    // needs /Iexternal\vulkan (so vk_video/* resolves)
 #include <vulkan/vulkan_win32.h>
 
+static void Log(const char *fmt, ...);
+template <typename H> static inline uint64_t FeedVkValue(H h)
+{
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h));
+}
+template <typename H> static inline H FeedVkDispatch(uint64_t v)
+{
+    return reinterpret_cast<H>(static_cast<uintptr_t>(v));
+}
+
 struct FeedVk
 {
     HMODULE lib;
@@ -101,7 +111,8 @@ static VkSemaphore FeedVkImportFence(FeedVk *vk, HANDLE d3d12_fence_handle)
 // Import a D3D12 shared texture (from CreateSharedHandle) as a VkImage backed by the
 // same memory. Dedicated allocation is required for imported D3D12 resources.
 static bool FeedVkImportImage(FeedVk *vk, HANDLE d3d12_res_handle, UINT w, UINT h,
-                              VkFormat fmt, bool storage, VkImage *out_image, VkDeviceMemory *out_mem)
+                              VkFormat fmt, bool storage, VkImage *out_image, VkDeviceMemory *out_mem,
+                              VkDeviceSize d3d12_size)
 {
     *out_image = VK_NULL_HANDLE;
     *out_mem   = VK_NULL_HANDLE;
@@ -142,7 +153,16 @@ static bool FeedVkImportImage(FeedVk *vk, HANDLE d3d12_res_handle, UINT w, UINT 
     imp.handle     = d3d12_res_handle;     // duplicated by the driver, not consumed
     VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     mai.pNext           = &imp;
-    mai.allocationSize  = req.size;
+    // Dedicated imports describe the external D3D12 allocation (upstream e4422df).
+    if (d3d12_size == 0 || d3d12_size == UINT64_MAX)
+    {
+        vk->DestroyImage(vk->dev, *out_image, nullptr);
+        *out_image = VK_NULL_HANDLE;
+        return false;
+    }
+    if (d3d12_size != req.size)
+        Log("[feed] import size: Vulkan=%llu D3D12=%llu; using D3D12 allocation", req.size, d3d12_size);
+    mai.allocationSize  = d3d12_size;
     mai.memoryTypeIndex = type_index;
     if (vk->AllocateMemory(vk->dev, &mai, nullptr, out_mem) != VK_SUCCESS)
     {
