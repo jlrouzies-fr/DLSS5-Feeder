@@ -72,6 +72,10 @@ static int  g_win_h = 1080;
 // neural consumer's panel is already open when they look at this window. Posted through
 // the message queue, which is where ReShade's WH_GETMESSAGE input hook reads keys.
 static UINT g_overlay_key = VK_HOME;
+// Whether ReShade actually hooked D3D12CreateDevice in time to proxy this window's device
+// (see InitDisguise). False means there is no ReShade runtime here at all, so the overlay
+// key is dead and the banner must not send the user after it.
+static bool g_reshade_hooked = false;
 static int  g_pump_count  = 0;
 // The pump at which to post the overlay key, and again three pumps later. Startup opens the
 // overlay once at 90; tag 'O' (v9) re-arms it so the add-on's button can bring it back.
@@ -1216,9 +1220,23 @@ static void InitBanner()
     RECT r2 = { 0, S(260), W, S(300) };
     DrawTextW(dc, L"DLSS 5 neural rendering runs here for your 32-bit game.", -1, &r2,
               DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    // Two things a user staring at this picture cannot work out for themselves. First, the
+    // overlay key is only worth pressing if ReShade is actually here -- when its hook lost the
+    // startup race (see InitDisguise) there is no runtime in this process and Home is dead, and
+    // "press Home" then reads as a broken program rather than as a state with a name. Second,
+    // when OptiScaler is the neural consumer its menu is its own, on Insert, and nothing else
+    // in this window says so.
     RECT r3 = { 0, S(305), W, S(345) };
-    DrawTextW(dc, L"Press  Home  in this window to tune it  \x2022  closing only hides the window", -1, &r3,
-              DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    DrawTextW(dc, g_reshade_hooked
+                  ? L"Press  Home  in this window to tune it  \x2022  closing only hides the window"
+                  : L"ReShade did not attach here, so  Home  does nothing  \x2022  closing only hides the window",
+              -1, &r3, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    if (g_opti.present)
+    {
+        RECT r4 = { 0, S(350), W, S(390) };
+        DrawTextW(dc, L"If using OptiScaler, press  Insert  in this window for its menu.", -1, &r4,
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
     SelectObject(dc, old_font);
     DeleteObject(fnt_big);
     DeleteObject(fnt_small);
@@ -1653,6 +1671,22 @@ static void PumpRetireOwedPresents()
     }
 }
 
+// Has ReShade taken over d3d12.dll's D3D12CreateDevice yet? Two shapes, because ReShade
+// uses both: an export-table replacement points the name at a function in ReShade's own
+// module, and an inline detour leaves the address inside d3d12.dll but writes a jump over
+// its first instruction. Anything else is the untouched Microsoft prologue.
+static bool ReShadeOwnsCreateDevice(HMODULE d3d12, FARPROC p)
+{
+    if (d3d12 == nullptr || p == nullptr) return false;
+    HMODULE owner = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(p), &owner))
+        return false;
+    if (owner != d3d12) return true;                     // the export now names someone else's code
+    const BYTE *b = reinterpret_cast<const BYTE *>(p);   // ... or the entry point was jumped over
+    return b[0] == 0xE9 || b[0] == 0xEB || (b[0] == 0xFF && b[1] == 0x25);
+}
+
 static bool InitDisguise()
 {
     // ReShade first: the app-directory dxgi.dll IS ReShade x64. Loading it before
@@ -1660,7 +1694,46 @@ static bool InitDisguise()
     // the same order a real game gets, and what lets the DLSS 5 add-on see us.
     HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
     HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
-    auto create_device  = d3d12 ? reinterpret_cast<PFN_D3D12CreateDevice_>(GetProcAddress(d3d12, "D3D12CreateDevice")) : nullptr;
+
+    // ... except that "loading it before" is not by itself enough, and when it is not, this
+    // whole process quietly loses its ReShade. ReShade registers d3d12.dll as a DELAYED hook
+    // and only patches the export when it sees the module arrive; the patch runs on whichever
+    // thread happened to load it. A second in-process add-in that pokes DXGI from its own
+    // thread -- OptiScaler does exactly this, its LoadLibrary hook answers our dxgi.dll load
+    // by calling CreateDXGIFactory "for overlay", which drags d3d12.dll in early -- makes that
+    // some OTHER thread, and our own LoadLibraryW above then comes back with ReShade logging
+    // "Ignoring LoadLibrary('d3d12.dll') call to avoid possible deadlock". The address we read
+    // a microsecond later is the raw Microsoft one, ReShade never sees the device get created,
+    // the swapchain below is refused with "Skipping swap chain because it was created without
+    // a proxy Direct3D device", and there is NO ReShade runtime in this process for the rest of
+    // the session: the overlay key does nothing, the add-on panel never draws, and the picture
+    // the game casts back is the bare banner. Observed in Fable Anniversary, both runs, once
+    // OptiScaler was installed beside the helper.
+    //
+    // The patch is milliseconds away when this happens, so wait for it rather than race it.
+    FARPROC raw_create_device = d3d12 ? GetProcAddress(d3d12, "D3D12CreateDevice") : nullptr;
+    if (dxgi != nullptr && !ReShadeOwnsCreateDevice(d3d12, raw_create_device))
+    {
+        const ULONGLONG t0 = GetTickCount64();
+        while (GetTickCount64() - t0 < 2000)
+        {
+            Sleep(10);
+            raw_create_device = GetProcAddress(d3d12, "D3D12CreateDevice");
+            if (ReShadeOwnsCreateDevice(d3d12, raw_create_device)) break;
+        }
+        const unsigned long long ms = static_cast<unsigned long long>(GetTickCount64() - t0);
+        if (ReShadeOwnsCreateDevice(d3d12, raw_create_device))
+            Log("[host] d3d12.dll was already in this process when we asked for it (something else pulled it in), "
+                "so ReShade was still patching D3D12CreateDevice; waited %llu ms and took the hooked address", ms);
+        else
+            Log("[host] WARNING: after %llu ms ReShade still has not hooked D3D12CreateDevice. It will refuse this "
+                "window's swapchain (\"created without a proxy Direct3D device\" in ReShade.log), which means NO "
+                "ReShade overlay in this process for the whole session: the overlay key does nothing and any "
+                "add-on panel is unreachable. The feed itself still works.", ms);
+    }
+    g_reshade_hooked = ReShadeOwnsCreateDevice(d3d12, raw_create_device);
+
+    auto create_device  = reinterpret_cast<PFN_D3D12CreateDevice_>(raw_create_device);
     auto create_factory = dxgi ? reinterpret_cast<PFN_CreateDXGIFactory1_>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
     if (create_device == nullptr || create_factory == nullptr) { Log("[host] dxgi/d3d12 exports missing"); return false; }
 
@@ -1678,8 +1751,19 @@ static bool InitDisguise()
     // the client area -- and the swapchain -- is exactly that.
     RECT frame = { 0, 0, g_win_w, g_win_h };
     AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+    // The caption is the one line of this window a user sees on the taskbar, so it carries the
+    // same advice as the banner -- including OptiScaler's Insert, which is the only door to a
+    // tuning UI when OptiScaler is the consumer and ReShade lost the hook race.
+    const wchar_t *caption =
+        !g_reshade_hooked && g_opti.present
+            ? L"DLSS 5 Feed host - ReShade did not attach; press Insert HERE for OptiScaler's menu"
+        : !g_reshade_hooked
+            ? L"DLSS 5 Feed host - ReShade did not attach to this window; Home does nothing here"
+        : g_opti.present
+            ? L"DLSS 5 Feed host - press Home HERE to tune DLSS 5, or Insert for OptiScaler's menu"
+            : L"DLSS 5 Feed host - press Home HERE to tune DLSS 5 neural rendering";
     h.hwnd = CreateWindowExW(g_behind ? (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) : 0, wc.lpszClassName,
-                             L"DLSS 5 Feed host - press Home HERE to tune DLSS 5 neural rendering",
+                             caption,
                              WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                              frame.right - frame.left, frame.bottom - frame.top,
                              nullptr, nullptr, wc.hInstance, nullptr);
