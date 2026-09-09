@@ -62,6 +62,7 @@
 #include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
 #include "feed_opti.h" // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
+#include "feed_pq12.h" // the D3D12 PQ<->linear pass, for the transports with no shaders of their own
 
 #define FEED_VERSION "0.15.1"
 
@@ -1504,6 +1505,14 @@ struct Feed
     // the colour; only the encode needs one of its own. Optional in exactly the way FSR 1 is:
     // if it will not compile the bridge stays off and the frame takes the ordinary path.
     ID3D11PixelShader  *bridge_out_ps;
+
+    // The D3D12 side of the bridge, for the transports with no shaders of their own
+    // (same-device, Vulkan, OpenGL). tex12[COLOR]/[OUTPUT] keep the swapchain's own 10-bit
+    // format, because that is what the game copies to and from; these two carry the linear
+    // light DLSS is actually given, and the pass converts between them.
+    FeedPq12            pq12;
+    ID3D12Resource     *lin_color;
+    ID3D12Resource     *lin_output;
     ID3D11Buffer       *pq_cb;          // the encode scale, for the copy-home pass
     bool   bridge_shaders_ok;
     bool   pq_bridge;                   // the bridge is active for the current build
@@ -3056,15 +3065,53 @@ static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOU
     g.list->ResourceBarrier(1, &b);
 }
 
+// The scale that puts paper white at linear 1.0, and its inverse.
+static float BridgePaperWhite() { return g_cfg.hdr_paper_white > 1.0f ? g_cfg.hdr_paper_white : 203.0f; }
+static float BridgeDecodeScale() { return 10000.0f / BridgePaperWhite(); }
+static float BridgeEncodeScale() { return BridgePaperWhite() / 10000.0f; }
+
+// The bridge's two per-frame halves, for the transports that record on our own list
+// (Vulkan and OpenGL). Called with the shared Colour already a non-pixel-shader resource and
+// the shared Output already an unordered access, which is where both already are.
+//
+// The shared pair never changes format: the game copies into Colour and out of Output in the
+// swapchain's own 10-bit layout, exactly as before. Only what DLSS sees is different.
+static void BridgeDecodePrivate12()
+{
+    if (!g.pq_bridge || g.lin_color == nullptr) return;
+    Barrier(g.lin_color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    FeedPq12Run(g.pq12, g.list, g.tex12[SLOT_COLOR], g.color_fmt,
+                g.lin_color, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                g.width, g.height, false, BridgeDecodeScale());
+    Barrier(g.lin_color, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+}
+
+static void BridgeEncodePrivate12()
+{
+    if (!g.pq_bridge || g.lin_output == nullptr) return;
+    Barrier(g.lin_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    FeedPq12Run(g.pq12, g.list, g.lin_output, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                g.tex12[SLOT_OUTPUT], g.output_fmt,
+                g.width, g.height, true, BridgeEncodeScale());
+    Barrier(g.lin_output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+// What DLSS is actually handed. With the bridge on it never sees the 10-bit pair.
+static ID3D12Resource *BridgeColorIn()  { return g.pq_bridge && g.lin_color  != nullptr ? g.lin_color  : g.tex12[SLOT_COLOR]; }
+static ID3D12Resource *BridgeColorOut() { return g.pq_bridge && g.lin_output != nullptr ? g.lin_output : g.tex12[SLOT_OUTPUT]; }
+
 // ---------------------------------------------------------------------------
 // Resources
 // ---------------------------------------------------------------------------
 
 static void ReleaseFrameResources()
 {
-    // Per-build state. Only the D3D11 cross-API builder turns it on; clearing it here is what
-    // stops a later Vulkan, OpenGL or same-device build from inheriting a stale true.
+    // Per-build state; each builder decides it afresh, so a stale true cannot leak between
+    // transports.
     g.pq_bridge = false;
+    SafeRelease(g.lin_color);
+    SafeRelease(g.lin_output);
+    FeedPq12Release(g.pq12);
 
     // The private fence retires D3D12 only. Vulkan may still have copy-home
     // commands referencing these imports (including on the immediate list).
@@ -3477,11 +3524,12 @@ static bool RecreateFeatureOnly(UINT w, UINT h)
 // already carries linear HDR in a format every consumer accepts, so bridging it would be two
 // conversions to arrive where it started. The 10-bit UNORM case is the one that has nowhere
 // to go without this.
-static bool BridgeWanted(DXGI_FORMAT bb_fmt, const char **why)
+// The half that is the same on every transport: is this frame actually PQ, and are we allowed
+// to touch it? What differs between transports is only where the conversion can be executed.
+static bool BridgePqWanted(DXGI_FORMAT bb_fmt, const char **why)
 {
     *why = "";
     if (g_cfg.hdr_bridge == 0) { *why = "hdr_bridge=0"; return false; }
-    if (!g.bridge_shaders_ok || g.pq_cb == nullptr) { *why = "its shaders are not available"; return false; }
 
     if (TypedColorFormat(bb_fmt) != DXGI_FORMAT_R10G10B10A2_UNORM)
     { *why = "the backbuffer is not a 10-bit UNORM one"; return false; }
@@ -3492,6 +3540,78 @@ static bool BridgeWanted(DXGI_FORMAT bb_fmt, const char **why)
     if (cs != reshade::api::color_space::hdr10_pq)
     { *why = "the swapchain is not PQ BT.2020"; return false; }
     *why = "the swapchain is PQ BT.2020 and the backbuffer is 10-bit";
+    return true;
+}
+
+static bool BridgeWanted(DXGI_FORMAT bb_fmt, const char **why)
+{
+    if (!BridgePqWanted(bb_fmt, why)) return false;
+    if (!g.bridge_shaders_ok || g.pq_cb == nullptr)
+    { *why = "its shaders are not available"; return false; }
+    return true;
+}
+
+// The D3D12-side half of the bridge: the conversion pass, plus the two private FP16 textures
+// it converts through. The shared pair keeps the swapchain's 10-bit format, because that is
+// what the game copies to and from; DLSS only ever sees these.
+//
+// Returns false rather than half-succeeding: the caller then runs without the bridge, which
+// is the old behaviour and is always safe.
+static bool SetupPq12Bridge(UINT w, UINT h, DXGI_FORMAT shared_fmt, const char *where)
+{
+    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+    auto compile = m != nullptr ? reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
+    if (compile == nullptr) { Log("[feed] HDR10 bridge (%s): no d3dcompiler", where); return false; }
+
+    // The encode writes the shared 10-bit Output through a typed UAV store. That is optional
+    // in D3D12, and without it the pass would produce nothing while everything reported fine.
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {};
+    fs.Format = shared_fmt;
+    if (FAILED(g.dev12->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) ||
+        (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) == 0)
+    {
+        Log("[feed] HDR10 bridge (%s): this GPU has no typed UAV store for %s, so the frame "
+            "cannot be encoded back. Bridge off; the picture is unchanged from before.",
+            where, FormatName(shared_fmt));
+        return false;
+    }
+
+    if (!FeedPq12Init(g.pq12, g.dev12, compile, &Log))
+        return false;
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width            = w;
+    rd.Height           = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    // Colour: our decode writes it through a UAV, then DLSS reads it.
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    HRESULT h1 = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                                  __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g.lin_color));
+    // Output: DLSS writes it through a UAV, then our encode reads it.
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    HRESULT h2 = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                  __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g.lin_output));
+    if (FAILED(h1) || FAILED(h2))
+    {
+        Log("[feed] HDR10 bridge (%s): the linear textures failed 0x%08X / 0x%08X", where, h1, h2);
+        SafeRelease(g.lin_color); SafeRelease(g.lin_output);
+        FeedPq12Release(g.pq12);
+        return false;
+    }
+
+    Log("[feed] HDR10 bridge ON (%s): %s -> linear R16G16B16A16_FLOAT at %.0f nits paper white, "
+        "and back on the way home. DLSS is handed the linear pair; the shared pair keeps the "
+        "swapchain's own format.", where, FormatName(shared_fmt), BridgePaperWhite());
     return true;
 }
 
@@ -4902,6 +5022,19 @@ static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         return false;
     }
 
+
+    // The HDR10 bridge, decided here because it changes what DLSS is handed. The shared pair
+    // keeps the swapchain's own 10-bit format either way, so nothing the game copies changes.
+    {
+        const char *bridge_why = "";
+        g.pq_bridge = BridgePqWanted(bb_fmt, &bridge_why) &&
+                      SetupPq12Bridge(g.width, g.height, g.color_fmt, "same-device D3D12, on the GAME device");
+        if (g.pq_bridge) g.hdr = true;
+        else if (TypedColorFormat(bb_fmt) == DXGI_FORMAT_R10G10B10A2_UNORM)
+            Log("[feed] HDR10 bridge off (%s); colour space is %s", bridge_why,
+                ColorSpaceName(PresentColorSpace()));
+    }
+
     D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = { g.output_fmt };
     if (SUCCEEDED(g.dev12->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
         (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) == 0)
@@ -5173,6 +5306,19 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         Log("[feed] backbuffer format %u (%s) is not supported", bb_fmt, FormatName(bb_fmt));
         FeedDisable("unsupported backbuffer format");
         return false;
+    }
+
+
+    // The HDR10 bridge, decided here because it changes what DLSS is handed. The shared pair
+    // keeps the swapchain's own 10-bit format either way, so nothing the game copies changes.
+    {
+        const char *bridge_why = "";
+        g.pq_bridge = BridgePqWanted(bb_fmt, &bridge_why) &&
+                      SetupPq12Bridge(g.width, g.height, g.color_fmt, "Vulkan transport, on our private device");
+        if (g.pq_bridge) g.hdr = true;
+        else if (TypedColorFormat(bb_fmt) == DXGI_FORMAT_R10G10B10A2_UNORM)
+            Log("[feed] HDR10 bridge off (%s); colour space is %s", bridge_why,
+                ColorSpaceName(PresentColorSpace()));
     }
 
     // Rest states keep the shared images permanently copy-ready on the game side:
@@ -5542,6 +5688,19 @@ static bool BuildResourcesGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_ha
         Log("[feed] backbuffer format %u (%s) is not supported", bb_fmt, FormatName(bb_fmt));
         FeedDisable("unsupported backbuffer format");
         return false;
+    }
+
+
+    // The HDR10 bridge, decided here because it changes what DLSS is handed. The shared pair
+    // keeps the swapchain's own 10-bit format either way, so nothing the game copies changes.
+    {
+        const char *bridge_why = "";
+        g.pq_bridge = BridgePqWanted(bb_fmt, &bridge_why) &&
+                      SetupPq12Bridge(g.width, g.height, g.color_fmt, "OpenGL transport, on our private device");
+        if (g.pq_bridge) g.hdr = true;
+        else if (TypedColorFormat(bb_fmt) == DXGI_FORMAT_R10G10B10A2_UNORM)
+            Log("[feed] HDR10 bridge off (%s); colour space is %s", bridge_why,
+                ColorSpaceName(PresentColorSpace()));
     }
 
     // What the technique's render target actually is decides which blit branch runs,
@@ -6118,9 +6277,11 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 GuideProbeRecord(mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                  depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
+                BridgeDecodePrivate12();   // PQ -> linear, before DLSS sees anything
+
                 NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
-                ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
-                ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
+                ep.Feature.pInColor  = BridgeColorIn();
+                ep.Feature.pInOutput = BridgeColorOut();
                 ep.Feature.InSharpness = 0.0f;
                 ep.pInDepth          = depth;   // the effect textures themselves: zero-copy
                 ep.pInMotionVectors  = mv;
@@ -6141,7 +6302,12 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 if (ecode != 0)
                     AbortCommands();  // never execute a list NGX crashed while recording
                 else
+                {
+                    // linear -> PQ on this same list, so it is submitted with the evaluate and
+                    // lands before the copy home that ReShade records next on the same queue.
+                    BridgeEncodePrivate12();
                     EndCommands();
+                }
 
                 if (ecode != 0)
                 {
@@ -6596,11 +6762,12 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 GuideProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                  g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                BridgeDecodePrivate12();   // PQ -> linear, before DLSS sees anything
                 CK("input barriers");
 
                 NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
-                ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
-                ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
+                ep.Feature.pInColor  = BridgeColorIn();
+                ep.Feature.pInOutput = BridgeColorOut();
                 ep.Feature.InSharpness = 0.0f;
                 ep.pInDepth          = g.tex12[SLOT_DEPTH];
                 ep.pInMotionVectors  = g.tex12[SLOT_MV];
@@ -6625,11 +6792,26 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                     // becomes a byte copy of this frame's colour input.
                     static bool said_pass = false;
                     if (!said_pass) { said_pass = true; Log("[feed] passthrough=1: NGX evaluate replaced by CopyResource (diagnostic)"); }
+                    if (g.pq_bridge)
+                    {
+                        // The copy has to happen on the bridge's own pair, because that is what
+                        // DLSS would have read and written. Copying the 10-bit pair instead would
+                        // leave the encode below reading a buffer nothing wrote this frame, and
+                        // the diagnostic would show garbage rather than the frame it stands in for.
+                        Barrier(g.lin_color,  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        Barrier(g.lin_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                        g.list->CopyResource(g.lin_output, g.lin_color);
+                        Barrier(g.lin_color,  D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        Barrier(g.lin_output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    }
+                    else
+                    {
                     Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
                     Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
                     g.list->CopyResource(g.tex12[SLOT_OUTPUT], g.tex12[SLOT_COLOR]);
                     Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                     Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    }
                     re = static_cast<NVSDK_NGX_Result>(0x1);   // NVSDK_NGX_Result_Success
                 }
                 else
@@ -6647,6 +6829,9 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 else
                 {
                     FeedVkProbeD12(true); // D: exact pInOutput, after EvaluateFeature/CopyResource
+                    // linear -> PQ, before anything downstream reads the shared Output: the
+                    // stale probe, buffer_home and the image copy home all take it from there.
+                    BridgeEncodePrivate12();
                     StaleProbeRecord(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                      g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                     if (g.home_buf12 != nullptr)
@@ -7095,10 +7280,11 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
                 GuideProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                  g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                BridgeDecodePrivate12();   // PQ -> linear, before DLSS sees anything
 
                 NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
-                ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
-                ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
+                ep.Feature.pInColor  = BridgeColorIn();
+                ep.Feature.pInOutput = BridgeColorOut();
                 ep.Feature.InSharpness = 0.0f;
                 ep.pInDepth          = g.tex12[SLOT_DEPTH];
                 ep.pInMotionVectors  = g.tex12[SLOT_MV];
@@ -7125,6 +7311,7 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
                 }
                 else
                 {
+                    BridgeEncodePrivate12();   // linear -> PQ, before anything reads the Output
                     StaleProbeRecord(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                      g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                     Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);

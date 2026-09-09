@@ -1063,7 +1063,7 @@ if you prefer editing the file directly:
 | `jitter_sign` | 1 | **Diagnostic for `work_upscale=2`, parse-only.** `1` or `-1`: the sign of the grid shift handed to DLSS. On a static scene the right sign converges to a stable image within a second, the wrong one crawls. Here until the convention is confirmed in a game. |
 | `jitter_phases` | 0 | **Diagnostic for `work_upscale=2`, parse-only.** Halton sequence length; `0` = NVIDIA's 8 × (native ÷ work)². |
 | `hdr` | -1 | -1 auto (FP16 / R11G11B10 backbuffer = HDR), 0 force SDR, 1 force HDR. Note this only sets the NGX `IsHDR` create flag; on a 10-bit backbuffer the neural consumer may ignore it — see `hdr_bridge`. |
-| `hdr_bridge` | -1 | **D3D11 (64-bit), HDR10 only.** -1 auto, 0 off, 1 force on. On an HDR10 swapchain (PQ BT.2020 in `R10G10B10A2_UNORM`) the frame is decoded to **linear light in FP16** on the way in and re-encoded to PQ on the way out, so the neural consumer is handed the linear HDR it expects in a format it accepts. Auto engages only when the swapchain really is PQ — the add-on asks ReShade for the colour space rather than guessing from the DXGI format, which cannot tell 10-bit SDR from HDR10. `work_upscale` is ignored while it runs (FSR 1 is a perceptual-space filter; the colour here is linear). |
+| `hdr_bridge` | -1 | **HDR10 only. All four 64-bit transports:** D3D11, same-device D3D12, Vulkan and OpenGL. -1 auto, 0 off, 1 force on. On an HDR10 swapchain (PQ BT.2020 in `R10G10B10A2_UNORM`) the frame is decoded to **linear light in FP16** on the way in and re-encoded to PQ on the way out, so the neural consumer is handed the linear HDR it expects in a format it accepts. Auto engages only when the swapchain really is PQ — the add-on asks ReShade for the colour space rather than guessing from the DXGI format, which cannot tell 10-bit SDR from HDR10. `work_upscale` is ignored while it runs (FSR 1 is a perceptual-space filter; the colour here is linear). On D3D11 the conversion extends the shaders that path already had; on the other three it is a small D3D12 compute pass (`src/feed_pq12.h`) — for Vulkan and OpenGL that runs on the add-on's **private** device, so nothing the game owns is touched. 32-bit games are not covered. |
 | `hdr_paper_white` | 203 | Nits that `hdr_bridge` maps to linear 1.0 — ITU-R BT.2408 reference white. Highlights run above 1.0 (a 10000-nit pixel arrives at ~49). Lower it if the picture is too dim through the bridge, raise it if it is too bright; it does not change what is displayed when the neural model is off, only the scale the model is shown. |
 | `depth_inverted` | -1 | -1 follow `RESHADE_DEPTH_INPUT_IS_REVERSED`, 0/1 force. |
 | `flags` | -1 | raw `DLSS.Feature.Create.Flags` override. |
@@ -1173,9 +1173,9 @@ Common cases:
   and its "guard" is a symmetric clamp on the whole composition, so at 1x it simply switches the
   effect off.
 
-  **The fix is `hdr_bridge`** (D3D11, 64-bit), on by default when the swapchain is PQ. It hands
-  the consumer linear light in FP16, which is what its HDR path is looking for. Confirm it in
-  `dlss5-feed.log`:
+  **The fix is `hdr_bridge`**, on by default when the swapchain is PQ, and covering all four
+  64-bit transports (D3D11, same-device D3D12, Vulkan, OpenGL). It hands the consumer linear
+  light in FP16, which is what its HDR path is looking for. Confirm it in `dlss5-feed.log`:
 
   ```
   [feed] swapchain colour space: PQ BT.2020 (HDR10)
