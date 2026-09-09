@@ -14,8 +14,8 @@
          bitness, the 64-bit host helper for 32-bit games, the shader, the Vulkan fallback
          layer, and the verification script.
       4. The ReShade framework headers and LumeniteFX (the recommended motion-vector provider).
-      5. The neural consumer -- Deep Fried Chicken by default -- and the two NVIDIA NGX
-         runtimes, in the folder where the 64-bit code runs (the game folder, or host64\).
+      5. The neural consumer -- the RenoDX DLSS 5 add-on by default -- and the two NVIDIA
+         NGX runtimes, in the folder where the 64-bit code runs (the game folder, or host64\).
       6. ReShade.ini and ReShadePreset.ini with the provider selected and both techniques
          enabled in the right order (merged into existing files, which are backed up first).
       7. dgVoodoo2 for Direct3D 8/9 games, configured the way the README says.
@@ -46,9 +46,17 @@
     D3D8 (both via dgVoodoo2). Default: Auto.
 
 .PARAMETER Consumer
-    Which neural consumer does the DLSS 5 work: DFC (Deep Fried Chicken) or RenoDX (Krish's
-    renodx-dlss5 add-on). Both are downloaded automatically. Omitted, the script asks at the
-    start; with -Yes and no choice given it takes Deep Fried Chicken.
+    Which neural consumer does the DLSS 5 work: RenoDX (Krish's renodx-dlss5 add-on),
+    DFC (Deep Fried Chicken) or OptiScaler (the OptiScaler_DLSSNR fork, installed as
+    winmm.dll beside ReShade and set up to run its neural pass on the feed).
+
+    RenoDX and OptiScaler are downloaded automatically. Deep Fried Chicken is NOT: its
+    author does not publish the files, so choosing it prints its Discord invite, asks you
+    to drop Deep-Fried-Chicken-*.zip in the cache folder, and waits. Pass it non-
+    interactively with -DfcZip.
+
+    Omitted, the script asks at the start; with -Yes and no choice given it takes RenoDX,
+    which is the only one it can fetch unattended.
 
 .PARAMETER MvProvider
     DLSS5_MV_PROVIDER value: 3 (LumeniteFX Kernel, default) or 4 (LumeniteFX QuantMotion).
@@ -61,10 +69,11 @@
     A folder holding any of the pieces you already have; each is used instead of a
     download when found there (matched by name): DLSS5-Feeder-*.zip,
     ReShade_Setup_*_Addon.exe, Deep-Fried-Chicken*.zip, nvngx_dlssnr.dll, nvngx_dlss.dll,
-    renodx-dlss5.addon64, LumeniteFX*.zip, dgVoodoo2_*.zip, ReShade.fxh, ReShadeUI.fxh,
-    DrawText.fxh.
+    renodx-dlss5*.addon64, OptiScaler-DLSSNR*.zip, LumeniteFX*.zip, dgVoodoo2_*.zip,
+    ReShade.fxh, ReShadeUI.fxh, DrawText.fxh. The NGX runtimes and the RenoDX add-on are
+    also accepted as the .zip they are published in.
 
-.PARAMETER FeederZip, DfcZip, DlssNrDll, DlssDll, RenoDxAddon, ReShadeSetup, LumeniteZip, DgVoodooZip
+.PARAMETER FeederZip, DfcZip, DlssNrDll, DlssDll, RenoDxAddon, OptiScalerZip, ReShadeSetup, LumeniteZip, DgVoodooZip
     Explicit path or URL for one piece, overriding both -LocalFiles and the defaults.
 
 .PARAMETER Prerelease
@@ -114,7 +123,7 @@ param(
     [ValidateSet('Auto', 'D3D', 'Vulkan', 'OpenGL', 'D3D9', 'D3D8')]
     [string] $Api = 'Auto',
 
-    [ValidateSet('Ask', 'DFC', 'RenoDX')]
+    [ValidateSet('Ask', 'DFC', 'RenoDX', 'OptiScaler')]
     [string] $Consumer = 'Ask',
 
     [ValidateSet(3, 4)]
@@ -128,6 +137,7 @@ param(
     [string] $DlssNrDll,
     [string] $DlssDll,
     [string] $RenoDxAddon,
+    [string] $OptiScalerZip,
     [string] $ReShadeSetup,
     [string] $LumeniteZip,
     [string] $DgVoodooZip,
@@ -148,9 +158,17 @@ $ProgressPreference = 'SilentlyContinue'
 # ---------------------------------------------------------------------------------------
 # Where things come from. Edit here when a link moves.
 #
-# The three Discord CDN links carry an "ex=" expiry (hex Unix time) and stop working after
-# it; the script decodes it and says so rather than reporting a bare 403/404. Fresh links
-# are in the Discord servers the README points at.
+# The NGX runtimes and the RenoDX add-on used to come from Discord CDN links. Those carry
+# an "ex=" expiry (hex Unix time) and Discord now stamps them roughly 24 HOURS out, so the
+# installer broke about a day after every release (#75). They are now pinned GitHub release
+# assets instead, which do not expire.
+#
+# Pinned by exact tag on purpose, not "latest": these are the builds this release was tested
+# against, and a new upstream build appearing overnight must not silently change what a user
+# gets. Bump the tag here when a newer one has been tried.
+#
+# Deep Fried Chicken is the exception and has no URL: its author does not publish the files
+# publicly. Choosing it takes the guided manual route in the consumer step below.
 # ---------------------------------------------------------------------------------------
 
 $Sources = @{
@@ -161,10 +179,12 @@ $Sources = @{
     CompatIni       = 'https://raw.githubusercontent.com/crosire/reshade-shaders/list/Compatibility.ini'
     Lumenite        = 'https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/mainline'
     DgVoodoo        = 'https://api.github.com/repos/dege-diosg/dgVoodoo2/releases/latest'
-    Dfc             = 'https://cdn.discordapp.com/attachments/1543936250657120366/1544601537844879410/Deep-Fried-Chicken-v1.4.8-alpha.zip?ex=6a99c287&is=6a987107&hm=9460267dc5be8024653c5d1feb6fff6f5d00f55bf2ab0262ffcfd285e1b7d143&'
-    DlssNr          = 'https://cdn.discordapp.com/attachments/1543976771920330884/1543982044797866107/nvngx_dlssnr.dll?ex=6a9a2495&is=6a98d315&hm=a0a12bd2e4d7ae4c7e915a21e1570c594af0e2cf2e15195d9dbf8a693f45ca99&'
-    Dlss            = 'https://cdn.discordapp.com/attachments/1543348014691651676/1544918856697643089/nvngx_dlss.dll?ex=6a9a414e&is=6a98efce&hm=17a6973ef6de0d211b7b3fe00362d851685156e73aab3e38670e00563332b22a&'
-    RenoDxDlss5     = 'https://cdn.discordapp.com/attachments/1542647972695904317/1544338777399365762/renodx-dlss5.addon64?ex=6a9a1f50&is=6a98cdd0&hm=2a695add57b27c6d7fd1ad2a70e2d3c4f49586a3d5c30f84cc33be3513d41de8&'
+    # No public download; see Get-ChickenManually.
+    DlssNr          = 'https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.8.0/nvngx_dlssnr_310.8.0.zip'
+    Dlss            = 'https://github.com/RankFTW/rhi-repo/releases/download/dlss-310.9.1/nvngx_dlss_310.9.1.zip'
+    RenoDxDlss5     = 'https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-4.70/renodx-dlss5_4.70.zip'
+    OptiScalerReleases = 'https://api.github.com/repos/Dagherbou/OptiScaler_DLSSNR/releases'
+    OptiScalerHome     = 'https://github.com/Dagherbou/OptiScaler_DLSSNR/releases'
     DfcDiscord      = 'https://discord.gg/g2v2XGqvR'
     RenoDxDiscord   = 'https://discord.com/invite/renodx'
 }
@@ -355,6 +375,22 @@ function Find-FileIn
     }
     catch { }
     return $null
+}
+
+# Every match, not just the first. The RenoDX add-on ships under versioned names as well
+# ('renodx-dlss5-4.7.addon64'), and ReShade loads EVERY *.addon64 in the folder. Disabling only
+# the exactly-named one left a versioned copy loaded beside Deep Fried Chicken -- the state that
+# makes Chicken silently inert while every check still reads healthy (#44). The C++ side has
+# matched the prefix since #1 (FindRenodxAddon, src/dlss5-feed.cpp:320).
+function Find-FilesIn
+{
+    param([string] $Dir, [string] $Name)
+    if (-not (Test-DirHere $Dir)) { return @() }
+    try {
+        $hits = @(Get-ChildItem -LiteralPath $Dir -File -Filter $Name -ErrorAction SilentlyContinue)
+        return $hits
+    }
+    catch { return @() }
 }
 
 function Find-FileUnder
@@ -581,6 +617,143 @@ function Get-PeInfo
     }
 }
 
+# RVA -> file offset, given a PE's section table. Split out from the reader below so the
+# lookup does not depend on PowerShell's nested-function scoping.
+function Convert-RvaToOffset
+{
+    param($Sections, [uint32] $Rva, [long] $Length)
+    foreach ($s in $Sections) {
+        if ($Rva -ge $s.V -and $Rva -lt ($s.V + $s.Span)) {
+            $o = [long]$s.Raw + ([long]$Rva - [long]$s.V)
+            if ($o -ge 0 -and $o -lt $Length) { return [long]$o }
+            return [long](-1)
+        }
+    }
+    return [long](-1)
+}
+
+# The names in a PE's export directory. $null when the file is not a readable PE; an empty
+# array when it is one and exports nothing.
+function Get-PeExportNames
+{
+    param([string] $Path, [int] $Max = 8192)
+    if (-not (Test-FileHere $Path)) { return $null }
+
+    $fs = $null
+    $br = $null
+    try {
+        $fs = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        if ($fs.Length -lt 0x40) { return $null }
+        $br = New-Object IO.BinaryReader($fs)
+
+        if ($br.ReadUInt16() -ne 0x5A4D) { return $null }            # 'MZ'
+        $fs.Position = 0x3C
+        $peOff = $br.ReadInt32()
+        if ($peOff -le 0 -or ($peOff + 24) -ge $fs.Length) { return $null }
+
+        $fs.Position = $peOff
+        if ($br.ReadUInt32() -ne 0x00004550) { return $null }        # 'PE\0\0'
+        $null      = $br.ReadUInt16()                                # Machine
+        $nSections = $br.ReadUInt16()
+        $null      = $br.ReadUInt32()                                # TimeDateStamp
+        $null      = $br.ReadUInt32()                                # PointerToSymbolTable
+        $null      = $br.ReadUInt32()                                # NumberOfSymbols
+        $optSize   = $br.ReadUInt16()
+        $null      = $br.ReadUInt16()                                # Characteristics
+
+        $optOff = [long]$peOff + 24
+        if ($optSize -lt 96 -or ($optOff + $optSize) -gt $fs.Length) { return $null }
+        $fs.Position = $optOff
+        $magic = $br.ReadUInt16()
+        # The data directories follow the optional header's fixed part: 96 bytes for PE32,
+        # 112 for PE32+ (four fields widened to 64-bit).
+        if     ($magic -eq 0x20B) { $dirOff = $optOff + 112 }
+        elseif ($magic -eq 0x10B) { $dirOff = $optOff + 96 }
+        else                      { return $null }
+        if (($dirOff + 8) -gt $fs.Length) { return $null }
+        $fs.Position = $dirOff
+        $expRva = $br.ReadUInt32()                                   # DataDirectory[0] = exports
+        $null   = $br.ReadUInt32()                                   # its size
+        if ($expRva -eq 0) { return ,([string[]] @()) }
+
+        $secOff = $optOff + $optSize
+        $sections = @()
+        for ($i = 0; $i -lt $nSections; $i++) {
+            $p = $secOff + ([long]$i * 40)
+            if (($p + 40) -gt $fs.Length) { break }
+            $fs.Position = $p + 8                                    # past the 8-byte name
+            $vsize = $br.ReadUInt32()
+            $vaddr = $br.ReadUInt32()
+            $rsize = $br.ReadUInt32()
+            $raw   = $br.ReadUInt32()
+            $span  = if ($vsize -gt 0) { $vsize } else { $rsize }
+            $sections += New-Object psobject -Property @{ V = $vaddr; Span = $span; Raw = $raw }
+        }
+        if ($sections.Count -eq 0) { return $null }
+
+        $eo = Convert-RvaToOffset $sections $expRva $fs.Length
+        if ($eo -lt 0 -or ($eo + 40) -gt $fs.Length) { return $null }
+
+        # IMAGE_EXPORT_DIRECTORY: NumberOfFunctions +20, NumberOfNames +24,
+        # AddressOfFunctions +28, AddressOfNames +32.
+        $fs.Position = $eo + 20
+        $null     = $br.ReadUInt32()
+        $nNames   = $br.ReadUInt32()
+        $null     = $br.ReadUInt32()
+        $namesRva = $br.ReadUInt32()
+        if ($nNames -eq 0 -or $namesRva -eq 0) { return ,([string[]] @()) }
+        if ($nNames -gt $Max) { $nNames = $Max }
+
+        $no = Convert-RvaToOffset $sections $namesRva $fs.Length
+        if ($no -lt 0) { return $null }
+
+        $names = New-Object 'System.Collections.Generic.List[string]'
+        for ($i = 0; $i -lt $nNames; $i++) {
+            $p = $no + ([long]$i * 4)
+            if (($p + 4) -gt $fs.Length) { break }
+            $fs.Position = $p
+            $so = Convert-RvaToOffset $sections ($br.ReadUInt32()) $fs.Length
+            if ($so -lt 0) { continue }
+            $fs.Position = $so
+            $sb = New-Object Text.StringBuilder
+            for ($k = 0; $k -lt 256; $k++) {
+                $b = $fs.ReadByte()
+                if ($b -le 0) { break }
+                $null = $sb.Append([char]$b)
+            }
+            if ($sb.Length -gt 0) { $null = $names.Add($sb.ToString()) }
+        }
+        return ,([string[]] $names.ToArray())
+    }
+    catch { return $null }
+    finally {
+        if ($br) { try { $br.Close() } catch { } }
+        if ($fs) { try { $fs.Dispose() } catch { } }
+    }
+}
+
+# Does this ReShade build support add-ons?
+#
+# ReShade ships two builds. They carry the same version number and the same ProductName, so
+# nothing here could tell them apart -- and this script only ever asked "is it new enough?",
+# which meant a plain build already on the machine was kept and reported as fine while the
+# add-on was never loaded (issue #53). The setup this script DOWNLOADS is always the right
+# one; the hole was in what it accepted as already present.
+#
+# The exports settle it, and not by inference: ReShade's own add-on API finds the ReShade
+# module in a process by testing GetProcAddress for exactly "ReShadeRegisterAddon" and
+# "ReShadeUnregisterAddon" (reshade.hpp). A build that does not export those two cannot load
+# an add-on, because that is the mechanism by which add-ons find it.
+#
+# $null means the file could not be read -- treat that as "assume it is fine", never as a fault.
+function Test-ReShadeHasAddons
+{
+    param([string] $Path)
+    $names = Get-PeExportNames $Path
+    if ($null -eq $names) { return $null }
+    return [bool](($names -contains 'ReShadeRegisterAddon') -and ($names -contains 'ReShadeUnregisterAddon'))
+}
+
 # Counts occurrences of the graphics-API DLL names (ASCII and UTF-16) inside a binary.
 # Only used when the import table says nothing. Capped at 256 MB.
 function Get-ApiStringHints
@@ -593,7 +766,11 @@ function Get-ApiStringHints
         $bytes = [IO.File]::ReadAllBytes($Path)
         $ascii = [Text.Encoding]::ASCII.GetString($bytes)
         $wide  = [Text.Encoding]::Unicode.GetString($bytes)
-        foreach ($n in @('vulkan-1.dll', 'dxgi.dll', 'd3d12.dll', 'd3d11.dll', 'd3d10.dll', 'd3d9.dll', 'd3d8.dll', 'opengl32.dll')) {
+        # d3d10_1.dll earns its place: a Direct3D 10 game imports THAT, not d3d10.dll, and
+        # without it here a title like Devil May Cry 4 SE -- which also imports d3d9.dll for
+        # its D3DPERF markers -- was detected as Direct3D 9 and sent down the dgVoodoo2 route,
+        # which implements DirectX 1-9 and cannot touch Direct3D 10.
+        foreach ($n in @('vulkan-1.dll', 'dxgi.dll', 'd3d12.dll', 'd3d11.dll', 'd3d10_1.dll', 'd3d10.dll', 'd3d10core.dll', 'd3d9.dll', 'd3d8.dll', 'opengl32.dll')) {
             $re = '(?i)(?<![\w.])' + [regex]::Escape($n)
             $c = [regex]::Matches($ascii, $re).Count + [regex]::Matches($wide, $re).Count
             if ($c -gt 0) { $hits[$n] = $c }
@@ -614,6 +791,93 @@ function New-WebClient
     $wc = New-Object Net.WebClient
     $wc.Headers.Add('User-Agent', 'DLSS5-Feeder-Installer (PowerShell)')
     return $wc
+}
+
+# The DLL names in a PE's import directory, lowercased. $null when the file is not a readable PE;
+# an empty array when it imports nothing. Used to pick the name OptiScaler is renamed to: the
+# process has to import that name at start, or OptiScaler is never in it.
+function Get-PeImportNames
+{
+    param([string] $Path, [int] $Max = 512)
+    if (-not (Test-FileHere $Path)) { return $null }
+
+    $fs = $null
+    $br = $null
+    try {
+        $fs = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        if ($fs.Length -lt 0x40) { return $null }
+        $br = New-Object IO.BinaryReader($fs)
+
+        if ($br.ReadUInt16() -ne 0x5A4D) { return $null }            # 'MZ'
+        $fs.Position = 0x3C
+        $peOff = $br.ReadInt32()
+        if ($peOff -le 0 -or ($peOff + 24) -ge $fs.Length) { return $null }
+
+        $fs.Position = $peOff
+        if ($br.ReadUInt32() -ne 0x00004550) { return $null }        # 'PE\0\0'
+        $null      = $br.ReadUInt16()                                # Machine
+        $nSections = $br.ReadUInt16()
+        $null      = $br.ReadUInt32()                                # TimeDateStamp
+        $null      = $br.ReadUInt32()                                # PointerToSymbolTable
+        $null      = $br.ReadUInt32()                                # NumberOfSymbols
+        $optSize   = $br.ReadUInt16()
+        $null      = $br.ReadUInt16()                                # Characteristics
+
+        $optOff = [long]$peOff + 24
+        if ($optSize -lt 96 -or ($optOff + $optSize) -gt $fs.Length) { return $null }
+        $fs.Position = $optOff
+        $magic = $br.ReadUInt16()
+        if     ($magic -eq 0x20B) { $dirOff = $optOff + 112 }
+        elseif ($magic -eq 0x10B) { $dirOff = $optOff + 96 }
+        else                      { return $null }
+        if (($dirOff + 16) -gt $fs.Length) { return $null }
+        $fs.Position = $dirOff + 8                                   # DataDirectory[1] = imports
+        $impRva = $br.ReadUInt32()
+        if ($impRva -eq 0) { return ,([string[]] @()) }
+
+        $secOff = $optOff + $optSize
+        $sections = @()
+        for ($i = 0; $i -lt $nSections; $i++) {
+            $p = $secOff + ([long]$i * 40)
+            if (($p + 40) -gt $fs.Length) { break }
+            $fs.Position = $p + 8
+            $vsize = $br.ReadUInt32()
+            $vaddr = $br.ReadUInt32()
+            $rsize = $br.ReadUInt32()
+            $raw   = $br.ReadUInt32()
+            $span  = if ($vsize -gt 0) { $vsize } else { $rsize }
+            $sections += New-Object psobject -Property @{ V = $vaddr; Span = $span; Raw = $raw }
+        }
+        if ($sections.Count -eq 0) { return $null }
+
+        $io = Convert-RvaToOffset $sections $impRva $fs.Length
+        if ($io -lt 0) { return $null }
+
+        $names = New-Object 'System.Collections.Generic.List[string]'
+        for ($i = 0; $i -lt $Max; $i++) {
+            $p = $io + ([long]$i * 20)                               # IMAGE_IMPORT_DESCRIPTOR
+            if (($p + 20) -gt $fs.Length) { break }
+            $fs.Position = $p + 12                                   # Name RVA
+            $nameRva = $br.ReadUInt32()
+            if ($nameRva -eq 0) { break }
+            $no = Convert-RvaToOffset $sections $nameRva $fs.Length
+            if ($no -lt 0) { continue }
+            $fs.Position = $no
+            $sb = New-Object Text.StringBuilder
+            for ($k = 0; $k -lt 256; $k++) {
+                $b = $fs.ReadByte()
+                if ($b -le 0) { break }
+                $null = $sb.Append([char]$b)
+            }
+            if ($sb.Length -gt 0) { $null = $names.Add($sb.ToString().ToLowerInvariant()) }
+        }
+        return ,([string[]] $names.ToArray())
+    }
+    catch { return $null }
+    finally {
+        if ($br) { try { $br.Close() } catch { } }
+        if ($fs) { try { $fs.Dispose() } catch { } }
+    }
 }
 
 function Get-WebString
@@ -720,6 +984,115 @@ function Resolve-Piece
 # Zip helpers. ReShade's setup exe is a zip appended to an executable, which .NET refuses
 # to open directly, so Open-Zip finds the archive start the way the setup itself does.
 # ---------------------------------------------------------------------------------------
+
+# A pinned GitHub release asset that wraps exactly one file (the NGX runtimes and the
+# RenoDX add-on all ship this way). Downloads it, extracts that one entry into the cache
+# and returns the extracted path -- so every caller downstream still receives a plain
+# path to a .dll / .addon64 and nothing else had to learn about archives.
+#
+# An override or a -LocalFiles hit that is already the bare file is taken as-is: people
+# who have been collecting these by hand have the loose file, not the zip.
+# Deep Fried Chicken has no public download and no stable URL: its author does not want the
+# files mirrored. So the installer never fetches it -- it looks in every place a person who
+# just downloaded it would plausibly have put it, and otherwise asks.
+function Find-ChickenZip
+{
+    param([string] $Explicit)
+
+    if ($Explicit) {
+        if (Test-FileHere $Explicit) { Report -Status 'Ok' -Text ('Deep Fried Chicken: using ' + $Explicit); return $Explicit }
+        Report -Status 'Warn' -Text ('Deep Fried Chicken: -DfcZip points at nothing: ' + $Explicit)
+    }
+
+    $where = New-Object System.Collections.ArrayList
+    if ($LocalFiles) { $null = $where.Add($LocalFiles) }
+    $null = $where.Add($script:Cache)
+    if ($gameDir) { $null = $where.Add($gameDir) }
+    $null = $where.Add($PSScriptRoot)
+    try { $null = $where.Add((Join-Safe $env:USERPROFILE 'Downloads')) } catch { }
+
+    foreach ($d in $where) {
+        if (-not $d -or -not (Test-DirHere $d)) { continue }
+        try {
+            $hit = Get-ChildItem -LiteralPath $d -File -Filter 'Deep-Fried-Chicken*.zip' -ErrorAction SilentlyContinue |
+                   Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($hit) { Report -Status 'Ok' -Text ('Deep Fried Chicken: found ' + $hit.FullName); return $hit.FullName }
+        }
+        catch { }
+    }
+    return $null
+}
+
+# The guided hand-fetch. Prints where to go and where to put it, then waits on Enter and
+# looks again, rather than failing and making the user start the installer over.
+function Get-ChickenManually
+{
+    $target = if ($script:Cache) { $script:Cache } else { $PSScriptRoot }
+    for ($try = 1; $try -le 3; $try++) {
+        Write-Host ''
+        Write-Chunk '  Deep Fried Chicken has to be fetched by hand.' 'Yellow'
+        Write-Chunk '  Its author does not publish the files, so nothing can download it for you.' 'DarkGray'
+        Write-Host ''
+        Write-Chunk '   1. Open its Discord:  ' 'Gray' -NoNewline
+        Write-Chunk $Sources.DfcDiscord 'Cyan'
+        Write-Chunk '   2. Download the latest  Deep-Fried-Chicken-*.zip' 'Gray'
+        Write-Chunk '   3. Put that file in this folder:' 'Gray'
+        Write-Chunk ('      ' + $target) 'White'
+        Write-Chunk '      (the game folder or your Downloads folder work too)' 'DarkGray'
+        Write-Host ''
+        Write-Chunk '  Press Enter when the file is there, or type  q  to stop. ' 'Cyan' -NoNewline
+        try { $a = Read-Host } catch { $a = 'q' }
+        # No "switch to RenoDX" here on purpose: the consumer decides what has already been
+        # downloaded and what must never be installed beside it, and changing it this late
+        # would leave half of those decisions made for the other one. Stopping and re-running
+        # with option 1 is the honest way out.
+        if ($a.Trim().ToLowerInvariant() -eq 'q') {
+            Stop-Install 'Deep Fried Chicken was not provided.' `
+                         'Nothing was installed for the neural consumer.' `
+                         'Re-run and choose 1 (RenoDX DLSS 5), which this installer can download for you.'
+        }
+        $found = Find-ChickenZip -Explicit ''
+        if ($found) { return $found }
+        Write-Chunk ('  Still no Deep-Fried-Chicken-*.zip in ' + $target + ' (or the other places checked).') 'Yellow'
+    }
+    return $null
+}
+
+function Resolve-PieceZipped
+{
+    param([string] $Label, [string] $Explicit, [string] $LocalPattern, [string] $DefaultUrl,
+          [string] $CacheName, [string] $InnerName)
+
+    $inner = Join-Safe $script:Cache $InnerName
+    if (-not $Explicit -and (Test-FileHere $inner)) {
+        Report -Status 'Ok' -Text ($Label + ': using the copy already in the cache')
+        return $inner
+    }
+
+    $got = Resolve-Piece -Label $Label -Explicit $Explicit -LocalPattern $LocalPattern `
+                         -DefaultUrl $DefaultUrl -CacheName $CacheName
+    if (-not $got) { return $null }
+    if ([IO.Path]::GetExtension($got) -ne '.zip') { return $got }
+
+    try {
+        $z = Open-Zip $got
+        try {
+            $e = Find-ZipEntry $z ('(^|/)' + [regex]::Escape($InnerName) + '$')
+            if (-not $e) {
+                Report -Status 'Fail' -Text ($Label + ': ' + $InnerName + ' is not inside ' + $got)
+                return $null
+            }
+            Expand-ZipEntry $e $inner
+        }
+        finally { $z.Dispose() }
+    }
+    catch {
+        Report -Status 'Fail' -Text ($Label + ': could not extract ' + $InnerName) -Detail $_.Exception.Message
+        return $null
+    }
+    return $inner
+}
+
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -1082,28 +1455,37 @@ Write-Host $script:Cache
 
 # Which neural consumer? Asked here, before anything is downloaded, because the answer
 # decides what gets fetched and what must never be installed beside it.
+# RenoDX is first and is the default: it is the only one of the three this installer can
+# actually fetch. Deep Fried Chicken is not published anywhere public -- its author does not
+# want the files mirrored -- so choosing it means a guided manual step rather than a download,
+# and making it the default meant every unattended run stopped to ask a human (#75).
 if ($Consumer -eq 'Ask') {
     if ($Yes) {
-        $Consumer = 'DFC'
+        $Consumer = 'RenoDX'
     }
     else {
         Write-Host ''
         Write-Chunk '  Neural consumer -- the add-on that turns the feed into neural rendering.' 'White'
-        Write-Chunk '   1. Deep Fried Chicken  ' 'Gray' -NoNewline
-        Write-Chunk 'recommended; negotiates with the feeder over its own interop ABI' 'DarkGray'
-        Write-Chunk '   2. RenoDX DLSS 5       ' 'Gray' -NoNewline
-        Write-Chunk 'Krish''s renodx-dlss5 add-on' 'DarkGray'
-        Write-Chunk '  Exactly one of them may be installed: each goes inert, or misbehaves, beside the other.' 'DarkGray'
-        Write-Chunk '  Which one? [1/2, Enter for 1] ' 'Cyan' -NoNewline
+        Write-Chunk '   1. RenoDX DLSS 5       ' 'Gray' -NoNewline
+        Write-Chunk 'recommended; Krish''s renodx-dlss5 add-on, downloaded for you' 'DarkGray'
+        Write-Chunk '   2. Deep Fried Chicken  ' 'Gray' -NoNewline
+        Write-Chunk 'negotiates with the feeder over its own interop ABI -- you must fetch it by hand from its Discord' 'DarkGray'
+        Write-Chunk '   3. OptiScaler DLSS-NR  ' 'Gray' -NoNewline
+        Write-Chunk 'the OptiScaler_DLSSNR fork: it takes the feed''s DLSS call, upscales, then runs the neural pass (menu on Insert)' 'DarkGray'
+        Write-Chunk '  Exactly one of them may be installed: each goes inert, or misbehaves, beside the others.' 'DarkGray'
+        Write-Chunk '  Which one? [1/2/3, Enter for 1] ' 'Cyan' -NoNewline
         try { $a = Read-Host } catch { $a = '' }
         switch ($a.Trim()) {
-            '2'      { $Consumer = 'RenoDX' }
-            'renodx' { $Consumer = 'RenoDX' }
-            default  { $Consumer = 'DFC' }
+            '2'          { $Consumer = 'DFC' }
+            'dfc'        { $Consumer = 'DFC' }
+            'chicken'    { $Consumer = 'DFC' }
+            '3'          { $Consumer = 'OptiScaler' }
+            'optiscaler' { $Consumer = 'OptiScaler' }
+            default      { $Consumer = 'RenoDX' }
         }
     }
 }
-$consumerLabel = if ($Consumer -eq 'DFC') { 'Deep Fried Chicken' } else { 'RenoDX DLSS 5' }
+$consumerLabel = switch ($Consumer) { 'DFC' { 'Deep Fried Chicken' } 'RenoDX' { 'RenoDX DLSS 5' } default { 'OptiScaler DLSS-NR' } }
 Write-Chunk '  Neural  ' 'DarkGray' -NoNewline
 Write-Host $consumerLabel
 if ($LocalFiles) {
@@ -1174,7 +1556,13 @@ foreach ($n in @('d3d9.dll', 'dxgi.dll', 'd3d11.dll', 'd3d10core.dll')) {
     $p = Find-FileIn $gameDir $n
     if ($p -and ((Get-ProductNameSafe $p) -match '(?i)dxvk')) { $dxvk = $true }
 }
-$dgVoodooPresent = [bool]((Find-FileIn $gameDir 'dgVoodoo.conf') -and (Find-FileIn $gameDir 'd3d9.dll'))
+# Either wrapper counts. dgVoodoo goes in as D3D9.dll for a Direct3D 9 game and D3D8.dll for a
+# Direct3D 8 one, but this only ever looked for the D3D9 name -- so a correctly installed D3D8
+# game read as "not present" on every run: the zip was re-downloaded, and the "files kept"
+# branch below never fired, which quietly overwrote the user's edited dgVoodoo.conf each time
+# (it is backed up first, but nobody expects to need the backup). Found while checking #56.
+$dgVoodooPresent = [bool]((Find-FileIn $gameDir 'dgVoodoo.conf') -and
+                          ((Find-FileIn $gameDir 'd3d9.dll') -or (Find-FileIn $gameDir 'd3d8.dll')))
 
 $detected = 'Unknown'
 if ($compat) {
@@ -1197,13 +1585,59 @@ if ($detected -eq 'Unknown') {
 
 # Second level: engines that LoadLibrary their API at run time (Max Payne 3, many RAGE /
 # in-house engines) import nothing. Look for the DLL names as strings in the exe instead.
+#
+# And where the exe is a small launcher shim that only starts the real engine -- Watch Dogs
+# ships a 136 KB Watch_Dogs.exe next to the Disrupt binaries -- the exe contains no such
+# string either, and scanning it alone found nothing at all. So fall through to the DLLs
+# beside it, largest first, since the renderer lives in the big one.
 $ambiguous = $false
 if ($detected -eq 'Unknown') {
+    $hintSource = 'the executable'
     $hints = Get-ApiStringHints $exePath
+    if ($hints.Count -eq 0) {
+        # Two things make this harder than "read the biggest DLL". A graphics RUNTIME or
+        # proxy sitting in the folder answers with its own name -- ReShade's dxgi.dll, DXVK,
+        # dgVoodoo2, or the NGX runtimes this very installer puts there on an earlier run
+        # (nvngx_dlssnr.dll is 165 MB, so it sorts first and says Vulkan). And a game can
+        # ship a GPU-detection helper that names every API it has ever heard of: Watch Dogs'
+        # systemdetection64.dll claims OpenGL and Direct3D 9 while the engine is D3D11.
+        #
+        # So: skip anything that IS a graphics runtime, read the rest, and add the counts up
+        # rather than trusting whichever file happened to be largest. The precedence below
+        # then resolves a folder that mentions several.
+        $skipExact = @('dxgi.dll','d3d8.dll','d3d9.dll','d3d10.dll','d3d10_1.dll','d3d11.dll','d3d12.dll',
+                       'opengl32.dll','vulkan-1.dll','ddraw.dll','dinput8.dll','winmm.dll','version.dll')
+        $skipLike  = @('nvngx_*','reshade*','deep-fried-chicken*','*dlss5*','alexs-toolkit*','dxvk*',
+                       'd3dcompiler*','nvapi*','amd_ags*','_nvngx*')
+        $scanned = @()
+        try {
+            $scanned = @(Get-ChildItem -LiteralPath $gameDir -File -Filter '*.dll' -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Length -gt 262144 } |
+                         Where-Object { $skipExact -notcontains $_.Name.ToLowerInvariant() } |
+                         Where-Object { $n = $_.Name; -not (@($skipLike | Where-Object { $n -like $_ }).Count) } |
+                         Sort-Object Length -Descending | Select-Object -First 8)
+        }
+        catch { }
+        $from = @()
+        foreach ($nb in $scanned) {
+            $h2 = Get-ApiStringHints $nb.FullName
+            if ($h2.Count -eq 0) { continue }
+            $from += $nb.Name
+            foreach ($k in $h2.Keys) {
+                if ($hints.ContainsKey($k)) { $hints[$k] = $hints[$k] + $h2[$k] } else { $hints[$k] = $h2[$k] }
+            }
+        }
+        if ($hints.Count -gt 0) {
+            $hintSource = ($from -join ' + ')
+            Report -Status 'Info' -Text ('The executable names no graphics API; read it out of ' + $hintSource + ' instead.') `
+                   -Detail 'A small launcher exe that starts the real engine carries no API strings of its own.'
+        }
+    }
     if ($hints.Count -gt 0) {
-        Report -Status 'Info' -Text ('API DLL names found inside the exe: ' + (($hints.Keys | Sort-Object | ForEach-Object { $_ + ' x' + $hints[$_] }) -join ', '))
+        Report -Status 'Info' -Text ('API DLL names found inside ' + $hintSource + ': ' + (($hints.Keys | Sort-Object | ForEach-Object { $_ + ' x' + $hints[$_] }) -join ', '))
         $hVK  = $hints.ContainsKey('vulkan-1.dll')
-        $hDX  = $hints.ContainsKey('dxgi.dll') -or $hints.ContainsKey('d3d11.dll') -or $hints.ContainsKey('d3d12.dll') -or $hints.ContainsKey('d3d10.dll')
+        $hDX  = $hints.ContainsKey('dxgi.dll') -or $hints.ContainsKey('d3d11.dll') -or $hints.ContainsKey('d3d12.dll') -or
+                $hints.ContainsKey('d3d10.dll') -or $hints.ContainsKey('d3d10_1.dll') -or $hints.ContainsKey('d3d10core.dll')
         $hD9  = $hints.ContainsKey('d3d9.dll')
         $hD8  = $hints.ContainsKey('d3d8.dll')
         $hGL  = $hints.ContainsKey('opengl32.dll')
@@ -1214,8 +1648,8 @@ if ($detected -eq 'Unknown') {
         elseif ($hGL) { $detected = 'OpenGL' }
         if ($detected -ne 'Unknown') {
             $d = 'This is a guess from strings, not from the import table.'
-            if ($ambiguous) { $d += "`nThe exe names both Direct3D 9 and 10/11/12: the game can run either. Direct3D 10/11/12 is assumed (ReShade makes the same choice); if the game is set to DirectX 9, re-run with -Api D3D9." }
-            Report -Status 'Warn' -Text ('Render API guessed as ' + $detected + ' from strings in the executable.') -Detail $d
+            if ($ambiguous) { $d += "`nBoth Direct3D 9 and 10/11/12 are named there: the game can run either. Direct3D 10/11/12 is assumed (ReShade makes the same choice); if the game is set to DirectX 9, re-run with -Api D3D9." }
+            Report -Status 'Warn' -Text ('Render API guessed as ' + $detected + ' from strings in ' + $hintSource + '.') -Detail $d
         }
     }
 }
@@ -1231,6 +1665,35 @@ if ($Api -ne 'Auto') {
 }
 else {
     $useApi = $detected
+}
+
+# Still nothing. This script already asks which executable and which neural consumer, so
+# stopping dead here -- and making the user re-run the whole thing with -Api -- was the one
+# unanswerable question in an otherwise interactive install. Ask it instead.
+if ($useApi -eq 'Unknown' -and -not $Yes) {
+    Write-Host ''
+    Write-Chunk '  Which render API does this game use?' 'White'
+    Write-Chunk '  Nothing in the executable or the files beside it says, which usually means the engine' 'DarkGray'
+    Write-Chunk '  loads it at run time. If you are not sure: almost every 64-bit game of the last decade' 'DarkGray'
+    Write-Chunk '  is Direct3D 10/11/12, and the game''s own graphics options usually name it.' 'DarkGray'
+    Write-Chunk '   1. Direct3D 10/11/12' 'Gray'
+    Write-Chunk '   2. Vulkan' 'Gray'
+    Write-Chunk '   3. OpenGL' 'Gray'
+    Write-Chunk '   4. Direct3D 9   ' 'Gray' -NoNewline
+    Write-Chunk '(installed through dgVoodoo2)' 'DarkGray'
+    Write-Chunk '   5. Direct3D 8   ' 'Gray' -NoNewline
+    Write-Chunk '(installed through dgVoodoo2)' 'DarkGray'
+    Write-Chunk '  Which one? [1-5, Enter for 1] ' 'Cyan' -NoNewline
+    try { $a = Read-Host } catch { $a = '' }
+    $useApi = switch ($a.Trim()) {
+        '2'      { 'Vulkan' }
+        '3'      { 'OpenGL' }
+        '4'      { 'D3D9' }
+        '5'      { 'D3D8' }
+        default  { 'D3D' }
+    }
+    Report -Status 'Info' -Text ('Render API set to ' + $useApi + ' by hand.') `
+           -Detail 'If the install completes but the game shows no ReShade overlay, this was the wrong answer -- re-run with -Api and the right one.'
 }
 
 switch ($useApi) {
@@ -1359,34 +1822,82 @@ $lumenitePath = Resolve-Piece -Label 'LumeniteFX' -Explicit $LumeniteZip -LocalP
 # 3e. Consumer
 $dfcPath = $null
 $renoPath = $null
+$optiPath = $null
 if ($Consumer -eq 'DFC') {
-    $dfcPath = Resolve-Piece -Label 'Deep Fried Chicken' -Explicit $DfcZip -LocalPattern 'Deep-Fried-Chicken*.zip' -DefaultUrl $Sources.Dfc -CacheName 'Deep-Fried-Chicken.zip'
-    if (-not $dfcPath -and -not $DfcZip) {
-        # Was the download eaten by Defender? Then the .zip never landed; the download reports
-        # the block, and Get-MpThreatDetection confirms it.
-        $det = Get-DefenderDetection (Join-Safe $script:Cache 'Deep-Fried-Chicken.zip')
+    $dfcPath = Find-ChickenZip -Explicit $DfcZip
+    # Nothing to download: the author does not publish these files, so the only routes are a
+    # copy the user already has, or the user fetching one now. Ask, wait, and re-check --
+    # printing an invite and failing in the same breath just sends them round again (#75).
+    if (-not $dfcPath -and -not $Yes) { $dfcPath = Get-ChickenManually }
+    # A zip fetched by hand can still be quarantined after it lands: Chicken hooks NGX with
+    # Detours and heuristics dislike that. If the file we just found has gone, that is what
+    # happened -- offer the same exclusion as before, for the same one folder.
+    if ($dfcPath -and -not (Test-FileHere $dfcPath)) {
+        $det = Get-DefenderDetection $dfcPath
         if ($det) {
-            $ok = Request-DefenderExclusion -Paths @($script:Cache, $gameDir) -Because 'It blocked the Deep Fried Chicken download into the cache folder.'
-            if ($ok) { $dfcPath = Resolve-Piece -Label 'Deep Fried Chicken (retry)' -Explicit $DfcZip -LocalPattern 'Deep-Fried-Chicken*.zip' -DefaultUrl $Sources.Dfc -CacheName 'Deep-Fried-Chicken.zip' }
+            $ok = Request-DefenderExclusion -Paths @($script:Cache, $gameDir) -Because 'It removed the Deep Fried Chicken archive after it was downloaded.'
+            if ($ok) { $dfcPath = Find-ChickenZip -Explicit $DfcZip }
         }
+        else { $dfcPath = $null }
     }
     if (-not $dfcPath) {
         Report -Status 'Fail' -Text 'Deep Fried Chicken is not available.' `
-               -Detail ('Get the zip from its Discord (' + $Sources.DfcDiscord + ') and pass it with -DfcZip, or drop it in -LocalFiles.')
+               -Detail ('It has no public download. Join ' + $Sources.DfcDiscord + ', get Deep-Fried-Chicken-*.zip, then re-run with -DfcZip <path> -- or choose the RenoDX consumer, which this installer can fetch for you.')
     }
 }
-else {
-    $renoPath = Resolve-Piece -Label 'RenoDX DLSS 5 add-on' -Explicit $RenoDxAddon -LocalPattern 'renodx-dlss5.addon64' `
-                              -DefaultUrl $Sources.RenoDxDlss5 -CacheName 'renodx-dlss5.addon64'
+elseif ($Consumer -eq 'RenoDX') {
+    $renoPath = Resolve-PieceZipped -Label 'RenoDX DLSS 5 add-on' -Explicit $RenoDxAddon `
+                                    -LocalPattern 'renodx-dlss5*' -DefaultUrl $Sources.RenoDxDlss5 `
+                                    -CacheName 'renodx-dlss5.zip' -InnerName 'renodx-dlss5.addon64'
     if (-not $renoPath) {
         Report -Status 'Fail' -Text 'renodx-dlss5.addon64 is not available.' `
                -Detail ('Get it from the RenoDX Discord (' + $Sources.RenoDxDiscord + ') or the RHI installer, and pass it with -RenoDxAddon or via -LocalFiles.')
     }
 }
+else {
+    # OptiScaler_DLSSNR ships as a GitHub release (about 130 MB; nvngx_dlssnr.dll is not in it).
+    # Newest asset, the way the feeder's own release is found above; offline, the newest cached copy.
+    if ($OptiScalerZip) {
+        $optiPath = Resolve-Piece -Label 'OptiScaler DLSS-NR' -Explicit $OptiScalerZip -CacheName 'OptiScaler-DLSSNR-explicit.zip'
+    }
+    else {
+        if ($LocalFiles) {
+            $hit = Get-ChildItem -LiteralPath $LocalFiles -File -Filter 'OptiScaler-DLSSNR*.zip' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($hit) { $optiPath = $hit.FullName; Report -Status 'Ok' -Text ('OptiScaler DLSS-NR: using ' + $optiPath) }
+        }
+        if (-not $optiPath) {
+            $relJson = Get-WebString ($Sources.OptiScalerReleases + '/latest')
+            $assetUrl = $null
+            $assetName = $null
+            if ($relJson) {
+                try {
+                    $rel = $relJson | ConvertFrom-Json
+                    foreach ($a in @($rel.assets)) {
+                        if ($a.name -match '(?i)^OptiScaler-DLSSNR-.*\.zip$') { $assetUrl = $a.browser_download_url; $assetName = $a.name; break }
+                    }
+                    if ($assetUrl) { Report -Status 'Info' -Text ('OptiScaler DLSS-NR latest release: ' + $rel.tag_name + ' (' + $assetName + ')') }
+                }
+                catch { }
+            }
+            if ($assetUrl) {
+                $dest = Join-Safe $script:Cache $assetName
+                if (Get-Download -Url $assetUrl -Dest $dest -Label 'OptiScaler DLSS-NR') { $optiPath = $dest }
+            }
+            else {
+                $hit = Get-ChildItem -LiteralPath $script:Cache -File -Filter 'OptiScaler-DLSSNR*.zip' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                if ($hit) { $optiPath = $hit.FullName; Report -Status 'Warn' -Text ('GitHub unreachable; using the cached OptiScaler release ' + $hit.Name) }
+            }
+        }
+    }
+    if (-not $optiPath) {
+        Report -Status 'Fail' -Text 'OptiScaler DLSS-NR is not available.' `
+               -Detail ('Download OptiScaler-DLSSNR-<version>.zip from ' + $Sources.OptiScalerHome + ' and pass it with -OptiScalerZip, or drop it in -LocalFiles.')
+    }
+}
 
 # 3f. NVIDIA runtimes
-$dlssNrPath = Resolve-Piece -Label 'nvngx_dlssnr.dll' -Explicit $DlssNrDll -LocalPattern 'nvngx_dlssnr.dll' -DefaultUrl $Sources.DlssNr -CacheName 'nvngx_dlssnr.dll'
-$dlssPath   = Resolve-Piece -Label 'nvngx_dlss.dll'   -Explicit $DlssDll   -LocalPattern 'nvngx_dlss.dll'   -DefaultUrl $Sources.Dlss   -CacheName 'nvngx_dlss.dll'
+$dlssNrPath = Resolve-PieceZipped -Label 'nvngx_dlssnr.dll' -Explicit $DlssNrDll -LocalPattern 'nvngx_dlssnr*' -DefaultUrl $Sources.DlssNr -CacheName 'nvngx_dlssnr.zip' -InnerName 'nvngx_dlssnr.dll'
+$dlssPath   = Resolve-PieceZipped -Label 'nvngx_dlss.dll'   -Explicit $DlssDll   -LocalPattern 'nvngx_dlss.dll'   -DefaultUrl $Sources.Dlss   -CacheName 'nvngx_dlss.zip'   -InnerName 'nvngx_dlss.dll'
 if (-not $dlssNrPath) { Report -Status 'Fail' -Text 'nvngx_dlssnr.dll is not available.' -Detail ('It is on the RenoDX Discord (' + $Sources.RenoDxDiscord + '). Pass it with -DlssNrDll.') }
 if (-not $dlssPath)   { Report -Status 'Fail' -Text 'nvngx_dlss.dll is not available.'   -Detail 'Any DLSS-enabled game ships one, or use DLSS Swapper. Pass it with -DlssDll.' }
 
@@ -1475,8 +1986,17 @@ function Install-ReShadeDll
         if (Test-IsReShade $To) {
             $v = Get-FileVersionSafe $To
             $ok = Test-ReShadeVersionOk $v
-            if ($ok -eq $true -and -not $Force) { Report -Status 'Ok' -Text ($Label + ': ReShade ' + $v + ' already present, kept.') -Detail $To; return $true }
-            if ($ok -ne $true) { Report -Status 'Info' -Text ($Label + ': ReShade ' + $v + ' is too old (need ' + $ReShadeMinVersion + '+); replacing.') }
+            # Add-on support is checked before the version, and a build without it is replaced
+            # even though it is new enough: it is ReShade's plain build, which cannot load an
+            # add-on at all, and it is indistinguishable from the right one by version or
+            # ProductName (issue #53).
+            $addons = Test-ReShadeHasAddons $To
+            if ($addons -eq $false) {
+                Report -Status 'Info' -Text ($Label + ': ReShade ' + $v + ' is present but built WITHOUT add-on support; replacing.') `
+                       -Detail 'It does not export ReShadeRegisterAddon, so dlss5-feed would never be loaded and nothing would say so.'
+            }
+            elseif ($ok -eq $true -and -not $Force) { Report -Status 'Ok' -Text ($Label + ': ReShade ' + $v + ' already present, kept.') -Detail $To; return $true }
+            elseif ($ok -ne $true) { Report -Status 'Info' -Text ($Label + ': ReShade ' + $v + ' is too old (need ' + $ReShadeMinVersion + '+); replacing.') }
         }
         else {
             $what = Get-ProductNameSafe $To
@@ -1509,7 +2029,16 @@ if ($isVulkan) {
     $needDll = $true
     if (Test-FileHere $pdDll) {
         $v = Get-FileVersionSafe $pdDll
-        if ((Test-ReShadeVersionOk $v) -eq $true -and -not $Force) { $needDll = $false; Report -Status 'Ok' -Text ('Vulkan layer ' + $layerName + '.dll ' + $v + ' already installed.') -Detail $pdDll }
+        # This is the case issue #53 was actually reporting. The Vulkan layer is machine-wide,
+        # so one plain (no-add-on) ReShade install done for any earlier game is silently reused
+        # for every game after it -- the script said "already installed", the verifier said OK,
+        # and the add-on was never loaded. Keeping it only if it can actually load add-ons.
+        $pdAddons = Test-ReShadeHasAddons $pdDll
+        if ($pdAddons -eq $false) {
+            Report -Status 'Info' -Text ('Vulkan layer ' + $layerName + '.dll ' + $v + ' is built WITHOUT add-on support; replacing with ' + $reshadeSetupVersion + '.') `
+                   -Detail ($pdDll + "`nIt does not export ReShadeRegisterAddon. This layer is shared by every Vulkan game on the machine, so it was probably installed by ReShade's plain setup for some other game.")
+        }
+        elseif ((Test-ReShadeVersionOk $v) -eq $true -and -not $Force) { $needDll = $false; Report -Status 'Ok' -Text ('Vulkan layer ' + $layerName + '.dll ' + $v + ' already installed (add-on build).') -Detail $pdDll }
         else { Report -Status 'Info' -Text ('Vulkan layer ' + $layerName + '.dll is ' + $v + '; will replace with ' + $reshadeSetupVersion + '.') }
     }
     $needJson = -not (Test-FileHere $pdJson)
@@ -1827,16 +2356,44 @@ function Disable-Conflict
     else { Report -Status 'Warn' -Text ($n + ' left in place.') -Detail $Why -Manual ('Remove ' + $Path + ' before playing.') }
 }
 
+# OptiScaler under any of the names it installs as (dxgi.dll excluded: that is ReShade). It captures
+# every nvngx load in the process, so beside another consumer it either takes that consumer's calls
+# or doubles the neural pass -- and beside a 32-bit exe a 64-bit winmm.dll stops the game starting.
+$OptiProxyNames = @('winmm.dll', 'version.dll', 'dbghelp.dll', 'winhttp.dll', 'wininet.dll', 'd3d12.dll', 'OptiScaler.dll', 'OptiScaler.asi')
+function Find-OptiScalerDll
+{
+    param([string] $Dir)
+    foreach ($n in $OptiProxyNames) {
+        $p = Find-FileIn $Dir $n
+        if (-not $p) { continue }
+        if ((Get-BinaryMarker -Path $p -Pattern 'nvngx\.dll_dlssnr\.dll') -or (Get-BinaryMarker -Path $p -Pattern 'OptiScaler\.ini')) { return $p }
+    }
+    return $null
+}
+
 Disable-Conflict -Path (Find-FileIn $consumerDir 'dlss5-dx11-bridge.addon64') -Why 'the DX11 bridge must never be combined with DLSS5-Feeder'
 if ($is32) {
-    foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5.addon64', 'alexs-toolkit.addon64')) {
-        Disable-Conflict -Path (Find-FileIn $gameDir $n) -Why 'a 64-bit add-on beside a 32-bit exe is never loaded; the consumer belongs in host64\'
+    Disable-Conflict -Path (Find-OptiScalerDll $gameDir) -Why 'a 64-bit OptiScaler beside a 32-bit exe stops the game from starting; for a 32-bit game it belongs in host64\'
+    foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5*.addon64', 'alexs-toolkit.addon64')) {
+        foreach ($f in (Find-FilesIn $gameDir $n)) {
+            Disable-Conflict -Path $f.FullName -Why 'a 64-bit add-on beside a 32-bit exe is never loaded; the consumer belongs in host64\'
+        }
     }
+    # The reverse mistake, and the damaging one: this project's own 64-bit add-on inside
+    # host64\. It DOES load -- host64\ is a 64-bit ReShade install -- and what loads is the
+    # add-on for a 64-bit game, running inside the helper that is already serving the 32-bit
+    # one: a second NGX session on a second private device, and an nvngx detour over the
+    # neural consumer's own hooks.
+    Disable-Conflict -Path (Find-FileIn $hostDir 'dlss5-feed.addon64') -Why 'that is the add-on for a 64-bit GAME; inside the helper it starts a second feeder in the process serving the first'
 }
 
 if ($Consumer -eq 'DFC') {
-    Disable-Conflict -Path (Find-FileIn $consumerDir 'renodx-dlss5.addon64') -Why 'Deep Fried Chicken stays inert while a RenoDX neural provider is loaded'
+    # Every copy, versioned names included: one left behind is enough to keep Chicken inert (#44).
+    foreach ($f in (Find-FilesIn $consumerDir 'renodx-dlss5*.addon64')) {
+        Disable-Conflict -Path $f.FullName -Why 'Deep Fried Chicken stays inert while a RenoDX neural provider is loaded'
+    }
     Disable-Conflict -Path (Find-FileIn $consumerDir 'alexs-toolkit.addon64') -Why 'a third interposer on the same NGX module; Chicken''s docs ask for it to be removed'
+    Disable-Conflict -Path (Find-OptiScalerDll $consumerDir) -Why 'OptiScaler captures every nvngx load in the process; beside Chicken it takes Chicken''s own calls or doubles the neural pass'
 
     if ($dfcPath) {
         $dfcFiles = @('deep-fried-chicken.addon64', 'deep-fried-chicken-nvngx.dll', 'deep-fried-chicken.cfg')
@@ -1911,9 +2468,10 @@ if ($Consumer -eq 'DFC') {
         }
     }
 }
-else {
+elseif ($Consumer -eq 'RenoDX') {
     Disable-Conflict -Path (Find-FileIn $consumerDir 'deep-fried-chicken.addon64') -Why 'exactly one neural consumer: you chose RenoDX'
     Disable-Conflict -Path (Find-FileIn $consumerDir 'deep-fried-chicken-nvngx.dll') -Why 'Chicken''s private NGX bridge has no business beside the RenoDX add-on'
+    Disable-Conflict -Path (Find-OptiScalerDll $consumerDir) -Why 'OptiScaler captures every nvngx load in the process; beside the RenoDX add-on it takes its calls or doubles the neural pass'
 
     if ($renoPath) {
         $to = Join-Safe $consumerDir 'renodx-dlss5.addon64'
@@ -1958,6 +2516,103 @@ else {
             }
             if (-not (Request-DefenderExclusion -Paths @($gameDir, $script:Cache) -Because $why)) { break }
             Report -Status 'Info' -Text 'Retrying the RenoDX add-on copy.'
+        }
+    }
+}
+else {
+    Disable-Conflict -Path (Find-FileIn $consumerDir 'deep-fried-chicken.addon64') -Why 'exactly one neural consumer: you chose OptiScaler, and it captures Chicken''s own nvngx loads'
+    Disable-Conflict -Path (Find-FileIn $consumerDir 'deep-fried-chicken-nvngx.dll') -Why 'Chicken''s private NGX bridge ends in nvngx.dll, and OptiScaler''s hook would hand it OptiScaler'
+    foreach ($f in (Find-FilesIn $consumerDir 'renodx-dlss5*.addon64')) {
+        Disable-Conflict -Path $f.FullName -Why 'exactly one neural consumer: you chose OptiScaler'
+    }
+    Disable-Conflict -Path (Find-FileIn $consumerDir 'alexs-toolkit.addon64') -Why 'a cascade over the RenoDX add-on; with OptiScaler there is nothing for it to attach to'
+
+    if ($optiPath) {
+        # The name OptiScaler is renamed to has to be one the process imports at start, and free.
+        # The 64-bit helper imports winmm.dll and version.dll; a game imports what it imports.
+        $optiName = $null
+        if ($is32) { $imports = @('winmm.dll', 'version.dll') }
+        else {
+            $imports = Get-PeImportNames $exePath
+            if ($null -eq $imports) { $imports = @() } else { $imports = @($imports) }
+        }
+        $candidates = @('winmm.dll', 'version.dll', 'dbghelp.dll', 'winhttp.dll', 'wininet.dll')
+        foreach ($n in $candidates) {
+            $existing = Find-FileIn $consumerDir $n
+            if ($existing -and -not (Get-BinaryMarker -Path $existing -Pattern 'OptiScaler\.ini')) { continue }   # taken by something else
+            if ($imports.Count -gt 0 -and -not ($imports -contains $n)) { continue }
+            $optiName = $n
+            break
+        }
+        if (-not $optiName) {
+            Report -Status 'Fail' -Text 'No DLL name for OptiScaler could be chosen.' `
+                   -Detail ('The process must import the name OptiScaler is renamed to, and that name must be free. Imports read from the exe: ' + $(if ($imports.Count -gt 0) { $imports -join ', ' } else { 'none' })) `
+                   -Action ('Pick a name by hand: rename OptiScaler.dll in ' + $consumerDir + ' to a DLL the game loads (OptiScaler''s own setup_windows.bat lists the choices; never dxgi.dll, which is ReShade).')
+        }
+        else {
+            if ($imports.Count -eq 0 -and -not $is32) { Report -Status 'Info' -Text ('Could not read the game''s imports; OptiScaler goes in as ' + $optiName + '. If OptiScaler.log never appears, rename it to a DLL the game does load.') }
+            try {
+                $z = Open-Zip $optiPath
+                try {
+                    $entries = @($z.Entries | Where-Object { $_.FullName -notmatch '[\\/]$' -and $_.Length -gt 0 })
+                    if (-not ($entries | Where-Object { $_.FullName -match '(?i)(^|[\\/])OptiScaler\.dll$' })) { throw 'OptiScaler.dll not found in the zip' }
+                    $iniKept = $false
+                    foreach ($e in $entries) {
+                        $rel = $e.FullName -replace '/', '\'
+                        if ($rel -match '(?i)^OptiScaler\.dll$') { $rel = $optiName }
+                        elseif ($rel -match '(?i)^OptiScaler\.ini$') {
+                            # An existing ini holds the user's settings (OptiScaler's menu saves into it).
+                            if ((Test-FileHere (Join-Safe $consumerDir 'OptiScaler.ini')) -and -not $Force) { $iniKept = $true; continue }
+                        }
+                        elseif ($rel -match '(?i)^(setup_windows\.bat|setup_linux\.sh|!! .*)$') { continue }   # OptiScaler's own installer; this script does its job
+                        Expand-ZipEntry -Entry $e -To (Join-Safe $consumerDir $rel)
+                    }
+                }
+                finally { $z.Dispose() }
+                Start-Sleep -Milliseconds 1000
+                $dll = Join-Safe $consumerDir $optiName
+                if (-not (Test-FileHere $dll)) { throw ($optiName + ' vanished right after extraction -- Defender? Check Windows Security > Protection history.') }
+                $t = 'OptiScaler DLSS-NR installed as ' + $optiName
+                if ($iniKept) { $t += ' (existing OptiScaler.ini kept)' }
+                Report -Status 'Done' -Text ($t + '.') -Detail ('in ' + $consumerWhere + '; the neural forwarder nvngx.dll_dlssnr.dll and the OptiScaler\ runtime folder beside it')
+
+                # The keys a bare NGX client needs. [DlssNr] Enabled is off in every release (the fork
+                # refuses to ship it on); the exposure scan hooks resource creation on the feeder's
+                # device for a buffer the feed never offers; the spoofs are for non-NVIDIA GPUs. A key
+                # the user has already set by hand (anything but "auto") is left alone.
+                $ini = Join-Safe $consumerDir 'OptiScaler.ini'
+                if (Test-FileHere $ini) {
+                    $text = [IO.File]::ReadAllText($ini)
+                    $wanted = @(
+                        @('DlssNr', 'Enabled', 'true'), @('DlssNr', 'ScanExposure', 'false'),
+                        @('Upscalers', 'Dx12Upscaler', 'dlss'),
+                        @('Log', 'LogToFile', 'true'), @('Log', 'LogLevel', '2'),
+                        @('Spoofing', 'Dxgi', 'false'), @('Spoofing', 'StreamlineSpoofing', 'false'),
+                        @('Inputs', 'EnableXeSSInputs', 'false'), @('Inputs', 'EnableFsr2Inputs', 'false'),
+                        @('Inputs', 'EnableFsr3Inputs', 'false'), @('Inputs', 'EnableFfxInputs', 'false'),
+                        @('Hotfix', 'CheckForUpdate', 'false'))
+                    $kept = @()
+                    foreach ($kv in $wanted) {
+                        $cur = Get-IniKey -Text $text -Section $kv[0] -Key $kv[1]
+                        if ($null -eq $cur -or $cur.Trim() -ieq 'auto' -or $cur.Trim() -ieq $kv[2]) { $text = Set-IniKey -Text $text -Section $kv[0] -Key $kv[1] -Value $kv[2] }
+                        else { $kept += ('[' + $kv[0] + '] ' + $kv[1] + '=' + $cur.Trim()) }
+                    }
+                    [IO.File]::WriteAllText($ini, $text, (New-Object Text.UTF8Encoding $false))
+                    $null = $script:Changed.Add($ini)
+                    $d = 'Keys you had set by hand are left alone'
+                    if ($kept.Count -gt 0) { $d += ': ' + ($kept -join ', ') }
+                    Report -Status 'Done' -Text 'OptiScaler.ini set up for the feed: [DlssNr] Enabled=true, ScanExposure=false, Dx12Upscaler=dlss, logging on, spoofing off.' -Detail ($d + '.')
+                    if ($kept | Where-Object { $_ -match '(?i)^\[DlssNr\] Enabled=' }) {
+                        Report -Status 'Warn' -Text 'OptiScaler.ini has [DlssNr] Enabled set to something other than true -- the neural pass is off until you turn it on in OptiScaler''s menu (Insert).'
+                    }
+                }
+                else {
+                    Report -Status 'Warn' -Text 'OptiScaler.ini is missing after the extraction.' -Action 'Extract OptiScaler.ini from the zip and set Enabled=true under [DlssNr].'
+                }
+            }
+            catch {
+                Report -Status 'Fail' -Text 'OptiScaler DLSS-NR could not be installed.' -Detail $_.Exception.Message
+            }
         }
     }
 }
@@ -2188,8 +2843,13 @@ if ($Consumer -eq 'DFC') {
     else { $steps += 'Turn on neural rendering in the Deep Fried Chicken tab of the overlay.' }
     $steps += 'On its first armed run Chicken registers itself for early load in ReShade.ini and asks for one more full restart. Do that restart.'
 }
-else {
+elseif ($Consumer -eq 'RenoDX') {
     $steps += 'Turn on neural rendering in the DLSS 5 Neural Rendering add-on panel.'
+}
+else {
+    if ($is32) { $steps += 'OptiScaler''s menu lives in the host64 helper: open the ReShade overlay > Add-ons > DLSS 5 Feed, press "Show the DLSS 5 panel in-game", then press Insert. "DLSS Neural Rendering" is its last section; the pass is already switched on.' }
+    else { $steps += 'Press Insert for OptiScaler''s menu; "DLSS Neural Rendering" is its last section, and the pass is already switched on.' }
+    $steps += 'dlss5-feed.log (host64\dlss5-feed-host.log for a 32-bit game) should say "NGX calls are routed through OptiScaler DLSS-NR" and, after the first frame, "neural model (feature 18) loaded".'
 }
 $steps += 'Turn the game''s MSAA/SSAA off.'
 if ($isDgV -and -not $DgVoodooWatermark) { $steps += 'dgVoodoo''s watermark is off. If nothing seems to happen, re-run with -DgVoodooWatermark to confirm dgVoodoo is active at all.' }
