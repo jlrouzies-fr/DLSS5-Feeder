@@ -59,7 +59,7 @@
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 #include "feed_opti.h"      // OptiScaler DLSS-NR: only the file scan and the ini reader are used here (it lives in host64 too)
 
-#define FEED_VERSION "0.15.0"
+#define FEED_VERSION "0.15.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =

@@ -63,7 +63,7 @@
 #include "feed_opti.h" // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 
-#define FEED_VERSION "0.15.0"
+#define FEED_VERSION "0.15.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
