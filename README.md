@@ -1062,7 +1062,9 @@ if you prefer editing the file directly:
 | `work_sharpness` | 0.3 | RCAS strength for `work_upscale` 1 and 2, `0` (off) to `1` (sharpest). At 100% work resolution only the sharpening runs. Overlay slider "Sharpness". |
 | `jitter_sign` | 1 | **Diagnostic for `work_upscale=2`, parse-only.** `1` or `-1`: the sign of the grid shift handed to DLSS. On a static scene the right sign converges to a stable image within a second, the wrong one crawls. Here until the convention is confirmed in a game. |
 | `jitter_phases` | 0 | **Diagnostic for `work_upscale=2`, parse-only.** Halton sequence length; `0` = NVIDIA's 8 × (native ÷ work)². |
-| `hdr` | -1 | -1 auto (FP16 / R11G11B10 backbuffer = HDR), 0 force SDR, 1 force HDR. |
+| `hdr` | -1 | -1 auto (FP16 / R11G11B10 backbuffer = HDR), 0 force SDR, 1 force HDR. Note this only sets the NGX `IsHDR` create flag; on a 10-bit backbuffer the neural consumer may ignore it — see `hdr_bridge`. |
+| `hdr_bridge` | -1 | **D3D11 (64-bit), HDR10 only.** -1 auto, 0 off, 1 force on. On an HDR10 swapchain (PQ BT.2020 in `R10G10B10A2_UNORM`) the frame is decoded to **linear light in FP16** on the way in and re-encoded to PQ on the way out, so the neural consumer is handed the linear HDR it expects in a format it accepts. Auto engages only when the swapchain really is PQ — the add-on asks ReShade for the colour space rather than guessing from the DXGI format, which cannot tell 10-bit SDR from HDR10. `work_upscale` is ignored while it runs (FSR 1 is a perceptual-space filter; the colour here is linear). |
+| `hdr_paper_white` | 203 | Nits that `hdr_bridge` maps to linear 1.0 — ITU-R BT.2408 reference white. Highlights run above 1.0 (a 10000-nit pixel arrives at ~49). Lower it if the picture is too dim through the bridge, raise it if it is too bright; it does not change what is displayed when the neural model is off, only the scale the model is shown. |
 | `depth_inverted` | -1 | -1 follow `RESHADE_DEPTH_INPUT_IS_REVERSED`, 0/1 force. |
 | `flags` | -1 | raw `DLSS.Feature.Create.Flags` override. |
 | `reset_every` | 0 | 1 = NGX Reset every frame (no temporal history; diagnostic). |
@@ -1160,6 +1162,34 @@ Common cases:
   (the legacy CNN presets clamp history harder).
 * **Nothing happens, no `dlss5-feed.log`** — ReShade's architecture does not match the game's
   (a 64-bit `dxgi.dll` cannot load into a 32-bit game, and vice versa).
+* **HDR game: highlights look wrong once the neural model is applied, and correct with it off** —
+  an HDR10 swapchain is `R10G10B10A2_UNORM` carrying **PQ BT.2020**, which is neither of the two
+  things a neural consumer knows how to handle: it is not linear HDR, and it is not an sRGB
+  tone-mapped picture. OptiScaler DLSS-NR gates its HDR path on the buffer *format* being a float
+  one, so a 10-bit surface takes its "already tone mapped" branch **whatever the `IsHDR` flag
+  says** — which is why setting `hdr=1` changes nothing — and then composes PQ code values as if
+  they were sRGB. PQ and sRGB disagree most at the top of the range, so the error lands in the
+  highlights. Its own knobs cannot reach it either: in that branch paper white is pinned to 1.0,
+  and its "guard" is a symmetric clamp on the whole composition, so at 1x it simply switches the
+  effect off.
+
+  **The fix is `hdr_bridge`** (D3D11, 64-bit), on by default when the swapchain is PQ. It hands
+  the consumer linear light in FP16, which is what its HDR path is looking for. Confirm it in
+  `dlss5-feed.log`:
+
+  ```
+  [feed] swapchain colour space: PQ BT.2020 (HDR10)
+  [feed] HDR10 bridge ON (the swapchain is PQ BT.2020 and the backbuffer is 10-bit): …
+  [feed] feature ready: … (HDR …) … [HDR10 bridge: the backbuffer is PQ, this is linear light]
+  ```
+
+  and in `OptiScaler.log`, `Init Flag IsHdr: true` with `colour transform on (linear HDR)` rather
+  than `off (frame already tone mapped)`.
+
+  **To check the bridge itself is faithful**, set `mode=1`: the transport runs and DLSS does not,
+  so the frame makes the whole PQ → linear → PQ round trip and comes back. It should be
+  indistinguishable from having no add-on loaded. Measured worst-case error over the full 10-bit
+  range is 0.06 of one code value, so anything visible there is a bug worth reporting.
 * **`D3D12CreateDevice failed 0x887E0003` / the session never opens** (issues
   [#61](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/61),
   [#81](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/81)) — `0x887E0003` is

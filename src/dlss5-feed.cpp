@@ -800,6 +800,48 @@ static bool DetectSmoothMotion()
 }
 
 // ---------------------------------------------------------------------------
+// What colour space the app actually presents in
+//
+// R10G10B10A2_UNORM is legitimately either 10-bit SDR or HDR10, so the DXGI format alone
+// cannot tell them apart -- and asking only the format is why every HDR10 title was handed
+// to the neural consumer described as SDR. PLAN-DETROIT.md recorded that as a real bug and
+// it was never fixed; it is what breaks highlights under OptiScaler DLSS-NR, which reads
+// our contract and then composes in the transfer function it was told about.
+//
+// ReShade already knows the answer -- the swapchain carries the colour space the app set --
+// so ask it instead of guessing. IDXGISwapChain3 has no GetColorSpace1 to ask directly.
+// ---------------------------------------------------------------------------
+static reshade::api::swapchain *g_swapchain = nullptr;
+
+static const char *ColorSpaceName(reshade::api::color_space cs)
+{
+    switch (cs)
+    {
+    case reshade::api::color_space::srgb:       return "sRGB G2.2 BT.709 (SDR)";
+    case reshade::api::color_space::scrgb:      return "linear BT.709 (scRGB, HDR)";
+    case reshade::api::color_space::hdr10_pq:   return "PQ BT.2020 (HDR10)";
+    case reshade::api::color_space::hdr10_hlg:  return "HLG BT.2020 (HDR)";
+    default:                                    return "unknown (assumed SDR)";
+    }
+}
+
+static reshade::api::color_space PresentColorSpace()
+{
+    return g_swapchain != nullptr ? g_swapchain->get_color_space() : reshade::api::color_space::unknown;
+}
+
+static void OnInitSwapchain(reshade::api::swapchain *sc, bool)
+{
+    g_swapchain = sc;
+    Log("[feed] swapchain colour space: %s", ColorSpaceName(PresentColorSpace()));
+}
+
+static void OnDestroySwapchain(reshade::api::swapchain *sc, bool)
+{
+    if (g_swapchain == sc) g_swapchain = nullptr;
+}
+
+// ---------------------------------------------------------------------------
 // Feed serialization
 //
 // One lock for the whole per-frame path, plus a busy flag. The lock keeps two
@@ -944,9 +986,27 @@ struct Cfg
                            // (8 * (native/work)^2, NVIDIA's guidance). Parse-only.
     int   vk_present_sync; // 1: order early Vulkan submits against the game's present waits
     int   vk_trace;        // per-frame identities + six-stage readbacks (diagnostic only)
+    int   hdr_bridge;      // HDR10 colour bridge: -1 auto (on when the swapchain is PQ BT.2020
+                           // and the backbuffer is a 10-bit UNORM), 0 off, 1 force on.
+                           //
+                           // A PQ frame is neither of the two things a neural consumer knows
+                           // how to handle -- it is not linear HDR, and it is not an sRGB
+                           // tone-mapped picture. OptiScaler DLSS-NR gates its HDR path on the
+                           // buffer FORMAT being a float one (FormatCanHoldLinearHdr), so a
+                           // 10-bit surface takes its "already tone mapped" branch whatever we
+                           // claim in the IsHDR flag, and composes PQ code values as if they
+                           // were sRGB. The error lands in the highlights, because that is
+                           // where PQ and sRGB disagree most.
+                           //
+                           // On: the frame is decoded to LINEAR light in FP16 on the way in and
+                           // re-encoded to PQ on the way out, so the consumer sees exactly the
+                           // linear HDR it expects, in a format it accepts.
+    float hdr_paper_white; // nits that the bridge maps to linear 1.0 (BT.2408 reference white
+                           // is 203). Highlights run above 1.0, up to 10000/this.
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 0, 0.3f, 2000, 1, 0, 0, 0, 0, 1.0f, 1.0f, 50, 1, 0, 1, 0 };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 0, 0.3f, 2000, 1, 0, 0, 0, 0, 1.0f, 1.0f, 50, 1, 0, 1, 0,
+                     /* hdr_bridge */ -1, /* hdr_paper_white */ 203.0f };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -986,12 +1046,15 @@ static void CfgWriteDefault()
             "sync_home=%d\n"
             "mv_scale_x=%.3f\n"
             "mv_scale_y=%.3f\n"
-            "stall_log_ms=%d\n",
+            "stall_log_ms=%d\n"
+            "hdr_bridge=%d\n"
+            "hdr_paper_white=%.0f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
-            g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms);
+            g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms,
+            g_cfg.hdr_bridge, g_cfg.hdr_paper_white);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -1034,6 +1097,8 @@ static bool CfgReload()
         else if (_stricmp(key, "passthrough")    == 0) next.passthrough    = iv;
         else if (_stricmp(key, "vk_present_sync") == 0) next.vk_present_sync = iv;
         else if (_stricmp(key, "vk_trace")        == 0) next.vk_trace = iv;
+        else if (_stricmp(key, "hdr_bridge")      == 0) next.hdr_bridge      = iv;
+        else if (_stricmp(key, "hdr_paper_white") == 0) next.hdr_paper_white = val;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
         else if (_stricmp(key, "stall_log_ms")   == 0) next.stall_log_ms   = iv;
@@ -1059,10 +1124,15 @@ static bool CfgReload()
                          // mode decides whether a feature exists at all: 1 (transport) creates
                          // none, so a hand edit from 1 to 2 without a rebuild left the frame
                          // path evaluating against a null feature until that failure rebuilt it.
-                         next.mode != g_cfg.mode;
+                         next.mode != g_cfg.mode ||
+                         // Both of these decide what format the shared textures are made in,
+                         // so neither can be picked up without rebuilding them.
+                         next.hdr_bridge != g_cfg.hdr_bridge ||
+                         next.hdr_paper_white != g_cfg.hdr_paper_white;
     const bool changed = rebuild || memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
     if (!changed) return false;
     g_cfg = next;
+    Log("[feed] config: hdr_bridge=%d hdr_paper_white=%.0f", g_cfg.hdr_bridge, g_cfg.hdr_paper_white);
     Log("[feed] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d warmup_rebuild=%d "
         "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f gpu_timeout_ms=%d buffer_home=%d async_home=%d sync_home=%d mv_scale=%.3f,%.3f stall_log_ms=%d",
         g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
@@ -1080,7 +1150,7 @@ static const char *const kCfgSavedKeys[] = {
     "enabled", "mode", "hdr", "depth_inverted", "flags", "reset_every", "warmup_rebuild",
     "rebuild", "log_frames", "create_delay", "preset", "work_resolution", "work_upscale",
     "work_sharpness", "gpu_timeout_ms", "buffer_home", "async_home", "sync_home",
-    "mv_scale_x", "mv_scale_y", "stall_log_ms",
+    "mv_scale_x", "mv_scale_y", "stall_log_ms", "hdr_bridge", "hdr_paper_white",
 };
 
 static bool CfgKeyIsSaved(const char *key)
@@ -1134,12 +1204,13 @@ static void CfgSave()
     fprintf(f,
         "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
             "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\ngpu_timeout_ms=%d\n"
-            "buffer_home=%d\nasync_home=%d\nsync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\nstall_log_ms=%d\n",
+            "buffer_home=%d\nasync_home=%d\nsync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\nstall_log_ms=%d\nhdr_bridge=%d\nhdr_paper_white=%.0f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
-            g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms);
+            g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms,
+            g_cfg.hdr_bridge, g_cfg.hdr_paper_white);
     if (!carried.empty()) fputs(carried.c_str(), f);
     fclose(f);
 }
@@ -1427,6 +1498,18 @@ struct Feed
     ID3D11SamplerState *blit_sampler;
     ID3D11SamplerState *point_sampler;
     ID3D11Buffer       *resample_cb;
+
+    // HDR10 colour bridge (hdr_bridge): PQ -> linear FP16 on the way in, linear -> PQ on
+    // the way out. The decode rides on the resample pass, which already runs a shader over
+    // the colour; only the encode needs one of its own. Optional in exactly the way FSR 1 is:
+    // if it will not compile the bridge stays off and the frame takes the ordinary path.
+    ID3D11PixelShader  *bridge_out_ps;
+    ID3D11Buffer       *pq_cb;          // the encode scale, for the copy-home pass
+    bool   bridge_shaders_ok;
+    bool   pq_bridge;                   // the bridge is active for the current build
+    DXGI_FORMAT bb_view_fmt;            // the backbuffer's own typed format, for reading it.
+                                        // Distinct from color_fmt once the bridge is on: that
+                                        // becomes FP16 while this stays R10G10B10A2_UNORM.
 
     // work_upscale=1 (feed_fsr1.h). Optional: when the compile fails the blit stays bilinear.
     ID3D11PixelShader  *easu_ps;
@@ -2979,6 +3062,10 @@ static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOU
 
 static void ReleaseFrameResources()
 {
+    // Per-build state. Only the D3D11 cross-API builder turns it on; clearing it here is what
+    // stops a later Vulkan, OpenGL or same-device build from inheriting a stale true.
+    g.pq_bridge = false;
+
     // The private fence retires D3D12 only. Vulkan may still have copy-home
     // commands referencing these imports (including on the immediate list).
     if (g.vk.ok && g.rs_queue && (g.vk_img[SLOT_COLOR] || g_vk_probe.dev)) g.rs_queue->wait_idle();
@@ -3174,17 +3261,33 @@ static bool MakeBlitShaders()
         // jitter_uv: work_upscale=2 shifts the whole sampling grid by a sub-pixel amount
         // each frame (the synthetic jitter DLSS reconstructs from); zero otherwise. All four
         // guides move together so depth/vectors/mask stay aligned with the colour sample.
-        "cbuffer ResampleConstants : register(b0) { float2 mv_scale; float2 jitter_uv; };\n"
+        "cbuffer ResampleConstants : register(b0) { float2 mv_scale; float2 jitter_uv;\n"
+        "  float pq_in; float pq_out; float2 pq_pad; };\n"
+        "// SMPTE ST.2084. PqDecode returns 0..1 where 1.0 is 10000 nits, so the caller\n"
+        "// scales by 10000/paper-white to put paper white at 1.0 and leave highlights above it.\n"
+        "float3 PqDecode(float3 n) {\n"
+        "  const float m1 = 0.1593017578125, m2 = 78.84375;\n"
+        "  const float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n"
+        "  float3 p = pow(max(n, 0.0), 1.0 / m2);\n"
+        "  return pow(max(p - c1, 0.0) / max(c2 - c3 * p, 1e-6), 1.0 / m1); }\n"
+        "float3 PqEncode(float3 y) {\n"
+        "  const float m1 = 0.1593017578125, m2 = 78.84375;\n"
+        "  const float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n"
+        "  float3 p = pow(saturate(y), m1);\n"
+        "  return pow((c1 + c2 * p) / (1.0 + c3 * p), m2); }\n"
         "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
         "VSOut vs(uint id : SV_VertexID) { VSOut o; float2 uv = float2((id << 1) & 2, id & 2);\n"
         "  o.uv = uv; o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
         "float4 ps(VSOut i) : SV_Target { return float4(src_color.Sample(linear_smp, i.uv).rgb, 1.0); }\n"
         "struct ResampleOut { float4 color : SV_Target0; float2 mv : SV_Target1; float depth : SV_Target2; float mask : SV_Target3; };\n"
         "ResampleOut ps_resample(VSOut i) { ResampleOut o; float2 uv = i.uv + jitter_uv;\n"
-        "  o.color = src_color.SampleLevel(linear_smp, uv, 0);\n"
+        "  float4 rc = src_color.SampleLevel(linear_smp, uv, 0);\n"
+        "  o.color = pq_in > 0.0 ? float4(PqDecode(rc.rgb) * pq_in, 1.0) : rc;\n"
         "  o.mv = src_mv.SampleLevel(point_smp, uv, 0) * mv_scale;\n"
         "  o.depth = src_depth.SampleLevel(point_smp, uv, 0);\n"
-        "  o.mask = src_mask.SampleLevel(point_smp, uv, 0); return o; }\n";
+        "  o.mask = src_mask.SampleLevel(point_smp, uv, 0); return o; }\n"
+        "float4 ps_bridge_out(VSOut i) : SV_Target {\n"
+        "  return float4(PqEncode(max(src_color.Sample(linear_smp, i.uv).rgb, 0.0) * pq_out), 1.0); }\n";
 
     HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
     auto compile = m != nullptr ? reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
@@ -3224,6 +3327,19 @@ static bool MakeBlitShaders()
         return false;
     }
 
+    // The HDR10 bridge pair. Optional in the same way FSR 1 is: a failure here only means the
+    // bridge cannot engage, and the frame takes the ordinary path with the old SDR contract.
+    {
+        ID3DBlob *bout = nullptr, *berr = nullptr;
+        HRESULT bh = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "ps_bridge_out", "ps_4_0", 0, 0, &bout, &berr);
+        if (SUCCEEDED(bh)) bh = g.dev11->CreatePixelShader(bout->GetBufferPointer(), bout->GetBufferSize(), nullptr, &g.bridge_out_ps);
+        g.bridge_shaders_ok = SUCCEEDED(bh);
+        if (!g.bridge_shaders_ok)
+            Log("[feed] the HDR10 bridge shaders would not build 0x%08X: %s -- hdr_bridge cannot engage",
+                bh, berr ? (const char *)berr->GetBufferPointer() : "");
+        SafeRelease(berr); SafeRelease(bout);
+    }
+
     D3D11_SAMPLER_DESC sd = {};
     sd.Filter   = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -3233,11 +3349,15 @@ static bool MakeBlitShaders()
     if (FAILED(g.dev11->CreateSamplerState(&sd, &g.point_sampler))) { Log("[feed] point sampler failed"); return false; }
 
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = 16;
+    cbd.ByteWidth = 32;   // mv_scale, jitter_uv, pq_in, pq_out, pad -- one float4 pair
     cbd.Usage = D3D11_USAGE_DYNAMIC;
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(g.dev11->CreateBuffer(&cbd, nullptr, &g.resample_cb))) { Log("[feed] resample constant buffer failed"); return false; }
+    // Same layout, separate buffer: the copy-home pass runs after the input pass in the same
+    // frame, and WRITE_DISCARD on one shared buffer would make each overwrite the other's.
+    if (FAILED(g.dev11->CreateBuffer(&cbd, nullptr, &g.pq_cb)))
+    { Log("[feed] HDR10 bridge constant buffer failed -- hdr_bridge cannot engage"); g.bridge_shaders_ok = false; }
     Log("[feed] copy-back and work-resolution resample shaders ready");
 
     // FSR 1 is optional: a failure here only pins work_upscale to the bilinear path.
@@ -3333,7 +3453,7 @@ static bool OnCreateFeatureFailed(bool crashed)
 static bool RecreateFeatureOnly(UINT w, UINT h)
 {
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
-    g.hdr = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+    g.hdr = g.pq_bridge ? true : (g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt));
 
     NVSDK_NGX_Handle *old = g.feature;
     g.feature = nullptr;
@@ -3348,6 +3468,30 @@ static bool RecreateFeatureOnly(UINT w, UINT h)
     g.warmup_done = true;  // and stop asking
     g.frame_ready = true;
     Log("[feed] feature re-create %s; keeping the previous feature", crashed ? "crashed (caught)" : "failed");
+    return true;
+}
+
+// Should the HDR10 bridge run for this backbuffer?
+//
+// Only where the frame really is PQ, and only where it is also a problem: a float backbuffer
+// already carries linear HDR in a format every consumer accepts, so bridging it would be two
+// conversions to arrive where it started. The 10-bit UNORM case is the one that has nowhere
+// to go without this.
+static bool BridgeWanted(DXGI_FORMAT bb_fmt, const char **why)
+{
+    *why = "";
+    if (g_cfg.hdr_bridge == 0) { *why = "hdr_bridge=0"; return false; }
+    if (!g.bridge_shaders_ok || g.pq_cb == nullptr) { *why = "its shaders are not available"; return false; }
+
+    if (TypedColorFormat(bb_fmt) != DXGI_FORMAT_R10G10B10A2_UNORM)
+    { *why = "the backbuffer is not a 10-bit UNORM one"; return false; }
+
+    if (g_cfg.hdr_bridge == 1) { *why = "hdr_bridge=1 (forced)"; return true; }
+
+    const reshade::api::color_space cs = PresentColorSpace();
+    if (cs != reshade::api::color_space::hdr10_pq)
+    { *why = "the swapchain is not PQ BT.2020"; return false; }
+    *why = "the swapchain is PQ BT.2020 and the backbuffer is 10-bit";
     return true;
 }
 
@@ -3370,19 +3514,45 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
     g.height     = h;
     g.backbuffer_width  = backbuffer_w;
     g.backbuffer_height = backbuffer_h;
-    g.bb_fmt     = bb_fmt;
-    g.color_fmt  = TypedColorFormat(bb_fmt);
-    g.output_fmt = ResolveOutputFormat(g.color_fmt, g.dev12);
-    g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+    g.bb_fmt      = bb_fmt;
+    g.bb_view_fmt = TypedColorFormat(bb_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
 
-    if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
+    if (g.bb_view_fmt == DXGI_FORMAT_UNKNOWN)
     {
         Log("[feed] backbuffer format %u (%s) is not supported", bb_fmt, FormatName(bb_fmt));
         dev1->Release();
         FeedDisable("unsupported backbuffer format");
         return false;
     }
+
+    // Built here rather than at the end, because whether the bridge can run at all decides
+    // what format the shared textures are made in a few lines below.
+    if (!MakeBlitShaders()) { dev1->Release(); ReleaseFrameResources(); return false; }
+
+    const char *bridge_why = "";
+    g.pq_bridge  = BridgeWanted(bb_fmt, &bridge_why);
+    // The bridge hands the consumer linear light in FP16 -- which is what it wants, and what
+    // its own format test accepts. Without it, a PQ frame goes across described as SDR and
+    // gets composed in the wrong transfer function.
+    g.color_fmt  = g.pq_bridge ? DXGI_FORMAT_R16G16B16A16_FLOAT : g.bb_view_fmt;
+    g.output_fmt = ResolveOutputFormat(g.color_fmt, g.dev12);
+    g.hdr        = g.pq_bridge ? true
+                               : (g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt));
+
+    if (g.pq_bridge)
+    {
+        const float pw = g_cfg.hdr_paper_white > 1.0f ? g_cfg.hdr_paper_white : 203.0f;
+        Log("[feed] HDR10 bridge ON (%s): %s -> linear %s at %.0f nits paper white, and back on "
+            "the way home. The consumer is told HDR, and gets a buffer it can treat as HDR.",
+            bridge_why, FormatName(g.bb_view_fmt), FormatName(g.color_fmt), pw);
+        if (g_cfg.work_upscale != 0)
+            Log("[feed] HDR10 bridge: work_upscale=%d is ignored while it runs -- FSR 1 is a "
+                "perceptual-space filter and the colour is linear here", g_cfg.work_upscale);
+    }
+    else if (TypedColorFormat(bb_fmt) == DXGI_FORMAT_R10G10B10A2_UNORM)
+        Log("[feed] HDR10 bridge off (%s); colour space is %s", bridge_why,
+            ColorSpaceName(PresentColorSpace()));
 
     // work_upscale=2: DLSS itself expands the work-size frame to native, so the Output is
     // native-sized and the feature is created in Super Resolution mode -- if NGX has a
@@ -3466,8 +3636,11 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
     if (FAILED(g.dev11->CreateShaderResourceView(g.tex11[SLOT_OUTPUT], &sv, &g.output_srv)))
     { Log("[feed] output SRV creation failed"); ReleaseFrameResources(); return false; }
 
-    // Work resolution below 100%: a native-size, SRV-able copy of the frame to downsample from.
-    if (backbuffer_w != w || backbuffer_h != h)
+    // A native-size, SRV-able copy of the frame. Needed below 100% to downsample from, and
+    // needed by the bridge at any size: ReShade's backbuffer has no BIND_SHADER_RESOURCE, so
+    // a pass that reads the frame has to read a copy of it.
+    const bool need_stage = g.pq_bridge || backbuffer_w != w || backbuffer_h != h;
+    if (need_stage)
     {
         D3D11_TEXTURE2D_DESC sd = {};
         sd.Width      = backbuffer_w;
@@ -3484,45 +3657,69 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
         if (FAILED(g.dev11->CreateTexture2D(&sd, nullptr, &g.color_stage)))
         { Log("[feed] work-resolution staging texture failed (%ux%u %s)", backbuffer_w, backbuffer_h, FormatName(sd.Format)); ReleaseFrameResources(); return false; }
 
-        // The view stays at g.color_fmt rather than bb_fmt on purpose. An sRGB view would
-        // apply the sRGB->linear conversion on sample and change what DLSS is fed; the
-        // 100% path copies raw bits, and this path has to match it.
+        // bb_view_fmt, not color_fmt: this view reads the BACKBUFFER copy, and with the
+        // bridge on those are different formats. Not the sRGB variant either -- an sRGB view
+        // converts on sample and would change what DLSS is fed relative to the raw-copy path.
         D3D11_SHADER_RESOURCE_VIEW_DESC ss = {};
-        ss.Format              = g.color_fmt;
+        ss.Format              = g.bb_view_fmt;
         ss.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
         ss.Texture2D.MipLevels = 1;
         const HRESULT ssr = g.dev11->CreateShaderResourceView(g.color_stage, &ss, &g.color_stage_srv);
         if (FAILED(ssr))
         {
             Log("[feed] work-resolution staging SRV failed 0x%08X (%s): a %s view on a %s texture "
-                "(backbuffer %s)", ssr, FeedHrName(ssr), FormatName(g.color_fmt), FormatName(sd.Format),
+                "(backbuffer %s)", ssr, FeedHrName(ssr), FormatName(g.bb_view_fmt), FormatName(sd.Format),
                 FormatName(bb_fmt));
             ReleaseFrameResources();
             return false;
         }
 
-        Log("[feed] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
+        if (backbuffer_w != w || backbuffer_h != h)
+            Log("[feed] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
 
         // work_upscale=1 needs somewhere native-sized for EASU to write and RCAS to read.
-        // Created regardless of the current setting so toggling it later is free.
-        D3D11_TEXTURE2D_DESC ed = sd;
-        ed.Format    = g.output_fmt;
-        ed.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-        if (SUCCEEDED(g.dev11->CreateTexture2D(&ed, nullptr, &g.easu_tex)))
+        // Created regardless of the current setting so toggling it later is free -- but only
+        // where something is actually being scaled. The bridge needs this staging copy at
+        // 100% as well, and there is nothing for FSR to do there.
+        if (backbuffer_w != w || backbuffer_h != h)
         {
-            D3D11_RENDER_TARGET_VIEW_DESC rv = {};
-            rv.Format = g.output_fmt;
-            rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-            D3D11_SHADER_RESOURCE_VIEW_DESC es = {};
-            es.Format              = g.output_fmt;
-            es.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
-            es.Texture2D.MipLevels = 1;
-            if (FAILED(g.dev11->CreateRenderTargetView(g.easu_tex, &rv, &g.easu_rtv)) ||
-                FAILED(g.dev11->CreateShaderResourceView(g.easu_tex, &es, &g.easu_srv)))
-            { SafeRelease(g.easu_rtv); SafeRelease(g.easu_srv); SafeRelease(g.easu_tex); }
+            D3D11_TEXTURE2D_DESC ed = sd;
+            ed.Format    = g.output_fmt;
+            ed.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+            if (SUCCEEDED(g.dev11->CreateTexture2D(&ed, nullptr, &g.easu_tex)))
+            {
+                D3D11_RENDER_TARGET_VIEW_DESC rv = {};
+                rv.Format = g.output_fmt;
+                rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                D3D11_SHADER_RESOURCE_VIEW_DESC es = {};
+                es.Format              = g.output_fmt;
+                es.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+                es.Texture2D.MipLevels = 1;
+                if (FAILED(g.dev11->CreateRenderTargetView(g.easu_tex, &rv, &g.easu_rtv)) ||
+                    FAILED(g.dev11->CreateShaderResourceView(g.easu_tex, &es, &g.easu_srv)))
+                { SafeRelease(g.easu_rtv); SafeRelease(g.easu_srv); SafeRelease(g.easu_tex); }
+            }
+            if (g.easu_tex == nullptr)
+                Log("[feed] fsr1 intermediate (%ux%u %s) failed; work_upscale=1 falls back to bilinear", backbuffer_w, backbuffer_h, FormatName(g.output_fmt));
         }
-        if (g.easu_tex == nullptr)
-            Log("[feed] fsr1 intermediate (%ux%u %s) failed; work_upscale=1 falls back to bilinear", backbuffer_w, backbuffer_h, FormatName(g.output_fmt));
+    }
+
+    // The copy-home pass reads its scale from here, and nothing rewrites it per frame.
+    if (g.pq_bridge && g.pq_cb != nullptr)
+    {
+        const float pw = g_cfg.hdr_paper_white > 1.0f ? g_cfg.hdr_paper_white : 203.0f;
+        const float pq[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 10000.0f / pw, pw / 10000.0f, 0.0f, 0.0f };
+        ID3D11DeviceContext *imm = nullptr;
+        g.dev11->GetImmediateContext(&imm);
+        if (imm != nullptr)
+        {
+            D3D11_MAPPED_SUBRESOURCE pm = {};
+            if (SUCCEEDED(imm->Map(g.pq_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &pm)))
+            { memcpy(pm.pData, pq, sizeof(pq)); imm->Unmap(g.pq_cb, 0); }
+            else
+            { Log("[feed] HDR10 bridge: the constant buffer would not map -- bridge disabled"); g.pq_bridge = false; }
+            imm->Release();
+        }
     }
 
     const int input_slots[] = { SLOT_COLOR, SLOT_MV, SLOT_DEPTH, SLOT_MASK };
@@ -3666,13 +3863,14 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
         Log("[feed] feature ready: %ux%u -> %ux%u DLSS %s (synthetic jitter), flags=%d, color %s -> output %s",
             w, h, target_w, target_h, g.sr_quality_name, flags, FormatName(g.color_fmt), FormatName(g.output_fmt));
     else
-    Log("[feed] feature ready: %ux%u DLAA, flags=%d (%s%s%s%s), color %s -> output %s, depth R32_FLOAT%s, mv R16G16_FLOAT",
+    Log("[feed] feature ready: %ux%u DLAA, flags=%d (%s%s%s%s), color %s -> output %s, depth R32_FLOAT%s, mv R16G16_FLOAT%s",
         w, h, flags,
         (flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) ? "HDR " : "SDR ",
         (flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) ? "MVLowRes " : "",
         (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) ? "DepthInverted " : "",
         (flags & NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) ? "AutoExposure" : "",
-        FormatName(g.color_fmt), FormatName(g.output_fmt), inverted ? " (reversed)" : "");
+        FormatName(g.color_fmt), FormatName(g.output_fmt), inverted ? " (reversed)" : "",
+        g.pq_bridge ? " [HDR10 bridge: the backbuffer is PQ, this is linear light]" : "");
     g.need_reset        = true;
     g.frame_ready       = true;
     g.create_fail_count = 0;
@@ -4493,6 +4691,9 @@ static void ShutdownSession()
     SafeRelease(g.blit_sampler);
     SafeRelease(g.point_sampler);
     SafeRelease(g.resample_cb);
+    SafeRelease(g.bridge_out_ps);
+    SafeRelease(g.pq_cb);
+    g.bridge_shaders_ok = false;
     SafeRelease(g.easu_ps);
     SafeRelease(g.rcas_ps);
     SafeRelease(g.fsr_cb);
@@ -5393,14 +5594,20 @@ static bool CopyOrResampleInputs(ID3D11DeviceContext *ctx,
     // on it fails), and `DLSS5_ColorInput : COLOR` is a semantic texture with no resource
     // of its own, so get_texture_binding() returns a null view for it. So copy the frame
     // into a texture we own and sample that. One native-resolution copy, only below 100%.
-    if (source_w != g.width || source_h != g.height)
+    // The bridge has to sample the frame to decode it, so it takes the staging copy at any
+    // size -- the same one the below-100% path uses, for the same reason.
+    if (g.pq_bridge || source_w != g.width || source_h != g.height)
     {
         if (g.color_stage == nullptr || g.color_stage_srv == nullptr) return false;
         ctx->CopyResource(g.color_stage, color);
         color_srv = g.color_stage_srv;
     }
 
-    if (source_w == g.width && source_h == g.height)
+    // Raw copies only where the colour needs no work. With the bridge on it always does, so
+    // the resample pass below runs even at 100%, where its scale is 1 and its jitter 0: every
+    // tap lands on a texel centre, so the guides come through exactly as a copy would leave
+    // them and only the colour is transformed.
+    if (source_w == g.width && source_h == g.height && !g.pq_bridge)
     {
         ctx->CopyResource(g.tex11[SLOT_COLOR], color);
         ctx->CopyResource(g.tex11[SLOT_DEPTH], depth);
@@ -5418,11 +5625,17 @@ static bool CopyOrResampleInputs(ID3D11DeviceContext *ctx,
     if (FAILED(ctx->Map(g.resample_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
     { Log("[feed] resample constant-buffer map failed"); return false; }
     // A shift of j work pixels is j / work_size in uv, whatever the source size is.
-    const float constants[4] = {
+    // pq_in is what tells the shader to decode: zero when the bridge is off, and the branch
+    // on it is uniform across the draw.
+    const float paper_white = g_cfg.hdr_paper_white > 1.0f ? g_cfg.hdr_paper_white : 203.0f;
+    const float constants[8] = {
         static_cast<float>(g.width) / static_cast<float>(source_w),
         static_cast<float>(g.height) / static_cast<float>(source_h),
         g.sr_active ? g.jitter_x / static_cast<float>(g.width)  : 0.0f,
-        g.sr_active ? g.jitter_y / static_cast<float>(g.height) : 0.0f
+        g.sr_active ? g.jitter_y / static_cast<float>(g.height) : 0.0f,
+        g.pq_bridge ? 10000.0f / paper_white : 0.0f,
+        g.pq_bridge ? paper_white / 10000.0f : 0.0f,
+        0.0f, 0.0f
     };
     memcpy(mapped.pData, constants, sizeof(constants));
     ctx->Unmap(g.resample_cb, 0);
@@ -5559,7 +5772,9 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     const UINT out_w = g.output_width  != 0 ? g.output_width  : g.width;
     const UINT out_h = g.output_height != 0 ? g.output_height : g.height;
     const bool scaled = out_w != g.backbuffer_width || out_h != g.backbuffer_height;
-    const bool fsr    = g_cfg.work_upscale != 0 && g.fsr_ok && g.easu_ps != nullptr;
+    // FSR 1 is a perceptual-space filter and the bridge leaves the colour linear, so the two
+    // do not go together; the bridge wins and the expand-back stays bilinear.
+    const bool fsr    = g_cfg.work_upscale != 0 && g.fsr_ok && g.easu_ps != nullptr && !g.pq_bridge;
     const bool easu   = fsr && scaled && g.easu_rtv != nullptr;
     const bool rcas   = fsr && g_cfg.work_sharpness > 0.0f && (easu || !scaled);   // RCAS reads at native texel indices
 
@@ -5581,6 +5796,11 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
         UpdateFsrConstants(ctx, easu ? out_w : g.backbuffer_width, easu ? out_h : g.backbuffer_height);
         ctx->PSSetConstantBuffers(0, 1, &g.fsr_cb);
     }
+    else if (g.pq_bridge)
+    {
+        // Written once when the resources were built; the encode scale does not change per frame.
+        ctx->PSSetConstantBuffers(0, 1, &g.pq_cb);
+    }
 
     ID3D11ShaderResourceView *src = g.output_srv;
     if (easu)
@@ -5598,7 +5818,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
         ctx->PSSetShaderResources(0, 1, &unbind);      // easu_tex leaves the OM before it enters the PS
         ID3D11RenderTargetView *target[] = { rtv };
         ctx->OMSetRenderTargets(1, target, nullptr);
-        ctx->PSSetShader(rcas ? g.rcas_ps : g.blit_ps, nullptr, 0);
+        ctx->PSSetShader(rcas ? g.rcas_ps : (g.pq_bridge ? g.bridge_out_ps : g.blit_ps), nullptr, 0);
         ctx->PSSetShaderResources(0, 1, &src);
         ctx->Draw(3, 0);
     }
@@ -8117,6 +8337,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         DetectSmoothMotion();
 
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
+        // The swapchain is the only thing that knows whether the frame is PQ; the format cannot say.
+        reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+        reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
@@ -8143,6 +8366,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         }
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
+        reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+        reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
