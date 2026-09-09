@@ -20,6 +20,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -27,8 +28,23 @@
 #include <vector>
 #include <string>
 
+// feed_vk.h forward-declares the add-on's own static Log() and calls it from its inline
+// helpers. In the add-on that resolves against dlss5-feed.cpp; here there is no such
+// translation unit, and MSVC rejects a static function that is used but never defined
+// (C2129) -- which broke this spike's build without saying anything about the spike.
+// The spike prints to stdout, so give it the same shape and send it there.
+static void Log(const char *fmt, ...);
 #include "../src/feed_vk.h"     // the add-on's own transport header, compiled x86
 #include "spike-vk-share.h"
+
+static void Log(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    printf("\n");
+}
 
 // feed_vk_hook.h's extension list, without dragging MinHook into the spike.
 static const char *kWanted[] = {
