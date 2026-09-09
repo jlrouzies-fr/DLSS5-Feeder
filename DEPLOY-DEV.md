@@ -290,6 +290,33 @@ follow step 6 above for the DLSS5-Feeder side. Also point them at `host64\`'s "3
 Feeder" window (Home key in it) — the DLSS 5 add-on's full panel lives there, not in the
 game's own overlay.
 
+**Host window size** (rewritten 2026-09-06, 0.14.0-beta.4 -- beta.3 shipped the host half only, and
+the in-game panel stretched because the add-on re-handed its old panel texture): the host window is now genuinely
+resizable, live. Three ways in, all the same code path:
+
+- **Drag its border.** Until beta.3 the border was draggable but nothing answered `WM_SIZE`, so
+  the swapchain kept its original size and DWM stretched it -- the picture distorted and the UI
+  never got more room (issue #44). It now really resizes: window, swapchain, banner, panel
+  texture, and ReShade's own docked tab column are all rebuilt.
+- **The overlay sliders** ("Host window width" / "Host window height") in the 32-bit game. These
+  used to write the ini only, so they appeared to do nothing until the host was restarted; they
+  now apply immediately over IPC v8.
+- **`[DLSS5Host] WindowWidth` / `WindowHeight` in `host64\ReShade.ini`**, still read at startup
+  and still written back with their in-use values, so the choice survives a restart.
+
+Default width is **900** (was 620, which left under 500 px for the consumer's panel once
+ReShade's own chrome was accounted for). `WindowHeight=0` means auto/full work-area height, and
+it may legitimately exceed the monitor: the window is normally hidden behind the game and never
+composited on screen at OS size. Clamps are 300-4000 wide, 300-8000 tall.
+
+On a deliberate resize the ReShade dock layout is re-fitted **even if the user has arranged it**
+-- deferring to a hand-arranged layout is right at startup and wrong when the user has just
+dragged the window, which is what made "expanding it doesn't scale correctly" reproducible.
+
+The in-game cast panel also has a **corner** now (`cast_anchor`, overlay: "Panel corner"). It was
+hard-coded to the top-right. This is separate from "Panel size (%)", which only scales the
+picture rather than giving the UI more room.
+
 ## 8. Optional: Alex's Toolkit (multi-pass DLSS 5 cascade)
 
 `deploy/alexs-toolkit.addon64` is a **third-party, optional** ReShade add-on that makes
@@ -343,9 +370,26 @@ Deploy exactly as sections 3-6, with these differences:
 deep-fried-chicken.addon64        # instead of renodx-dlss5.addon64
 deep-fried-chicken-nvngx.dll      # its private NGX bridge (3 KB, not a copy of NVIDIA's)
 deep-fried-chicken.cfg            # ships with arm=1, one pass, Texture Boost off = the
-                                  # recommended first-test config; no edits needed
+                                  # recommended first-test config; no edits needed EXCEPT
+                                  # safe_neutral_start (see below) -- set that to 0
 nvngx_dlssnr.dll, nvngx_dlss.dll  # still required, same as always
 ```
+
+**`safe_neutral_start=1` throws away tuning every launch (found 2026-09-04, Chicken
+1.4.13-alpha, not documented in any vendored `external/deepfried/*` release notes up to
+1.4.8 -- this key is newer than what is vendored here).** With it at the shipped default of
+`1`, `deep-fried-chicken.log` says so plainly on every start: `SAFE_NEUTRAL_START=1; reset
+to one pass, native 100% work scale, model Automatic Mask, adaptive scene white, and no
+optional stack experiments; control-plane settings retained`. Only `arm` / `enabled` /
+the hotkey (the "control plane") survive a restart; every tuning knob -- layers, Texture
+Boost, Clean Fry, Motion Stability, per-layer presets/strengths -- silently reverts to
+default each time the game is relaunched, even though `deep-fried-chicken.cfg` on disk
+still has the values you set last session (Chicken re-saves it with `legacy config/
+provider-arm schema -> current schema: saved atomically` right after, which looks like a
+schema migration but is actually this reset being written back). Reads as "none of my
+Deep Fried Chicken settings are saved" when what is actually happening is a deliberate
+safe-start behavior overriding a config that *is* saved correctly. Set `safe_neutral_start=0`
+in `deep-fried-chicken.cfg` to keep tuned settings across restarts.
 
 **Exactly one neural provider.** Retire `renodx-dlss5.addon64` **and**
 `alexs-toolkit.addon64` (section 8) — Chicken stays inert for the whole process if a Reno
@@ -436,3 +480,104 @@ migrate), and early load is now automatic — on its first armed run Chicken app
 `[ADDON] LoadFromDllMain` in the sibling `ReShade.ini`, backs the original up beside it, and
 asks for one more full restart. Expect that extra restart on the first launch after installing
 it, and expect a `ReShade.ini.deep-fried-chicken-backup-*` file to appear next to it.
+
+## 9b. OptiScaler DLSS-NR instead of Chicken
+
+The third consumer is the OptiScaler fork with the neural pass built in
+(github.com/Dagherbou/OptiScaler_DLSSNR, release zip `OptiScaler-DLSSNR-<ver>.zip`, ~130 MB, cached
+in `deploy/optiscaler/`). It is not a Detours consumer: installed as a proxy DLL the process imports,
+its LoadLibrary hook hands its own module to the statically linked NGX SDK, so every
+`NVSDK_NGX_D3D12_*` call the feeder makes lands in OptiScaler with no code on our side. The feeder
+detects it, fingerprints the routing and the neural model, and skips the warm-up re-create
+(`src/feed_opti.h`; the same section in the add-on and the host).
+
+**Layout.** Zip contents beside the exe that does the DLSS work (`host64\` for a 32-bit game):
+`OptiScaler.dll` renamed **`winmm.dll`** (or `version.dll`; both are imports of the host exe, and of
+most games), `OptiScaler.ini`, `nvngx.dll_dlssnr.dll` (the forwarder, at the zip root), the
+`OptiScaler\` runtime folder, plus `nvngx_dlss.dll` and `nvngx_dlssnr.dll` as always. In
+`OptiScaler.ini`: `[DlssNr] Enabled=true` (ships off), `ScanExposure=false`, `[Upscalers]
+Dx12Upscaler=dlss`, `[Log] LogToFile=true`, `LogLevel=2`; recommended `[Spoofing] Dxgi=false`,
+`StreamlineSpoofing=false`, the four non-DLSS `[Inputs] Enable*Inputs=false`, `[Hotfix]
+CheckForUpdate=false`. OptiScaler.ini has many `Enabled=` keys — edit it section-aware, never with a
+blind sed. No Chicken, no renodx, no toolkit beside it.
+
+### Verifying without a game
+
+The section-9 rig, with the OptiScaler set in place of Chicken's three files. Run
+`dlss5-feed-host64.exe --test --hide`. Measured 2026-09-07 (v0.2.0-dlssnr, driver 616.64, RTX 5090):
+
+| run | `--test` | GPU ms/frame at 640x360 | proof |
+| --- | --- | --- | --- |
+| no consumer | 300/300 | 0.25 | probe: `min GPU architecture 0x160, min OS 10.0.0` (the driver) |
+| OptiScaler, `dlss` | 300/300 | 3.0–3.4 | probe: `0x0, 10.0.10240.16384` (OptiScaler); `DLSS-NR running at 640x360` |
+| OptiScaler, `xess` | 300/300 | 2.4–3.1 | same; no `Creating DLSS upscaler feature` |
+| OptiScaler, `fsr31` | 300/300 | 2.1–2.3 | same |
+| OptiScaler, `[DlssNr] Enabled=false` | 300/300 | 0.25 | `DLSS-NR did not run`; `nvngx_dlssnr.dll` never loaded |
+| OptiScaler + Chicken | 300/300 | — | host WARNS; Chicken still arms and reports `feeder_marker=1`, i.e. a second consumer really runs |
+| OptiScaler as `dbghelp.dll` | 300/300 | 0.24 | host WARNS it is never loaded; probe shows the driver |
+
+What a good run looks like in `dlss5-feed-host.log`:
+
+```
+OptiScaler DLSS-NR loaded as WINMM.dll (...); OptiScaler.ini: [DlssNr] Enabled=true ScanExposure=false, [Upscalers] Dx12Upscaler=dlss, ...
+NGX feature requirements: SuperSampling ... -> supported (min GPU architecture 0x0, min OS 10.0.10240.16384)
+NGX calls are routed through OptiScaler DLSS-NR (WINMM.dll): the requirements probe carries its fingerprint
+OptiScaler DLSS-NR after the first evaluate: neural forwarder loaded, neural model (feature 18) loaded; upscaler asked for in OptiScaler.ini: dlss
+--test finished: 300/300 evaluates succeeded
+--test: neural consumer OptiScaler DLSS-NR (WINMM.dll): NGX routed through it, neural model created (feature 18), upscaler asked for: dlss
+```
+
+and in `OptiScaler.log` beside the DLL: `working as winmm.dll`, `nvngx call: ...\nvngx.dll, returning
+this dll!`, `Creating DLSS upscaler feature`, `_CreateFeature result: NVSDK_NGX_Result_Success`,
+`DLSS-NR forwarder loaded from`, `DLSS-NR running at 640x360`. Its tail can be cut short: the host exits
+through `TerminateProcess` and OptiScaler's log has no flush-on-write.
+
+Things learned that are not obvious:
+
+- **Module presence cannot tell the upscalers apart.** OptiScaler preloads `nvngx_dlss.dll` and
+  `libxess.dll` whatever it builds; only `nvngx_dlssnr.dll` + `nvngx.dll_dlssnr.dll` (loaded at the
+  first neural dispatch) are evidence, and they prove the pass, not the upscaler. Which upscaler ran is
+  in `OptiScaler.log`. Without `nvngx_dlss.dll` OptiScaler disables its DLSS side, builds FSR 2.1.2, still
+  reports Success — and the neural pass still ran in the rig. The feature-18 requirements probe is refused
+  in that state, which the host reports.
+- `[DlssNr] ScanExposure=false` does not stop the `ExposureScan::Adopt` lines (it adopts DLSS's own 1x1
+  exposure buffer; our textures are filter-rejected). Harmless.
+- The fork's `dlssnr-capture.trigger` (an empty file beside the DLL) writes `before_NN.raw` /
+  `after_NN.raw` + `manifest.txt` into `dlssnr-capture\` with the xess/fsr31 backends; with `dlss` the
+  request was logged but nothing was written, twice. The host's own warm-up re-create at frame 180 also
+  restarts the fork's auto-capture, which is one reason the routed path skips it.
+
+## 10. Cutting a release
+
+Tag on the release branch (`v0.12.1-beta.1` and `-beta.2` are both tagged on `v0.12.1`, not
+on `main` — `gh release create --target <branch>`).
+
+**Every release carries the automatic-installation notice, in both places.** Most people
+land on the release page, not the README, and the manual sections are long enough that
+someone will follow them without ever learning the installer exists:
+
+1. `AUTOMATIC_INSTALLATION_AVAILABLE.txt` (repo root) uploaded as a **standalone asset**, so
+   it is visible in the assets list before anyone downloads the zip.
+2. The same thing, condensed, as a **blockquote at the very top of the release description**,
+   above the changelog.
+
+Keep the `.txt` in step with the README's "Install: the automated way" section — it restates
+the switches (`-Consumer`, `-LocalFiles`, `-NoElevate`, `-Api`, …), so a change there is a
+change here.
+
+The zip asset is the same 12-entry layout every time; build all four binaries first (step 2),
+never just the add-on:
+
+```
+READ-ME-FIRST.txt                      # what changed in THIS build, plain text, no markdown
+Verify-DLSS5Feeder.ps1                 # tools\
+dlss5-feed.addon64                     # build\
+dlss5-feed.addon32                     # build\
+host64/dlss5-feed-host64.exe           # host\
+layer-x64/VkLayer_feed_vk.{dll,json}, run-with-feed-layer.bat        # layer\
+layer-x86/VkLayer_feed_vk32.{dll,json}, run-with-feed-layer32.bat    # layer\x86\
+reshade-shaders/Shaders/DLSS5_Feed.fx  # shaders\
+```
+
+Bump `FEED_VERSION` in `src/dlss5-feed.cpp` before building — it is what `dlss5-feed.log`
+line 1 prints, and the release notes tell people to check it.

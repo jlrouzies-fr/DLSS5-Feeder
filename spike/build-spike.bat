@@ -1,6 +1,6 @@
 @echo off
-rem Phase-0 spikes: the D3D11/D3D12 cross-process pair, the OpenGL interop pair, and
-rem the 32-bit Vulkan interop pair.
+rem Phase-0 spikes: the D3D11/D3D12 cross-process pair, the OpenGL interop pair, the
+rem 32-bit Vulkan interop pair, and the D3D10.1 <-> D3D11 relay bridge.
 rem Spikes may link opengl32.lib -- there is no ReShade in their processes. None of
 rem them links vulkan-1.lib: src\feed_vk.h is VK_NO_PROTOTYPES, so the Vulkan pair
 rem resolves everything through vkGetInstanceProcAddr, exactly as the add-on does.
@@ -24,6 +24,11 @@ call "%~dp0..\tools\vcvars.bat" amd64_x86 || exit /b 1
 cl /nologo /O2 /EHsc /W3 spike-client32.cpp /Fe:spike-client32.exe d3d11.lib
 if errorlevel 1 exit /b 1
 cl /nologo /O2 /EHsc /W3 spike-gl32.cpp /Fe:spike-gl32.exe opengl32.lib gdi32.lib user32.lib
+if errorlevel 1 exit /b 1
+rem Compiling ..\src\feed_d3d10.h as x86 is a phase-0 answer in itself, as it was for
+rem feed_vk.h. This one links d3d10_1.lib because a spike has to CREATE a D3D10.1 device;
+rem the add-on borrows the game's and so still links nothing new.
+cl /nologo /O2 /EHsc /W3 /I..\src spike-d3d10client32.cpp /Fe:spike-d3d10client32.exe d3d10_1.lib d3d11.lib dxgi.lib
 if errorlevel 1 exit /b 1
 rem Compiling ..\src\feed_vk.h as x86 is itself one of the phase-0 answers.
 cl /nologo /O2 /EHsc /W3 /std:c++20 /I..\external\vulkan spike-vkclient32.cpp /Fe:spike-vkclient32.exe

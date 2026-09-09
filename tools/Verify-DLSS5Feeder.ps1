@@ -95,7 +95,16 @@ $ErrorActionPreference = 'Stop'
 $script:CountOk   = 0
 $script:CountWarn = 0
 $script:CountFail = 0
+# DLSS5_MV_PROVIDER as the add-on itself resolved it in the last run, out of dlss5-feed.log.
+# Better evidence than any ini, because it is read after ReShade has done the overriding.
+$script:FeedLogProvider = $null
 $script:Actions   = New-Object System.Collections.ArrayList
+
+# The first NVIDIA driver that ships DLSS 5 neural rendering at all. Below it NGX answers
+# FeatureNotSupported (0xBAD00001) and nothing here works, so it is a hard failure -- see
+# issue #47, where a machine on 596.36 passed this script with 0 failures.
+$kMinDriver       = '616.56'
+$kMinDriverDigits = 61656
 
 # Does this host support colour at all? A transcript, a redirected stream or an exotic host
 # may not. Probe once and fall back to plain text rather than throwing per line.
@@ -246,6 +255,23 @@ function Find-FileIn
     return $null
 }
 
+# Every match, not just the first. The RenoDX add-on ships under versioned names as well
+# ('renodx-dlss5-4.7.addon64'), and ReShade loads EVERY *.addon64 in the folder -- so "is one
+# present" and "which ones are present" are different questions, and the second is the one that
+# matters when two copies would both hook NGX. The C++ side has matched the prefix since #1
+# (FindRenodxAddon, src/dlss5-feed.cpp:320); this script did not, and reported a perfectly good
+# versioned install as "no neural consumer found".
+function Find-FilesIn
+{
+    param([string] $Dir, [string] $Name)
+    if (-not (Test-DirHere $Dir)) { return @() }
+    try {
+        $hits = @(Get-ChildItem -LiteralPath $Dir -File -Filter $Name -ErrorAction SilentlyContinue)
+        return $hits
+    }
+    catch { return @() }
+}
+
 # Case-insensitive recursive search under a folder. ReShade's EffectSearchPaths normally ends
 # in "**", so a header sitting in Shaders\CrosireMaster\ is found by the compiler and must be
 # treated as present here too.
@@ -344,6 +370,165 @@ function Get-PeInfo
     }
 }
 
+# Does this executable look like something that renders? A renderer names a graphics runtime
+# somewhere in its binary; a command-line tool that ships beside the game does not. Used only
+# to break a tie when the game exe is being guessed (#60) -- never to fail anything, so a
+# string scan is enough and no import-table walk is needed. Capped, like the installer's.
+function Test-ExeLooksGraphical
+{
+    param([string] $Path)
+    try {
+        $fi = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($fi.Length -eq 0 -or $fi.Length -gt 268435456) { return $false }
+        $bytes = [IO.File]::ReadAllBytes($Path)
+        $ascii = [Text.Encoding]::ASCII.GetString($bytes)
+        $wide  = [Text.Encoding]::Unicode.GetString($bytes)
+        foreach ($n in @('vulkan-1.dll', 'dxgi.dll', 'd3d12.dll', 'd3d11.dll', 'd3d10_1.dll', 'd3d10.dll', 'd3d9.dll', 'd3d8.dll', 'opengl32.dll')) {
+            $re = '(?i)(?<![\w.])' + [regex]::Escape($n)
+            if ([regex]::IsMatch($ascii, $re) -or [regex]::IsMatch($wide, $re)) { return $true }
+        }
+    }
+    catch { }
+    return $false
+}
+
+# RVA -> file offset, given a PE's section table. Split out from the reader below so the
+# lookup does not depend on PowerShell's nested-function scoping.
+function Convert-RvaToOffset
+{
+    param($Sections, [uint32] $Rva, [long] $Length)
+    foreach ($s in $Sections) {
+        if ($Rva -ge $s.V -and $Rva -lt ($s.V + $s.Span)) {
+            $o = [long]$s.Raw + ([long]$Rva - [long]$s.V)
+            if ($o -ge 0 -and $o -lt $Length) { return [long]$o }
+            return [long](-1)
+        }
+    }
+    return [long](-1)
+}
+
+# The names in a PE's export directory. $null when the file is not a readable PE; an empty
+# array when it is one and exports nothing.
+function Get-PeExportNames
+{
+    param([string] $Path, [int] $Max = 8192)
+    if (-not (Test-FileHere $Path)) { return $null }
+
+    $fs = $null
+    $br = $null
+    try {
+        $fs = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        if ($fs.Length -lt 0x40) { return $null }
+        $br = New-Object IO.BinaryReader($fs)
+
+        if ($br.ReadUInt16() -ne 0x5A4D) { return $null }            # 'MZ'
+        $fs.Position = 0x3C
+        $peOff = $br.ReadInt32()
+        if ($peOff -le 0 -or ($peOff + 24) -ge $fs.Length) { return $null }
+
+        $fs.Position = $peOff
+        if ($br.ReadUInt32() -ne 0x00004550) { return $null }        # 'PE\0\0'
+        $null      = $br.ReadUInt16()                                # Machine
+        $nSections = $br.ReadUInt16()
+        $null      = $br.ReadUInt32()                                # TimeDateStamp
+        $null      = $br.ReadUInt32()                                # PointerToSymbolTable
+        $null      = $br.ReadUInt32()                                # NumberOfSymbols
+        $optSize   = $br.ReadUInt16()
+        $null      = $br.ReadUInt16()                                # Characteristics
+
+        $optOff = [long]$peOff + 24
+        if ($optSize -lt 96 -or ($optOff + $optSize) -gt $fs.Length) { return $null }
+        $fs.Position = $optOff
+        $magic = $br.ReadUInt16()
+        # The data directories follow the optional header's fixed part: 96 bytes for PE32,
+        # 112 for PE32+ (four fields widened to 64-bit).
+        if     ($magic -eq 0x20B) { $dirOff = $optOff + 112 }
+        elseif ($magic -eq 0x10B) { $dirOff = $optOff + 96 }
+        else                      { return $null }
+        if (($dirOff + 8) -gt $fs.Length) { return $null }
+        $fs.Position = $dirOff
+        $expRva = $br.ReadUInt32()                                   # DataDirectory[0] = exports
+        $null   = $br.ReadUInt32()                                   # its size
+        if ($expRva -eq 0) { return ,([string[]] @()) }
+
+        $secOff = $optOff + $optSize
+        $sections = @()
+        for ($i = 0; $i -lt $nSections; $i++) {
+            $p = $secOff + ([long]$i * 40)
+            if (($p + 40) -gt $fs.Length) { break }
+            $fs.Position = $p + 8                                    # past the 8-byte name
+            $vsize = $br.ReadUInt32()
+            $vaddr = $br.ReadUInt32()
+            $rsize = $br.ReadUInt32()
+            $raw   = $br.ReadUInt32()
+            $span  = if ($vsize -gt 0) { $vsize } else { $rsize }
+            $sections += New-Object psobject -Property @{ V = $vaddr; Span = $span; Raw = $raw }
+        }
+        if ($sections.Count -eq 0) { return $null }
+
+        $eo = Convert-RvaToOffset $sections $expRva $fs.Length
+        if ($eo -lt 0 -or ($eo + 40) -gt $fs.Length) { return $null }
+
+        # IMAGE_EXPORT_DIRECTORY: NumberOfFunctions +20, NumberOfNames +24,
+        # AddressOfFunctions +28, AddressOfNames +32.
+        $fs.Position = $eo + 20
+        $null     = $br.ReadUInt32()
+        $nNames   = $br.ReadUInt32()
+        $null     = $br.ReadUInt32()
+        $namesRva = $br.ReadUInt32()
+        if ($nNames -eq 0 -or $namesRva -eq 0) { return ,([string[]] @()) }
+        if ($nNames -gt $Max) { $nNames = $Max }
+
+        $no = Convert-RvaToOffset $sections $namesRva $fs.Length
+        if ($no -lt 0) { return $null }
+
+        $names = New-Object 'System.Collections.Generic.List[string]'
+        for ($i = 0; $i -lt $nNames; $i++) {
+            $p = $no + ([long]$i * 4)
+            if (($p + 4) -gt $fs.Length) { break }
+            $fs.Position = $p
+            $so = Convert-RvaToOffset $sections ($br.ReadUInt32()) $fs.Length
+            if ($so -lt 0) { continue }
+            $fs.Position = $so
+            $sb = New-Object Text.StringBuilder
+            for ($k = 0; $k -lt 256; $k++) {
+                $b = $fs.ReadByte()
+                if ($b -le 0) { break }
+                $null = $sb.Append([char]$b)
+            }
+            if ($sb.Length -gt 0) { $null = $names.Add($sb.ToString()) }
+        }
+        return ,([string[]] $names.ToArray())
+    }
+    catch { return $null }
+    finally {
+        if ($br) { try { $br.Close() } catch { } }
+        if ($fs) { try { $fs.Dispose() } catch { } }
+    }
+}
+
+# Does this ReShade build support add-ons?
+#
+# ReShade ships two builds. They carry the same version number and the same ProductName, so
+# nothing this script checked could tell them apart -- and an install with the wrong one looks
+# perfectly healthy while the add-on is never loaded at all (issue #53). It bites hardest on
+# Vulkan, where the layer is machine-wide: anyone who has ever run ReShade's plain setup for
+# any Vulkan game already has one, and it is reused for every game after that.
+#
+# The exports settle it, and not by inference: ReShade's own add-on API finds the ReShade
+# module in a process by testing GetProcAddress for exactly "ReShadeRegisterAddon" and
+# "ReShadeUnregisterAddon" (reshade.hpp). A build that does not export those two cannot load
+# an add-on, because that is the mechanism by which add-ons find it.
+#
+# $null means the file could not be read -- never report that as a failure.
+function Test-ReShadeHasAddons
+{
+    param([string] $Path)
+    $names = Get-PeExportNames $Path
+    if ($null -eq $names) { return $null }
+    return [bool](($names -contains 'ReShadeRegisterAddon') -and ($names -contains 'ReShadeUnregisterAddon'))
+}
+
 # Scan a binary for an ASCII marker string. Deliberately capped: the NGX DLLs are 160 MB and
 # there is never a reason to slurp one.
 function Get-BinaryMarker
@@ -427,6 +612,37 @@ function Read-LinesSafe
     return ($t -split "`r?`n")
 }
 
+# Value of one key in one section of an ini. Pass '' for $Section to read the ROOT
+# (section-less) block at the top of the file, which is where ReShade keeps a preset's
+# Techniques= and its preset-wide PreprocessorDefinitions=. Last occurrence wins, as
+# ReShade's own parser does.
+function Get-IniValue
+{
+    param([string] $Path, [string] $Section, [string] $Key)
+    $lines = Read-LinesSafe $Path
+    if ($null -eq $lines) { return $null }
+    $cur   = ''
+    $value = $null
+    $rx    = '(?i)^' + [regex]::Escape($Key) + '\s*=\s*(.*)$'
+    foreach ($ln in $lines) {
+        $t = $ln.Trim()
+        if ($t -match '^\[(.+)\]$') { $cur = $Matches[1]; continue }
+        if (-not ($cur -ieq $Section)) { continue }
+        if ($t -match $rx) { $value = $Matches[1] }
+    }
+    return $value
+}
+
+# One NAME=VALUE out of a ReShade PreprocessorDefinitions list (comma separated).
+function Get-PreprocessorDefinition
+{
+    param([string] $Defs, [string] $Name)
+    if (-not $Defs) { return $null }
+    $m = [regex]::Match($Defs, '(?i)(?:^|[,;\s])' + [regex]::Escape($Name) + '\s*=\s*([^,;\s]+)')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return $null
+}
+
 function Format-Size
 {
     param([long] $Bytes)
@@ -503,17 +719,43 @@ if ($Exe) {
 
 if (-not $exePath) {
     $skip = '(?i)(launcher|unins|setup|crash|redist|vcredist|dxsetup|dxwebsetup|dgvoodoocpl|touchup|prereq|activation|helper|updater|report)'
+    # #60: "the largest exe that is not a launcher" picked studiomdl.exe -- the Source engine's
+    # model compiler -- out of a Garry's Mod bin\win64 folder, and every check after that
+    # described an install relative to a tool that never renders anything. Engine and SDK
+    # tooling ships beside the game and is often bigger than it, so size alone cannot decide.
+    $skipTool = '(?i)^(studiomdl|vbsp|vvis|vrad|hlmv|hlfaceposer|glview|height2ssbump|vtex|vtf2tga|tgadiff|motionmapper|qc_eyes|scenemanager|captioncompiler|shadercompile|bugreporter\w*|phonemeextractor|vice|vpk|dmxconvert|dmxedit|smd\w*)\.exe$'
     $exes = $null
     try {
-        $exes = Get-ChildItem -LiteralPath $gameDir -File -Filter '*.exe' -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -notmatch $skip } |
-                Sort-Object Length -Descending
+        # @() so a single match is still an array: StrictMode makes .Count on a bare
+        # FileInfo a hard error, and a folder with exactly one exe is the common case.
+        $exes = @(Get-ChildItem -LiteralPath $gameDir -File -Filter '*.exe' -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -notmatch $skip -and $_.Name -notmatch $skipTool } |
+                  Sort-Object Length -Descending)
     }
     catch { }
 
+    # Prefer an exe that actually imports a graphics runtime: a renderer imports d3d9/d3d11/
+    # d3d12/dxgi/opengl32/vulkan-1, and a command-line compiler does not. The installer already
+    # scans imports for the same reason (Install-DLSS5Feeder.ps1, Get-PeImports).
+    $exeAmbiguous = $false
     if ($exes) {
-        $exePath = $exes[0].FullName
+        $gfx = @($exes | Where-Object { Test-ExeLooksGraphical $_.FullName })
+        if ($gfx.Count -ge 1) {
+            $exePath = $gfx[0].FullName
+            $exeAmbiguous = $gfx.Count -gt 1
+        }
+        else {
+            $exePath = $exes[0].FullName
+            $exeAmbiguous = $exes.Count -gt 1
+        }
         $exeGuessed = $true
+    }
+
+    # Say so when the pick was a coin toss, instead of reporting the rest of the run as fact.
+    if ($exeGuessed -and $exeAmbiguous) {
+        Report -Status 'Warn' -Text ('The game executable was guessed: ' + [IO.Path]::GetFileName($exePath)) `
+               -Detail 'Several executables in this folder could be the game, and everything below is measured against this one.' `
+               -Action 'If that is the wrong one, re-run with -Exe "<the game exe>".'
     }
 }
 
@@ -576,9 +818,28 @@ $api = 'unknown'
 $apiDetail = ''
 $isVulkan = $false
 
-if ($d3d9Local -and $dgVoodooConf) {
+# #60: "a d3d9.dll plus a dgVoodoo.conf" is not proof of dgVoodoo2. The DLL can be ReShade's
+# own Direct3D 9 hook, and the conf can be a leftover from an install that was later disabled
+# (#56 is exactly that state). Ask the file who it is before claiming the whole route.
+$dgVoodooWrapper = $false
+if ($d3d9Local) {
+    $d9name = Get-ProductNameSafe $d3d9Local
+    if ($d9name -and $d9name -match '(?i)dgvoodoo') { $dgVoodooWrapper = $true }
+    elseif (-not $d9name) {
+        $dgVoodooWrapper = [bool](Get-BinaryMarker -Path $d3d9Local -Pattern 'dgVoodoo' -MaxBytes 16777216)
+    }
+}
+
+if ($d3d9Local -and $dgVoodooConf -and $dgVoodooWrapper) {
     $api = 'Direct3D 9 via dgVoodoo2 (translated to D3D11)'
-    $apiDetail = 'Inferred from a local d3d9.dll plus dgVoodoo.conf. ReShade hooks the D3D11 device dgVoodoo2 creates, so ReShade itself is the local dxgi.dll.'
+    $apiDetail = 'The local d3d9.dll identifies itself as dgVoodoo2 and dgVoodoo.conf is present. ReShade hooks the D3D11 device dgVoodoo2 creates, so ReShade itself is the local dxgi.dll.'
+}
+elseif ($d3d9Local -and $dgVoodooConf -and -not $dgVoodooWrapper) {
+    $api = 'Direct3D 9 (dgVoodoo.conf present, but the local d3d9.dll is not dgVoodoo2)'
+    $apiDetail = 'dgVoodoo.conf is here but the d3d9.dll beside it does not identify itself as dgVoodoo2 -- most likely a leftover conf from an install that was replaced or disabled.'
+    Report -Status 'Fail' -Text 'The dgVoodoo2 wrapper is not actually in place.' `
+           -Detail $apiDetail `
+           -Action 'Re-run Install-DLSS5Feeder.ps1 for this game, or copy dgVoodoo2''s D3D9.dll (D3D8.dll for a Direct3D 8 game) next to the exe.'
 }
 elseif ($reshadeLocalName -eq 'opengl32.dll') {
     $api = 'OpenGL'
@@ -587,6 +848,16 @@ elseif ($reshadeLocalName -eq 'opengl32.dll') {
 elseif ($reshadeLocalName -eq 'dxgi.dll') {
     $api = 'Direct3D 10/11/12'
     $apiDetail = 'Inferred from a local ReShade dxgi.dll.'
+}
+elseif ($reshadeLocalName -eq 'd3d9.dll') {
+    # #60: this used to report a bland "Direct3D (hooked via d3d9.dll)" and carry on, so a
+    # Direct3D 9 game with no wrapper -- which this project cannot touch at all -- looked like
+    # a normal install right up to the shader's compile error. Say it here instead.
+    $api = 'Direct3D 9 (ReShade is on its D3D9 backend)'
+    $apiDetail = 'The local ReShade DLL is d3d9.dll, so ReShade is running its Direct3D 9 backend.'
+    Report -Status 'Fail' -Text 'Direct3D 9 is not supported directly.' `
+           -Detail 'This project attaches to Direct3D 10/11/12, OpenGL and Vulkan. On ReShade''s D3D9 backend there is no D3D11/D3D12 device to share textures with, and DLSS5_Feed.fx refuses to compile (it reports this in plain language). A 64-bit D3D9 game is best served by ShortFuse''s renodx-dlss standalone, which needs no feeder.' `
+           -Action 'For a 32-bit D3D9 game, install dgVoodoo2 so the game runs on D3D11 and point ReShade at dxgi.dll -- Install-DLSS5Feeder.ps1 does this. Otherwise use renodx-dlss on its own.'
 }
 elseif ($reshadeLocalName) {
     $api = 'Direct3D (hooked via ' + $reshadeLocalName + ')'
@@ -630,9 +901,22 @@ function Report-ReShadeDll
                -Detail $Path
         return
     }
+    # Add-on support first: a new-enough ReShade WITHOUT it is the more confusing failure,
+    # because every other check passes and nothing in any log says the add-on was refused --
+    # it is simply never looked for (issue #53).
+    $addons = Test-ReShadeHasAddons $Path
+    if ($addons -eq $false) {
+        Report -Status 'Fail' -Text ($Label + ': ' + $ver + ' -- built WITHOUT add-on support') `
+               -Detail ('This is ReShade''s plain build. It does not export ReShadeRegisterAddon, which is how an add-on finds ReShade, so dlss5-feed is never loaded and nothing anywhere says so. The version number and ProductName are identical to the add-on build, which is why this is easy to miss. On Vulkan the layer is machine-wide, so one plain install from any earlier game is reused for every game after it.') `
+               -Action ('Re-run the ReShade installer over ' + $Path + ' and tick "Enable loading of add-ons" (the ReShade_Setup_*_Addon.exe download).')
+        return
+    }
+
     $ok = Test-ReShadeVersion $ver
     if ($ok -eq $true) {
-        Report -Status 'Ok' -Text ($Label + ': ' + $ver) -Detail $Path
+        $d = $Path
+        if ($null -eq $addons) { $d = $Path + "`nAdd-on support could not be read from this file; assuming it is present." }
+        Report -Status 'Ok' -Text ($Label + ': ' + $ver + $(if ($addons -eq $true) { ' (add-on build)' } else { '' })) -Detail $d
     }
     elseif ($ok -eq $false) {
         Report -Status 'Fail' -Text ($Label + ': ' + $ver + ' -- too old') `
@@ -692,7 +976,11 @@ if ($needVulkanCheck) {
             $m = [regex]::Match($appsText, '(?im)^\s*Apps\s*=\s*(.*)$')
             $entries = @()
             if ($m.Success) {
-                $entries = $m.Groups[1].Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+                # @() so a single surviving entry is still an array. Without it the pipeline
+                # unrolls to a bare String, and $entries.Count below is a hard error under the
+                # Set-StrictMode -Version 2.0 at the top of this script -- on the SUCCESS
+                # branch, so it only ever killed installs that were correct (#13).
+                $entries = @($m.Groups[1].Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
             }
             $listed = $false
             foreach ($e in $entries) {
@@ -860,19 +1148,51 @@ else {
 }
 
 $dfcAddon   = Find-FileIn $consumerDir 'deep-fried-chicken.addon64'
-$renoAddon  = Find-FileIn $consumerDir 'renodx-dlss5.addon64'
+$renoAddon  = Find-FileIn $consumerDir 'renodx-dlss5*.addon64'
 $toolkit    = Find-FileIn $consumerDir 'alexs-toolkit.addon64'
 $dx11Bridge = Find-FileIn $consumerDir 'dlss5-dx11-bridge.addon64'
 
+# OptiScaler, under any of the names it installs as. The DLSS-NR fork (Dagherbou/OptiScaler_DLSSNR)
+# is a supported consumer; stock OptiScaler is not -- it takes the feeder's NGX calls, upscales, and
+# never runs a neural pass. Told apart by the neural forwarder's file name, a literal only the fork has.
+$optiDll  = $null
+$optiFork = $false
+foreach ($n in @('winmm.dll', 'version.dll', 'dbghelp.dll', 'winhttp.dll', 'wininet.dll', 'd3d12.dll', 'OptiScaler.dll', 'OptiScaler.asi')) {
+    $p = Find-FileIn $consumerDir $n
+    if (-not $p) { continue }
+    if (Get-BinaryMarker -Path $p -Pattern 'nvngx\.dll_dlssnr\.dll') { $optiDll = $p; $optiFork = $true; break }
+    if (Get-BinaryMarker -Path $p -Pattern 'OptiScaler\.ini') { $optiDll = $p; break }
+}
+
 if ($gameBits -eq 32) {
     # A 64-bit add-on beside a 32-bit exe is the single most common 32-bit deploy mistake.
-    foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5.addon64', 'alexs-toolkit.addon64')) {
+    foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5*.addon64', 'alexs-toolkit.addon64')) {
         $stray = Find-FileIn $gameDir $n
         if ($stray) {
+            $n = [IO.Path]::GetFileName($stray)   # the versioned name, not the pattern
             Report -Status 'Fail' -Text ($n + ' is next to the 32-bit game exe -- wrong place.') `
                    -Detail 'This game is 32-bit, so the neural consumer must live in host64\ where the 64-bit helper process loads it. A 64-bit add-on beside an x86 exe is never loaded by anything.' `
                    -Action ('Move ' + $n + ' into ' + $hostDir)
         }
+    }
+    $strayOpti = Find-FileIn $gameDir 'OptiScaler.ini'
+    if ($strayOpti) {
+        Report -Status 'Fail' -Text 'The OptiScaler set is next to the 32-bit game exe -- wrong place.' `
+               -Detail 'OptiScaler is 64-bit. For a 32-bit game it goes into host64\ (OptiScaler.dll renamed winmm.dll beside dlss5-feed-host64.exe), where the DLSS work happens. A 64-bit winmm.dll or version.dll beside a 32-bit exe stops the game from starting at all.' `
+               -Action ('Move OptiScaler.ini, the OptiScaler DLL, nvngx.dll_dlssnr.dll and the OptiScaler\ folder into ' + $hostDir)
+    }
+    # And the mirror image of it: the feeder's own 64-bit add-on inside host64\. Unlike a
+    # stray consumer beside the exe this one does load -- host64\ is a 64-bit ReShade
+    # install, so the helper picks it up and runs the add-on meant for a 64-bit GAME inside
+    # the very process that is serving the 32-bit one. It opens a second NGX session on its
+    # own private device and detours nvngx over the consumer's hooks, in a process where
+    # none of that is tested. Recent builds recognise the helper and stay inert, but an
+    # older one does not, and either way the file should not be there.
+    $strayFeeder = Find-FileIn $hostDir 'dlss5-feed.addon64'
+    if ($strayFeeder) {
+        Report -Status 'Fail' -Text 'host64\dlss5-feed.addon64 should not be there.' `
+               -Detail 'That is the add-on for a 64-bit GAME. The helper''s own ReShade loads every add-on in host64\, so this one ends up inside the helper process, where it can do nothing useful and gets in the way of the neural consumer. host64\ takes dlss5-feed-host64.exe, a 64-bit ReShade dxgi.dll, the neural consumer and the nvngx runtimes -- nothing else.' `
+               -Action ('Delete ' + $strayFeeder)
     }
     if (-not (Test-DirHere $hostDir)) {
         Report -Status 'Fail' -Text 'host64\ does not exist, so there is nowhere for the neural consumer to live.' `
@@ -880,10 +1200,96 @@ if ($gameBits -eq 32) {
     }
 }
 
-if ($dfcAddon -and $renoAddon) {
-    Report -Status 'Fail' -Text 'BOTH Deep Fried Chicken and the RenoDX DLSS 5 add-on are present.' `
-           -Detail 'Deep Fried Chicken goes completely inert for the whole process while a RenoDX neural provider is loaded. Everything still looks healthy -- frames are delivered, no errors -- and neural rendering does nothing.' `
-           -Action ('Remove one of them from ' + $consumerDir + ' (keep deep-fried-chicken.addon64 unless you specifically want RenoDX).')
+$consumers = @()
+if ($dfcAddon)  { $consumers += 'Deep Fried Chicken' }
+if ($renoAddon) { $consumers += 'RenoDX DLSS 5' }
+if ($optiDll)   { $consumers += ('OptiScaler (' + [IO.Path]::GetFileName($optiDll) + ')') }
+if ($consumers.Count -ge 2) {
+    if ($optiDll) {
+        $why = 'OptiScaler captures every nvngx load in the process: another consumer beside it either talks to OptiScaler instead of the driver (Chicken''s own deep-fried-chicken-nvngx.dll ends in nvngx.dll) or runs its neural pass a second time inside OptiScaler''s DLSS backend.'
+    }
+    else {
+        $why = 'Deep Fried Chicken goes completely inert for the whole process while a RenoDX neural provider is loaded. Everything still looks healthy -- frames are delivered, no errors -- and neural rendering does nothing.'
+    }
+    Report -Status 'Fail' -Text ('More than one neural consumer is present: ' + ($consumers -join ', ') + '.') `
+           -Detail $why `
+           -Action ('Keep exactly one in ' + $consumerDir + ' and remove or rename the rest.')
+}
+elseif ($optiDll) {
+    $optiName = [IO.Path]::GetFileName($optiDll)
+    if (-not $optiFork) {
+        Report -Status 'Fail' -Text ($optiName + ' is OptiScaler, but NOT the DLSS-NR fork.') `
+               -Detail 'Stock OptiScaler takes the feeder''s NGX calls and upscales, and no neural pass ever runs -- the picture never changes while every log reads healthy.' `
+               -Action 'Use the Dagherbou/OptiScaler_DLSSNR release, or remove OptiScaler and install Deep Fried Chicken.'
+    }
+    else {
+        Report -Status 'Ok' -Text ('OptiScaler DLSS-NR present as ' + $optiName + ' (supported alternative).') `
+               -Detail ('in ' + $consumerWhere + ' -- it answers the feeder''s NGX calls itself, upscales, then runs the neural pass in place. Its menu is on Insert.')
+        if ($gameBits -eq 32 -and $optiName -notmatch '(?i)^(winmm|version)\.dll$') {
+            Report -Status 'Fail' -Text ('host64\' + $optiName + ' is never loaded by the helper.') `
+                   -Detail 'dlss5-feed-host64.exe imports winmm.dll and version.dll at start; under any other name OptiScaler is not in the process when the first NGX call is made, and the driver answers instead.' `
+                   -Action ('Rename ' + $optiName + ' to winmm.dll in ' + $hostDir)
+        }
+        if (Find-FileIn $consumerDir 'nvngx.dll_dlssnr.dll') {
+            Report -Status 'Ok' -Text 'nvngx.dll_dlssnr.dll (the neural forwarder) present.'
+        }
+        else {
+            Report -Status 'Fail' -Text 'nvngx.dll_dlssnr.dll is missing.' `
+                   -Detail 'The neural model refuses any caller whose module path does not contain nvngx.dll; this 100 KB shim from the OptiScaler_DLSSNR zip is what satisfies it. Without it OptiScaler.log says "nvngx.dll_dlssnr.dll not found" and no neural pass runs.' `
+                   -Action ('Extract nvngx.dll_dlssnr.dll from the OptiScaler_DLSSNR zip into ' + $consumerDir)
+        }
+        if (-not (Test-DirHere (Join-Safe $consumerDir 'OptiScaler'))) {
+            Report -Status 'Warn' -Text 'The OptiScaler\ runtime folder is missing.' `
+                   -Detail 'It holds libxess, the FidelityFX runtimes and the Agility SDK. The dlss backend does not need them, but OptiScaler preloads them and logs their absence.'
+        }
+        $optiIni = Join-Safe $consumerDir 'OptiScaler.ini'
+        if (Test-FileHere $optiIni) {
+            $en = Get-IniValue -Path $optiIni -Section 'DlssNr' -Key 'Enabled'
+            if ($en -and $en.Trim() -imatch '^(true|1)$') {
+                Report -Status 'Ok' -Text 'OptiScaler.ini: [DlssNr] Enabled=true.'
+            }
+            else {
+                $shown = if ($en) { $en.Trim() } else { '(absent)' }
+                Report -Status 'Fail' -Text ('OptiScaler.ini: [DlssNr] Enabled=' + $shown + ' -- the neural pass is OFF.') `
+                       -Detail 'auto means false: the fork ships with the pass off. OptiScaler will take the feeder''s calls and only upscale.' `
+                       -Action 'Set Enabled=true under [DlssNr] in OptiScaler.ini (or tick it in OptiScaler''s menu, Insert) and restart.'
+            }
+            $up = Get-IniValue -Path $optiIni -Section 'Upscalers' -Key 'Dx12Upscaler'
+            $upShown = if ($up) { $up.Trim() } else { 'auto' }
+            Report -Status 'Na' -Text ('OptiScaler.ini: [Upscalers] Dx12Upscaler=' + $upShown + ' (dlss keeps the feed''s DLAA; auto picks DLSS on an RTX with nvngx_dlss.dll beside it).')
+            $se = Get-IniValue -Path $optiIni -Section 'DlssNr' -Key 'ScanExposure'
+            if ($se -and $se.Trim() -imatch '^(true|1)$') {
+                Report -Status 'Warn' -Text 'OptiScaler.ini: [DlssNr] ScanExposure=true.' `
+                       -Detail 'The scan hooks resource creation on the feeder''s device looking for an exposure buffer the feed never offers.' `
+                       -Action 'Set ScanExposure=false.'
+            }
+            $di = Get-IniValue -Path $optiIni -Section 'Inputs' -Key 'EnableDlssInputs'
+            $ho = Get-IniValue -Path $optiIni -Section 'Hooks' -Key 'HookOriginalNvngxOnly'
+            if (($di -and $di.Trim() -imatch '^(false|0)$') -or ($ho -and $ho.Trim() -imatch '^(true|1)$')) {
+                Report -Status 'Fail' -Text 'OptiScaler.ini defeats the nvngx redirect.' `
+                       -Detail ('[Inputs] EnableDlssInputs=' + $di + ', [Hooks] HookOriginalNvngxOnly=' + $ho + '. With these the feeder''s NGX calls reach the driver, not OptiScaler, and nothing neural happens.') `
+                       -Action 'Set EnableDlssInputs=true (or auto) and HookOriginalNvngxOnly=false (or auto).'
+            }
+        }
+        else {
+            Report -Status 'Fail' -Text 'OptiScaler.ini is missing beside OptiScaler.' `
+                   -Action ('Extract it from the zip into ' + $consumerDir + ' and set [DlssNr] Enabled=true.')
+        }
+        $dlssDllForSig = Find-FileIn $consumerDir 'nvngx_dlss.dll'
+        if ($dlssDllForSig) {
+            try {
+                $sig = Get-AuthenticodeSignature -LiteralPath $dlssDllForSig -ErrorAction Stop
+                if ($sig.Status -eq 'Valid') {
+                    Report -Status 'Ok' -Text 'nvngx_dlss.dll carries a valid signature (OptiScaler redirects the NGX SDK''s trust check to it).'
+                }
+                else {
+                    Report -Status 'Warn' -Text ('nvngx_dlss.dll signature: ' + $sig.Status + '.') `
+                           -Detail 'OptiScaler points the NGX SDK''s signature check at this file; an unsigned or tampered copy makes the SDK refuse the core ("failed to load NGXCore").'
+                }
+            }
+            catch { }
+        }
+    }
 }
 elseif ($dfcAddon) {
     $dfcVer = Get-BinaryMarker -Path $dfcAddon -Pattern 'Deep Fried Chicken (\d[\w.\-+]*)'
@@ -906,12 +1312,20 @@ elseif ($dfcAddon) {
     }
 }
 elseif ($renoAddon) {
-    Report -Status 'Ok' -Text 'renodx-dlss5.addon64 present (supported alternative).' `
+    Report -Status 'Ok' -Text ([IO.Path]::GetFileName($renoAddon) + ' present (supported alternative).') `
            -Detail ('in ' + $consumerWhere + '. Deep Fried Chicken is the recommended default.')
+    # ReShade loads every *.addon64 in the folder, so a second copy is not redundant -- both
+    # hook NGX and the result is undefined.
+    $renoAll = @(Find-FilesIn $consumerDir 'renodx-dlss5*.addon64')
+    if ($renoAll.Count -gt 1) {
+        Report -Status 'Warn' -Text 'More than one renodx-dlss5 add-on is present.' `
+               -Detail (($renoAll | ForEach-Object { $_.Name }) -join ', ') `
+               -Action ('Keep one of them in ' + $consumerDir + ' and remove or rename the rest.')
+    }
 }
 else {
     Report -Status 'Fail' -Text 'No neural consumer found.' `
-           -Detail ('Expected deep-fried-chicken.addon64 (recommended) or renodx-dlss5.addon64 in ' + $consumerDir + '. The feeder publishes a synthetic DLSS contract; without a consumer, nothing acts on it.') `
+           -Detail ('Expected deep-fried-chicken.addon64 (recommended), renodx-dlss5.addon64, or the OptiScaler DLSS-NR set (winmm.dll + OptiScaler.ini + nvngx.dll_dlssnr.dll) in ' + $consumerDir + '. The feeder publishes a synthetic DLSS contract; without a consumer, nothing acts on it.') `
            -Action ('Copy deep-fried-chicken.addon64 (+ deep-fried-chicken-nvngx.dll and deep-fried-chicken.cfg) into ' + $consumerDir)
 }
 
@@ -919,6 +1333,11 @@ if ($toolkit) {
     if ($dfcAddon) {
         Report -Status 'Warn' -Text 'alexs-toolkit.addon64 is present alongside Deep Fried Chicken.' `
                -Detail 'That is a third interposer on the same NGX module. Chicken''s own test notes ask for the toolkit to be removed -- do not combine them.'
+    }
+    elseif ($optiDll) {
+        Report -Status 'Warn' -Text 'alexs-toolkit.addon64 is present alongside OptiScaler.' `
+               -Detail 'The toolkit is a cascade over the RenoDX add-on. With OptiScaler as the consumer there is nothing for it to attach to, and it is one more interposer on the NGX module OptiScaler is redirecting.' `
+               -Action ('Remove alexs-toolkit.addon64 from ' + $consumerDir)
     }
     else {
         Report -Status 'Warn' -Text 'alexs-toolkit.addon64 is present (optional multi-pass cascade).' `
@@ -946,7 +1365,30 @@ foreach ($n in @('nvngx_dlssnr.dll', 'nvngx_dlss.dll')) {
     if ($p) {
         $v = Get-FileVersionSafe $p
         if ($v) { $t = $n + ': ' + $v } else { $t = $n + ': present (no version info)' }
-        Report -Status 'Ok' -Text $t -Detail ('in ' + $consumerWhere)
+        # NVIDIA's own build and ShortFuse's .SF repack both carry file version 310.8.0.0, so
+        # the version alone cannot tell them apart -- and that is exactly the distinction
+        # issue #47 turns on. The product/description strings do differ, so print them.
+        $d = ('in ' + $consumerWhere)
+        $pn = Get-ProductNameSafe $p
+        if ($pn) { $d = $d + "`n" + $pn }
+        # Two more fields, and neither is asserted to be decisive. This used to call
+        # OriginalFilename ("CL 38718415") the sharpest tell there is; #50's reporter says the
+        # changelist is identical on both builds and what differs is the stated FileVersion
+        # STRING -- "310,8,0,0" from NVIDIA, "310.8.SF.0" from the repack. That string is a
+        # separate field from the version quad above and was never being read. Print both and
+        # let whoever compares two machines decide.
+        try {
+            $vi = (Get-Item -LiteralPath $p -ErrorAction Stop).VersionInfo
+            if ($vi.OriginalFilename) { $d = $d + "`nbuild: " + $vi.OriginalFilename.Trim() }
+            # Only when it disagrees with the quad: on a stock runtime it is the same numbers
+            # with commas, and repeating it would train people to skip the line.
+            if ($vi.FileVersion) {
+                $stated = ($vi.FileVersion -replace '\s', '') -replace ',', '.'
+                if ($stated -and $stated -ne $v) { $d = $d + "`nstated FileVersion: " + $vi.FileVersion.Trim() }
+            }
+        }
+        catch { }
+        Report -Status 'Ok' -Text $t -Detail $d
     }
     else {
         if ($n -eq 'nvngx_dlssnr.dll') { $why = 'This is the neural-rendering model itself -- DLSS 5 cannot run without it.' }
@@ -992,6 +1434,30 @@ if (-not $foundAny) {
 # 7. GPU
 # ---------------------------------------------------------------------------------------
 
+Write-Section 'Direct3D 12 runtime'
+
+# A game-local D3D12 folder is an Agility SDK redist path. If the game's exe exports
+# D3D12SDKVersion/D3D12SDKPath, every D3D12 device created in that process -- including the
+# feeder's private one -- loads D3D12Core.dll from there. An empty or incomplete folder then
+# fails D3D12CreateDevice with 0x887E0003 (D3D12_ERROR_INVALID_REDIST), which reads as a
+# feeder bug and is not one. Issue #61 arrived with exactly that code and an empty folder.
+$agilityDir = Join-Safe $gameDir 'D3D12'
+if (-not (Test-Path -LiteralPath $agilityDir -PathType Container)) {
+    Report -Status 'Ok' -Text 'No game-local D3D12\ (Agility SDK) folder; the system Direct3D 12 runtime is used.'
+}
+else {
+    $agilityFiles = @(Get-ChildItem -LiteralPath $agilityDir -File -ErrorAction SilentlyContinue)
+    $agilityCore  = @($agilityFiles | Where-Object { $_.Name -ieq 'D3D12Core.dll' })
+    if ($agilityCore.Count -gt 0) {
+        Report -Status 'Ok' -Text ('Game-local D3D12\ (Agility SDK) folder with D3D12Core.dll (' + $agilityFiles.Count + ' file(s)).')
+    }
+    else {
+        Report -Status 'Warn' -Text ('Game-local D3D12\ folder with ' + $agilityFiles.Count + ' file(s) and NO D3D12Core.dll.') `
+               -Detail 'If the game points Direct3D 12 at this folder, every device created in the process fails with 0x887E0003 (D3D12_ERROR_INVALID_REDIST) -- including the feeder private device, which then reports "D3D12CreateDevice failed".' `
+               -Action 'If the feeder log shows D3D12CreateDevice failed 0x887E0003, rename the game D3D12 folder and relaunch.'
+    }
+}
+
 Write-Section 'GPU'
 
 $gpus = $null
@@ -1009,6 +1475,43 @@ else {
     $names = @($gpus | ForEach-Object { $_.Name }) -join '; '
     if ($rtx.Count -gt 0) {
         Report -Status 'Ok' -Text ('NVIDIA RTX adapter found: ' + (($rtx | ForEach-Object { $_.Name }) -join '; '))
+
+        # The driver version. Win32_VideoController already carries it, so this costs no
+        # extra query -- and without it "the driver is too old" and issue #47's NGX
+        # 0xBAD00001 are indistinguishable from this script's output. One reporter passed
+        # with 14 OK / 0 failures on 596.36, a configuration that cannot work at all.
+        # NVIDIA's branding is the last five digits of the Windows version, dotted.
+        $drv = @($rtx | ForEach-Object { $_.DriverVersion } | Where-Object { $_ })
+        if ($drv.Count -eq 0) {
+            Report -Status 'Warn' -Text 'The NVIDIA driver version could not be read.' `
+                   -Detail ('DLSS 5 neural rendering needs ' + $kMinDriver + ' or newer; check it in the NVIDIA app.')
+        }
+        else {
+            # Compare the five digits as an INTEGER, never as a decimal: [double] '616.56'
+            # goes through the current culture in PowerShell 5.1, and on a comma-decimal
+            # machine that silently reads as 61656 while the literal reads as 616.56.
+            $digits = ($drv[0] -replace '[^0-9]', '')
+            $shown  = $drv[0]
+            $num    = $null
+            if ($digits.Length -ge 5) {
+                $tail  = $digits.Substring($digits.Length - 5)
+                $shown = $tail.Substring(0, 3) + '.' + $tail.Substring(3)
+                $num   = [int]$tail
+            }
+            if ($null -eq $num) {
+                Report -Status 'Na' -Text ('NVIDIA driver: ' + $shown) `
+                       -Detail ('Could not compare against the ' + $kMinDriver + ' minimum; check it by hand.')
+            }
+            elseif ($num -lt $kMinDriverDigits) {
+                Report -Status 'Fail' -Text ('NVIDIA driver ' + $shown + ' is older than ' + $kMinDriver + '.') `
+                       -Detail 'DLSS 5 neural rendering ships in the driver, and NGX reports FeatureNotSupported (0xBAD00001) on older ones -- which looks exactly like a bug in this project.' `
+                       -Action ('Update the NVIDIA driver to ' + $kMinDriver + ' or newer, then re-run this script.')
+            }
+            else {
+                Report -Status 'Ok' -Text ('NVIDIA driver: ' + $shown) -Detail ('Minimum for neural rendering is ' + $kMinDriver + '.')
+            }
+        }
+
         if (@($gpus).Count -gt 1) {
             Report -Status 'Na' -Text ('Other adapters present: ' + $names) `
                    -Detail 'On a hybrid machine, confirm the game actually renders on the RTX GPU -- the interop extensions do not exist on an iGPU.'
@@ -1070,6 +1573,14 @@ function Report-FeedLog
         Report -Status 'Warn' -Text ($Label + ': no "frame N delivered" line -- nothing was ever fed to the consumer.')
     }
 
+    # The "[feed] effects:" line carries the provider the effect was actually COMPILED with,
+    # which is what section 9 should believe over any of the three ini levels (issue #50).
+    $effects = @($lines | Where-Object { $_ -match '(?i)DLSS5_MV_PROVIDER\s*=\s*\d' }) | Select-Object -Last 1
+    if ($effects) {
+        $m = [regex]::Match($effects, '(?i)DLSS5_MV_PROVIDER\s*=\s*(\d+)')
+        if ($m.Success -and -not $script:FeedLogProvider) { $script:FeedLogProvider = $m.Groups[1].Value }
+    }
+
     $bad = @($lines | Where-Object { $_ -match '(?i)(WARNING|not loaded|disabl|TOO OLD|different releases|refus)' } |
                       Select-Object -Unique)
 
@@ -1113,7 +1624,13 @@ if (-not $anyLog) {
 }
 
 $dfcLog = Find-FileIn $consumerDir 'deep-fried-chicken.log'
-if ($dfcLog) {
+# A log left behind by a consumer that is no longer installed says nothing about this
+# install, and reading it out as [ OK ] is worse than saying nothing: switching consumers
+# leaves the old log in place, so the folder would report two of them working at once.
+if ($dfcLog -and -not $dfcAddon) {
+    Report -Status 'Na' -Text 'deep-fried-chicken.log is here but Deep Fried Chicken is not installed any more -- the log is from an earlier run and is not read.'
+}
+elseif ($dfcLog) {
     $lines = Read-LinesSafe $dfcLog
     if ($null -eq $lines) {
         Report -Status 'Warn' -Text 'deep-fried-chicken.log exists but could not be read.' -Detail $dfcLog
@@ -1150,6 +1667,77 @@ elseif ($dfcAddon) {
     Report -Status 'Na' -Text 'No deep-fried-chicken.log yet -- Chicken has not run here.'
 }
 
+if ($optiDll) {
+    # Two lines in the feeder's own logs decide it: the probe fingerprint ("routed through
+    # OptiScaler") and the module check after the first evaluate ("neural model (feature 18)
+    # loaded"). OptiScaler.log beside the DLL then names the upscaler and the pass.
+    $ownLogs = @()
+    if ($feedLog) { $ownLogs += $feedLog }
+    if ($gameBits -eq 32) {
+        $hl = Find-FileIn $hostDir 'dlss5-feed-host.log'
+        if ($hl) { $ownLogs += $hl }
+    }
+    $routed = $null
+    $notRouted = $null
+    $model = $null
+    foreach ($lp in $ownLogs) {
+        $ls = Read-LinesSafe $lp
+        if ($null -eq $ls) { continue }
+        $r = @($ls | Where-Object { $_ -match 'routed through OptiScaler' }) | Select-Object -Last 1
+        if ($r) { $routed = $r }
+        $nr = @($ls | Where-Object { $_ -match 'DRIVER answered the NGX probe' }) | Select-Object -Last 1
+        if ($nr) { $notRouted = $nr }
+        $m = @($ls | Where-Object { $_ -match 'neural model \(feature 18\) (NOT )?loaded' }) | Select-Object -Last 1
+        if ($m) { $model = $m }
+    }
+    if ($routed) {
+        Report -Status 'Ok' -Text 'The feeder''s NGX calls were routed through OptiScaler (probe fingerprint).'
+    }
+    elseif ($notRouted) {
+        Report -Status 'Fail' -Text 'OptiScaler is loaded but the DRIVER answered the feeder''s NGX probe.' `
+               -Detail 'OptiScaler''s nvngx redirect did not take. See [Inputs] EnableDlssInputs / [Hooks] HookOriginalNvngxOnly above, and OptiScaler.log for "returning this dll!".'
+    }
+    elseif ($ownLogs.Count -gt 0) {
+        Report -Status 'Warn' -Text 'The feeder log has no OptiScaler routing line yet.' `
+               -Detail 'It is written when the NGX session opens. Run the game to gameplay and re-check.'
+    }
+    if ($model) {
+        if ($model -match 'NOT loaded') {
+            Report -Status 'Fail' -Text 'The neural model (feature 18) was never created inside OptiScaler.' `
+                   -Detail (($model -replace '^\s*[\d:.]+\s+', '').Trim()) `
+                   -Action 'OptiScaler.log says why. Check [DlssNr] Enabled=true, and nvngx_dlssnr.dll plus nvngx.dll_dlssnr.dll beside OptiScaler.'
+        }
+        else {
+            Report -Status 'Ok' -Text 'The neural model (feature 18) was created inside OptiScaler.'
+        }
+    }
+    $optiLog = Find-FileIn (Split-Path -Parent $optiDll) 'OptiScaler.log'
+    if ($optiLog) {
+        $ol = Read-LinesSafe $optiLog
+        if ($null -ne $ol) {
+            $strip = '^\[[^\]]*\]\s*\[\w\]\s*'
+            $run  = @($ol | Where-Object { $_ -match 'DLSS-NR running at' }) | Select-Object -Last 1
+            $bad  = @($ol | Where-Object { $_ -match 'DLSS-NR create failed|nvngx\.dll_dlssnr\.dll not found|DLSS-NR did not run|DLSS-NR unavailable' }) | Select-Object -Last 1
+            $noDl = @($ol | Where-Object { $_ -match 'nvngx_dlss\.dll not found, disabling DLSS' }) | Select-Object -Last 1
+            $ups  = @($ol | Where-Object { $_ -match 'Creating \S+ upscaler feature|Creating XeSS|Creating FSR' }) | Select-Object -Last 1
+            if ($run)  { Report -Status 'Ok'   -Text ('OptiScaler.log: ' + ($run -replace $strip, '').Trim()) }
+            if ($bad)  { Report -Status 'Fail' -Text ('OptiScaler.log: ' + ($bad -replace $strip, '').Trim()) }
+            if ($noDl) {
+                Report -Status 'Warn' -Text 'OptiScaler.log: nvngx_dlss.dll was not found, so OptiScaler disabled its DLSS side.' `
+                       -Detail 'It builds FSR 2.1.2 in place of DLSS and still reports success. Put nvngx_dlss.dll beside OptiScaler.'
+            }
+            if ($ups)  { Report -Status 'Na'   -Text ('OptiScaler.log: ' + ($ups -replace $strip, '').Trim()) }
+            if (-not $run -and -not $bad) {
+                Report -Status 'Warn' -Text 'OptiScaler.log has no DLSS-NR line yet.' `
+                       -Detail 'The pass logs "DLSS-NR running at WxH" on its first frame. Run the game to gameplay and re-check; the log tail can also be cut short when the helper exits.'
+            }
+        }
+    }
+    else {
+        Report -Status 'Na' -Text 'No OptiScaler.log yet beside OptiScaler ([Log] LogToFile=true writes one).'
+    }
+}
+
 # ---------------------------------------------------------------------------------------
 # 9. Motion vectors
 # ---------------------------------------------------------------------------------------
@@ -1170,7 +1758,20 @@ $providerFx = @{
     '4' = 'lumenite_QuantMotion.fx'
 }
 
-$preset = Find-FileIn $gameDir 'ReShadePreset.ini'
+# Which preset is actually in use: ReShade.ini's [GENERAL] PresetPath names it, and it is
+# not required to be called ReShadePreset.ini or to sit next to the game (issue #50).
+$preset = $null
+if ($reshadeIni) {
+    $presetPath = Get-IniValue $reshadeIni 'GENERAL' 'PresetPath'
+    if ($presetPath) {
+        $presetPath = $presetPath.Trim()
+        if (-not [System.IO.Path]::IsPathRooted($presetPath)) {
+            $presetPath = Join-Path (Split-Path -Parent $reshadeIni) $presetPath
+        }
+        if (Test-FileHere $presetPath) { $preset = (Resolve-Path -LiteralPath $presetPath).Path }
+    }
+}
+if (-not $preset) { $preset = Find-FileIn $gameDir 'ReShadePreset.ini' }
 if (-not $preset) {
     Report -Status 'Fail' -Text 'ReShadePreset.ini is missing.' `
            -Detail 'The motion-vector provider is stored there, per effect. Without it DLSS5_Feed.fx falls back to provider 0 and no technique is enabled.' `
@@ -1182,47 +1783,53 @@ else {
         Report -Status 'Warn' -Text 'ReShadePreset.ini could not be read.' -Detail $preset
     }
     else {
-        # Walk the ini by hand: we need the PreprocessorDefinitions that is inside the
-        # [DLSS5_Feed.fx] section specifically, not any other effect's.
-        $section = ''
-        $provider = $null
-        $techniques = $null
-        $sectionSeen = $false
-        foreach ($ln in $lines) {
-            $t = $ln.Trim()
-            if ($t -match '^\[(.+)\]$') { $section = $Matches[1]; if ($section -ieq 'DLSS5_Feed.fx') { $sectionSeen = $true }; continue }
-            if ($section -eq '' -and $t -match '(?i)^Techniques\s*=\s*(.*)$') { $techniques = $Matches[1] }
-            if ($section -ieq 'DLSS5_Feed.fx' -and $t -match '(?i)^PreprocessorDefinitions\s*=\s*(.*)$') {
-                $defs = $Matches[1]
-                $m = [regex]::Match($defs, '(?i)DLSS5_MV_PROVIDER\s*=\s*(\d+)')
-                if ($m.Success) { $provider = $m.Groups[1].Value }
-            }
-        }
+        $techniques = Get-IniValue $preset '' 'Techniques'
 
-        if (-not $sectionSeen) {
-            Report -Status 'Fail' -Text 'ReShadePreset.ini has no [DLSS5_Feed.fx] section.' `
-                   -Detail 'The effect has never been configured (or the preset in use is a different file).' `
-                   -Action 'Enable DLSS5_Feed in the ReShade overlay once, or copy the project''s preset template in.'
+        # ReShade assembles an effect's preprocessor definitions from THREE levels, in
+        # runtime.cpp's load_effect: ReShade.ini's [GENERAL] PreprocessorDefinitions is the
+        # base list, the preset's ROOT (section-less) PreprocessorDefinitions applies to
+        # every effect, and a per-effect [DLSS5_Feed.fx] section overrides both. This check
+        # used to read only the third, call a missing section a FAILURE and call the other
+        # two levels mistakes -- so it declared "this install will not work as it stands" on
+        # installs whose own add-on log read "-> Lumenite_Kernel (enabled)" (issue #50).
+        # Most specific first; all three are valid places to set it.
+        $mvLevels = @(
+            @{ Where = 'the [DLSS5_Feed.fx] section of the preset'
+               Value = (Get-PreprocessorDefinition (Get-IniValue $preset 'DLSS5_Feed.fx' 'PreprocessorDefinitions') 'DLSS5_MV_PROVIDER') },
+            @{ Where = "the preset's root PreprocessorDefinitions (applies to every effect)"
+               Value = (Get-PreprocessorDefinition (Get-IniValue $preset '' 'PreprocessorDefinitions') 'DLSS5_MV_PROVIDER') },
+            @{ Where = "ReShade.ini's [GENERAL] PreprocessorDefinitions (the base list)"
+               Value = $(if ($reshadeIni) { Get-PreprocessorDefinition (Get-IniValue $reshadeIni 'GENERAL' 'PreprocessorDefinitions') 'DLSS5_MV_PROVIDER' } else { $null }) }
+        )
+        $set      = @($mvLevels | Where-Object { $_.Value })
+        $provider = $null
+        $mvWhere  = $null
+        if ($set.Count -gt 0) { $provider = $set[0].Value; $mvWhere = $set[0].Where }
+
+        # The add-on's own log is better evidence than any of the three: it reports what
+        # ReShade actually resolved at compile time, after all the overriding is done.
+        if ($script:FeedLogProvider -and $script:FeedLogProvider -ne $provider) {
+            Report -Status 'Na' -Text ('dlss5-feed.log resolved DLSS5_MV_PROVIDER=' + $script:FeedLogProvider + ' at compile time.') `
+                   -Detail 'That is what the effect was actually built with in the last run. Where it disagrees with the ini files, believe the log.'
+            $provider = $script:FeedLogProvider
+            $mvWhere  = 'the add-on''s own log line from the last run'
         }
 
         if ($provider) {
             if ($providerNames.ContainsKey($provider)) { $pn = $providerNames[$provider] } else { $pn = 'unknown provider id' }
-            Report -Status 'Ok' -Text ('DLSS5_MV_PROVIDER=' + $provider + ' -- ' + $pn) `
-                   -Detail 'Read from the [DLSS5_Feed.fx] section, which is where ReShade actually stores it.'
-        }
-        elseif ($sectionSeen) {
-            Report -Status 'Warn' -Text 'No DLSS5_MV_PROVIDER in the [DLSS5_Feed.fx] section -- the effect defaults to provider 0.' `
-                   -Detail 'Provider 0 reads the shared texMotionVectors texture, so it only works if another effect (DRME, qUINT, dh_uber_motion) writes it. The recommended setting is DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel).'
-            $provider = '0'
-        }
-
-        # The classic mistake: setting it globally in ReShade.ini, where it does nothing.
-        if ($reshadeIni) {
-            $riText = Read-TextSafe $reshadeIni
-            if ($riText -and $riText -match '(?i)DLSS5_MV_PROVIDER') {
-                Report -Status 'Warn' -Text 'DLSS5_MV_PROVIDER also appears in ReShade.ini.' `
-                       -Detail 'It is a PER-EFFECT key. Setting it in ReShade.ini''s [GENERAL] PreprocessorDefinitions does nothing for this effect -- only the [DLSS5_Feed.fx] section of ReShadePreset.ini counts.'
+            Report -Status 'Ok' -Text ('DLSS5_MV_PROVIDER=' + $provider + ' -- ' + $pn) -Detail ('Read from ' + $mvWhere + '.')
+            # More than one level carrying a value is legal, and the most specific wins --
+            # but it is worth naming, because editing the losing one changes nothing.
+            if ($set.Count -gt 1) {
+                $shadowed = @($set | Select-Object -Skip 1 | ForEach-Object { $_.Where + ' = ' + $_.Value }) -join '; '
+                Report -Status 'Na' -Text 'DLSS5_MV_PROVIDER is set at more than one level.' `
+                       -Detail ('The most specific wins, so ' + $mvWhere + ' is the one in force. Also set, and overridden: ' + $shadowed)
             }
+        }
+        else {
+            Report -Status 'Warn' -Text 'DLSS5_MV_PROVIDER is not set anywhere -- the effect defaults to provider 0.' `
+                   -Detail 'Checked the [DLSS5_Feed.fx] section of the preset, the preset''s root PreprocessorDefinitions and ReShade.ini''s [GENERAL] PreprocessorDefinitions; any of the three is valid. Provider 0 reads the shared texMotionVectors texture, so it only works if another effect (DRME, qUINT, dh_uber_motion) writes it. The recommended setting is DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel).'
+            $provider = '0'
         }
 
         # Techniques= line: is DLSS5_Feed on, and is the provider's own effect on too?

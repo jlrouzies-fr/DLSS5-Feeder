@@ -33,10 +33,14 @@
 
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
+#include <nvsdk_ngx_defs_dlssd.h>   // SuperSamplingDenoising.Available (DLSS Ray Reconstruction, nvngx_dlssd.dll)
 
+#include "../src/feed_ngx.h"  // NGX result names and DLL identity, shared with the add-on
+#include "../src/feed_crash.h" // naming a C++ throw and the modules it came through, likewise
 #include "../src/feed_ipc.h"
 #include "../src/feed_fmt.h"
 #include "../src/feed_dfc.h"   // Deep Fried Chicken interop ABI 1 (producer side, HostMode=1 here)
+#include "../src/feed_opti.h"  // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -50,11 +54,17 @@ static bool g_show_window = false;   // visible host window = the user's door to
 // the Z-order. The game's add-on positions it under the game window and forwards the
 // user's clicks to it. Banner and auto-Home run as for a visible window.
 static bool g_behind = false;
-// Client area of the host window and its swapchain. Twice the original 960x540 -- the
-// neural consumer's whole tuning panel lives in this window, and at 4K a 960x540 overlay
-// was unreadable -- capped to the primary work area (16:9 kept). Set once in InitDisguise;
-// the banner and the swapchain both size themselves from it.
-static int  g_win_w = 1920;
+// Client area of the host window and its swapchain: TALL and narrow, not a 16:9 landscape
+// shape. The cast panel (dlss5-feed32's CastLayout) is right-aligned and fit to the game
+// window's height, so a tall source scales up to fill the game's vertical space and stays
+// a modest fraction of its width -- a menu column down the right edge, not a large overlay
+// eating the middle of the screen. Set once in InitDisguise; the banner and the swapchain
+// both size themselves from it.
+// 620 was the first cut at "slim column" and it was too slim: ReShade's own tab column plus
+// the 96 px editor strip leaves under 500 px for the neural consumer's panel, whose sliders
+// and labels then wrap into an unusable stack (issue #44, "pretty unusable"). 900 keeps the
+// column shape while leaving the panel room to lay out.
+static int  g_win_w = 900;
 static int  g_win_h = 1080;
 
 // ReShade's overlay toggle key in the host's ReShade.ini ([INPUT] KeyOverlay, Home by
@@ -62,47 +72,120 @@ static int  g_win_h = 1080;
 // neural consumer's panel is already open when they look at this window. Posted through
 // the message queue, which is where ReShade's WH_GETMESSAGE input hook reads keys.
 static UINT g_overlay_key = VK_HOME;
+// Whether ReShade actually hooked D3D12CreateDevice in time to proxy this window's device
+// (see InitDisguise). False means there is no ReShade runtime here at all, so the overlay
+// key is dead and the banner must not send the user after it.
+static bool g_reshade_hooked = false;
 static int  g_pump_count  = 0;
+// The pump at which to post the overlay key, and again three pumps later. Startup opens the
+// overlay once at 90; tag 'O' (v9) re-arms it so the add-on's button can bring it back.
+static int  g_overlay_key_at = 90;
+
+// Present accounting (issue #15). The neural consumer wants one Present per evaluate; when
+// DWM holds every back buffer the per-evaluate Present cannot happen on the spot, and the
+// deficit is what makes it decline passes. A raw skip counter could not be compared against
+// anything, so count what it is a fraction OF, and how much is still owed.
+static unsigned long long g_present_forced  = 0;   // per-evaluate PumpPresent(true) calls
+static unsigned long long g_present_skipped = 0;   // ... that found no free back buffer
+static unsigned long long g_present_owed    = 0;   // ... still owed; retired from the frame and idle paths
+static unsigned long long g_present_debt_run = 0;  // consecutive skips, whatever the client contract
+
+// Pacing accounting (issue #15, the rhythmic collapse under async_home=1).
+//
+// The thread has spent a long time reasoning about which of two stalls this is -- the host's
+// serve thread blocked in BeginCommands' allocator-retire wait, or the client's per-frame pipe
+// write blocked because this thread is not reading -- and neither has ever been measured. So
+// measure both. None of these gate anything; they only make the next log line able to answer
+// the question, which is the point of the release.
+static unsigned long long g_ring_waits    = 0;   // BeginCommands found the slot still busy
+static double             g_ring_wait_ms  = 0.0; // ... and this is what it cost the serve thread
+static unsigned long long g_pace_evals    = 0;   // evaluates since the last report
+static double             g_pace_span_ms  = 0.0; // wall time they spanned
+static unsigned long long g_pace_presents = 0;   // Presents ATTEMPTED across those evaluates
+static unsigned long long g_backlog_peak  = 0;   // frame messages the client had queued ahead of us
 
 static void Log(const char *fmt, ...);
 
-// Fit the 1920x1080 default into the primary monitor's work area (90% of it, 16:9 kept).
-// Runs before PrepareHostOverlay, which sizes the overlay layout from the result.
-static void FitWindowToWorkArea()
+// Height goes to (almost) the full primary monitor work area by default -- a menu column
+// benefits from vertical room more than the old 16:9 shape ever gave it, and this window is
+// normally parked behind the game and never seen at OS size, only cast into it (see the
+// comment on g_win_w/g_win_h above). Width stays fixed by default: a settings column
+// doesn't get more useful past a few hundred px, and a fixed width keeps this from
+// ballooning sideways on an ultrawide monitor.
+//
+// Either dimension can be overridden in the host's own ReShade.ini -- [DLSS5Host]
+// WindowWidth / WindowHeight, pixels, 0 (height only) meaning the default above. This is
+// a REAL resize: the swapchain and the panel texture the 32-bit add-on casts are both this
+// size, so ReShade's own UI actually gets more room to lay out in, not just a bigger-drawn
+// copy of the same pixels -- unlike the cast panel's own "Panel size" slider, which only
+// scales the picture. WindowHeight is not clamped to the monitor's height: this window is
+// normally hidden behind the game (never composited on screen at OS size), so taller than
+// the screen is a legitimate way to ask for more vertical room without more scrolling.
+// Keys are written back with their in-use values when unset, so they show up in the ini
+// for a user to find and edit without needing to know this. Runs before PrepareHostOverlay,
+// which sizes the overlay layout from the result -- pass it the ini path so both functions
+// don't each resolve the module's own directory.
+static void FitWindowToWorkArea(const char *ini)
 {
     RECT wa = {};
-    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0))
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0) && wa.bottom > wa.top)
     {
-        const int max_w = (wa.right - wa.left) * 9 / 10, max_h = (wa.bottom - wa.top) * 9 / 10;
-        if (g_win_w > max_w) { g_win_w = max_w; g_win_h = max_w * 9 / 16; }
-        if (g_win_h > max_h) { g_win_h = max_h; g_win_w = max_h * 16 / 9; }
+        // The height computed here becomes a client rect; CreateWindowExW's caller
+        // (InitDisguise) runs it through AdjustWindowRect for WS_OVERLAPPEDWINDOW before
+        // sizing the actual window, so the outer window stays on screen in the rare case
+        // this window is shown directly (not parked behind a game) -- reserve that
+        // caption+border overhead here rather than after the fact.
+        RECT deco = {};
+        AdjustWindowRect(&deco, WS_OVERLAPPEDWINDOW, FALSE);
+        g_win_h = (wa.bottom - wa.top) - (deco.bottom - deco.top);
     }
-    if (g_win_w < 960) { g_win_w = 960; g_win_h = 540; }
+    if (g_win_h < 540) g_win_h = 540;
+
+    const int cfg_w = GetPrivateProfileIntA("DLSS5Host", "WindowWidth", 0, ini);
+    const int cfg_h = GetPrivateProfileIntA("DLSS5Host", "WindowHeight", 0, ini);
+    if (cfg_w > 0) g_win_w = cfg_w < 300 ? 300 : cfg_w > 4000 ? 4000 : cfg_w;
+    if (cfg_h > 0) g_win_h = cfg_h < 300 ? 300 : cfg_h > 8000 ? 8000 : cfg_h;
     g_win_w &= ~1; g_win_h &= ~1;
+
+    char buf[16];
+    if (GetPrivateProfileStringA("DLSS5Host", "WindowWidth", "", buf, sizeof(buf), ini) == 0)
+    {
+        sprintf_s(buf, "%d", g_win_w);
+        WritePrivateProfileStringA("DLSS5Host", "WindowWidth", buf, ini);
+    }
+    if (GetPrivateProfileStringA("DLSS5Host", "WindowHeight", "", buf, sizeof(buf), ini) == 0)
+        WritePrivateProfileStringA("DLSS5Host", "WindowHeight", "0", ini);   // 0 = auto (fill the work area)
+    Log("[host] window size: %dx%d (from [DLSS5Host] WindowWidth/WindowHeight in ReShade.ini; "
+        "WindowHeight=0 there means auto -- fill the work area)", g_win_w, g_win_h);
 }
 
 // Once ReShade's overlay is docked, its tabs (Home / Add-ons -- where the neural
 // consumer's panel is) sit in a 335 px column with the effect editor beside it. In this
 // window nobody edits shaders, so the tab column gets almost the whole width.
-static void PrepareHostOverlay()
+// Resolve the host's own ReShade.ini once; both the startup path and every later resize
+// need it.
+static void HostIniPath(char *out, size_t cb)
 {
-    FitWindowToWorkArea();
-    char dir[MAX_PATH], ini[MAX_PATH];
+    char dir[MAX_PATH];
     GetModuleFileNameA(nullptr, dir, MAX_PATH);
     if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
-    sprintf_s(ini, "%sReShade.ini", dir);
+    sprintf_s(out, cb, "%sReShade.ini", dir);
+}
 
-    char buf[64] = {};
-    GetPrivateProfileStringA("INPUT", "KeyOverlay", "36", buf, sizeof(buf), ini);
-    const int k = atoi(buf);   // "36,0,0,0" -> 36; modifiers are ignored, ReShade's default has none
-    if (k > 0 && k < 256) g_overlay_key = static_cast<UINT>(k);
-
-    // Only the stock ReShade split (335 | 623 for a 960-wide window) is rewritten; a
-    // layout the user dragged into shape is left exactly as ReShade saved it.
+// force=false is the startup rule: adopt an empty or stock layout, resize one this host
+// wrote itself, and never touch one the user dragged into shape.
+//
+// force=true is what a deliberate resize needs. Declining to re-fit a user-arranged layout
+// is right when we are merely starting up beside it, and wrong when the user has just
+// dragged this window to a new size: the outer window and swapchain would change while
+// ReShade's own docked column stayed at its old absolute pixel width, which is the "expanding
+// it doesn't scale correctly" of issue #44.
+static void RefitHostOverlay(const char *ini, bool force)
+{
     char dock[4096] = {};
     GetPrivateProfileStringA("OVERLAY", "Docking", "", dock, sizeof(dock), ini);
     const int tabs_w = g_win_w - 96;
-    if (dock[0] == '\0')
+    if (dock[0] == '\0' || force)
     {
         char v[4096];
         sprintf_s(v, "[Docking][Data],DockSpace   ID=0xB0DF600F Window=0xCC18005E Pos=8,,8 Size=%d,,%d Split=X,  "
@@ -121,7 +204,8 @@ static void PrepareHostOverlay()
                   tabs_w, g_win_h - 16, tabs_w, g_win_h - 16, tabs_w, g_win_h - 16, tabs_w, g_win_h - 16,
                   tabs_w, g_win_h - 16, tabs_w, g_win_h - 16, g_win_w, g_win_h);
         WritePrivateProfileStringA("OVERLAY", "Window", v, ini);
-        Log("[host] ReShade.ini: wrote an overlay layout with the tab column %d px wide", tabs_w);
+        Log("[host] ReShade.ini: %s an overlay layout with the tab column %d px wide",
+            force ? "re-fitted" : "wrote", tabs_w);
     }
     else if (strstr(dock, "SizeRef=335,,540") != nullptr && strstr(dock, "SizeRef=623,,540") != nullptr)
     {
@@ -163,10 +247,33 @@ static void PrepareHostOverlay()
         Log("[host] ReShade.ini: overlay layout is user-arranged; leaving it alone");
     }
 }
+
+static void PrepareHostOverlay()
+{
+    char ini[MAX_PATH];
+    HostIniPath(ini, sizeof(ini));
+
+    FitWindowToWorkArea(ini);
+
+    char buf[64] = {};
+    GetPrivateProfileStringA("INPUT", "KeyOverlay", "36", buf, sizeof(buf), ini);
+    const int k = atoi(buf);   // "36,0,0,0" -> 36; modifiers are ignored, ReShade's default has none
+    if (k > 0 && k < 256) g_overlay_key = static_cast<UINT>(k);
+
+    RefitHostOverlay(ini, false);
+}
 static bool g_renodx_present = false;   // renodx-dlss5.addon64 sits next to this exe
+// Its actual file name, which is not always the canonical one: a browser that downloaded the
+// file twice leaves "renodx-dlss5(2).addon64", and a real 616.86 log has exactly that. Needed
+// to recognise the consumer's own frames on a faulting stack (see NoteNgxFault).
+static char g_renodx_file[MAX_PATH] = "";
 static bool g_renodx_lazy = false;   // DLSS 5 add-on is v45+ (per-present rescan, lazy adoption)
 static bool g_renodx_v46  = false;   // DLSS 5 add-on is v4.6+ (global hotkeys, upscaling latch)
 static bool g_renodx_v47  = false;   // DLSS 5 add-on is v4.7+ (reversible colour bridge, workset pool)
+// NVIDIA's branded driver version times 100 (616.64 -> 61664), 0 when it could not be read.
+// A driver number is not usually worth comparing against, but see LogHostAdapter: one
+// specific pairing of driver and neural consumer faults inside the driver every frame.
+static unsigned g_driver_x100 = 0;
 
 static void Log(const char *fmt, ...);
 
@@ -263,6 +370,7 @@ static void DetectRenodxAddon()
     if (f == INVALID_HANDLE_VALUE) { Log("[host] %s is here but could not be opened (error %lu)", name, GetLastError()); return; }
     Log("[host] DLSS 5 add-on file: %s", name);
     g_renodx_present = true;
+    strcpy_s(g_renodx_file, name);
     const DWORD size = GetFileSize(f, nullptr);
     DWORD got = 0;
     char *buf = (size > 0 && size < 8u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
@@ -547,6 +655,97 @@ static void ChickenPoll()
                                         : "Unknown state value; a newer Chicken ABI than this host knows.");
 }
 
+// OptiScaler DLSS-NR beside this exe -- the third neural consumer (see feed_opti.h; mirrors the
+// section in src/dlss5-feed.cpp, keep the two in step). It is a proxy DLL this exe imports
+// (winmm.dll or version.dll), so by the time this runs it is loaded and its nvngx redirect is
+// armed: nothing is loaded from this side. What this does is name it, tell the DLSS-NR fork from
+// upstream OptiScaler, read the ini keys that decide whether the neural pass can run at all, and
+// refuse to be quiet about a second consumer.
+static OptiInfo    g_opti;
+static OptiBackend g_opti_backend;
+
+static void DetectOptiScaler()
+{
+    g_opti = OptiInfo{};
+    g_opti.nr_enabled = g_opti.scan_exposure = g_opti.dlss_inputs = g_opti.hook_original_only = g_opti.overlay_menu = -1;
+    char dir[MAX_PATH];
+    GetModuleFileNameA(nullptr, dir, MAX_PATH);
+    if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
+
+    if (!OptiFindModule(&g_opti))
+    {
+        // Not loaded. Is a copy sitting here under a name this exe never imports? Then it can
+        // never redirect anything, and the user needs to know which names would.
+        for (const char *name : kOptiProxyNames)
+        {
+            if (_stricmp(name, "dxgi.dll") == 0) continue;   // that one is ReShade here
+            char path[MAX_PATH];
+            sprintf_s(path, "%s%s", dir, name);
+            if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
+            if (!OptiFileHasLiteral(path, OPTI_FORWARDER) && !OptiFileHasLiteral(path, OPTI_INI)) continue;
+            Log("[host] WARNING: %s is an OptiScaler build, but this helper never loads a DLL of that name, so it "
+                "cannot take the NGX calls. Rename it winmm.dll or version.dll (both are imported at start).", path);
+            return;
+        }
+        Log("[host] OptiScaler: not present");
+        return;
+    }
+
+    g_opti.present = true;
+    g_opti.nr_fork = OptiFileHasLiteral(g_opti.path, OPTI_FORWARDER);
+    FeedReadFileIdent(g_opti.path, &g_opti.ident);
+    OptiReadIni(&g_opti);
+    char ver[400];
+    FeedFormatFileIdent(g_opti.ident, ver, sizeof(ver));
+    Log("[host] %s loaded as %s (%s); OptiScaler.ini: [DlssNr] Enabled=%s ScanExposure=%s, [Upscalers] Dx12Upscaler=%s, "
+        "[Inputs] EnableDlssInputs=%s, [Hooks] HookOriginalNvngxOnly=%s",
+        g_opti.nr_fork ? OPTI_LABEL : "OptiScaler (upstream build, no neural pass)", g_opti.module, ver,
+        OptiTri(g_opti.nr_enabled, "auto (= false)"), OptiTri(g_opti.scan_exposure, "auto (= false)"), g_opti.upscaler,
+        OptiTri(g_opti.dlss_inputs, "auto (= true)"), OptiTri(g_opti.hook_original_only, "auto (= false)"));
+
+    if (!g_opti.nr_fork)
+        Log("[host] WARNING: this OptiScaler is not the DLSS-NR fork: it will take the NGX calls and upscale, and no "
+            "neural pass will ever run. Use the Dagherbou/OptiScaler_DLSSNR build, or remove it and use Deep Fried "
+            "Chicken or renodx-dlss5 instead.");
+    else
+    {
+        Log("[host] %s is the neural consumer: the NGX calls this helper makes are answered by it (its LoadLibrary "
+            "hook hands its own module to the NGX SDK), it runs its upscaler on the DLAA contract and then the neural "
+            "model in place on the output. Its menu is on Insert in this window. No warm-up re-create: there is no "
+            "hook to wait for.", OPTI_LABEL);
+        if (g_opti.nr_enabled != 1)
+        {
+            Log("[host] WARNING: [DlssNr] Enabled is %s in OptiScaler.ini -- the neural pass is OFF and OptiScaler "
+                "will only upscale.", g_opti.nr_enabled == 0 ? "false (user-set)" : "auto (= false)");
+            OptiIniDefault(&g_opti, "DlssNr", "Enabled", "true", "the neural pass is what this helper exists for",
+                           &Log, "host");
+        }
+        if (g_opti.scan_exposure != 0)
+            OptiIniDefault(&g_opti, "DlssNr", "ScanExposure", "false",
+                           "this helper passes AutoExposure and owns no exposure buffer; the scan would only hook "
+                           "resource creation on its device", &Log, "host");
+        if (g_opti.dlss_inputs == 0 || g_opti.hook_original_only == 1)
+            Log("[host] WARNING: OptiScaler.ini has [Inputs] EnableDlssInputs=%s and [Hooks] HookOriginalNvngxOnly=%s -- "
+                "with these the NGX SDK in this helper is NOT redirected to OptiScaler and the driver answers instead "
+                "(plain DLAA, no neural pass). Set EnableDlssInputs=true and HookOriginalNvngxOnly=false.",
+                OptiTri(g_opti.dlss_inputs, "auto"), OptiTri(g_opti.hook_original_only, "auto"));
+    }
+
+    // One consumer. OptiScaler's redirect catches every nvngx load in the process, Chicken's own
+    // deep-fried-chicken-nvngx.dll and renodx's _nvngx.dll included, and OptiScaler's dlss backend
+    // calls the real core, where their detours would fire a second time.
+    char toolkit[MAX_PATH];
+    sprintf_s(toolkit, "%salexs-toolkit.addon64", dir);
+    const bool toolkit_present = GetFileAttributesA(toolkit) != INVALID_FILE_ATTRIBUTES;
+    if (g_chicken_present || g_renodx_present || toolkit_present)
+        Log("[host] WARNING: %s%s%sis ALSO in host64 beside OptiScaler. OptiScaler captures every nvngx load in this "
+            "process, so a second consumer either talks to OptiScaler instead of the driver or runs its neural pass a "
+            "second time on top of OptiScaler's. Keep exactly one: remove the other consumer's files (or the OptiScaler "
+            "set), then restart the game.",
+            g_chicken_present ? "Deep Fried Chicken " : "", g_renodx_present ? "renodx-dlss5.addon64 " : "",
+            toolkit_present ? "alexs-toolkit.addon64 " : "");
+}
+
 static void Log(const char *fmt, ...)
 {
     char line[2048];
@@ -565,21 +764,6 @@ static void Log(const char *fmt, ...)
     }
 }
 
-static const char *NgxResultName(NVSDK_NGX_Result r)
-{
-    switch (static_cast<unsigned>(r))
-    {
-    case 0x1:        return "Success";
-    case 0xBAD00005: return "InvalidParameter";
-    case 0xBAD00007: return "NotInitialized";
-    case 0xBAD00008: return "UnsupportedInputFormat";
-    case 0xBAD0000A: return "MissingInput";
-    case 0xBAD0000B: return "UnableToInitializeFeature";
-    case 0xBAD0000D: return "OutOfGPUMemory";
-    case 0xBAD0000E: return "UnsupportedFormat";
-    default:         return "?";
-    }
-}
 
 // ---------------------------------------------------------------------------
 // State
@@ -597,6 +781,15 @@ struct Host
     ID3D12CommandAllocator    *alloc[kFrames];
     UINT64                     alloc_fence[kFrames];
     int                        frame_slot;
+    // GPU time for the DLSS work this helper submits. Same shape as the add-on's: two
+    // timestamps per ring slot, collected a full ring later when the fence says the slot
+    // is finished, so nothing ever waits for it (issue #52).
+    ID3D12QueryHeap           *ts_heap;
+    ID3D12Resource            *ts_read;
+    UINT64                     ts_freq;
+    bool                       ts_failed;
+    double                     ts_sum_ms;
+    unsigned                   ts_n;
     ID3D12Fence               *fence;      // internal (allocator ring)
     HANDLE                     fence_event;
     UINT64                     fence_value;
@@ -617,7 +810,12 @@ struct Host
     const char     *sr_quality_name;
     DXGI_FORMAT     color_fmt, output_fmt;
 
-    HANDLE          latency_wait;  // the disguise swapchain's frame-latency waitable object
+    HANDLE          latency_wait;  // the disguise swapchain's frame-latency waitable object.
+                                   // Held, never waited on: see PumpPresent for why waiting
+                                   // on it froze the window for good (issue #33).
+    bool            async_home;    // FEED_BUILD_ASYNC_HOME: the client copies home the PREVIOUS frame's
+                                   // result, so it is never blocked behind the evaluate running now. Lets
+                                   // PumpPresent retire a skipped present instead of dropping it (#15).
 
     // v7: the panel texture -- the GAME's D3D11 texture (this driver refuses the other
     // direction), opened here, into which the frame this window just presented is copied
@@ -636,8 +834,76 @@ static Host h;
 // Command submission (allocator ring), same shape as the add-on
 // ---------------------------------------------------------------------------
 
+// Created on first use. A queue that refuses timestamps costs one log line and nothing
+// else: the feed does not depend on this.
+static void TimingEnsure()
+{
+    if (h.ts_heap != nullptr || h.ts_failed) return;
+    if (h.dev == nullptr || h.queue == nullptr) return;
+    if (FAILED(h.queue->GetTimestampFrequency(&h.ts_freq)) || h.ts_freq == 0)
+    { Log("[host] GPU timing unavailable: this queue reports no timestamp frequency"); h.ts_failed = true; return; }
+
+    D3D12_QUERY_HEAP_DESC qd = {};
+    qd.Type  = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qd.Count = Host::kFrames * 2;
+    if (FAILED(h.dev->CreateQueryHeap(&qd, __uuidof(ID3D12QueryHeap),
+                                      reinterpret_cast<void **>(&h.ts_heap))) || h.ts_heap == nullptr)
+    { Log("[host] GPU timing unavailable: no timestamp query heap"); h.ts_failed = true; return; }
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width            = Host::kFrames * 2 * sizeof(UINT64);
+    rd.Height           = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = DXGI_FORMAT_UNKNOWN;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    // A readback resource stays in COPY_DEST for its whole life.
+    if (FAILED(h.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                              nullptr, __uuidof(ID3D12Resource),
+                                              reinterpret_cast<void **>(&h.ts_read))) || h.ts_read == nullptr)
+    {
+        Log("[host] GPU timing unavailable: no timestamp readback buffer");
+        if (h.ts_heap != nullptr) { h.ts_heap->Release(); h.ts_heap = nullptr; }
+        h.ts_failed = true;
+        return;
+    }
+    Log("[host] GPU timing on (queue timestamp frequency %llu Hz)", (unsigned long long)h.ts_freq);
+}
+
+// Only called once the slot's fence has retired, so the map cannot block.
+static void TimingCollect(int slot)
+{
+    if (h.ts_read == nullptr) return;
+    const size_t base = static_cast<size_t>(slot) * 2;
+    D3D12_RANGE  want = { base * sizeof(UINT64), (base + 2) * sizeof(UINT64) };
+    void        *p    = nullptr;
+    if (FAILED(h.ts_read->Map(0, &want, &p)) || p == nullptr) return;
+    const UINT64 *t = static_cast<const UINT64 *>(p);
+    if (t[base + 1] > t[base])
+    {
+        h.ts_sum_ms += 1000.0 * double(t[base + 1] - t[base]) / double(h.ts_freq);
+        ++h.ts_n;
+    }
+    const D3D12_RANGE wrote = { 0, 0 };
+    h.ts_read->Unmap(0, &wrote);
+}
+
 static bool BeginCommands()
 {
+    // AbortCommands releases the list and tries to make a new one; if that create failed --
+    // which is most likely exactly when things are already going wrong, a removed device --
+    // there is no list to reset and the h.list->Reset() below would fault. Fail the frame
+    // instead: the caller CPU-signals fence_out, so the game never waits on us for it.
+    if (h.list == nullptr)
+    {
+        static bool said = false;
+        if (!said) { said = true; Log("[host] no command list (a previous NGX fault could not be recovered from)"); }
+        return false;
+    }
     const int slot = h.frame_slot;
     const UINT64 retire = h.alloc_fence[slot];
     if (retire != 0 && h.fence->GetCompletedValue() < retire)
@@ -649,16 +915,42 @@ static bool BeginCommands()
         // dropping a frame.
         ResetEvent(h.fence_event);
         h.fence->SetEventOnCompletion(retire, h.fence_event);
-        if (WaitForSingleObject(h.fence_event, 2000) != WAIT_OBJECT_0 ||
-            h.fence->GetCompletedValue() < retire)
+        // Timed, because this is one of the two candidate stalls in #15 and nothing has ever
+        // measured it. This blocks the ONE thread that also reads the pipe, so any time spent
+        // here is time the client's next frame write cannot complete either.
+        LARGE_INTEGER rw0, rw1, rwf;
+        QueryPerformanceFrequency(&rwf);
+        QueryPerformanceCounter(&rw0);
+        // 2000 ms is the host's worst reader stall, and the client's per-frame write budget
+        // (kPipeFrameMs in dlss5-feed32.cpp) must stay comfortably above it -- this thread is
+        // the only pipe reader, so every millisecond here is a millisecond the client's write
+        // cannot complete, and the client treats a timed-out write as a lost host. Raise both
+        // together or neither.
+        const bool signaled = WaitForSingleObject(h.fence_event, 2000) == WAIT_OBJECT_0;
+        QueryPerformanceCounter(&rw1);
+        ++g_ring_waits;
+        g_ring_wait_ms += 1000.0 * double(rw1.QuadPart - rw0.QuadPart) / double(rwf.QuadPart);
+        if (!signaled || h.fence->GetCompletedValue() < retire)
         { Log("[host] GPU did not retire allocator slot %d", slot); return false; }
     }
+    // Past the fence wait: this slot's previous submission is finished, so its timestamps
+    // are readable and reading them costs no synchronisation.
+    if (h.alloc_fence[slot] != 0) TimingCollect(slot);
     if (FAILED(h.alloc[slot]->Reset())) return false;
-    return SUCCEEDED(h.list->Reset(h.alloc[slot], nullptr));
+    if (FAILED(h.list->Reset(h.alloc[slot], nullptr))) return false;
+    TimingEnsure();
+    if (h.ts_heap != nullptr) h.list->EndQuery(h.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
+    return true;
 }
 
 static UINT64 EndCommands()
 {
+    if (h.ts_heap != nullptr)
+    {
+        h.list->EndQuery(h.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, h.frame_slot * 2 + 1);
+        h.list->ResolveQueryData(h.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, h.frame_slot * 2, 2, h.ts_read,
+                                 static_cast<UINT64>(h.frame_slot) * 2 * sizeof(UINT64));
+    }
     h.list->Close();
     ID3D12CommandList *lists[] = { h.list };
     h.queue->ExecuteCommandLists(1, lists);
@@ -723,6 +1015,113 @@ static void PublishDfcInterop()
     h.params->Set(DFC_KEY_EVALUATE_CADENCE, DFC_EVALUATE_CADENCE);
 }
 
+// A fault inside NGX used to reach the log as a bare exception code, and "evaluate raised
+// 0xC0000005" is true of every possible cause: the driver's NGX core, the neural consumer's
+// detour over it, the model runtime, or this file's own parameters. The exception record
+// says which, and the filter runs before the stack unwinds, so the module chain is still
+// there to be walked -- which is what separates "NVIDIA's problem" from "ours" in a report.
+struct HostFault
+{
+    DWORD code;
+    char  detail[640];       // " (reading address 0x...)" / " (C++ exception: ...)"
+    char  where[MAX_PATH];   // the module the faulting instruction is in
+    char  stack[512];        // the module chain that led there
+    bool  via_consumer;      // the neural consumer's own code is on that chain
+};
+static HostFault g_ngx_fault;
+
+static bool ContainsNoCase(const char *hay, const char *needle)
+{
+    if (hay == nullptr || needle == nullptr || needle[0] == '\0') return false;
+    const size_t n = strlen(needle);
+    for (const char *p = hay; *p != '\0'; ++p)
+        if (_strnicmp(p, needle, n) == 0) return true;
+    return false;
+}
+
+static int NoteNgxFault(EXCEPTION_POINTERS *ep)
+{
+    g_ngx_fault = HostFault{};
+    g_ngx_fault.code = ep != nullptr && ep->ExceptionRecord != nullptr ? ep->ExceptionRecord->ExceptionCode : 0;
+    FeedCrashDescribe(ep != nullptr ? ep->ExceptionRecord : nullptr, g_ngx_fault.detail, sizeof(g_ngx_fault.detail));
+    FeedCrashModuleOf(ep != nullptr && ep->ExceptionRecord != nullptr ? ep->ExceptionRecord->ExceptionAddress : nullptr,
+                      g_ngx_fault.where, sizeof(g_ngx_fault.where));
+    FeedCrashStackModules(ep != nullptr ? ep->ContextRecord : nullptr, g_ngx_fault.stack, sizeof(g_ngx_fault.stack));
+    g_ngx_fault.via_consumer = ContainsNoCase(g_ngx_fault.stack, g_renodx_file) ||
+                               ContainsNoCase(g_ngx_fault.stack, DFC_ADDON_FILENAME) ||
+                               ContainsNoCase(g_ngx_fault.stack, g_opti.module) ||
+                               ContainsNoCase(g_ngx_fault.stack, OPTI_FORWARDER);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// ---------------------------------------------------------------------------------------
+// Why a caught fault is not the end of it.
+//
+// This file is built /EHsc, and so is the neural consumer. Under /EHsc an SEH __except
+// unwinds the frames between the throw and the handler WITHOUT running C++ destructors in
+// them -- that is the whole difference between /EHsc and /EHa. So when the evaluate faults
+// inside NGX, every std::lock_guard the consumer took on the way in is skipped over: the
+// mutex is never released, and the consumer is left permanently locked by a thread that has
+// already walked away.
+//
+// The next call into it is then fatal, and not in a way that looks related. From a real
+// 616.86 run (Tomb Raider Anniversary), 5 ms after the caught fault:
+//
+//   evaluate raised 0xC0000005 (reading address FFFFFFFFFFFFFFFF) in D3D12Core.dll
+//       ... <- nvngx_dlssnr.dll <- _nvngx.dll <- renodx-dlss5.addon64 <- dlss5-feed-host64.exe
+//   ### CRASH RECORDED ###  exception 0xE06D7363
+//       (C++ exception: std::system_error -- "resource deadlock would occur")
+//       KERNELBASE.dll <- renodx-dlss5.addon64 <- dxgi.dll <- dlss5-feed-host64.exe
+//
+// std::mutex::lock() throws exactly that when the calling thread already owns the mutex.
+// Nobody catches it, and the process dies -- which is how this arrived as "the new driver
+// crashes the 32-bit path" rather than as "the neural pass is unavailable".
+//
+// So catching the fault and carrying on is what kills the process. Once a fault has come
+// back up through the consumer's own code, stop calling into it: the game keeps rendering,
+// the log says why, and nothing crashes.
+// ---------------------------------------------------------------------------------------
+static bool g_ngx_poisoned = false;
+
+static bool NgxRefuse(const char *what)
+{
+    if (!g_ngx_poisoned) return false;
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        Log("[host] not calling %s again: the neural consumer's own code was on the faulting stack, so its "
+            "internal locks were skipped by the unwind and are still held. Calling back in throws "
+            "\"resource deadlock would occur\" and takes the process with it. The feed stops here; the game "
+            "renders normally, and a restart is needed to try again.", what);
+    }
+    return true;
+}
+
+// An evaluate that faults faults again on the very next frame, and a log with the same two
+// lines sixty times a second is a log nobody can read the start of -- which is where the
+// useful part is. Say it in full twice, then once every ten seconds of game frames with the
+// running total.
+static void LogNgxFault(const char *what)
+{
+    static unsigned n = 0;
+    ++n;
+    if (n <= 2 || n % 600 == 0)
+    {
+        Log("[host] %s raised 0x%08X%s in %s (caught; nothing submitted)", what, g_ngx_fault.code,
+            g_ngx_fault.detail, g_ngx_fault.where);
+        if (g_ngx_fault.stack[0] != '\0')
+            Log("[host] %s fault stack, by module (innermost first): %s", what, g_ngx_fault.stack);
+        if (n > 2) Log("[host] %s has now faulted %u times; the feed delivers nothing while this lasts", what, n);
+        else if (n == 2)
+            Log("[host] the fault is inside the call, not in the code around it -- the module chain on the "
+                "line above says whose. Further occurrences are summarised rather than repeated.");
+    }
+    // See NgxRefuse: an unwind through the consumer's frames leaves its locks held, and the
+    // next call in is what actually kills the process.
+    if (g_ngx_fault.via_consumer) g_ngx_poisoned = true;
+}
+
 static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
 {
     *code = 0;
@@ -730,7 +1129,7 @@ static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *
     g_chicken_created_unarmed = g_chicken_present && g_chicken_state != DFC_STATE_ARMED;
     PublishDfcInterop();
     __try { return NGX_D3D12_CREATE_DLSS_EXT(h.list, 1, 1, &h.feature, h.params, cp); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+    __except (NoteNgxFault(GetExceptionInformation())) { *code = g_ngx_fault.code; return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
 }
 
 static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, DWORD *code)
@@ -738,7 +1137,7 @@ static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, D
     *code = 0;
     PublishDfcInterop();
     __try { return NGX_D3D12_EVALUATE_DLSS_EXT(h.list, h.feature, h.params, ep); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+    __except (NoteNgxFault(GetExceptionInformation())) { *code = g_ngx_fault.code; return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
 }
 
 static void SafeReleaseFeature(NVSDK_NGX_Handle *f)
@@ -753,9 +1152,40 @@ static void SafeReleaseFeature(NVSDK_NGX_Handle *f)
 // and the DLSS 5 add-on arms itself, exactly as in a real D3D12 game.
 // ---------------------------------------------------------------------------
 
+static bool HostResize(int new_w, int new_h, const char *why);   // defined with the swapchain
+static bool g_sizing;                    // inside a border drag: WM_SIZE is coalesced until it ends
+static int  g_sizing_w, g_sizing_h;
+
 static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 {
     if (m == WM_CLOSE) { ShowWindow(w, SW_HIDE); return 0; }   // closing only hides; the feed lives on
+    // WS_OVERLAPPEDWINDOW has always let the user drag this window's border; until now
+    // nothing answered, so the swapchain kept its original size and DWM stretched it.
+    if (m == WM_GETMINMAXINFO)
+    {
+        RECT deco = {};
+        AdjustWindowRect(&deco, WS_OVERLAPPEDWINDOW, FALSE);
+        MINMAXINFO *mmi = reinterpret_cast<MINMAXINFO *>(lp);
+        mmi->ptMinTrackSize.x = 300 + (deco.right - deco.left);
+        mmi->ptMinTrackSize.y = 300 + (deco.bottom - deco.top);
+        return 0;
+    }
+    // A border drag delivers WM_SIZE on every mouse move, and each one would be a swapchain
+    // resize plus a ReShade runtime recreate. Hold them until the drag ends.
+    if (m == WM_ENTERSIZEMOVE) { g_sizing = true; g_sizing_w = g_sizing_h = 0; return 0; }
+    if (m == WM_EXITSIZEMOVE)
+    {
+        g_sizing = false;
+        if (g_sizing_w > 0 && g_sizing_h > 0) HostResize(g_sizing_w, g_sizing_h, "the window was resized");
+        return 0;
+    }
+    // SIZE_MINIMIZED arrives as 0x0, which is not a size anyone asked for.
+    if (m == WM_SIZE && wp != SIZE_MINIMIZED)
+    {
+        if (g_sizing) { g_sizing_w = LOWORD(lp); g_sizing_h = HIWORD(lp); }
+        else HostResize(LOWORD(lp), HIWORD(lp), "the window was resized");
+        return 0;
+    }
     return DefWindowProcW(w, m, wp, lp);
 }
 
@@ -818,9 +1248,23 @@ static void InitBanner()
     RECT r2 = { 0, S(260), W, S(300) };
     DrawTextW(dc, L"DLSS 5 neural rendering runs here for your 32-bit game.", -1, &r2,
               DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    // Two things a user staring at this picture cannot work out for themselves. First, the
+    // overlay key is only worth pressing if ReShade is actually here -- when its hook lost the
+    // startup race (see InitDisguise) there is no runtime in this process and Home is dead, and
+    // "press Home" then reads as a broken program rather than as a state with a name. Second,
+    // when OptiScaler is the neural consumer its menu is its own, on Insert, and nothing else
+    // in this window says so.
     RECT r3 = { 0, S(305), W, S(345) };
-    DrawTextW(dc, L"Press  Home  in this window to tune it  \x2022  closing only hides the window", -1, &r3,
-              DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    DrawTextW(dc, g_reshade_hooked
+                  ? L"Press  Home  in this window to tune it  \x2022  closing only hides the window"
+                  : L"ReShade did not attach here, so  Home  does nothing  \x2022  closing only hides the window",
+              -1, &r3, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    if (g_opti.present)
+    {
+        RECT r4 = { 0, S(350), W, S(390) };
+        DrawTextW(dc, L"If using OptiScaler, press  Insert  in this window for its menu.", -1, &r4,
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
     SelectObject(dc, old_font);
     DeleteObject(fnt_big);
     DeleteObject(fnt_small);
@@ -922,14 +1366,112 @@ static void InitBanner()
         Log("[host] panel copy unavailable; the game can only cast this window through the compositor");
 }
 
+// The single path for every size change after startup, whether it came from the user
+// dragging the window's border (WM_SIZE) or from the add-on's sliders over the pipe ('W').
+//
+// Until 0.14.0-beta.3 there was no such path at all: WndProc handled only WM_CLOSE, and
+// nothing in this file called ResizeBuffers. The window style has always been
+// WS_OVERLAPPEDWINDOW, so Windows let the user drag the border and then DWM stretched a
+// swapchain that was still its original size into the new client rect -- the picture
+// distorted instead of the UI getting more room, which is what issue #44 reported as "too
+// narrow and expanding it doesn't scale correctly". The [DLSS5Host] ini keys were the only
+// real resize, and they were read once, before the window existed.
+//
+// Returns true if anything actually changed.
+static bool HostResize(int new_w, int new_h, const char *why)
+{
+    if (new_w <= 0) new_w = g_win_w;
+    if (new_h <= 0) new_h = g_win_h;
+    if (new_w < 300) new_w = 300; else if (new_w > 4000) new_w = 4000;
+    if (new_h < 300) new_h = 300; else if (new_h > 8000) new_h = 8000;
+    new_w &= ~1; new_h &= ~1;
+    if (new_w == g_win_w && new_h == g_win_h) return false;
+    if (h.swap == nullptr) { g_win_w = new_w; g_win_h = new_h; return true; }   // before InitDisguise
+
+    Log("[host] resizing the window from %dx%d to %dx%d (%s)", g_win_w, g_win_h, new_w, new_h, why);
+
+    // Everything recorded against the old back buffers must have retired before
+    // ResizeBuffers, or it releases surfaces the GPU is still reading. This wait was
+    // 2000 ms, and in Fable it cost exactly 2000 ms on EVERY resize: the window is parked
+    // behind the game, DWM is not compositing it, and the pump queue sits inside DXGI's
+    // present-wait -- the copy finished long ago; only the fence SIGNAL is queued behind a
+    // present nobody will consume. ResizeBuffers discards those presents, which is the
+    // thing that unblocks it. So: long enough for a copy that is genuinely in flight, then
+    // go, and say so.
+    const ULONGLONG t0 = GetTickCount64();
+    bool retired = true;
+    if (g_pump_fence  != nullptr && !WaitFenceValue(g_pump_fence,  g_pump_val,  150)) retired = false;
+    if (g_panel_fence != nullptr && !WaitFenceValue(g_panel_fence, g_panel_val, 150)) retired = false;
+    if (!retired)
+        Log("[host] resize: the pump queue had not retired after %llu ms (the window is not being composited); resizing anyway",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+
+    // ReShade re-reads its ini inside ResizeBuffers (Destroyed -> Recreated runtime), so the
+    // re-fitted dock layout has to be on disk BEFORE the call, or the recreated runtime
+    // loads the layout for the old size and this write lands twenty milliseconds too late
+    // -- which is exactly what the first beta.3 log shows.
+    const int old_w = g_win_w, old_h = g_win_h;
+    g_win_w = new_w;
+    g_win_h = new_h;
+    char ini[MAX_PATH];
+    HostIniPath(ini, sizeof(ini));
+    RefitHostOverlay(ini, true);   // a deliberate resize re-fits even a user-arranged layout
+
+    if (g_swap3 != nullptr) { g_swap3->Release(); g_swap3 = nullptr; }
+    const HRESULT hr = h.swap->ResizeBuffers(3, static_cast<UINT>(new_w), static_cast<UINT>(new_h),
+                                             DXGI_FORMAT_R8G8B8A8_UNORM,
+                                             DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
+    if (FAILED(hr))
+    {
+        Log("[host] ResizeBuffers failed 0x%08X (%s); keeping %dx%d", hr, FeedHrName(hr), old_w, old_h);
+        g_win_w = old_w;
+        g_win_h = old_h;
+        RefitHostOverlay(ini, true);
+        h.swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_swap3));
+        return false;
+    }
+    h.swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_swap3));
+
+    // The banner is drawn at window size, and the panel copy's command pair goes with it.
+    if (g_banner != nullptr) { g_banner->Release(); g_banner = nullptr; }
+    if (g_panel_list != nullptr) { g_panel_list->Release(); g_panel_list = nullptr; }
+    if (g_panel_alloc != nullptr) { g_panel_alloc->Release(); g_panel_alloc = nullptr; }
+    if (g_panel_fence != nullptr) { g_panel_fence->Release(); g_panel_fence = nullptr; }
+    g_panel_val = 0;
+    g_panel_ready = false;
+    InitBanner();
+
+    // The shared panel texture is the wrong size now, whichever side created it. A D3D11
+    // game hands a new one over on the rebuild the add-on forces; for a GL / Vulkan game
+    // this side makes a new one on that same rebuild, so its old one goes here too.
+    if (h.panel != nullptr) { h.panel->Release(); h.panel = nullptr; }
+    if (h.panel_local != nullptr) { CloseHandle(h.panel_local); h.panel_local = nullptr; }
+    h.panel_host_owned = false;
+    h.panel_size = 0;
+
+    char buf[16];
+    sprintf_s(buf, "%d", g_win_w); WritePrivateProfileStringA("DLSS5Host", "WindowWidth", buf, ini);
+    sprintf_s(buf, "%d", g_win_h); WritePrivateProfileStringA("DLSS5Host", "WindowHeight", buf, ini);
+    return true;
+}
+
 // After Present: copy the buffer that was just presented -- banner plus whatever ReShade
 // drew on it inside its Present hook -- into the shared panel texture. FLIP_SEQUENTIAL
 // keeps that buffer's contents intact until it is handed back to us.
+//
+// The index arithmetic has to follow BufferCount, which is why it is read from the
+// swapchain rather than written here: this used to be "(current + 1) % 2" from when the
+// chain had two buffers, and it survived the move to three (issue #15's third buffer).
+// With three it picks 0 or 1 arbitrarily and never 2, so the panel the 32-bit game shows
+// in its cast was fed a stale buffer roughly a third of the time -- a picture that stops
+// tracking the helper while the helper is perfectly healthy (issue #33).
 static void CopyPanel()
 {
     if (h.panel == nullptr || g_panel_list == nullptr || g_swap3 == nullptr) return;
     if (g_panel_fence->GetCompletedValue() < g_panel_val) return;   // the last copy is still running
-    const UINT presented = (g_swap3->GetCurrentBackBufferIndex() + 1) % 2;
+    DXGI_SWAP_CHAIN_DESC sd = {};
+    if (FAILED(g_swap3->GetDesc(&sd)) || sd.BufferCount == 0) return;
+    const UINT presented = (g_swap3->GetCurrentBackBufferIndex() + sd.BufferCount - 1) % sd.BufferCount;
     ID3D12Resource *bb = nullptr;
     if (FAILED(g_swap3->GetBuffer(presented, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&bb))) || bb == nullptr)
         return;
@@ -955,6 +1497,34 @@ static void CopyPanel()
 typedef HRESULT (WINAPI *PFN_D3D12CreateDevice_)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
 typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1_)(REFIID, void **);
 
+// #58: the helper dies with 0xC0000005 immediately after the game side reports releasing a
+// button it still believed the host was holding. Those releases arrive here as synthesized
+// WM_*BUTTONUP / WM_KEYUP and are dispatched into ReShade's window procedure and ImGui --
+// third-party code, in a window that the resize path may have rebuilt underneath it.
+//
+// This does not pretend to know the root cause; it stops one fault in a dispatched message
+// from taking the helper (and with it the game's feed) down, and names it in the log, which
+// is what the report needs before anything more precise can be written. Everything the drain
+// touches is a plain MSG, so there is nothing here for /EHsc to refuse to unwind.
+static volatile LONG g_pump_faults;
+
+static void PumpMessagesGuarded()
+{
+    __try
+    {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        const LONG n = InterlockedIncrement(&g_pump_faults);
+        if (n <= 3)
+            Log("[host] a window message faulted with 0x%08X while being dispatched (caught, #%ld). If this "
+                "repeats, it is issue #58 -- please attach this log and dlss5-feed-crash.dmp",
+                GetExceptionCode(), static_cast<long>(n));
+    }
+}
+
 // The message drain always runs -- it is what keeps the window responsive. When idle
 // (no frames arriving), the banner copy and the Present behind it are throttled to
 // 30 Hz; what made the old per-frame call expensive was the CPU wait for our own
@@ -963,11 +1533,12 @@ typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1_)(REFIID, void **);
 // per-frame state to Present (the v4.7 banner says "workset pool") -- letting several
 // evaluates land between presents made consecutive evaluates share state and the game
 // flicker. One cheap Present per evaluate keeps its world consistent.
-static void PumpPresent(bool force = false)
+// Returns true when a Present actually went through, which is what PumpRetireOwedPresents
+// needs in order to pay the debt down one at a time.
+static bool PumpPresent(bool force = false)
 {
-    MSG msg;
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-    if (h.swap == nullptr) return;
+    PumpMessagesGuarded();
+    if (h.swap == nullptr) return false;
 
     // Open ReShade's overlay for the user once the window is up: key down on one pump, key
     // up three pumps later, so ReShade sees a held key across a frame boundary (down and
@@ -976,31 +1547,44 @@ static void PumpPresent(bool force = false)
     {
         ++g_pump_count;
         const UINT scan = MapVirtualKeyW(g_overlay_key, MAPVK_VK_TO_VSC);
-        if (g_pump_count == 90)
+        if (g_pump_count == g_overlay_key_at)
             PostMessageW(h.hwnd, WM_KEYDOWN, g_overlay_key, 1 | (scan << 16));
-        else if (g_pump_count == 93)
+        else if (g_pump_count == g_overlay_key_at + 3)
         {
             PostMessageW(h.hwnd, WM_KEYUP, g_overlay_key, 1 | (scan << 16) | (1u << 30) | (1u << 31));
             Log("[host] opened ReShade's overlay (key %u) so the neural consumer's panel is in view", g_overlay_key);
         }
     }
 
+    // Idle throttle: with no frames arriving there is nothing to show, so 30 Hz is plenty.
+    // An owed present is not idle work, though -- it is a frame the consumer is missing --
+    // so it goes as soon as a back buffer is free.
     static ULONGLONG last = 0;
     const ULONGLONG now = GetTickCount64();
-    if (!force && now - last < 33) return;
+    if (!force && g_present_owed == 0 && now - last < 33) return false;
     last = now;
 
-    // No free back buffer yet: skip this present rather than wait for DWM (see the
-    // swapchain creation for why). The DLSS 5 add-on keys per-frame state to Present, so
-    // a skipped present makes two evaluates share a frame on its side -- counted here so
-    // a log can show how often, and never more than DWM's own rhythm forces.
-    if (h.latency_wait != nullptr && WaitForSingleObject(h.latency_wait, 0) != WAIT_OBJECT_0)
-    {
-        static unsigned skipped = 0;
-        if (++skipped == 1 || (skipped % 1800) == 0)
-            Log("[host] present skipped: DWM still holds the back buffer (%u so far; the game is never made to wait for it)", skipped);
-        return;
-    }
+    // Never wait for DWM here -- this runs between "evaluate n is done" and "read the next
+    // frame message", so a wait would delay evaluate n+1 and pace the game at the
+    // compositor's rhythm all over again (the 33.5 ms plateau).
+    //
+    // This used to ask the frame-latency waitable object, with a zero timeout, whether a
+    // back buffer was free, and return early when it was not. That was a permanent-freeze
+    // bug (issue #33). The object is a SEMAPHORE: a successful wait takes a count, and the
+    // only thing that ever puts one back is a PRESENTED frame retiring. Both failure exits
+    // below returned after the count had already been taken, so each Present that did not
+    // go through spent a count that never came back -- and SetMaximumFrameLatency(2) means
+    // there are only two. Two failed presents over the life of the process drained it to
+    // zero for good, after which every check here failed, PumpRetireOwedPresents failed the
+    // same check, and the window never repainted again while the feed carried on evaluating.
+    // That is exactly the report: responsive window, frozen picture, healthy feed, forever.
+    //
+    // DXGI_PRESENT_DO_NOT_WAIT already gives us the non-blocking guarantee this needs, and
+    // answers DXGI_ERROR_WAS_STILL_DRAWING when there is no free buffer -- the same
+    // information, from the call itself, with nothing to leak. So we ask Present, not the
+    // semaphore. The waitable flag stays on the swapchain for its latency behaviour; the
+    // handle is simply never waited on.
+    if (force) ++g_present_forced;   // counted here so "skipped of forced" is always consistent
 
     // Paint the banner into the backbuffer (ReShade's overlay composites on top at Present).
     if (g_banner != nullptr && g_pump_list != nullptr && g_swap3 != nullptr)
@@ -1034,14 +1618,106 @@ static void PumpPresent(bool force = false)
         }
     }
     const HRESULT hr = h.swap->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
-    if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+    if (FAILED(hr))
     {
-        static unsigned busy = 0;
-        if (++busy == 1 || (busy % 1800) == 0)
-            Log("[host] present skipped: DXGI was still drawing (%u so far)", busy);
+        // One accounting for every reason a present did not go through. WAS_STILL_DRAWING
+        // is the ordinary one (DWM still holds every back buffer); anything else used to
+        // return here in complete silence, so a window frozen by a repeating INVALID_CALL
+        // or a device reset left nothing whatsoever in the log to read (issue #33).
+        if (force) ++g_present_skipped;
+        // A dropped present is not free: the neural consumer keys its per-frame state to
+        // Present, so two evaluates then share one frame of it and it declines a pass
+        // (issue #15's "toggling on and off"). It becomes a DEBT rather than a drop.
+        if (force && h.async_home && g_present_owed < 4) ++g_present_owed;
+
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+        {
+            if (g_present_skipped == 1 || (g_present_skipped % 1800) == 0)
+                Log("[host] present skipped: DWM still holds the back buffer (%llu of %llu per-evaluate "
+                    "presents, %llu owed; the game is never made to wait for it)",
+                    (unsigned long long)g_present_skipped, (unsigned long long)g_present_forced,
+                    (unsigned long long)g_present_owed);
+        }
+        else
+        {
+            static unsigned long long hard    = 0;
+            static HRESULT            last_hr = S_OK;
+            const bool                fresh   = (hr != last_hr);
+            last_hr = hr;
+            if (++hard == 1 || fresh || (hard % 1800) == 0)
+                Log("[host] Present failed 0x%08X (%llu so far). This window holds its last picture until "
+                    "one succeeds; the feed runs on a separate queue and is unaffected.",
+                    hr, (unsigned long long)hard);
+        }
+
+        // A rising skip count on its own reads as benign, because it usually is. A long
+        // UNBROKEN run is the state that is not: from there the window has stopped
+        // repainting and the consumer is missing frames. Counted for every client, not
+        // only the pipelined ones -- a same-frame client owes no debt, and so used to
+        // reach this state with fewer clues in its log rather than more (issue #33).
+        if (++g_present_debt_run == 120)
+            Log("[host] 120 presents in a row could not go through: this window has stopped repainting and "
+                "the consumer is missing frames. The feed itself is unaffected; a window that looks frozen "
+                "from here is this, not a hang.");
+        return false;
     }
-    else if (SUCCEEDED(hr))
-        CopyPanel();
+    // DXGI_STATUS_OCCLUDED is a SUCCESS code, so it falls through the test above: the
+    // present was accepted, but nothing of it reaches the screen. That is the normal state
+    // for a helper parked at HWND_BOTTOM under a fullscreen game, and worth naming once
+    // rather than leaving a reader to infer it from a picture that never changes.
+    if (hr == DXGI_STATUS_OCCLUDED)
+    {
+        static bool said_occluded = false;
+        if (!said_occluded)
+        {
+            said_occluded = true;
+            Log("[host] this window is occluded (the game is in front of it): presents are accepted but "
+                "nothing is drawn until it is raised. The feed is unaffected.");
+        }
+    }
+    g_present_debt_run = 0;   // a present went through; the window is repainting again
+    CopyPanel();
+    return true;
+}
+
+// Retire presents the per-evaluate call could not make, from the serve loop's idle path.
+// The game is not waiting on us there -- we are blocked on its next frame message -- so a
+// present here is the one that costs nothing, and it is what keeps the neural consumer's
+// per-Present state at one frame per evaluate (issue #15). The debt is only paid down here:
+// a per-evaluate present is the frame THAT evaluate is entitled to, not a repayment.
+// Bounded by g_present_owed, so this can never present more often than evaluates asked for.
+// max_pay 0 = unbounded, which is what the idle path wants: there the game is not waiting on
+// us at all and a present costs nothing. The per-evaluate call passes 1, because there it is
+// competing with the next evaluate for this one thread -- see the call site (#15).
+static void PumpRetireOwedPresents(unsigned max_pay = 0)
+{
+    unsigned paid = 0;
+    // No frame-latency wait here either, for the reason spelled out in PumpPresent: a wait
+    // that is not followed by a present spends a semaphore count nothing gives back, and
+    // this loop's whole job is to keep trying when presents are failing (issue #33).
+    // PumpPresent already returns false without blocking when there is no free buffer.
+    while (g_present_owed > 0 && h.swap != nullptr && (max_pay == 0 || paid < max_pay))
+    {
+        if (!PumpPresent(false)) break;   // no buffer after all, or DXGI busy: try again later
+        --g_present_owed;
+        ++paid;
+    }
+}
+
+// Has ReShade taken over d3d12.dll's D3D12CreateDevice yet? Two shapes, because ReShade
+// uses both: an export-table replacement points the name at a function in ReShade's own
+// module, and an inline detour leaves the address inside d3d12.dll but writes a jump over
+// its first instruction. Anything else is the untouched Microsoft prologue.
+static bool ReShadeOwnsCreateDevice(HMODULE d3d12, FARPROC p)
+{
+    if (d3d12 == nullptr || p == nullptr) return false;
+    HMODULE owner = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(p), &owner))
+        return false;
+    if (owner != d3d12) return true;                     // the export now names someone else's code
+    const BYTE *b = reinterpret_cast<const BYTE *>(p);   // ... or the entry point was jumped over
+    return b[0] == 0xE9 || b[0] == 0xEB || (b[0] == 0xFF && b[1] == 0x25);
 }
 
 static bool InitDisguise()
@@ -1051,7 +1727,64 @@ static bool InitDisguise()
     // the same order a real game gets, and what lets the DLSS 5 add-on see us.
     HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
     HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
-    auto create_device  = d3d12 ? reinterpret_cast<PFN_D3D12CreateDevice_>(GetProcAddress(d3d12, "D3D12CreateDevice")) : nullptr;
+
+    // ... except that "loading it before" is not by itself enough, and when it is not, this
+    // whole process quietly loses its ReShade. ReShade registers d3d12.dll as a DELAYED hook
+    // and only patches the export when it sees the module arrive; the patch runs on whichever
+    // thread happened to load it. A second in-process add-in that pokes DXGI from its own
+    // thread -- OptiScaler does exactly this, its LoadLibrary hook answers our dxgi.dll load
+    // by calling CreateDXGIFactory "for overlay", which drags d3d12.dll in early -- makes that
+    // some OTHER thread, and our own LoadLibraryW above then comes back with ReShade logging
+    // "Ignoring LoadLibrary('d3d12.dll') call to avoid possible deadlock". The address we read
+    // a microsecond later is the raw Microsoft one, ReShade never sees the device get created,
+    // the swapchain below is refused with "Skipping swap chain because it was created without
+    // a proxy Direct3D device", and there is NO ReShade runtime in this process for the rest of
+    // the session: the overlay key does nothing, the add-on panel never draws, and the picture
+    // the game casts back is the bare banner. Observed in Fable Anniversary, both runs, once
+    // OptiScaler was installed beside the helper.
+    //
+    // The patch is milliseconds away when this happens, so wait for it rather than race it.
+    //
+    // Only worth waiting for when the dxgi.dll that answered is ReShade's. If Windows' own
+    // answered instead, ReShade is simply not installed beside this helper, nothing will ever
+    // hook anything, and a 2000 ms wait would only delay saying so.
+    wchar_t dxgi_path[MAX_PATH] = {}, sysdir[MAX_PATH] = {};
+    if (dxgi != nullptr) GetModuleFileNameW(dxgi, dxgi_path, MAX_PATH);
+    GetSystemDirectoryW(sysdir, MAX_PATH);
+    const bool reshade_dxgi = dxgi != nullptr && dxgi_path[0] != L'\0' && sysdir[0] != L'\0' &&
+                              CompareStringOrdinal(dxgi_path, static_cast<int>(wcslen(sysdir)),
+                                                   sysdir, -1, TRUE) != CSTR_EQUAL;
+
+    FARPROC raw_create_device = d3d12 ? GetProcAddress(d3d12, "D3D12CreateDevice") : nullptr;
+    if (!reshade_dxgi)
+        Log("[host] WARNING: dxgi.dll here is Windows' own (%ls), not ReShade -- there is no overlay and no "
+            "add-on panel in this process at all. Put ReShade x64 beside this helper as dxgi.dll.", dxgi_path);
+    // d3d12 != nullptr guards the wait: with no d3d12.dll at all there is no export for
+    // ReShade to patch and nothing to wait for, and without this the loop below spends two
+    // seconds calling GetProcAddress(nullptr) two hundred times before the failure a few lines
+    // down reports the real problem.
+    else if (d3d12 != nullptr && !ReShadeOwnsCreateDevice(d3d12, raw_create_device))
+    {
+        const ULONGLONG t0 = GetTickCount64();
+        while (GetTickCount64() - t0 < 2000)
+        {
+            Sleep(10);
+            raw_create_device = GetProcAddress(d3d12, "D3D12CreateDevice");
+            if (ReShadeOwnsCreateDevice(d3d12, raw_create_device)) break;
+        }
+        const unsigned long long ms = static_cast<unsigned long long>(GetTickCount64() - t0);
+        if (ReShadeOwnsCreateDevice(d3d12, raw_create_device))
+            Log("[host] d3d12.dll was already in this process when we asked for it (something else pulled it in), "
+                "so ReShade was still patching D3D12CreateDevice; waited %llu ms and took the hooked address", ms);
+        else
+            Log("[host] WARNING: after %llu ms ReShade still has not hooked D3D12CreateDevice. It will refuse this "
+                "window's swapchain (\"created without a proxy Direct3D device\" in ReShade.log), which means NO "
+                "ReShade overlay in this process for the whole session: the overlay key does nothing and any "
+                "add-on panel is unreachable. The feed itself still works.", ms);
+    }
+    g_reshade_hooked = ReShadeOwnsCreateDevice(d3d12, raw_create_device);
+
+    auto create_device  = reinterpret_cast<PFN_D3D12CreateDevice_>(raw_create_device);
     auto create_factory = dxgi ? reinterpret_cast<PFN_CreateDXGIFactory1_>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
     if (create_device == nullptr || create_factory == nullptr) { Log("[host] dxgi/d3d12 exports missing"); return false; }
 
@@ -1069,19 +1802,42 @@ static bool InitDisguise()
     // the client area -- and the swapchain -- is exactly that.
     RECT frame = { 0, 0, g_win_w, g_win_h };
     AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+    // The caption is the one line of this window a user sees on the taskbar, so it carries the
+    // same advice as the banner -- including OptiScaler's Insert, which is the only door to a
+    // tuning UI when OptiScaler is the consumer and ReShade lost the hook race.
+    const wchar_t *caption =
+        !g_reshade_hooked && g_opti.present
+            ? L"DLSS 5 Feed host - ReShade did not attach; press Insert HERE for OptiScaler's menu"
+        : !g_reshade_hooked
+            ? L"DLSS 5 Feed host - ReShade did not attach to this window; Home does nothing here"
+        : g_opti.present
+            ? L"DLSS 5 Feed host - press Home HERE to tune DLSS 5, or Insert for OptiScaler's menu"
+            : L"DLSS 5 Feed host - press Home HERE to tune DLSS 5 neural rendering";
     h.hwnd = CreateWindowExW(g_behind ? (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) : 0, wc.lpszClassName,
-                             L"DLSS 5 Feed host - press Home HERE to tune DLSS 5 neural rendering",
+                             caption,
                              WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                              frame.right - frame.left, frame.bottom - frame.top,
                              nullptr, nullptr, wc.hInstance, nullptr);
-    Log("[host] window: %dx%d client (2x the original 960x540, capped to the work area)%s", g_win_w, g_win_h,
+    Log("[host] window: %dx%d client (tall and narrow, fit to the work area height)%s", g_win_w, g_win_h,
         g_behind ? ", behind the game (tool window, no taskbar button)" : "");
     if (h.hwnd == nullptr) { Log("[host] window creation failed"); return false; }
     if (g_show_window) ShowWindow(h.hwnd, SW_SHOWNOACTIVATE);   // never steal the game's focus
 
     HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                                reinterpret_cast<void **>(&h.dev));
-    if (FAILED(hr)) { Log("[host] D3D12CreateDevice failed 0x%08X", hr); return false; }
+    if (FAILED(hr))
+    {
+        Log("[host] D3D12CreateDevice failed 0x%08X (%s)", hr, FeedHrName(hr));
+        // The add-on names this one for the game process (#61); say it here too, because the
+        // 32-bit path fails HERE and its reporters only ever see this log. This exe exports no
+        // D3D12SDKVersion, so a redist error means an Agility folder next to THIS exe, or
+        // something injected into this process pointing Direct3D 12 at one (#81).
+        if (static_cast<unsigned long>(hr) == 0x887E0003ul)
+            Log("[host] D3D12_ERROR_INVALID_REDIST: Direct3D 12 was pointed at an Agility SDK redist "
+                "it could not load. This helper asks for none, so look for a D3D12\\ folder next to "
+                "dlss5-feed-host64.exe and rename it, or for an injector that sets one.");
+        return false;
+    }
 
     D3D12_COMMAND_QUEUE_DESC qd = {};
     h.dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&h.pump_queue));
@@ -1098,17 +1854,26 @@ static bool InitDisguise()
     sd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount      = 2;
+    // Three buffers, latency 2. Two-and-one frees the waitable object at most once per
+    // vblank, so above the desktop's refresh rate one present per evaluate is not merely
+    // unlikely, it is impossible -- a 72 fps game on a 60 Hz desktop must drop roughly one
+    // present in six no matter what. Each drop makes two evaluates share one frame of the
+    // neural consumer's per-Present state, and the consumer answers by declining a pass:
+    // the frame-by-frame "neural rendering toggling on and off" of issue #15. The third
+    // buffer is what makes one-per-evaluate reachable; it costs one window-sized surface.
+    sd.BufferCount      = 3;
     // SEQUENTIAL, not DISCARD: the buffer just presented must keep its contents so
     // CopyPanel can lift ReShade's overlay off it afterwards (the v7 panel texture).
     sd.SwapEffect       = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-    // Waitable, latency 1: Present on this chain must never block. It is called once per
-    // evaluate, and the game's next frame waits on fence_out behind that evaluate -- so
-    // a Present that DWM holds until the next vblank (the window is occluded by a
-    // fullscreen game, or the present queue is full) paced the GAME at the compositor's
-    // rhythm: the rigid 33.5 ms / 30 fps plateaus of issue #15 on 32-bit DXVK, with the
-    // feed's own CPU cost at 0.1 ms. PumpPresent checks the waitable object and skips
-    // the Present when a buffer is not free, and asks DXGI not to wait either way.
+    // Waitable: Present on this chain must never block. It is called once per evaluate, and
+    // the game's next frame waits on fence_out behind that evaluate -- so a Present that DWM
+    // holds until the next vblank (the window is occluded by a fullscreen game, or the
+    // present queue is full) paced the GAME at the compositor's rhythm: the rigid 33.5 ms /
+    // 30 fps plateaus of issue #15 on 32-bit DXVK, with the feed's own CPU cost at 0.1 ms.
+    // The flag is kept for that latency behaviour. PumpPresent does NOT wait on the object
+    // it produces, and no longer polls it either: DXGI_PRESENT_DO_NOT_WAIT is what actually
+    // guarantees the non-blocking present, and a zero-timeout poll spent semaphore counts
+    // that only a presented frame gives back -- which froze the window for good (issue #33).
     sd.Flags            = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     hr = factory->CreateSwapChainForHwnd(h.pump_queue, h.hwnd, &sd, nullptr, nullptr, &h.swap);
     if (SUCCEEDED(hr))
@@ -1116,11 +1881,13 @@ static bool InitDisguise()
         IDXGISwapChain2 *swap2 = nullptr;
         if (SUCCEEDED(h.swap->QueryInterface(__uuidof(IDXGISwapChain2), reinterpret_cast<void **>(&swap2))) && swap2 != nullptr)
         {
-            swap2->SetMaximumFrameLatency(1);
+            swap2->SetMaximumFrameLatency(2);
             h.latency_wait = swap2->GetFrameLatencyWaitableObject();
             swap2->Release();
         }
-        if (h.latency_wait == nullptr) Log("[host] no frame-latency waitable object; Present may block on DWM");
+        if (h.latency_wait == nullptr)
+            Log("[host] no frame-latency waitable object; this chain queues presents the ordinary way "
+                "(DXGI_PRESENT_DO_NOT_WAIT still keeps them off the game's thread)");
     }
     // By default DXGI watches this window and may act on window/foreground changes -- which,
     // for a helper spawned behind a fullscreen game, can pull the game out of focus. We only
@@ -1153,30 +1920,248 @@ static bool InitDisguise()
     return true;
 }
 
+// Which GPU this helper actually landed on. It creates its device on DXGI's DEFAULT adapter
+// while the 64-bit add-on creates its private device on the GAME's adapter, and neither side
+// logged an adapter identity -- so a report where the helper and the game are on different
+// GPUs was indistinguishable from one where they are not (issue #47).
+static void LogHostAdapter()
+{
+    if (h.dev == nullptr) return;
+    const LUID luid = h.dev->GetAdapterLuid();
+    wchar_t desc[128] = L"(unnamed)";
+    UINT vendor = 0, device = 0;
+    char driver[32] = "?";
+    IDXGIFactory1 *f = nullptr;
+    // GetProcAddress like InitDisguise does: this exe carries no dxgi import, so that the
+    // app-directory dxgi.dll (which is ReShade) is loaded in the order a real game gives it.
+    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    auto create_factory = dxgi != nullptr
+        ? reinterpret_cast<PFN_CreateDXGIFactory1_>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+    if (create_factory != nullptr &&
+        SUCCEEDED(create_factory(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&f))) && f != nullptr)
+    {
+        IDXGIAdapter1 *a = nullptr;
+        for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i)
+        {
+            DXGI_ADAPTER_DESC1 ad = {};
+            a->GetDesc1(&ad);
+            if (ad.AdapterLuid.LowPart == luid.LowPart && ad.AdapterLuid.HighPart == luid.HighPart)
+            {
+                wcscpy_s(desc, ad.Description);
+                vendor = ad.VendorId;
+                device = ad.DeviceId;
+                // Same decode as the add-on's LogAdapterIdentity: the last five digits of
+                // the quad's last two components are NVIDIA's branded version.
+                LARGE_INTEGER umd = {};
+                if (SUCCEEDED(a->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd)))
+                {
+                    const unsigned sub_v = HIWORD(umd.LowPart), bld = LOWORD(umd.LowPart);
+                    const unsigned n     = (sub_v * 10000u + bld) % 100000u;
+                    sprintf_s(driver, "%u.%02u", n / 100u, n % 100u);
+                }
+                a->Release();
+                break;
+            }
+            a->Release();
+        }
+        f->Release();
+    }
+    Log("[host] device adapter: %ls  LUID %08lX:%08lX  PCI %04X:%04X  driver %s (DXGI's default adapter)",
+        desc, (unsigned long)luid.HighPart, (unsigned long)luid.LowPart, vendor, device, driver);
+    g_driver_x100 = driver[0] != '?' ? static_cast<unsigned>(atof(driver) * 100.0 + 0.5) : 0;
+
+    // 616.64 and the v4.6+ RenoDX engine: reproduced here, on this machine, in --test.
+    //
+    //   consumer                       driver 616.56   driver 616.64
+    //   none                           300/300         300/300
+    //   Deep Fried Chicken 1.4.8       300/300         300/300
+    //   renodx-dlss5 v4.55 (classic)   300/300         300/300
+    //   renodx-dlss5 v4.6              300/300         1/300
+    //   renodx-dlss5 v4.7              300/300         0/300
+    //
+    // The failures are all one fault, and the module chain names it: our evaluate goes into
+    // the consumer's NGX detour, on into the driver's _nvngx.dll and nvngx_dlssnr.dll, and
+    // then dereferences an uninitialised pointer inside D3D12Core.dll -- the address differs
+    // per run (-1 one time, 0xC the next), which is what an uninitialised one looks like.
+    // Nothing on this side is in that chain past the call itself, and the same call on the
+    // same files succeeds three other ways.
+    //
+    // 616.64 also changed what NGX says about the feature that path creates: the
+    // requirements query for feature 18 answered NotImplemented (0xBAD00012) on 616.56 and
+    // answers `supported` on 616.64. So the driver moved, and the v4.6+ engine is what does
+    // not survive the move.
+    //
+    // Said up front, because the alternative is a helper that runs, logs nothing alarming
+    // and delivers no neural frame -- which is exactly how this arrived as "the new driver
+    // broke the 32-bit path" (issue #54).
+    // The bound is >= 616.64 rather than == because there is no evidence a later driver
+    // fixes it, and a warning that stops the moment NVIDIA ships 616.70 would be worse than
+    // one that says plainly which driver it was measured on.
+    if (g_renodx_v46 && g_driver_x100 >= 61664)
+        Log("[host] WARNING: renodx-dlss5 %s with NVIDIA driver %s is a combination measured to fail (on "
+            "616.64 exactly; anything newer is untested here and assumed the same). The neural evaluate "
+            "faults inside the driver's own NGX runtime -- an access violation in D3D12Core.dll, reached "
+            "through nvngx_dlssnr.dll -- so DLSS 5 delivers nothing while everything else keeps working, "
+            "and there is nothing to fix on this side. Three things do work: Deep Fried Chicken as the "
+            "neural consumer, a classic-engine renodx-dlss5 build (v4.55 and the 'latest' build both pass "
+            "here), or driver 616.56. Run this helper with --test to check any combination in seconds.",
+            g_renodx_v47 ? "v4.7" : "v4.6", driver);
+}
+
+// Ask NGX which of the adapter, the driver or the OS it is objecting to. Same question the
+// add-on asks through its own NgxAskWhy; kept symmetrical on purpose, because issue #47 is
+// built on comparing what the two sides report.
+
+// What the probe concluded, so the failure line can be written from what NGX actually said
+// rather than a catch-all that blames the device (#47, #73). Symmetrical with the add-on.
+static FeedNgxVerdict g_ngx_verdict = {};
+
+static void NgxAskWhy(const wchar_t *data_path, const NVSDK_NGX_FeatureCommonInfo *info)
+{
+    if (h.dev == nullptr) return;
+    IDXGIAdapter  *ad = nullptr;
+    IDXGIFactory4 *f4 = nullptr;
+    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    auto make_factory = dxgi != nullptr
+        ? reinterpret_cast<PFN_CreateDXGIFactory1_>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+    if (make_factory != nullptr &&
+        SUCCEEDED(make_factory(__uuidof(IDXGIFactory4), reinterpret_cast<void **>(&f4))) && f4 != nullptr)
+    {
+        f4->EnumAdapterByLuid(h.dev->GetAdapterLuid(), __uuidof(IDXGIAdapter),
+                              reinterpret_cast<void **>(&ad));
+        f4->Release();
+    }
+    FeedLogNgxFeatureRequirements(&Log, "host", ad, data_path, info, &g_ngx_verdict);
+    if (ad != nullptr) ad->Release();
+}
+
 static bool InitNgx()
 {
     wchar_t data_path[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, data_path, MAX_PATH);
     if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
-    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, h.dev, nullptr, NVSDK_NGX_Version_API);
+    LogHostAdapter();
+    // Say where NGX is being pointed, and whether it can write there. NGX puts its own logs
+    // in this folder, and an install under Program Files is not writable without elevation
+    // -- which nothing checked or reported (issue #47).
+    {
+        wchar_t probe[MAX_PATH];
+        _snwprintf_s(probe, _TRUNCATE, L"%sdlss5-feed-ngx-probe.tmp", data_path);
+        HANDLE t = CreateFileW(probe, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        const bool writable = t != INVALID_HANDLE_VALUE;
+        if (writable) CloseHandle(t);
+        Log("[host] NGX application data path: %ls (%s)", data_path, writable ? "writable" : "NOT WRITABLE");
+    }
+
+    {
+        char dir8[MAX_PATH] = {};
+        WideCharToMultiByte(CP_UTF8, 0, data_path, -1, dir8, MAX_PATH, nullptr, nullptr);
+        FeedLogNgxRuntimes(&Log, "host", dir8);
+    }
+
+    // A PathListInfo, which this side passed as nullptr while the add-on passed one. That
+    // was the last structural difference between the two call sites, and issue #47 is built
+    // entirely on comparing them -- so it should not be a difference at all.
+    const wchar_t *const search[1] = { data_path };
+    NVSDK_NGX_FeatureCommonInfo info = {};
+    info.PathListInfo.Path   = search;
+    info.PathListInfo.Length = 1;
+
+    // Before the attempt, not only after a failure: a machine where NGX works records what
+    // it answers here too, and the working cases are the control the failing ones need.
+    NgxAskWhy(data_path, &info);
+    // The probe above is the first NGX call this process makes, so it is also where the NGX SDK
+    // resolved its implementation. With OptiScaler loaded, its answer says which one it got.
+    if (g_opti.present)
+    {
+        g_opti.routed = OptiRouted(g_ngx_verdict);
+        if (g_opti.routed)
+        {
+            Log("[host] NGX calls are routed through %s (%s): the requirements probe carries its fingerprint "
+                "(MinHWArchitecture 0, MinOSVersion %s)", OPTI_LABEL, g_opti.module, OPTI_MIN_OS);
+            // OptiScaler forwards the feature-18 query to the driver core only while its own DLSS
+            // side is alive (nvngx_dlss.dll beside it, an NVIDIA GPU). Without that it has no dlss
+            // backend (it builds FSR 2.1.2 and still says Success). Measured: the neural pass itself
+            // still ran without nvngx_dlss.dll, so this predicts the upscaler, not the pass.
+            if (NVSDK_NGX_FAILED(g_ngx_verdict.nr_query))
+                Log("[host] WARNING: OptiScaler refused the feature-18 requirements query (0x%08X %s). It only forwards "
+                    "that to the driver while its DLSS side is up, which needs nvngx_dlss.dll beside %s and an NVIDIA "
+                    "GPU. OptiScaler then builds FSR 2.1.2 in place of DLSS and still reports Success (the neural pass itself "
+                    "survived this in the rig); OptiScaler.log names the upscaler that ran.",
+                    g_ngx_verdict.nr_query, NgxResultName(g_ngx_verdict.nr_query), g_opti.module);
+        }
+        else
+            Log("[host] WARNING: %s is loaded but the DRIVER answered the NGX probe -- the NGX SDK in this helper was "
+                "not redirected, so OptiScaler will see nothing and the neural pass will not run. OptiScaler.ini: "
+                "[Inputs] EnableDlssInputs must be true and [Hooks] HookOriginalNvngxOnly false; OptiScaler.log says "
+                "whether its hooks came up (look for \"nvngx call: ..., returning this dll!\").", g_opti.module);
+    }
+
+    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, h.dev, &info, NVSDK_NGX_Version_API);
     Log("[host] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))
     {
         r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                                                "1.0", data_path, h.dev, nullptr, NVSDK_NGX_Version_API);
+                                                "1.0", data_path, h.dev, &info, NVSDK_NGX_Version_API);
         Log("[host] Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
     }
-    if (NVSDK_NGX_FAILED(r)) return false;
+    if (NVSDK_NGX_FAILED(r))
+    {
+        // The helper failing here is the case the add-on's data-path theory does NOT explain
+        // (issue #47, case C: same files, same driver, the helper itself returns
+        // FeatureNotSupported). Leave a reader everything needed to tell the two apart.
+        static const wchar_t *kMods[] = { L"_nvngx.dll", L"nvngx.dll", L"nvngx_dlss.dll", L"nvngx_dlssnr.dll" };
+        for (const wchar_t *m : kMods)
+        {
+            HMODULE mh = GetModuleHandleW(m);
+            if (mh == nullptr) continue;
+            wchar_t path[MAX_PATH] = {};
+            GetModuleFileNameW(mh, path, MAX_PATH);
+            Log("[host] NGX module loaded: %ls -> %ls", m, path);
+        }
+        HKEY k = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", 0,
+                          KEY_READ | KEY_WOW64_64KEY, &k) == ERROR_SUCCESS)
+        {
+            DWORD installed = 0, cb = sizeof(installed), type = 0;
+            if (RegQueryValueExW(k, L"NGXCoreInstalled", nullptr, &type, reinterpret_cast<BYTE *>(&installed), &cb) != ERROR_SUCCESS)
+            { cb = sizeof(installed); RegQueryValueExW(k, L"Installed", nullptr, &type, reinterpret_cast<BYTE *>(&installed), &cb); }
+            wchar_t full[MAX_PATH] = {};
+            cb = sizeof(full);
+            RegQueryValueExW(k, L"FullPath", nullptr, &type, reinterpret_cast<BYTE *>(full), &cb);
+            Log("[host] NGX Core: Installed=%lu FullPath=%ls", (unsigned long)installed,
+                full[0] != L'\0' ? full : L"(unset)");
+            RegCloseKey(k);
+        }
+        else
+            Log("[host] NGX Core: the HKLM NGXCore key could not be opened -- the driver's NGX runtime may not be installed");
+
+        // Say what NGX actually objected to. Everything above is evidence; this is the verdict,
+        // and it is the line a reporter quotes (#47, #72, #73).
+        Log("[host] %s", FeedNgxWhyNot(g_ngx_verdict));
+        return false;
+    }
     h.ngx_inited = true;
 
     NVSDK_NGX_Parameter *caps = nullptr;
     r = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
     if (NVSDK_NGX_SUCCEED(r) && caps != nullptr)
     {
-        int avail = 0;
+        int avail = 0, denoise = 0, needs_driver = 0, maj = 0, min_v = 0;
         caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
-        Log("[host] SuperSampling.Available=%d", avail);
+        caps->Get(NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &denoise);
+        caps->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);
+        caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &maj);
+        caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &min_v);
+        // SuperSamplingDenoising is DLSS Ray Reconstruction (nvngx_dlssd.dll), NOT the
+        // DLSS 5 neural rendering this project feeds -- that is NGX feature 18, backed by
+        // nvngx_dlssnr.dll, and no capability parameter reports on it. Kept as the cheapest
+        // way to see how much of the DLSS family NGX has here; feature 18 is asked about
+        // properly by FeedLogNgxFeatureRequirements on the failure path.
+        Log("[host] NGX capabilities: SuperSampling.Available=%d SuperSamplingDenoising.Available=%d "
+            "NeedsUpdatedDriver=%d MinDriver=%d.%d", avail, denoise, needs_driver, maj, min_v);
         if (!avail) return false;
     }
     r = NVSDK_NGX_D3D12_AllocateParameters(&h.params);
@@ -1226,6 +2211,7 @@ static bool PickSrQuality(UINT w, UINT h_, UINT out_w, UINT out_h)
 // PickSrQuality chose; the caller made sure it did.
 static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r, UINT target_w = 0, UINT target_h = 0)
 {
+    if (NgxRefuse("CreateFeature")) return false;
     const bool sr = target_w != 0 && target_h != 0 && (target_w != w || target_h != h_);
     NVSDK_NGX_DLSS_Create_Params cp = {};
     cp.Feature.InWidth            = w;
@@ -1245,7 +2231,7 @@ static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r, U
         AbortCommands();
         // NGX may have partially written *OutHandle before the fault; never trust it.
         h.feature = nullptr;
-        Log("[host] CreateFeature raised 0x%08X (caught; nothing submitted)", ccode);
+        LogNgxFault("CreateFeature");
         return false;
     }
     const UINT64 v = EndCommands();
@@ -1271,9 +2257,37 @@ static bool ReinitNgx()
     return InitNgx();
 }
 
+// Inputs COMMON <-> NON_PIXEL_SHADER_RESOURCE, and on the way in the output COMMON -> UNORDERED_ACCESS.
+static void OptiBarriers(ID3D12Resource *const *inputs, int n_inputs, ID3D12Resource *output, bool before)
+{
+    D3D12_RESOURCE_BARRIER b[4] = {};
+    int n = 0;
+    for (int i = 0; i < n_inputs && n < 3; ++i)
+    {
+        if (inputs[i] == nullptr) continue;
+        b[n].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[n].Transition.pResource   = inputs[i];
+        b[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[n].Transition.StateBefore = before ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        b[n].Transition.StateAfter  = before ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON;
+        ++n;
+    }
+    if (output != nullptr && before)
+    {
+        b[n].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[n].Transition.pResource   = output;
+        b[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[n].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        b[n].Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        ++n;
+    }
+    if (n > 0) h.list->ResourceBarrier(n, b);
+}
+
 static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resource *depth, ID3D12Resource *mv,
                      UINT w, UINT h_, int reset, float mvsx, float mvsy, float jitter_x = 0.0f, float jitter_y = 0.0f)
 {
+    if (NgxRefuse("evaluate")) return false;
     if (!BeginCommands()) return false;
 
     NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
@@ -1291,9 +2305,34 @@ static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resour
     ep.InPreExposure     = 1.0f;
     ep.InExposureScale   = 1.0f;
 
+    // The states NGX's contract names -- inputs NON_PIXEL_SHADER_RESOURCE, output UNORDERED_ACCESS.
+    // This host hands its textures over in COMMON and lets the driver promote them, which NVIDIA's
+    // DLSS tolerates; OptiScaler's upscalers and its neural pass record barriers FROM the states
+    // they assume, so when OptiScaler is the callee, give it those states and take them back after.
+    // The shared textures are SIMULTANEOUS_ACCESS and the scratch is a plain UAV texture; both
+    // accept these transitions.
+    ID3D12Resource *const opti_in[3] = { color, depth, mv };
+    if (g_opti.routed) OptiBarriers(opti_in, 3, output, true);
+
     DWORD ecode = 0;
     NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
-    if (ecode != 0) { AbortCommands(); Log("[host] evaluate raised 0x%08X (caught; nothing submitted)", ecode); return false; }
+    if (ecode != 0) { AbortCommands(); LogNgxFault("evaluate"); return false; }
+    if (g_opti.routed)
+    {
+        OptiBarriers(opti_in, 3, nullptr, false);
+        // The scratch output is taken UAV -> COPY_SOURCE by the copy-home block below; the shared
+        // output, written in place, goes back to COMMON here.
+        if (!(NVSDK_NGX_SUCCEED(re) && output == h.out_scratch && h.out_scratch != nullptr))
+        {
+            D3D12_RESOURCE_BARRIER bar = {};
+            bar.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            bar.Transition.pResource   = output;
+            bar.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+            bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            h.list->ResourceBarrier(1, &bar);
+        }
+    }
     if (NVSDK_NGX_SUCCEED(re) && output == h.out_scratch && h.out_scratch != nullptr)
     {
         // The game's device cannot open a UAV texture: NGX wrote the private scratch,
@@ -1344,16 +2383,21 @@ static ID3D12Resource *MakeTex(UINT w, UINT h_, DXGI_FORMAT fmt, bool uav)
 // for a host-creating client (OpenGL, Vulkan) this host owns the only one. Where the
 // support is missing, fall back to RGBA and let the game's copy home convert: wrong
 // channel order beats a feature that cannot be created at all.
+// Asks about whatever is actually being requested, not only BGRA8: R8G8B8A8_UNORM is the one
+// format whose typed UAV store is required, so everything else has to be checked or NGX fails
+// the create with 0xBAD0000B on hardware that lacks it (#84, an R10G10B10A2 swapchain).
 static DXGI_FORMAT ResolveOutputFormatHost(DXGI_FORMAT want)
 {
-    if (want != DXGI_FORMAT_B8G8R8A8_UNORM || h.dev == nullptr) return want;
+    if (want == DXGI_FORMAT_R8G8B8A8_UNORM || h.dev == nullptr) return want;
     D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {};
     fs.Format = want;
     if (SUCCEEDED(h.dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
         (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0)
         return want;
-    Log("[host] B8G8R8A8_UNORM has no typed UAV store on this device; the output stays R8G8B8A8_UNORM "
-        "(the game's copy home will convert, so expect the washed-out image of issue #11)");
+    Log("[host] %s has no typed UAV store on this device; the output stays R8G8B8A8_UNORM and the "
+        "game's copy home will convert%s", FeedFmtName(want),
+        want == DXGI_FORMAT_B8G8R8A8_UNORM ? " (expect the washed-out image of issue #11)"
+                                           : " (a create would otherwise fail 0xBAD0000B, see #84)");
     return DXGI_FORMAT_R8G8B8A8_UNORM;
 }
 
@@ -1383,6 +2427,8 @@ static ID3D12Resource *MakeSharedTexHost(UINT w, UINT h_, DXGI_FORMAT fmt, bool 
     rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     // ALLOW_RENDER_TARGET is what a D3D11 opener needs for its work-resolution resample
     // RTVs (D3D11 derives its bind flags from these); GL/Vulkan importers do not care.
+    // It also has to be set on any slot a D3D11 opener sees that carries no UAV either --
+    // see the FEED_SLOTS loop in Serve() and issue #43.
     rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
                           (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE) |
                           (render_target ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE);
@@ -1397,6 +2443,10 @@ static ID3D12Resource *MakeSharedTexHost(UINT w, UINT h_, DXGI_FORMAT fmt, bool 
         return nullptr;
     }
     *out_size = h.dev->GetResourceAllocationInfo(0, 1, &rd).SizeInBytes;
+    // One line per slot with the exact flags. Issue #43 came down to which of four
+    // otherwise identical textures was born without a bind flag, and no log said.
+    Log("[host]   shared %ux%u %s d3d12 flags=0x%X (%s%ssimultaneous)", w, h_, FeedFmtName(fmt),
+        static_cast<unsigned>(rd.Flags), uav ? "UAV " : "", render_target ? "RT " : "");
     return t;
 }
 
@@ -1428,7 +2478,8 @@ static int RunTest()
         PumpPresent(true);
         if (Evaluate(color, output, depth, mv, W, H, i == 0 ? 1 : 0, 1.0f, 1.0f)) ++good;
         else break;
-        if (i == 180)   // the warm-up re-create, same medicine as in-game
+        if (i == 1 && g_opti.routed) OptiBackendCheck(&Log, "host", g_opti.upscaler, &g_opti_backend);
+        if (i == 180 && !g_opti.routed)   // the warm-up re-create, same medicine as in-game; OptiScaler is the callee and needs none
         {
             Log("[host] warm-up: re-creating the feature once");
             NVSDK_NGX_Handle *old = h.feature;
@@ -1438,6 +2489,18 @@ static int RunTest()
         }
     }
     Log("[host] --test finished: %d/300 evaluates succeeded", good);
+    if (g_opti.present)
+        Log("[host] --test: neural consumer %s (%s): NGX %s, neural model %s, upscaler asked for: %s",
+            g_opti.nr_fork ? OPTI_LABEL : "OptiScaler (upstream, no neural pass)", g_opti.module,
+            g_opti.routed ? "routed through it" : "NOT routed (the driver answered)",
+            g_opti_backend.nr_created ? "created (feature 18)" : "NOT created", g_opti.upscaler);
+    // What those evaluates actually cost on the GPU. The rig is the one place this can be
+    // checked against a known workload before anyone reads it in a bug report (issue #52).
+    if (h.ts_n > 0)
+        Log("[host] --test: DLSS GPU %.2f ms/frame over %u timed frames at %dx%d",
+            h.ts_sum_ms / double(h.ts_n), h.ts_n, W, H);
+    else
+        Log("[host] --test: no GPU timing was collected");
     Log("[host] check the host's ReShade.log for 'feature 18 created' / 'evaluation succeeded'");
     return good >= 250 ? 0 : 1;
 }
@@ -1450,6 +2513,17 @@ static int RunTest()
 // wait on alongside the window's message queue), so every synchronous transfer has to
 // carry an OVERLAPPED and block on it here. Byte-mode pipes may satisfy a read short,
 // hence the loop; the game's end stays an ordinary blocking handle and is unaffected.
+//
+// This runs on the window thread -- the host has exactly one thread, and it owns the
+// window, the pipe and the D3D12 queue alike. So the wait cannot be the plain
+// GetOverlappedResult(..., TRUE) it used to be: the pipe buffer is 1024 bytes, a
+// FeedBuild is written in pieces, and a game that stalls between them froze the window
+// outright with no upper bound (issue #33). Pump the message queue while waiting, and
+// give up after kTransferStallMs so a wedged client costs us a reconnect rather than a
+// hung window. Not presenting here is deliberate: this is called during the hello, before
+// there is a swapchain to present on.
+static const DWORD kTransferStallMs = 30000;
+
 static bool TransferFull(HANDLE pipe, void *buf, DWORD len, bool write)
 {
     HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -1465,7 +2539,35 @@ static bool TransferFull(HANDLE pipe, void *buf, DWORD len, bool write)
         const BOOL started = write ? WriteFile(pipe, p, left, nullptr, &ov)
                                    : ReadFile(pipe, p, left, nullptr, &ov);
         if (!started && GetLastError() != ERROR_IO_PENDING) { ok = false; break; }
-        if (!GetOverlappedResult(pipe, &ov, &moved, TRUE) || moved == 0) { ok = false; break; }
+
+        const ULONGLONG deadline = GetTickCount64() + kTransferStallMs;
+        bool timed_out = false;
+        for (;;)
+        {
+            const ULONGLONG now  = GetTickCount64();
+            const DWORD     wait = now >= deadline ? 0 : static_cast<DWORD>(deadline - now);
+            const DWORD     r    = MsgWaitForMultipleObjects(1, &ev, FALSE, wait, QS_ALLINPUT);
+            if (r == WAIT_OBJECT_0) break;
+            if (r == WAIT_OBJECT_0 + 1)
+            {
+                MSG msg;
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+                continue;
+            }
+            timed_out = true;   // WAIT_TIMEOUT, or the wait itself failed
+            break;
+        }
+        if (timed_out)
+        {
+            Log("[host] the game stalled mid-message: %lu of %lu bytes %s after %lu ms; dropping the connection",
+                (unsigned long)(len - left), (unsigned long)len, write ? "written" : "read",
+                (unsigned long)kTransferStallMs);
+            CancelIoEx(pipe, &ov);
+            GetOverlappedResult(pipe, &ov, &moved, TRUE);   // the cancel completes it; do not leak the OVERLAPPED
+            ok = false;
+            break;
+        }
+        if (!GetOverlappedResult(pipe, &ov, &moved, FALSE) || moved == 0) { ok = false; break; }
         p    += moved;
         left -= moved;
     }
@@ -1481,11 +2583,30 @@ static int Serve(DWORD game_pid)
 {
     char name[128];
     sprintf_s(name, FEED_PIPE_FMT, static_cast<unsigned long>(game_pid));
+    // The IN buffer (game -> host) is the client's run-ahead reservoir, and it is the
+    // mechanism behind #15's burst-then-collapse rhythm. Under async_home=1 the client's GPU
+    // waits on the frame before, but its CPU waits on nothing at all: it keeps signalling and
+    // writing frame messages until the kernel buffer is full. At 1024 bytes and 21 bytes per
+    // tagged frame message that is 48 frames -- roughly a quarter of a second at 185 fps -- so
+    // the game sprints while the reservoir fills and then walls while it drains, over and over.
+    //
+    // 256 bytes leaves 12 frames of run-ahead, still holds a whole FeedBuild (93 bytes) so the
+    // build path is untouched, and moves the blocking onto the client's PipeXfer write, which
+    // is already the designed, bounded, render-thread-safe path: a 2000 ms budget, the abort
+    // event in the wait set, and a CancelIoEx reap. Nothing new can hang.
+    //
+    // Deliberately here and not client-side: it changes no protocol bytes, no IPC version and
+    // no client build, so a reporter can A/B it by swapping this exe alone -- and it paces the
+    // OpenGL client too, which has no CPU-readable fence value and could never be gated from
+    // its own side. The OUT buffer stays 1024; FeedBuildAck is the biggest thing on it.
+    static const DWORD kPipeInBytes = 256;
     HANDLE pipe = CreateNamedPipeA(name, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                                   1, 1024, 1024, 0, nullptr);
+                                   1, 1024, kPipeInBytes, 0, nullptr);
     if (pipe == INVALID_HANDLE_VALUE) { Log("[host] CreateNamedPipe failed %lu", GetLastError()); return 1; }
-    Log("[host] serving on %s", name);
+    Log("[host] serving on %s (frame backlog bounded to %lu messages: the client is paced by this "
+        "pipe, not by a run-ahead reservoir)", name,
+        static_cast<unsigned long>(kPipeInBytes / (1 + sizeof(FeedFrameMsg))));
     {
         HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         OVERLAPPED ov = {};
@@ -1565,9 +2686,18 @@ static int Serve(DWORD game_pid)
         FAILED(h.dev->CreateSharedHandle(h.fence_out, nullptr, GENERIC_ALL, nullptr, &hout)))
     { Log("[host] shared fence creation failed"); return 1; }
 
+    // These two are the whole synchronisation contract. Ignoring the result meant a failure
+    // (a process handle without PROCESS_DUP_HANDLE, say) still sent the game an ack saying
+    // ok=1 with two null fence handles, and it went looking for the fault everywhere except
+    // here. Fail the session instead; the add-on respawns a host.
     HANDLE game_in = nullptr, game_out = nullptr;
-    DuplicateHandle(GetCurrentProcess(), hin, hgame, &game_in, 0, FALSE, DUPLICATE_SAME_ACCESS);
-    DuplicateHandle(GetCurrentProcess(), hout, hgame, &game_out, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    if (!DuplicateHandle(GetCurrentProcess(), hin, hgame, &game_in, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
+        !DuplicateHandle(GetCurrentProcess(), hout, hgame, &game_out, 0, FALSE, DUPLICATE_SAME_ACCESS))
+    {
+        Log("[host] could not duplicate the shared fences into the game (error %lu); nothing could be "
+            "synchronised, so this host exits", GetLastError());
+        return 1;
+    }
 
     int flags_active = 0;
     bool transport_only = false;
@@ -1576,7 +2706,8 @@ static int Serve(DWORD game_pid)
     // not race that (a 15 ms miss latched STANDBY in Blacklist), so hold it briefly.
     UINT64 hold_until = GetTickCount64() + 800;
     UINT64 evaluated  = 0;
-    bool   warm_done  = g_renodx_lazy;   // v45+ adopts missed creates on its own; Chicken: see the build below
+    bool   warm_done  = g_renodx_lazy || g_opti.routed;   // v45+ adopts missed creates on its own; OptiScaler IS the callee; Chicken: see the build below
+    UINT64 opti_frames = 0;
     int    build_fails = 0;
 
     // The tag read stays pended across pump ticks: a plain blocking ReadFile starves
@@ -1608,7 +2739,10 @@ static int Serve(DWORD game_pid)
                 pending = true;
             }
             const DWORD r = MsgWaitForMultipleObjects(1, &ev_tag, FALSE, 100, QS_ALLINPUT);
-            if (r == WAIT_OBJECT_0 + 1 || r == WAIT_TIMEOUT) { PumpPresent(); continue; }
+            // Idle: the game has not sent the next frame yet, so it is not waiting on us.
+            // The one moment a Present costs it nothing -- pay off anything the
+            // per-evaluate call could not present (issue #15).
+            if (r == WAIT_OBJECT_0 + 1 || r == WAIT_TIMEOUT) { PumpRetireOwedPresents(); PumpPresent(); continue; }
             if (r != WAIT_OBJECT_0) break;
             DWORD got = 0;
             if (!GetOverlappedResult(pipe, &ov_tag, &got, FALSE) || got != 1) { pending = false; break; }
@@ -1631,8 +2765,14 @@ static int Serve(DWORD game_pid)
             // textures under that work hung the GPU on a work-resolution change (Fable
             // Anniversary, 2026-09-02: the next create never completed, DEVICE_HUNG). The
             // warm-up re-create below has always drained first; this path now does too.
-            if (h.feature != nullptr && !WaitFenceValue(h.fence, h.fence_value, 2000))
-                Log("[host] rebuild: the previous feature's GPU work did not retire within 2 s");
+            //
+            // Unconditionally, not just when a feature exists: in transport mode there is no
+            // feature but the last frame's CopyTextureRegion out of h.tex[] can still be in
+            // flight, and the release below would pull the source out from under it. The wait
+            // returns at once on an idle queue, so it costs nothing when there is nothing to
+            // wait for.
+            if (!WaitFenceValue(h.fence, h.fence_value, 2000))
+                Log("[host] rebuild: the previous frame's GPU work did not retire within 2 s");
             SafeReleaseFeature(h.feature);
             h.feature = nullptr;
             for (int i = 0; i < FEED_SLOTS; ++i)
@@ -1647,6 +2787,18 @@ static int Serve(DWORD game_pid)
             const bool host_creates_b = host_creates || (b.client_flags & FEED_BUILD_HOST_CREATES) != 0;
             const bool no_uav         = host_creates_b && (b.client_flags & FEED_BUILD_OUTPUT_NO_UAV) != 0;
             const bool d3d11_opener   = host_creates_b && !host_creates;
+            // Whether the client copies home the previous frame's result. Decides whether a
+            // present the per-evaluate call could not make becomes a debt or a drop (#15).
+            const bool was_async = h.async_home;
+            h.async_home = (b.client_flags & FEED_BUILD_ASYNC_HOME) != 0;
+            static bool said_handoff = false;
+            if (h.async_home != was_async || !said_handoff)
+            {
+                said_handoff = true;
+                Log("[host] client handoff: %s", h.async_home
+                    ? "pipelined (async_home=1): a present DWM defers is retired from the idle path"
+                    : "same frame (async_home=0): a present DWM defers is dropped");
+            }
             if (d3d11_opener)
                 Log("[host] the game's D3D11 device could not create the shared set; creating it here%s",
                     no_uav ? " with the DLSS output's UAV kept on this side" : "");
@@ -1678,9 +2830,18 @@ static int Serve(DWORD game_pid)
                 for (int i = 0; i < FEED_SLOTS && ok; ++i)
                 {
                     HANDLE local = nullptr;
+                    // ALLOW_RENDER_TARGET on every slot a D3D11 opener will see -- the Output
+                    // included when its UAV has moved to the private scratch below (no_uav).
+                    // The old `i != FEED_OUTPUT` assumed the Output always carried the UAV
+                    // flag; with no_uav it carried neither, so it was the only resource in the
+                    // set born with SIMULTANEOUS_ACCESS and nothing else, and the only one a
+                    // feature-level 10_0 device refused to open (issue #43: Color opened, the
+                    // Output came back E_INVALIDARG at identical size and format). The game
+                    // never makes an RTV on the Output -- only the SRV it reads home from -- so
+                    // the extra bind is unused there, and free.
                     h.tex[i] = MakeSharedTexHost(i == FEED_OUTPUT ? out_w : b.width, i == FEED_OUTPUT ? out_h : b.height,
                                                  fmt[i], i == FEED_OUTPUT && !no_uav, &local, &tex_size[i],
-                                                 d3d11_opener && i != FEED_OUTPUT);
+                                                 d3d11_opener && (i != FEED_OUTPUT || no_uav));
                     if (h.tex[i] == nullptr) { ok = false; break; }
                     HANDLE remote = nullptr;
                     if (!DuplicateHandle(GetCurrentProcess(), local, hgame, &remote, 0, FALSE, DUPLICATE_SAME_ACCESS))
@@ -1694,8 +2855,11 @@ static int Serve(DWORD game_pid)
                 {
                     if (h.panel == nullptr)
                     {
+                        // Same rule as the slot loop: a D3D11 opener needs a bind flag on it,
+                        // or CastAdoptHostPanel11 would hit the issue-#43 wall the moment the
+                        // build got this far.
                         h.panel = MakeSharedTexHost(static_cast<UINT>(g_win_w), static_cast<UINT>(g_win_h), DXGI_FORMAT_R8G8B8A8_UNORM,
-                                                    false, &h.panel_local, &h.panel_size, false);
+                                                    false, &h.panel_local, &h.panel_size, d3d11_opener);
                         h.panel_host_owned = h.panel != nullptr;
                         if (h.panel != nullptr) Log("[host] panel texture created for the game (%dx%d): every presented frame is copied into it", g_win_w, g_win_h);
                     }
@@ -1742,11 +2906,40 @@ static int Serve(DWORD game_pid)
                     HRESULT hr = h.dev->OpenSharedHandle(local, __uuidof(ID3D12Resource),
                                                          reinterpret_cast<void **>(&h.tex[i]));
                     CloseHandle(local);
-                    if (FAILED(hr)) { Log("[host] OpenSharedHandle(tex %d) failed 0x%08X", i, hr); ok = false; }
+                    if (FAILED(hr)) { Log("[host] OpenSharedHandle(tex %d) failed 0x%08X", i, hr); ok = false; continue; }
+
+                    // Check what actually arrived against what the message claims. Everything
+                    // downstream -- the NGX create, InRenderSubrectDimensions, the transport
+                    // copy box -- trusts b.width/height/formats, so a texture that does not
+                    // match them is a device-removed or a corrupt frame several steps later,
+                    // with nothing pointing back here. The panel has always been checked this
+                    // way; the four slots that matter were not.
+                    const D3D12_RESOURCE_DESC td = h.tex[i]->GetDesc();
+                    const UINT want_w = (i == FEED_OUTPUT) ? out_w : b.width;
+                    const UINT want_h = (i == FEED_OUTPUT) ? out_h : b.height;
+                    const DXGI_FORMAT want_fmt =
+                        i == FEED_COLOR  ? static_cast<DXGI_FORMAT>(b.color_fmt) :
+                        i == FEED_OUTPUT ? out_fmt :
+                        i == FEED_DEPTH  ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R16G16_FLOAT;
+                    const bool needs_uav = (i == FEED_OUTPUT) && !no_uav && b.transport == 0;
+                    if (td.Width != static_cast<UINT64>(want_w) || td.Height != want_h || td.Format != want_fmt ||
+                        (needs_uav && (td.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0))
+                    {
+                        Log("[host] the game's %s texture is %ux%u fmt=%u flags=0x%X, not %ux%u fmt=%u%s -- refusing the build",
+                            i == FEED_COLOR ? "Color" : i == FEED_OUTPUT ? "Output" : i == FEED_DEPTH ? "Depth" : "MV",
+                            static_cast<unsigned>(td.Width), td.Height, td.Format, td.Flags,
+                            want_w, want_h, want_fmt, needs_uav ? " with a UAV" : "");
+                        ok = false;
+                    }
                 }
             }
 
             // v7: a D3D11 game's panel texture, opened the same way. Never fatal for the build.
+            // CopyPanel runs on pump_queue and tracks its own fence, which the drain at the top
+            // of this rebuild does not cover -- so wait for it here or the release below can
+            // pull the destination out from under a copy that is still running.
+            if (h.panel != nullptr && !h.panel_host_owned && g_panel_fence != nullptr)
+                WaitFenceValue(g_panel_fence, g_panel_val, 500);
             if (h.panel != nullptr && !h.panel_host_owned) { h.panel->Release(); h.panel = nullptr; }
             if (b.panel_tex != 0 && g_panel_ready && !h.panel_host_owned)
             {
@@ -1814,7 +3007,7 @@ static int Serve(DWORD game_pid)
             evaluated = 0;
             // No warm-up without NGX, with v45+, or when Chicken already had its detours ARMED
             // at this create (then it saw it). Otherwise the block below waits for ARMED.
-            warm_done = transport_only || g_renodx_lazy || (g_chicken_present && !g_chicken_created_unarmed);
+            warm_done = transport_only || g_renodx_lazy || g_opti.routed || (g_chicken_present && !g_chicken_created_unarmed);
 
             FeedBuildAck back = {};
             back.ok         = ok ? 1 : 0;
@@ -1830,11 +3023,67 @@ static int Serve(DWORD game_pid)
             WriteFull(pipe, &back, sizeof(back));
             if (!ok && DeviceRemoved("a rebuild")) break;   // the ack went out; retrying here is pointless
         }
+        else if (tag == 'W')
+        {
+            // v8: the add-on's window sliders, applied live. Handled here rather than by
+            // posting to the window thread so it is ordered against the rebuild the add-on
+            // sends straight afterwards -- the panel texture it hands over must be the new
+            // size, and both arrive down this one pipe in order.
+            FeedWindowMsg wm = {};
+            if (!ReadFull(pipe, &wm, sizeof(wm))) break;
+            int want_h = static_cast<int>(wm.height);
+            if (want_h == 0)   // 0 = auto: fill the work area, same rule as the ini key
+            {
+                RECT wa = {}, deco = {};
+                if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0) && wa.bottom > wa.top)
+                {
+                    AdjustWindowRect(&deco, WS_OVERLAPPEDWINDOW, FALSE);
+                    want_h = (wa.bottom - wa.top) - (deco.bottom - deco.top);
+                }
+            }
+            if (HostResize(static_cast<int>(wm.width), want_h, "the game asked") && h.hwnd != nullptr)
+            {
+                RECT frame = { 0, 0, g_win_w, g_win_h };
+                AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+                SetWindowPos(h.hwnd, nullptr, 0, 0, frame.right - frame.left, frame.bottom - frame.top,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+        else if (tag == 'O')
+        {
+            // v9: the add-on's "Show ReShade in Host" button. Re-arm the startup sequence
+            // rather than posting here: the two edges have to land in different frames of
+            // THIS process, and the pump is what counts them.
+            g_overlay_key_at = g_pump_count + 2;
+            // The key toggles, so this shows the overlay only if it is currently hidden. The
+            // add-on tracks that and labels its button show/hide; nothing here can query ReShade.
+            Log("[host] the game asked to toggle ReShade's overlay: posting key %u to this window", g_overlay_key);
+        }
         else if (tag == 'F')
         {
             FeedFrameMsg fm = {};
             if (!ReadFull(pipe, &fm, sizeof(fm))) break;
-            if (h.feature == nullptr && !transport_only) { h.fence_out->Signal(fm.n); continue; }
+
+            // How far ahead of us the client has run. Under async_home=1 nothing bounds its
+            // CPU: its GPU waits on the frame before, but the frame MESSAGES pile up in the
+            // pipe's kernel buffer until that buffer is full. That reservoir is the shape
+            // #15's burst-then-wall rhythm fits, and this is the number that proves or kills
+            // it. Non-blocking, and safe with an overlapped read pended.
+            {
+                DWORD avail = 0;
+                if (PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr))
+                {
+                    const unsigned long long queued = avail / (1 + sizeof(FeedFrameMsg));
+                    if (queued > g_backlog_peak) g_backlog_peak = queued;
+                }
+            }
+            // No feature yet: release the game's wait and take the next frame. The pump
+            // still has to run here. This loop's only other pumps are the per-evaluate
+            // PumpPresent below and the idle branch of the tag wait, and with frames
+            // arriving at game rate the tag wait never goes idle -- so a bare `continue`
+            // left the window unpumped for as long as the feature was missing, and
+            // Windows ghosts it as "Not Responding" within seconds while the game runs on.
+            if (h.feature == nullptr && !transport_only) { h.fence_out->Signal(fm.n); PumpPresent(); continue; }
 
             // Order the evaluate behind the game's input copies on the GPU timeline and
             // move on. This used to block the CPU on the same value first, which
@@ -1870,6 +3119,8 @@ static int Serve(DWORD game_pid)
             if (done)
             {
                 h.queue->Signal(h.fence_out, fm.n);
+                if (g_opti.routed && !g_opti_backend.checked && ++opti_frames == 2)
+                    OptiBackendCheck(&Log, "host", g_opti.upscaler, &g_opti_backend);
                 // One warm-up re-create per build. RenoDX: it misses the very first create
                 // (STANDBY latch) when its hooks armed a moment too late, so re-create at a
                 // fixed frame count. Chicken: it arms its detours seconds after claiming, and
@@ -1910,7 +3161,73 @@ static int Serve(DWORD game_pid)
             }
 
             if (fm.n <= 3 || (fm.n % 1800) == 0)
-                Log("[host] frame %llu evaluated", (unsigned long long)fm.n);
+            {
+                // The GPU cost of the DLSS work, which is the number a "performance loss"
+                // report actually needs and which nothing here used to measure (issue #52).
+                char gpu_part[64] = "";
+                if (h.ts_n > 0)
+                {
+                    sprintf_s(gpu_part, ", DLSS GPU %.2f ms/frame", h.ts_sum_ms / double(h.ts_n));
+                    h.ts_sum_ms = 0.0;
+                    h.ts_n = 0;
+                }
+                // The pacing block (issue #15). Everything here is per-window and reset below,
+                // so two consecutive lines can be compared directly: a steady ms/evaluate with
+                // a backlog near the pipe's capacity is the run-ahead reservoir, and a
+                // ring-wait total near zero is what retires the allocator-ring theory.
+                char pace[224] = "";
+                if (g_pace_evals > 0)
+                    sprintf_s(pace, " | pace: %.2f ms/evaluate (%.1f/s), %.2f presents per evaluate, "
+                                    "client queued up to %llu frames ahead, ring waited %.2f ms over %llu frames",
+                              g_pace_span_ms / double(g_pace_evals),
+                              g_pace_span_ms > 0.0 ? 1000.0 * double(g_pace_evals) / g_pace_span_ms : 0.0,
+                              double(g_pace_presents) / double(g_pace_evals),
+                              (unsigned long long)g_backlog_peak,
+                              g_ring_wait_ms, (unsigned long long)g_ring_waits);
+                Log("[host] frame %llu evaluated (%llu presents skipped so far, %llu owed%s)%s",
+                    (unsigned long long)fm.n, (unsigned long long)g_present_skipped,
+                    (unsigned long long)g_present_owed, gpu_part, pace);
+                g_pace_evals    = 0;
+                g_pace_span_ms  = 0.0;
+                g_pace_presents = 0;
+                g_backlog_peak  = 0;
+                g_ring_waits    = 0;
+                g_ring_wait_ms  = 0.0;
+            }
+            // How fast evaluates are actually arriving, and how many Presents each one drives.
+            {
+                static LARGE_INTEGER prev = {}, freq = {};
+                if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                if (prev.QuadPart != 0)
+                {
+                    g_pace_span_ms += 1000.0 * double(now.QuadPart - prev.QuadPart) / double(freq.QuadPart);
+                    ++g_pace_evals;
+                }
+                prev = now;
+            }
+
+            // Pay off what earlier evaluates could not present BEFORE taking this one's own
+            // present. The idle branch of the tag wait above is the other repayment point,
+            // but it only runs when MsgWaitForMultipleObjects times out after 100 ms -- so
+            // in a game delivering frames every ~20 ms it never runs at all, and the debt
+            // sat at its cap for the whole session (issue #33). Here the game is already
+            // behind fence_out and is not waiting on us, which is the same argument.
+            //
+            // Bounded to ONE repayment, though. The debt caps at 4, so an unbounded repayment
+            // here let a single evaluate drive up to five Presents -- each one a full-window
+            // banner CopyResource, ReShade's whole Present hook (where the neural consumer's
+            // per-frame work lives) and CopyPanel. Above the desktop's refresh rate
+            // WAS_STILL_DRAWING is the steady state, so the debt pins at its cap and every
+            // evaluate pays the full five: present amplification is the one per-evaluate cost
+            // that differs between async_home=1 and =0, which is the split #15 reports. One
+            // repayment plus this evaluate's own present is two, the debt still exists, still
+            // caps at 4, and the idle path below still repays it without limit -- so #33's
+            // reasoning is untouched, and so is one-Present-per-evaluate.
+            const unsigned long long owed_before = g_present_owed;
+            PumpRetireOwedPresents(1);
+            g_pace_presents += 1 + (owed_before - g_present_owed);
             PumpPresent(true);   // per evaluate, deliberately -- see PumpPresent
         }
         else
@@ -1966,8 +3283,15 @@ static void ShutdownDisguise()
 // Same shape as the add-ons' filter: the crash goes in the log with the faulting
 // module, and a minidump lands next to it (dbghelp loaded on demand).
 typedef BOOL (WINAPI *PFN_MiniDumpWriteDump_)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+static volatile LONG g_crash_once;
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
+    // One thread records; the rest go straight on. Both add-ons learned this from The Surge
+    // 2, where a GPU fault took out eight threads inside the driver at once and they raced
+    // for the same dump file -- seven sharing violations and no dump. This side never got
+    // the same guard, and it runs the identical driver stack.
+    if (InterlockedCompareExchange(&g_crash_once, 1, 0) != 0) return EXCEPTION_CONTINUE_SEARCH;
+
     const void *addr = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
     const DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
     wchar_t owner[MAX_PATH] = L"unknown";
@@ -1976,8 +3300,17 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            static_cast<LPCWSTR>(addr), &mod) && mod != nullptr)
         GetModuleFileNameW(mod, owner, MAX_PATH);
-    Log("### CRASH RECORDED ###  exception 0x%08X at %p in %ls%s", code, addr, owner,
+    // A C++ throw is raised from inside KERNELBASE, so `owner` always names KERNELBASE.dll
+    // and `addr` is meaningless. This process loads ReShade, the neural consumer and the
+    // whole NVIDIA user-mode driver stack, so "something in here threw" is not an answer:
+    // the thrown type and the module chain are (feed_crash.h).
+    char detail[640];
+    FeedCrashDescribe(ep != nullptr ? ep->ExceptionRecord : nullptr, detail, sizeof(detail));
+    Log("### CRASH RECORDED ###  exception 0x%08X%s at %p in %ls%s", code, detail, addr, owner,
         mod == GetModuleHandleW(nullptr) ? " (inside this host)" : "");
+    char stack[512];
+    FeedCrashStackModules(ep != nullptr ? ep->ContextRecord : nullptr, stack, sizeof(stack));
+    if (stack[0] != '\0') Log("[host] crash stack, by module (innermost first): %s", stack);
 
     char path[MAX_PATH];
     strcpy_s(path, g_log_path);
@@ -2000,15 +3333,100 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// ---------------------------------------------------------------------------------------
+// Optional: ask the GPU scheduler to favour this process (#83)
+//
+// A reporter on GTA IV under DXVK hit multi-second stalls every ~30 s and fixed them by
+// raising this helper's GPU scheduling priority with Process Lasso. The helper renders
+// nothing of its own -- it holds one queue that the game is blocked on -- so letting it be
+// preempted by whatever else wants the GPU shows up directly as a stall in the game.
+//
+// Off unless asked for. Realtime GPU priority can starve the very game it is meant to help,
+// which is why the reporter suggested it be optional, and why this is a flag and not a
+// default. D3DKMTSetProcessSchedulingPriorityClass is in gdi32 but in no public import
+// library, so it is resolved by name; the call also needs privilege that may not be
+// granted, so the result is logged either way rather than assumed.
+// ---------------------------------------------------------------------------------------
+typedef enum _FEED_D3DKMT_PRIORITY_CLASS
+{
+    FEED_D3DKMT_PRIORITY_IDLE = 0,
+    FEED_D3DKMT_PRIORITY_BELOW_NORMAL,
+    FEED_D3DKMT_PRIORITY_NORMAL,
+    FEED_D3DKMT_PRIORITY_ABOVE_NORMAL,
+    FEED_D3DKMT_PRIORITY_HIGH,
+    FEED_D3DKMT_PRIORITY_REALTIME
+} FEED_D3DKMT_PRIORITY_CLASS;
+
+static void RaiseGpuSchedulingPriority()
+{
+    typedef LONG (WINAPI *PFN_SetPrio)(HANDLE, FEED_D3DKMT_PRIORITY_CLASS);
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    if (gdi == nullptr) gdi = LoadLibraryW(L"gdi32.dll");
+    auto set_prio = gdi != nullptr
+        ? reinterpret_cast<PFN_SetPrio>(GetProcAddress(gdi, "D3DKMTSetProcessSchedulingPriorityClass"))
+        : nullptr;
+    if (set_prio == nullptr)
+    {
+        Log("[host] gpu_priority: D3DKMTSetProcessSchedulingPriorityClass not available; left alone");
+        return;
+    }
+    const LONG st = set_prio(GetCurrentProcess(), FEED_D3DKMT_PRIORITY_REALTIME);
+    if (st == 0)
+        Log("[host] gpu_priority: GPU scheduling priority raised to REALTIME for this helper. "
+            "If the game itself now stutters, turn host_gpu_priority back off (#83)");
+    else
+        Log("[host] gpu_priority: the GPU scheduler refused the change (status 0x%08X); "
+            "priority is unchanged and nothing else is affected", st);
+}
+
 int main(int argc, char **argv)
 {
+    // A run with no arguments is somebody double-clicking this exe to find out what it is --
+    // and it used to answer by TRUNCATING the log of the run they were trying to explain,
+    // because the log is opened "w" as the first thing main does. Say what this is and
+    // leave, touching nothing (issue #46: the attached host log turned out to be a log of
+    // the investigation rather than of the fault).
+    if (argc < 2)
+    {
+        MessageBoxA(nullptr,
+                    "This is the 64-bit helper for the DLSS 5 Feed ReShade add-on.\r\n\r\n"
+                    "It is started by the add-on from inside the game -- there is nothing to run here.\r\n"
+                    "Its log is dlss5-feed-host.log, next to this file; this run has left it alone.",
+                    "DLSS 5 Feed helper", MB_OK | MB_ICONINFORMATION);
+        return 1;
+    }
+
     GetModuleFileNameA(nullptr, g_log_path, MAX_PATH);
     if (char *s = strrchr(g_log_path, '\\'))
         strcpy_s(s + 1, MAX_PATH - (s + 1 - g_log_path), "dlss5-feed-host.log");
-    { FILE *f = nullptr; if (fopen_s(&f, g_log_path, "w") == 0 && f) fclose(f); }
+    // An install under Program Files is not writable without elevation, and both fopen_s
+    // calls used to fail in silence -- CREATE_NO_WINDOW leaves no console for the duplicate
+    // printf either, so the helper ran completely mute. Fall back to LocalAppData, and log
+    // the path we settled on so nobody reads a stale file.
+    {
+        FILE *f = nullptr;
+        if (fopen_s(&f, g_log_path, "w") == 0 && f) fclose(f);
+        else
+        {
+            char fallback[MAX_PATH] = {};
+            size_t n = 0;
+            if (getenv_s(&n, fallback, MAX_PATH, "LOCALAPPDATA") == 0 && n > 1)
+            {
+                strcat_s(fallback, MAX_PATH, "\\DLSS5-Feeder");
+                CreateDirectoryA(fallback, nullptr);
+                strcat_s(fallback, MAX_PATH, "\\dlss5-feed-host.log");
+                FILE *g = nullptr;
+                if (fopen_s(&g, fallback, "w") == 0 && g) { fclose(g); strcpy_s(g_log_path, MAX_PATH, fallback); }
+            }
+        }
+    }
     SetUnhandledExceptionFilter(&CrashFilter);
 
     Log("dlss5-feed-host64 (built %s %s)", __DATE__, __TIME__);
+    // Logged before it is parsed, so a log that ends at the usage line says WHY: "no
+    // arguments" and "an argument zeroed the pid" used to be indistinguishable (issue #46).
+    Log("[host] command line (argc=%d): %s", argc, GetCommandLineA());
+    Log("[host] log file: %s", g_log_path);
 
     // Every Sleep in this process is a frame-pacing decision: at the default 15.6 ms
     // timer tick a Sleep(1) lands at 15.6 ms, and the serve loop's poll alone used to
@@ -2016,33 +3434,49 @@ int main(int argc, char **argv)
     // helper, and process exit restores the resolution anyway.
     timeBeginPeriod(1);
 
-    bool  test = false, hide = false, behind = false;
+    bool  test = false, hide = false, behind = false, gpu_priority = false;
     DWORD pid = 0;
     for (int i = 1; i < argc; ++i)
     {
         if      (strcmp(argv[i], "--test") == 0) test = true;
         else if (strcmp(argv[i], "--hide") == 0) hide = true;
         else if (strcmp(argv[i], "--behind") == 0) behind = true;
-        else pid = static_cast<DWORD>(strtoul(argv[i], nullptr, 10));
+        else if (strcmp(argv[i], "--gpu-priority") == 0) gpu_priority = true;
+        // First numeric token wins. This used to be a bare assignment, so ANY later token
+        // the parser did not recognise ran through strtoul, came back 0, and silently
+        // overwrote an already-parsed pid -- turning a good command line into the usage
+        // exit with nothing in the log to say which argument did it.
+        else if (pid == 0 && (pid = static_cast<DWORD>(strtoul(argv[i], nullptr, 10))) != 0) {}
+        else Log("[host] ignoring an argument I do not understand: %s", argv[i]);
     }
     if (!test && pid == 0)
     {
-        Log("usage: dlss5-feed-host64 --test | dlss5-feed-host64 <game pid> [--hide | --behind]");
+        Log("usage: dlss5-feed-host64 --test | dlss5-feed-host64 <game pid> [--hide | --behind] "
+            "[--gpu-priority]");
         return 1;
     }
     g_show_window = !test && !hide;   // the visible window carries the DLSS 5 add-on's tuning panel
     g_behind      = g_show_window && behind;
+    if (gpu_priority) RaiseGpuSchedulingPriority();
 
     DetectRenodxAddon();   // must run BEFORE ReShade loads, so an EnableHooks write is read
     DetectToolkitAddon();
     DetectChickenAddon();   // after DetectRenodxAddon: it needs g_renodx_present
+    DetectOptiScaler();     // after both: it warns when either is beside it
     DetectStaleD3DCompiler();
     PrepareHostOverlay();   // edits ReShade.ini, so also BEFORE ReShade loads (InitDisguise)
 
-    if (!InitDisguise()) return 1;
-    if (!InitNgx()) { Log("[host] NGX unavailable"); return 1; }
+    // Both failures used to `return 1` straight out, skipping the tail below -- and a failed
+    // NGX init is exactly the case where ReShade is already loaded and its teardown is the
+    // thing that hangs. Everything leaves through one door now.
+    int rc = 1;
+    if (!InitDisguise())
+        Log("[host] the disguise swapchain could not be created");
+    else if (!InitNgx())
+        Log("[host] NGX unavailable");
+    else
+        rc = test ? RunTest() : Serve(pid);
 
-    const int rc = test ? RunTest() : Serve(pid);
     ShutdownDisguise();
     // Everything that had to happen has happened: ReShade wrote its ini when its runtime
     // went with the swapchain above. What is left is ReShade's own DLL teardown (unhooking

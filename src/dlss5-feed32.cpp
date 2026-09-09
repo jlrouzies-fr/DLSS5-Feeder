@@ -16,6 +16,11 @@
 //    import-only (there is no export in GL_EXT_external_objects_win32). The GL half
 //    is raw, through the very same src/feed_gl.h the 64-bit add-on uses, compiled
 //    x86; both directions are proven by spike/spike-gl32.exe. See PLAN-OPENGL §5.
+//  * D3D10: created here as well -- but by a PRIVATE D3D11 RELAY DEVICE, not by the
+//    game's. A D3D10.1 device has no NT-handle sharing, no fence and no UAV, so it
+//    cannot reach the host at all; it hands its frame to the relay over a legacy
+//    keyed-mutex texture (src/feed_d3d10.h) and from there this is the D3D11 client
+//    above, unchanged -- same client kind, same protocol version, same host.
 //  * Vulkan: created by the HOST too, because D3D12 cannot open what Vulkan exports.
 //    The transport is src/feed_vk.h -- again the 64-bit add-on's own header, compiled
 //    x86 -- with the queue signal/wait going through ReShade (an api::fence handle IS
@@ -44,18 +49,21 @@
 #include <reshade.hpp>
 
 #include "feed_ipc.h"
+#include "feed_crash.h" // naming a C++ throw, shared with the 64-bit add-on and the host
 #include "feed_fmt.h"  // the DXGI format decisions shared with the host
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 #include "feed_gl.h"   // raw-OpenGL interop, the same header the 64-bit add-on uses
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
+#include "feed_d3d10.h"     // D3D10.1 <-> D3D11 keyed-mutex bridge + the private relay device
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
+#include "feed_opti.h"      // OptiScaler DLSS-NR: only the file scan and the ini reader are used here (it lives in host64 too)
 
-#define FEED_VERSION "0.12.0"
+#define FEED_VERSION "0.15.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Feeds DLSS 5 neural rendering in 32-bit D3D11, OpenGL and Vulkan (DXVK) games without DLSS: ships the frame, depth and "
+    "Feeds DLSS 5 neural rendering in 32-bit D3D10, D3D11, OpenGL and Vulkan (DXVK) games without DLSS: ships the frame, depth and "
     "motion vectors to a 64-bit helper process (host64\\dlss5-feed-host64.exe) over cross-process "
     "shared GPU textures, and blits the neural result back. Needs DLSS5_Feed.fx and a motion-vector "
     "provider (DRME, qUINT, Launchpad, VORT or LumeniteFX; pick it with the DLSS5_MV_PROVIDER definition). "
@@ -101,35 +109,73 @@ static void Warn(const char *fmt, ...)
     reshade::log::message(reshade::log::level::warning, tagged);
 }
 
-static const char *volatile g_where = "starting up";
+// The initial value has to read as "nothing has happened yet", not as a phase. It used to
+// say "starting up", which is what a crash line reports whenever no Breadcrumb has been
+// reached -- and every Breadcrumb is inside the feed path, so with the feed off, or before
+// the first shared-texture build, it can never say anything else. A reporter (and the
+// maintainer answering them) read that as evidence the crash happened during our startup,
+// which it is not: the useful half of the line is the faulting module (issue #44).
+static const char *volatile g_where = "nothing yet -- no feed work has run in this process";
 static void Breadcrumb(const char *what) { g_where = what; }
 
 // The 64-bit add-on has recorded crashes with a breadcrumb since 0.8; this side only
 // set the breadcrumb and never read it, so a 32-bit crash left nothing in the log past
-// the last ordinary line. Same filter here, plus a minidump next to the log (dbghelp
-// loaded on demand -- the process is already dying when it is needed).
+// the last ordinary line. Same filter here, plus a minidump next to the log.
+//
+// dbghelp is resolved EARLY (FeedResolveDbghelp, from an effect-runtime init) rather
+// than inside the filter: ReShade refuses a LoadLibrary made from a thread it considers
+// deadlock-prone and logs "Ignoring LoadLibrary('dbghelp.dll') call to avoid possible
+// deadlock", which is how the one crash worth a dump ended up with none.
 typedef BOOL (WINAPI *PFN_MiniDumpWriteDump_)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+static PFN_MiniDumpWriteDump_ g_write_dump;
+
+// Called from an event where a LoadLibrary is safe (never from DllMain, never from the
+// exception filter). Cheap and idempotent.
+static void FeedResolveDbghelp()
+{
+    if (g_write_dump != nullptr) return;
+    if (HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll"))
+        g_write_dump = reinterpret_cast<PFN_MiniDumpWriteDump_>(GetProcAddress(dbghelp, "MiniDumpWriteDump"));
+}
+
 static void WriteCrashDump(EXCEPTION_POINTERS *ep)
 {
     char path[MAX_PATH];
     strcpy_s(path, g_log_path);
     if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "dlss5-feed-crash.dmp");
-    HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
-    auto write = dbghelp ? reinterpret_cast<PFN_MiniDumpWriteDump_>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+    // Last resort only: if the early resolve never ran, try anyway -- ReShade may refuse it.
+    PFN_MiniDumpWriteDump_ write = g_write_dump;
+    if (write == nullptr)
+    {
+        if (HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll"))
+            write = reinterpret_cast<PFN_MiniDumpWriteDump_>(GetProcAddress(dbghelp, "MiniDumpWriteDump"));
+    }
     if (write == nullptr) { Log("[feed32] no dbghelp.dll; no crash dump written"); return; }
-    HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // FILE_SHARE_READ: a second thread faulting at the same moment should be able to read
+    // this file rather than fail with a sharing violation (error 32).
+    HANDLE f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) { Log("[feed32] could not create %s (error %lu)", path, GetLastError()); return; }
     struct { DWORD tid; EXCEPTION_POINTERS *ep; BOOL client; } info = { GetCurrentThreadId(), ep, FALSE };
     const int type = 0x0040 | 0x0001 | 0x0004;   // IndirectlyReferencedMemory | DataSegs | HandleData
-    const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), f, type, ep != nullptr ? &info : nullptr, nullptr, nullptr);
+    const BOOL  ok  = write(GetCurrentProcess(), GetCurrentProcessId(), f, type, ep != nullptr ? &info : nullptr, nullptr, nullptr);
+    const DWORD err = ok ? 0 : GetLastError();   // before CloseHandle, which overwrites it
     CloseHandle(f);
-    Log(ok ? "[feed32] crash dump written: %s -- attach it to the issue with this log"
-           : "[feed32] crash dump FAILED (%s, error %lu)", path, GetLastError());
+    if (ok) Log("[feed32] crash dump written: %s -- attach it to the issue with this log", path);
+    else    Log("[feed32] crash dump FAILED (%s, error %lu)", path, err);
 }
 
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
+static volatile LONG g_crash_once;
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
+    // One record per process, and only one thread may make it. Two ways this is reached
+    // more than once: a game whose own handler resumes the faulting instruction comes
+    // back every few hundred ms (WormsXHD at exit, 31 times), and a GPU fault takes out
+    // every thread inside the driver at once (The Surge 2, eight of them -- they raced
+    // for the same dump file and seven got a sharing violation).
+    if (InterlockedCompareExchange(&g_crash_once, 1, 0) != 0)
+        return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+
     const void *addr = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
     const DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
     wchar_t owner[MAX_PATH] = L"unknown";
@@ -138,13 +184,15 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            static_cast<LPCWSTR>(addr), &mod) && mod != nullptr)
         GetModuleFileNameW(mod, owner, MAX_PATH);
-    Log("### CRASH RECORDED ###  exception 0x%08X at %p in %ls; this add-on was last doing: %s%s", code, addr,
+    // A C++ throw is raised from inside KERNELBASE, so `owner` above always names
+    // KERNELBASE.dll and `addr` is meaningless -- the thrown type is what identifies the
+    // thrower (feed_crash.h; the module chain needs x64 unwind tables, so not on this side).
+    char detail[640];
+    FeedCrashDescribe(ep != nullptr ? ep->ExceptionRecord : nullptr, detail, sizeof(detail));
+    Log("### CRASH RECORDED ###  exception 0x%08X%s at %p in %ls; this add-on was last doing: %s%s "
+        "(later faults in this process are not recorded)", code, detail, addr,
         owner, g_where, mod == g_self ? " (inside this add-on)" : "");
-    // One dump per process: a game whose own handler resumes the faulting instruction
-    // comes back here every few hundred ms (WormsXHD at exit, 31 times), and rewriting
-    // the dump each time is what would keep it busy.
-    static int crashes = 0;
-    if (++crashes == 1) WriteCrashDump(ep);
+    WriteCrashDump(ep);
     return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -254,6 +302,16 @@ struct Cfg
                            // tuning panel is cast INTO the game window on request (the overlay's "Show the
                            // DLSS 5 panel in-game" button / cast_key). 1 = the host's own visible window,
                            // the old way (press Home there). Read when the host is started.
+                           //
+                           // NOT a hide switch, and it has been read as one: 0 passes --behind, which is
+                           // still a shown, still a PRESENTED window -- only its z-order and extended
+                           // style differ. #15 used host_window as an A/B for "does the helper's present
+                           // cost anything", and both arms presented every evaluate, so it measured
+                           // nothing. Only --hide, which the add-on never passes, suppresses the window.
+    int   host_gpu_priority; // 1 = pass --gpu-priority, asking the GPU scheduler to favour the
+                           // helper process. Off by default: it can starve the game it is meant to
+                           // help, and it only matters where the helper is being preempted (#83,
+                           // GTA IV under DXVK: multi-second stalls the reporter fixed by hand).
     int   work_resolution; // 50..100 percent of each backbuffer axis; the game stays native-sized
     int   work_upscale;    // expand-back of the work-size output: 0 = bilinear, 1 = AMD FSR 1
                            // (EASU + RCAS), 2 = DLSS Super Resolution on synthetic jitter (D3D11
@@ -274,9 +332,18 @@ struct Cfg
     int   cast_mode;       // how the panel is displayed: 0 = desktop-compositor thumbnail of the host window
                            // (windowed / borderless only), 1 = the host's shared panel texture drawn by the
                            // game's ReShade (IPC v7; works in exclusive fullscreen; all three client APIs)
+    int   cast_anchor;     // which corner of the game window the cast panel sits in: 0 top-left,
+                           // 1 top-right (the original, and still the default), 2 bottom-left,
+                           // 3 bottom-right. It was nailed to the top-right with no control at
+                           // all, which issue #44 reported as pinned and unmovable.
+    int   host_creates;    // 0 = auto: this side creates the shared set and falls back to the host only when
+                           // its device refuses one (a feature-level 10.x game, issue #33/#43). 1 = always
+                           // let the host create it, which is the only way to exercise that path on a device
+                           // that does not need it. Parse-only, not written back, not on the overlay.
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 100, 0 };
+//                                        host_window --v  v-- host_gpu_priority (off)
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 100, 0, 1, 0 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -343,27 +410,72 @@ static void CfgWriteDefault()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_scale=%d\ncast_mode=%d\n",
+               "host_window=%d\nhost_gpu_priority=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
-            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale, g_cfg.cast_mode);
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
+            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale, g_cfg.cast_mode,
+            g_cfg.cast_anchor);
     fclose(f);
 }
 
-// Writes every current value, overwriting the file -- used by the overlay page so an
-// edit made there survives the next CfgReload() instead of being read back off the
-// stale on-disk copy 60 frames later.
+// The keys CfgSave() writes. Anything else in the file is carried over untouched: comments,
+// and any key a different build of this add-on understands. (The 64-bit side lost hand-set
+// diagnostics this way -- see its CfgSave.)
+static const char *const kCfgSavedKeys[] = {
+    "enabled", "mode", "hdr", "depth_inverted", "flags", "reset_every", "log_frames",
+    "host_window", "host_gpu_priority", "work_resolution", "work_upscale", "work_sharpness", "async_home",
+    "mv_scale_x", "mv_scale_y", "cast_key", "cast_scale", "cast_mode", "cast_anchor",
+};
+
+static bool CfgKeyIsSaved(const char *key)
+{
+    for (const char *k : kCfgSavedKeys)
+        if (_stricmp(k, key) == 0) return true;
+    return false;
+}
+
+// Writes every current value -- used by the overlay page so an edit made there survives the
+// next CfgReload() instead of being read back off the stale on-disk copy 60 frames later.
+// Everything the file holds that is not one of ours is preserved rather than truncated away.
 static void CfgSave()
 {
     char path[MAX_PATH];
     CfgPath(path);
+
+    std::string carried;
+    FILE *r = nullptr;
+    if (fopen_s(&r, path, "r") == 0 && r != nullptr)
+    {
+        char line[256];
+        while (fgets(line, sizeof(line), r) != nullptr)
+        {
+            char key[64] = {};
+            const char *eq = strchr(line, '=');
+            bool ours = false;
+            if (eq != nullptr && sscanf_s(line, "%63[^=]", key, static_cast<unsigned>(sizeof(key))) == 1)
+            {
+                size_t n = strlen(key);
+                while (n > 0 && (key[n - 1] == ' ' || key[n - 1] == '\t')) key[--n] = '\0';
+                const char *k = key;
+                while (*k == ' ' || *k == '\t') ++k;
+                ours = CfgKeyIsSaved(k);
+            }
+            if (ours) continue;   // rewritten below from g_cfg
+            carried += line;
+            if (carried.back() != '\n') carried += '\n';
+        }
+        fclose(r);
+    }
+
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_scale=%d\ncast_mode=%d\n",
+               "host_window=%d\nhost_gpu_priority=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
-            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale, g_cfg.cast_mode);
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
+            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale, g_cfg.cast_mode,
+            g_cfg.cast_anchor);
+    if (!carried.empty()) fputs(carried.c_str(), f);
     fclose(f);
 }
 
@@ -422,6 +534,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "reset_every")    == 0) next.reset_every    = iv;
         else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
         else if (_stricmp(key, "host_window")    == 0) next.host_window    = iv;
+        else if (_stricmp(key, "host_gpu_priority") == 0) next.host_gpu_priority = iv;
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
         else if (_stricmp(key, "work_upscale")   == 0) next.work_upscale   = iv;
         else if (_stricmp(key, "work_sharpness") == 0) next.work_sharpness = val;
@@ -431,6 +544,8 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "cast_key")       == 0) next.cast_key       = (iv > 0 && iv < 256) ? iv : 0;
         else if (_stricmp(key, "cast_scale")     == 0) next.cast_scale     = iv < 25 ? 25 : iv > 300 ? 300 : iv;
         else if (_stricmp(key, "cast_mode")      == 0) next.cast_mode      = iv == 1 ? 1 : 0;
+        else if (_stricmp(key, "cast_anchor")    == 0) next.cast_anchor    = iv < 0 ? 0 : iv > 3 ? 3 : iv;
+        else if (_stricmp(key, "host_creates")   == 0) next.host_creates   = iv == 1 ? 1 : 0;
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
@@ -443,9 +558,16 @@ static bool CfgReload()   // true when a build-affecting value changed
     if (changed)
     {
         g_cfg = next;
-        Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f",
+        // Every knob, not a selection of them. async_home in particular decides the whole
+        // handoff contract, and no DXVK report could be triaged without asking the reporter
+        // what they had set (issue #15). The 64-bit side has always printed its full set.
+        Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d log_frames=%d "
+            "host_window=%d host_gpu_priority=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f async_home=%d "
+            "mv_scale=%.3f,%.3f cast_key=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness);
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
+            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale,
+            g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.host_creates);
     }
     return rebuild;
 }
@@ -603,6 +725,15 @@ struct Feed32
     bool                       vk_released;      // our images are released to VK_QUEUE_FAMILY_EXTERNAL
                                                  // (the host's D3D12 device owns them until the next acquire)
 
+    // D3D10 client: not really a client at all. A private D3D11 relay device (feed_d3d10.h)
+    // is what talks to the host, so g.dev, g.ctx4, g.tex[] and g.fence_* below are all the
+    // RELAY's -- everything from BuildShared down is the D3D11 path, byte for byte. The
+    // game's own D3D10.1 device only ever does CopyResource, into and out of the bridges.
+    bool            is_d3d10;
+    FeedD3D10       d10;
+    FeedD3D10Bridge d10_bridge[FEED_SLOTS];   // native-sized; FEED_OUTPUT is the one with an RTV
+    ID3D10Device1  *d10_dev;                  // not owned, and only for the log line
+
     bool        built;
     UINT        width, height;                  // the work resolution DLSS runs at
     UINT        output_width, output_height;    // the Output slot: == work (DLAA) or native (work_upscale=2)
@@ -672,6 +803,28 @@ static DXGI_FORMAT TypedColorFormat(DXGI_FORMAT f)
     }
 }
 
+// The typeless member of a backbuffer format's family. A D3D11 view format must match its
+// resource exactly unless the resource is typeless, so a work-resolution staging copy made
+// in the raw backbuffer format cannot carry the ..._UNORM view TypedColorFormat asks for
+// when the backbuffer is ..._UNORM_SRGB. Formats with no typeless member come back
+// unchanged -- they are their own family, and the typed view already matches. (#85)
+static DXGI_FORMAT TypelessColorFormat(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    default:
+        return f;
+    }
+}
+
 static DXGI_FORMAT OutputFormatFor(DXGI_FORMAT color_typed)
 {
     switch (color_typed)
@@ -725,7 +878,76 @@ static void FeedFail(const char *what)
 
 // ---------------------------------------------------------------------------
 // Host process + pipe
+//
+// Starting the helper, shaking hands with it and asking it to build all used to happen on
+// the render thread, inside Present. Starting it meant spinning on CreateFile for up to
+// 15 s and then blocking on the hello ack; every build blocked on an ack the host only
+// sends once NGX is up and the feature is created, which on a cold host includes the
+// ~165 MB model load. So every Apply, restart, resize and work-resolution change froze the
+// game for seconds while the overlay's own text claimed it kept rendering. And a host that
+// hung rather than died froze it for good: the pipe calls had no timeout, and HostAlive()
+// cannot tell a hang from health.
+//
+// So: a worker thread does the waiting, the frame path polls it, and every pipe transfer
+// is bounded. The worker touches nothing but Win32 and the pipe -- never ReShade, never the
+// game's device -- and the pipe has exactly one user at a time by construction, not by
+// lock: the render thread only writes a frame message once a build has finished, and a
+// build only finishes after the job that carried it was consumed here.
 // ---------------------------------------------------------------------------
+
+enum { LINK_IDLE = 0, LINK_RUNNING, LINK_DONE, LINK_FAILED };
+
+enum { JOB_CONNECT = 1, JOB_BUILD };
+
+struct HostLink
+{
+    HANDLE        thread;
+    volatile LONG state;        // LINK_*; the worker only ever moves RUNNING -> DONE/FAILED
+    volatile LONG abort;        // set by the render thread; the worker checks it between steps
+    HANDLE        abort_event;  // and it wakes every wait the worker is parked in
+    int           job;          // JOB_*
+    FeedBuild     build;        // JOB_BUILD in
+    FeedBuildAck  ack;          // JOB_BUILD out
+    HANDLE        pipe;         // JOB_CONNECT out -- adopted into g.pipe / g.hproc by the
+    HANDLE        proc;         //   render thread, on success AND on failure (so HostClose
+    uint32_t      panel_w;      //   disposes of a half-made link the usual way)
+    uint32_t      panel_h;
+    HMODULE       mod_ref;      // a reference on THIS module, held for the worker's lifetime
+    bool          fatal;        // true = FeedDisable(why), false = HostLost(why)
+    char          why[192];
+    DWORD         ms;           // how long the job took, for the log
+};
+static HostLink g_link;
+
+// How long we are willing to wait for the host at each step. The first two are the worker's,
+// so the game never feels them. The last one IS on the frame path: 21 bytes into a 1 KB pipe
+// buffer can only block if the host has stopped reading it, but a busy host can be a little
+// late, and running out of patience there ends the session (HostLost). So: generous enough
+// that reaching it really does mean the host is not coming back, short enough that the worst
+// case is a survivable hitch rather than the indefinite freeze this replaced.
+static const DWORD kPipeHelloMs = 15000;
+static const DWORD kPipeBuildMs = 60000;
+// This one has an ordering constraint against the HOST, and it was violated the moment the
+// host's frame backlog was bounded (#15). The host's serve loop is single-threaded: the same
+// thread that reads this pipe can sit for up to 2000 ms inside BeginCommands waiting for the
+// GPU to retire an allocator slot. While it does, nothing is read, and a write that fills the
+// pipe blocks. At 2000 ms both sides had the SAME deadline, so the worst case was a coin flip
+// between "survivable hitch" and HostLost -- which tears the feed down for the whole session.
+// The 1024-byte pipe buffer used to hide that by absorbing 48 frames of backlog; bounding it
+// to 12 exposed it. So the client's patience must exceed the host's worst reader stall, with
+// room to spare. Raise BOTH together if the host's BeginCommands timeout ever changes.
+static const DWORD kPipeFrameMs = 4000;
+
+static bool HostLinkStop();   // below: abort and join the worker, from HostClose
+static bool g_detaching;      // DLL_PROCESS_DETACH: the loader lock is held, so never join
+
+static bool HostRequestPending();   // below: an overlay button is waiting to be acted on
+static void HostConsumeRequest();   // below: act on it, on the render thread, inside the lock
+
+// A build is in flight (waiting for the host to connect, or for its answer). The frame path
+// skips feeding while this is set WITHOUT counting a failure: the exponential backoff in
+// FeedFail is for a build that went wrong, not for one that has simply not come back yet.
+static bool g_build_pending;
 
 static void HostDrain()
 {
@@ -801,9 +1023,14 @@ static void HostDrain()
 
 static void CastHostLost();       // below: drop the thumbnail of a window that is going away
 static void CastReleasePanel();   // below: and our view of its panel texture
+static void CastFlushInput();     // below: release any key/button the host still thinks is held
 
 static void HostClose()
 {
+    // First: nothing else here may run beside a worker still using the pipe. When it says
+    // false an orphan survived, and g.pipe is the handle a JOB_BUILD worker holds.
+    const bool worker_done = HostLinkStop();
+    g_build_pending = false;   // whatever was in flight went with the link
     CastHostLost();
     CastReleasePanel();
     HostDrain();   // BEFORE the pipe closes: the host must still be around to signal
@@ -812,15 +1039,25 @@ static void HostClose()
     g.sent_n    = 0;
     g.wait_n    = 0;
     g.out_valid = false;
-    if (g.pipe != nullptr)  { CloseHandle(g.pipe); g.pipe = nullptr; }
     if (g.hproc != nullptr)
     {
-        // 4 s: the host now releases its swapchain on the way out so ReShade x64 can save
-        // its ini (the overlay layout), and ReShade's own unhook takes about a second.
+        // Ending the host first is what unblocks an orphan worker parked on the pipe, and it
+        // is always safe: no worker ever touches g.hproc. 4 s, because the host releases its
+        // swapchain on the way out so ReShade x64 can save its ini (the overlay layout), and
+        // ReShade's own unhook takes about a second.
         if (WaitForSingleObject(g.hproc, 4000) != WAIT_OBJECT_0)
             TerminateProcess(g.hproc, 0);      // it did not exit on the pipe break
         CloseHandle(g.hproc);
         g.hproc = nullptr;
+    }
+    if (g.pipe != nullptr)
+    {
+        // Closing it under a live worker would let the value be reused and the orphan's next
+        // write land in an unrelated handle. Leaking one pipe handle is the cheaper mistake;
+        // the host it named is gone by now, so the orphan's I/O fails and it exits.
+        if (worker_done) CloseHandle(g.pipe);
+        else Log("[feed32] leaking the pipe handle: a host worker may still be using it");
+        g.pipe = nullptr;
     }
     // The fences belong to the host that just went away; a new host creates new ones.
     // Releasing them on EVERY close (not just the apply path) is what makes a respawn
@@ -883,7 +1120,11 @@ static void RestoreGameFocus()
 
 static void HostLost(const char *why)
 {
-    Log("[feed32] host lost: %s", why);
+    DWORD code = 0;
+    if (g.hproc != nullptr && GetExitCodeProcess(g.hproc, &code) && code != STILL_ACTIVE)
+        Log("[feed32] host lost: %s (exit code %lu)", why, code);
+    else
+        Log("[feed32] host lost: %s", why);
     HostClose();
     FeedDisable("the 64-bit host went away -- its own dlss5-feed-host.log (in host64\\) names the reason");
 }
@@ -953,6 +1194,16 @@ static RECT CastCloseRect()
 static bool       g_cast_shown;           // something is on screen this frame (thumbnail or texture)
 static char       g_cast_status[160] = "hidden";
 
+// What this add-on has told the host is currently held down. Key and button messages are
+// only forwarded while the cursor is over the panel, so a key released after the cursor
+// left it -- or while the panel was being hidden by the toggle key, Escape, the close
+// button or a host restart -- never got its WM_KEYUP, and ReShade x64's ImGui went on
+// believing it was down: every later click became a Ctrl+click, text fields repeated,
+// Shift stuck. CastFlushInput() releases whatever is still marked here.
+static bool       g_cast_key_down[256];
+static UINT       g_cast_btn_down;        // bit i = kCastButtons[i] is down in the host
+static int16_t    g_cast_wheel_pending;   // wheel notches seen in reshade_overlay, consumed by CastInput
+
 static HWND CastFindHostWindow()
 {
     if (g.hproc == nullptr) return nullptr;
@@ -968,6 +1219,10 @@ static HWND CastFindHostWindow()
 
 static void CastRelease()   // the thumbnail only; the host window stays known
 {
+    // Before the panel goes away: hand the host a key-up for everything it still thinks is
+    // held. This is the path every hide takes -- toggle key, Escape, Alt+F4, the close
+    // button, a lost host, DLL detach -- so it is the one place that has to do it.
+    CastFlushInput();
     if (g_cast_thumb != nullptr) { DwmUnregisterThumbnail(g_cast_thumb); g_cast_thumb = nullptr; }
     g_cast_dest     = nullptr;
     g_cast_rect     = {};
@@ -997,9 +1252,35 @@ static void CastReleasePanel()
     g.panel_w = g.panel_h = 0;
 }
 
+// A resize on either side makes every view of the panel the wrong size. CastMakePanel
+// returns its cached handle whenever it has one, and the GL / Vulkan importers likewise
+// keep what they imported -- so a plain g.built = false after a resize handed the host
+// the OLD 900x1992 texture again, the host refused it ("not 1290x1660 RGBA8; ignoring
+// it"), CopyPanel never ran, and the cast drew that frozen texture into a rect sized
+// for the new one. That is the "it just stretches" of the first beta.3 test in Fable.
+//
+// Drop the D3D11 texture here; the GL / Vulkan imports are host-created per build and
+// go with ReleaseShared on the rebuild this forces, and the host recreates its own at
+// the new size. Then adopt the size so the next CastMakePanel makes one that matches.
+static ULONGLONG g_panel_poll_quiet_until;   // CastLayout leaves the window size alone until then
+static void CastAdoptPanelSize(unsigned w, unsigned h, const char *why)
+{
+    CastReleasePanel();
+    g.panel_w = w;
+    g.panel_h = h;
+    g.built   = false;
+    Log("[feed32] cast: panel dropped and %ux%u adopted (%s); the next build hands the host one that matches", w, h, why);
+}
+
 // Returns the handle value to put in FeedBuild::panel_tex (0 = none).
 static uint64_t CastMakePanel()
 {
+    // Not on D3D10. The panel is drawn by handing its shader resource view to the GAME's
+    // ReShade as an ImTextureID, and on a D3D10 game that ImGui backend wants an
+    // ID3D10ShaderResourceView -- ours would be a D3D11 view from the relay wearing the
+    // wrong vtable. Refusing here leaves CastPanelAvailable() false, which is what makes
+    // the cast fall back to the compositor thumbnail; see the note in CastLayout.
+    if (g.is_d3d10) return 0;
     if (g.dev == nullptr || g.panel_w == 0 || g.panel_h == 0) return 0;
     if (g.panel_handle != nullptr) return reinterpret_cast<uintptr_t>(g.panel_handle);
 
@@ -1038,8 +1319,12 @@ static uint64_t CastMakePanel()
 // Vulkan objects are dropped in ReleaseShared with the four slots, so this runs per build.
 static void CastImportPanelGl(const FeedBuildAck &ack)
 {
-    if (ack.panel_tex == 0 || g.panel_w == 0 || g.gl_panel_tex != 0) return;
+    if (ack.panel_tex == 0) return;
     HANDLE hnd = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex));
+    // The host duplicates a FRESH handle into this process on every build. When we are not
+    // importing it -- the panel is already there, or the hello ack named no size -- it still
+    // has to be closed here, or every rebuild leaks one.
+    if (g.panel_w == 0 || g.gl_panel_tex != 0) { CloseHandle(hnd); return; }
     if (!FeedGlImportImage(&g.gl, hnd, ack.panel_size, static_cast<GLsizei>(g.panel_w), static_cast<GLsizei>(g.panel_h),
                            GL_RGBA8, &g.gl_panel_tex, &g.gl_panel_memobj))
         Log("[feed32] cast: panel import FAILED (GL error 0x%04X); texture mode unavailable", FeedGlDrainErrors(&g.gl));
@@ -1050,14 +1335,48 @@ static void CastImportPanelGl(const FeedBuildAck &ack)
 
 static void CastImportPanelVk(const FeedBuildAck &ack)
 {
-    if (ack.panel_tex == 0 || g.panel_w == 0 || g.vk_panel != VK_NULL_HANDLE) return;
+    if (ack.panel_tex == 0) return;
     HANDLE hnd = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex));
+    if (g.panel_w == 0 || g.vk_panel != VK_NULL_HANDLE) { CloseHandle(hnd); return; }   // see CastImportPanelGl
     if (!FeedVkImportImage(&g.vk, hnd, g.panel_w, g.panel_h, VK_FORMAT_R8G8B8A8_UNORM, false, &g.vk_panel, &g.vk_panel_mem))
         Log("[feed32] cast: panel import FAILED (Vulkan external-memory import); texture mode unavailable");
     else
         Log("[feed32] cast: host panel texture imported (Vulkan, %ux%u)", g.panel_w, g.panel_h);
     g.vk_panel_init = false;
     CloseHandle(hnd);
+}
+
+// A D3D11 client whose own device refused the shared set (feature level 10.x, issue #33)
+// gets a host-created panel as well: the host takes the same branch as a GL/Vulkan client
+// and never looks at FeedBuild::panel_tex, so a panel made on this side would be a texture
+// nobody ever writes -- texture cast showed a frozen frame, and the handle the host
+// duplicated in was dropped on the floor once per build. Open the host's instead.
+static void CastAdoptHostPanel11(ID3D11Device1 *dev1, const FeedBuildAck &ack)
+{
+    if (ack.panel_tex == 0) return;
+    HANDLE hnd = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex));
+    // Not on D3D10, for the reason CastMakePanel gives: the view would be the relay's.
+    if (dev1 == nullptr || g.panel_w == 0 || g.is_d3d10) { CloseHandle(hnd); return; }
+
+    const UINT pw = g.panel_w, ph = g.panel_h;   // CastReleasePanel clears these; the size has not changed
+    CastReleasePanel();
+    g.panel_w = pw; g.panel_h = ph;
+
+    ID3D11Texture2D *tex = nullptr;
+    HRESULT hr = dev1->OpenSharedResource1(hnd, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&tex));
+    if (SUCCEEDED(hr)) hr = g.dev->CreateShaderResourceView(tex, nullptr, &g.panel_srv);
+    if (FAILED(hr))
+    {
+        Log("[feed32] cast: could not open the host's panel texture 0x%08X; texture mode unavailable", hr);
+        SafeRelease(g.panel_srv);
+        if (tex != nullptr) tex->Release();
+        CloseHandle(hnd);
+        g.panel_w = g.panel_h = 0;   // do not retry every build
+        return;
+    }
+    g.panel_tex    = tex;
+    g.panel_handle = hnd;   // CastReleasePanel closes it
+    Log("[feed32] cast: host panel texture opened (%ux%u, host-created set)", g.panel_w, g.panel_h);
 }
 
 static bool CastPanelAvailable()
@@ -1146,10 +1465,44 @@ static void CastKeyName(int vk, char *out, size_t n)
 
 static void CastPostKey(UINT msg, UINT vk, bool up)
 {
+    // IsWindow, not just non-null: the host window can go away between the last layout pass
+    // and this call (a host restart, or a resize that recreated it), and the flush that runs
+    // when the panel comes down is the one place that is guaranteed to post into whatever
+    // handle was last seen (#58).
+    if (g_cast_hwnd == nullptr || !IsWindow(g_cast_hwnd)) return;
     const UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
     LPARAM lp = 1 | (static_cast<LPARAM>(scan) << 16);
     if (up) lp |= (1 << 30) | (1u << 31);
     PostMessageW(g_cast_hwnd, msg, vk, lp);
+}
+
+// ReShade's mouse button order: 0 left, 1 middle, 2 right.
+static const struct { uint32_t idx; UINT down, up; } kCastButtons[] = {
+    { 0, WM_LBUTTONDOWN, WM_LBUTTONUP },
+    { 1, WM_MBUTTONDOWN, WM_MBUTTONUP },
+    { 2, WM_RBUTTONDOWN, WM_RBUTTONUP },
+};
+
+// Release everything the host still believes is held. Called when the cursor leaves the
+// panel and whenever the panel is taken down, so no key or button can stay stuck in ReShade
+// x64's ImGui after this side stops forwarding.
+static void CastFlushInput()
+{
+    int keys = 0, buttons = 0;
+    for (UINT vk = 0; vk < 256; ++vk)
+        if (g_cast_key_down[vk]) { g_cast_key_down[vk] = false; ++keys; CastPostKey(WM_KEYUP, vk, true); }
+    if (g_cast_btn_down != 0 && g_cast_hwnd != nullptr && IsWindow(g_cast_hwnd))
+    {
+        // Clamp, do not trust: g_cast_last is the last position inside the panel, and a
+        // resize can leave it outside the window it is about to be posted into (#58).
+        const LPARAM at = MAKELPARAM(g_cast_last.x >= 0 ? g_cast_last.x : 0,
+                                     g_cast_last.y >= 0 ? g_cast_last.y : 0);
+        for (const auto &b : kCastButtons)
+            if (g_cast_btn_down & (1u << b.idx)) { ++buttons; PostMessageW(g_cast_hwnd, b.up, 0, at); }
+    }
+    g_cast_btn_down = 0;
+    if ((keys != 0 || buttons != 0) && g_cfg.log_frames > 0)
+        Log("[feed32] cast: released %d key(s) and %d button(s) still held in the host", keys, buttons);
 }
 
 // Finds the host window, registers the thumbnail on the game window and lays the panel
@@ -1167,6 +1520,26 @@ static bool CastLayout()
         if (g_cast_hwnd == nullptr) { strcpy_s(g_cast_status, "waiting for the host window"); return false; }
         Log("[feed32] cast: host window %p found", (void *)g_cast_hwnd);
     }
+    // The host resizes itself when its border is dragged, and nothing announces that to
+    // this side: its window is the announcement. Adopt a size the panel disagrees with once
+    // it has held still for a moment, same even-alignment as the host applies to its
+    // swapchain. Quiet after the sliders send a size, since the window lags the request.
+    if (g.panel_w != 0 && GetTickCount64() >= g_panel_poll_quiet_until)
+    {
+        static ULONGLONG mismatch_since;
+        RECT wc = {};
+        if (GetClientRect(g_cast_hwnd, &wc) && wc.right >= 300 && wc.bottom >= 300 && !IsIconic(g_cast_hwnd))
+        {
+            const unsigned ww = static_cast<unsigned>(wc.right) & ~1u, wh = static_cast<unsigned>(wc.bottom) & ~1u;
+            if (ww == g.panel_w && wh == g.panel_h) mismatch_since = 0;
+            else if (mismatch_since == 0) mismatch_since = GetTickCount64();
+            else if (GetTickCount64() - mismatch_since > 400)
+            {
+                mismatch_since = 0;
+                CastAdoptPanelSize(ww, wh, "the host window was resized");
+            }
+        }
+    }
     if (!g_cast_placed)
     {
         // Under the game window, at its position: on a second monitor the parked host
@@ -1177,7 +1550,9 @@ static bool CastLayout()
         g_cast_placed = true;
     }
 
-    const bool texture = g_cfg.cast_mode == 1;
+    // D3D10 has no texture mode -- the panel view cannot cross into the game's ImGui --
+    // so the cast is always the compositor thumbnail there.
+    const bool texture = g_cfg.cast_mode == 1 && !g.is_d3d10;
     if (texture != g_cast_texture)   // the mode changed while shown: start over in the other one
     {
         CastRelease();
@@ -1210,7 +1585,13 @@ static bool CastLayout()
     if (src.cx * s > gc.right) s = static_cast<float>(gc.right) / static_cast<float>(src.cx);
     s *= static_cast<float>(g_cfg.cast_scale) / 100.0f;   // the user's size, relative to the fit
     const int dw = static_cast<int>(src.cx * s + 0.5f), dh = static_cast<int>(src.cy * s + 0.5f);
-    const RECT dest = { gc.right - dw, 0, gc.right, dh };
+    // cast_anchor picks the corner. This was { gc.right - dw, 0, gc.right, dh } outright --
+    // the top-right and nothing else, which is fine until the game puts something there.
+    const bool  right  = g_cfg.cast_anchor == 1 || g_cfg.cast_anchor == 3;
+    const bool  bottom = g_cfg.cast_anchor >= 2;
+    const LONG  dx = right  ? gc.right  - dw : 0;
+    const LONG  dy = bottom ? gc.bottom - dh : 0;
+    const RECT dest = { dx, dy, dx + dw, dy + dh };
 
     if (texture)
     {
@@ -1297,6 +1678,8 @@ static void CastInput(reshade::api::effect_runtime *rt)
     uint32_t cx = 0, cy = 0;
     int16_t  wheel = 0;
     rt->get_mouse_cursor_position(&cx, &cy, &wheel);   // the wheel comes in notches
+    if (wheel == 0) wheel = g_cast_wheel_pending;      // OnOverlay's earlier read, if this one came up empty
+    g_cast_wheel_pending = 0;
     const POINT p = { static_cast<LONG>(cx), static_cast<LONG>(cy) };
     g_cast_cursor = p;
     const bool inside = PtInRect(&g_cast_rect, p) != FALSE;
@@ -1315,12 +1698,16 @@ static void CastInput(reshade::api::effect_runtime *rt)
         }
         g_cast_hover = false;
         g_cast_last  = { -1, -1 };
+        CastFlushInput();
         return;
     }
     if (!inside && !g_cast_captured)
     {
+        // Leaving the panel stops the forwarding, so anything still held has to be released
+        // now -- otherwise its key-up happens out there and the host never hears it.
         g_cast_hover = false;
         g_cast_last  = { -1, -1 };
+        CastFlushInput();
         return;
     }
 
@@ -1338,22 +1725,43 @@ static void CastInput(reshade::api::effect_runtime *rt)
     g_cast_hover = true;
 
     // Press and release land on different frames by construction -- what ImGui needs
-    // to see a click. ReShade's button indices are 0 left, 1 middle, 2 right.
-    static const struct { uint32_t idx; UINT down, up; } kButtons[] =
+    // to see a click.
+    for (const auto &b : kCastButtons)
     {
-        { 0, WM_LBUTTONDOWN, WM_LBUTTONUP }, { 1, WM_MBUTTONDOWN, WM_MBUTTONUP }, { 2, WM_RBUTTONDOWN, WM_RBUTTONUP },
-    };
-    for (const auto &b : kButtons)
-    {
-        if (rt->is_mouse_button_pressed(b.idx))  { PostMessageW(g_cast_hwnd, b.down, mk, at); g_cast_captured = true; }
-        if (rt->is_mouse_button_released(b.idx)) PostMessageW(g_cast_hwnd, b.up, mk, at);
+        if (rt->is_mouse_button_pressed(b.idx))
+        {
+            PostMessageW(g_cast_hwnd, b.down, mk, at);
+            g_cast_captured = true;
+            g_cast_btn_down |= 1u << b.idx;
+        }
+        if (rt->is_mouse_button_released(b.idx))
+        {
+            PostMessageW(g_cast_hwnd, b.up, mk, at);
+            g_cast_btn_down &= ~(1u << b.idx);
+        }
     }
 
     if (wheel != 0)
     {
-        POINT sp = {};
-        GetCursorPos(&sp);
-        PostMessageW(g_cast_hwnd, WM_MOUSEWHEEL, MAKEWPARAM(mk, wheel * WHEEL_DELTA), MAKELPARAM(sp.x, sp.y));
+        // WM_MOUSEWHEEL carries the cursor in SCREEN coordinates, and ReShade x64 turns the
+        // position in the message into its ImGui mouse position. Sending the real cursor's
+        // screen position put that somewhere over the game instead of over the panel, so the
+        // scroll landed on whatever ImGui window happened to be under a point the user was
+        // not pointing at -- usually none, which is why nothing scrolled. Send the panel
+        // position mapped into the host's own screen space, and a move first so ImGui has
+        // the hover before the wheel arrives.
+        POINT s = { hx, hy };
+        ClientToScreen(g_cast_hwnd, &s);
+        PostMessageW(g_cast_hwnd, WM_MOUSEMOVE, mk, at);
+        g_cast_last = { hx, hy };
+        // One message per notch: ImGui accumulates them, and some builds clamp a single
+        // oversized delta to one line.
+        const int notches = wheel > 0 ? wheel : -wheel;
+        const int step    = wheel > 0 ? WHEEL_DELTA : -WHEEL_DELTA;
+        for (int i = 0; i < notches && i < 16; ++i)
+            PostMessageW(g_cast_hwnd, WM_MOUSEWHEEL, MAKEWPARAM(mk, step), MAKELPARAM(s.x, s.y));
+        if (g_cfg.log_frames > 0)
+            Log("[feed32] cast: wheel %d notch(es) -> host client %d,%d (screen %ld,%ld)", wheel, hx, hy, s.x, s.y);
     }
 
     // Keys, so Ctrl+click text entry, typing a value and the host's own overlay key work.
@@ -1366,6 +1774,7 @@ static void CastInput(reshade::api::effect_runtime *rt)
         if (rt->is_key_pressed(vk))
         {
             CastPostKey(WM_KEYDOWN, vk, false);
+            g_cast_key_down[vk] = true;   // so CastFlushInput can release it if the cursor leaves
             if (have_ks && !ctrl)
             {
                 wchar_t chars[4] = {};
@@ -1374,7 +1783,7 @@ static void CastInput(reshade::api::effect_runtime *rt)
                     if (chars[i] >= 32) PostMessageW(g_cast_hwnd, WM_CHAR, chars[i], 1);
             }
         }
-        if (rt->is_key_released(vk)) CastPostKey(WM_KEYUP, vk, true);
+        if (rt->is_key_released(vk)) { CastPostKey(WM_KEYUP, vk, true); g_cast_key_down[vk] = false; }
     }
 }
 
@@ -1427,14 +1836,44 @@ static bool OnSetFullscreenState(reshade::api::swapchain *, bool fullscreen, voi
     return false;   // never interfere with the game's choice
 }
 
+// Defined far below with the other ReShade callbacks; OnPresent and DrawOverlay call it to
+// re-adopt the runtime when enabled goes 0 -> 1, since no event will fire again for it.
+static void OnInitEffectRuntime(reshade::api::effect_runtime *rt);
+
 static bool OnOpenOverlay(reshade::api::effect_runtime *rt, bool open, reshade::api::input_source)
 {
-    if (rt == g.runtime) g_game_overlay_open = open;
+    if (g_cfg.enabled && rt == g.runtime) g_game_overlay_open = open;
     return false;   // never veto
 }
 
 static void OnPresent(reshade::api::effect_runtime *rt)
 {
+    // The host buttons are drained HERE, not in FeedFrame. FeedFrame only runs when the
+    // DLSS5_Feed technique renders, so with the effect missing or disabled, effects toggled
+    // off, or mode=0, "Start the DLSS 5 host" would have done nothing at all -- and that is
+    // exactly the state a user presses it in. This callback runs every frame regardless.
+    // Ahead of the enabled gate, and the only CfgReload that is: the other three are in the
+    // frame path, which enabled=0 never reaches, so a cfg file edited back to enabled=1
+    // could never be picked up -- only the overlay checkbox could undo it. Time-throttled
+    // rather than frame-counted, because the frame counter only advances when feeding.
+    {
+        static ULONGLONG next = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now >= next)
+        {
+            next = now + 1000;
+            const int was = g_cfg.enabled;
+            if (CfgReload() || was != g_cfg.enabled) g.built = false;
+            if (was == 0 && g_cfg.enabled != 0 && rt != nullptr)
+            { Log("[feed32] enabled=1 read back from dlss5-feed.cfg; re-adopting the effect runtime"); OnInitEffectRuntime(rt); }
+        }
+    }
+    if (!g_cfg.enabled) return;
+    if (rt == g.runtime && HostRequestPending() && FeedEnter())
+    {
+        HostConsumeRequest();   // inside the lock: it tears down what a frame uses
+        FeedLeave();
+    }
     CastTick(rt);
 }
 
@@ -1443,7 +1882,17 @@ static void OnPresent(reshade::api::effect_runtime *rt)
 // window. Drawn on the foreground list so it sits above the game's own ReShade overlay.
 static void OnOverlay(reshade::api::effect_runtime *rt)
 {
-    if (rt != g.runtime) return;
+    if (!g_cfg.enabled || rt != g.runtime) return;
+    // ReShade's wheel delta is a per-frame value. This callback runs inside its GUI draw,
+    // earlier in the frame than reshade_present where CastInput reads it, so take it here
+    // too: if the delta has already been cleared by then, this is the copy that survives.
+    // CastInput prefers its own read and only falls back to this one.
+    {
+        uint32_t wx = 0, wy = 0;
+        int16_t  w  = 0;
+        rt->get_mouse_cursor_position(&wx, &wy, &w);
+        if (w != 0) g_cast_wheel_pending = w;
+    }
     if (!g_cast_shown)
     {
         if (g_cast_hid_cursor) { ImGui::GetIO().MouseDrawCursor = true; g_cast_hid_cursor = false; }
@@ -1451,7 +1900,7 @@ static void OnOverlay(reshade::api::effect_runtime *rt)
     }
     ImDrawList *dl = ImGui::GetForegroundDrawList(nullptr);
     if (dl == nullptr) return;
-    if (g_cast_texture && g.panel_srv != nullptr && g.panel_w != 0)
+    if (g_cast_texture && !g.is_d3d10 && g.panel_srv != nullptr && g.panel_w != 0)
     {
         // ReShade's D3D11 ImGui backend takes the view pointer itself as the texture id
         // (the same convention as the rtv.handle casts in FeedFrame11).
@@ -1495,10 +1944,60 @@ static void OnOverlay(reshade::api::effect_runtime *rt)
     dl->AddPolyline(arrow, 7, IM_COL32(0, 0, 0, 255), ImDrawFlags_Closed, 1.5f);
 }
 
+// One bounded transfer. The pipe is opened FILE_FLAG_OVERLAPPED, so every read and write in
+// this file goes through here: a host that stops answering costs the caller `timeout_ms`
+// and an error, where a synchronous call would have parked it forever -- on the render
+// thread, mid-Present. `ev` is the caller's own manual-reset event (the worker and the
+// render thread never transfer at the same time, but they do not share one either).
+static bool PipeXfer(HANDLE pipe, HANDLE ev, bool write, void *buf, DWORD len, DWORD timeout_ms)
+{
+    if (pipe == nullptr || pipe == INVALID_HANDLE_VALUE || ev == nullptr) return false;
+    BYTE *p = static_cast<BYTE *>(buf);
+    DWORD left = len;
+    while (left > 0)
+    {
+        OVERLAPPED ov = {};
+        ov.hEvent = ev;
+        ResetEvent(ev);
+        DWORD moved = 0;
+        const BOOL done = write ? WriteFile(pipe, p, left, &moved, &ov)
+                                : ReadFile(pipe, p, left, &moved, &ov);
+        if (!done)
+        {
+            if (GetLastError() != ERROR_IO_PENDING) return false;
+            const HANDLE waits[2] = { ev, g_link.abort_event };
+            const DWORD  n = g_link.abort_event != nullptr ? 2u : 1u;
+            if (WaitForMultipleObjects(n, waits, FALSE, timeout_ms) != WAIT_OBJECT_0)
+            {
+                // This OVERLAPPED is on the stack, so the I/O has to be finished with before
+                // the frame goes -- otherwise the kernel writes into memory that is gone.
+                // Once cancelled (or already complete) the event is signalled, so the wait
+                // returns at once; it is unbounded on purpose, because the alternative is
+                // memory corruption.
+                CancelIoEx(pipe, &ov);
+                WaitForSingleObject(ev, INFINITE);
+                return false;
+            }
+            if (!GetOverlappedResult(pipe, &ov, &moved, FALSE)) return false;
+        }
+        if (moved == 0) return false;   // the far end closed
+        p    += moved;
+        left -= moved;
+    }
+    return true;
+}
+
+// The render thread's own event for PipeXfer, made on first use.
+static HANDLE g_pipe_ev;
+static HANDLE PipeEvent()
+{
+    if (g_pipe_ev == nullptr) g_pipe_ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    return g_pipe_ev;
+}
+
 static bool PipeWrite(const void *buf, DWORD len)
 {
-    DWORD put = 0;
-    return g.pipe != nullptr && WriteFile(g.pipe, buf, len, &put, nullptr) && put == len;
+    return PipeXfer(g.pipe, PipeEvent(), true, const_cast<void *>(buf), len, kPipeFrameMs);
 }
 
 // The tag and the message go in ONE write. Two writes put two round trips through the
@@ -1508,16 +2007,28 @@ static bool PipeWrite(const void *buf, DWORD len)
 struct FeedTaggedFrame { BYTE tag; FeedFrameMsg fm; };
 #pragma pack(pop)
 
+// What the per-frame write costs the render thread, over the current 600-frame window.
+//
+// This is the other candidate stall in #15, and the one the reporter's own numbers can already
+// settle: PipeWriteFrame runs INSIDE the window TimingTick measures, so a "feed CPU" in the
+// milliseconds means the render thread is blocking here -- the host is not reading, because it
+// is busy -- while a "feed CPU" still at 0.03 ms with a collapsed frame interval means the
+// stall is somewhere else entirely. Nothing measured it before.
+static double g_pipe_write_ms_sum;
+static double g_pipe_write_ms_max;
+
 static bool PipeWriteFrame(const FeedFrameMsg &fm)
 {
     const FeedTaggedFrame msg = { 'F', fm };
-    return PipeWrite(&msg, sizeof(msg));
-}
-
-static bool PipeRead(void *buf, DWORD len)
-{
-    DWORD got = 0;
-    return g.pipe != nullptr && ReadFile(g.pipe, buf, len, &got, nullptr) && got == len;
+    LARGE_INTEGER w0, w1, wf;
+    QueryPerformanceFrequency(&wf);
+    QueryPerformanceCounter(&w0);
+    const bool ok = PipeWrite(&msg, sizeof(msg));
+    QueryPerformanceCounter(&w1);
+    const double ms = 1000.0 * double(w1.QuadPart - w0.QuadPart) / double(wf.QuadPart);
+    g_pipe_write_ms_sum += ms;
+    if (ms > g_pipe_write_ms_max) g_pipe_write_ms_max = ms;
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -1554,6 +2065,115 @@ static void DetectChickenHost()
              "It belongs in host64\\ (it is already there too). Remove the copy next to the game.");
 }
 
+// OptiScaler DLSS-NR in host64\ -- the third neural consumer on the split path (see feed_opti.h).
+// It is a 64-bit proxy DLL the HOST imports (winmm.dll or version.dll), so it lives in host64\
+// like Chicken does, and the host does the detecting and the two fingerprints. This side only
+// needs to know it is there so the overlay stops mirroring RenoDX's keys, shows the [DlssNr]
+// headline keys read-only from host64\OptiScaler.ini, and points at OptiScaler's own menu
+// (Insert, in the host window -- reachable through the in-game cast).
+static bool   g_opti_host            = false;
+static bool   g_opti_host_nr         = false;   // the DLSS-NR fork, not upstream OptiScaler
+static char   g_opti_host_module[64] = "";
+static char   g_opti_ini_path[MAX_PATH];
+static UINT64 g_opti_ini_read_at     = 0;
+static char   g_opti_enabled[16], g_opti_preset[16], g_opti_style[16], g_opti_intensity[16],
+              g_opti_scale[16], g_opti_passes[16], g_opti_upscaler[32];
+
+static void DetectOptiHost()
+{
+    char dir[MAX_PATH];
+    GetModuleFileNameA(g_self, dir, MAX_PATH);
+    if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
+    char h64[MAX_PATH];
+    sprintf_s(h64, "%shost64\\", dir);
+    sprintf_s(g_opti_ini_path, "%s" OPTI_INI, h64);
+
+    for (const char *name : kOptiProxyNames)
+    {
+        if (_stricmp(name, "dxgi.dll") == 0) continue;   // host64\dxgi.dll is ReShade x64
+        char path[MAX_PATH];
+        sprintf_s(path, "%s%s", h64, name);
+        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
+        const bool fork = OptiFileHasLiteral(path, OPTI_FORWARDER);
+        if (!fork && !OptiFileHasLiteral(path, OPTI_INI)) continue;
+        g_opti_host        = true;
+        g_opti_host_nr     = fork;
+        strcpy_s(g_opti_host_module, name);
+        break;
+    }
+
+    // The whole set beside the 32-bit game exe instead: a 32-bit process cannot load any of it.
+    char stray[MAX_PATH];
+    sprintf_s(stray, "%s" OPTI_INI, dir);
+    if (GetFileAttributesA(stray) != INVALID_FILE_ATTRIBUTES)
+        Warn("OptiScaler.ini is next to the 32-bit game exe. OptiScaler is 64-bit and belongs in host64\\ (beside "
+             "dlss5-feed-host64.exe, renamed winmm.dll), where the DLSS work happens. A 32-bit game cannot load it, "
+             "and a 64-bit winmm.dll or version.dll beside a 32-bit exe stops the game from starting at all.");
+
+    if (!g_opti_host) { Log("[feed32] OptiScaler: not present in host64\\"); return; }
+    if (!g_opti_host_nr)
+        Warn("host64\\%s is OptiScaler, but not the DLSS-NR fork: the host's NGX calls go to it, it upscales, and no "
+             "neural pass ever runs. Use the Dagherbou/OptiScaler_DLSSNR build.", g_opti_host_module);
+    else
+        Log("[feed32] %s: present in host64\\ as %s -- it is the neural consumer; the host's NGX calls are answered by "
+            "it, and its menu is on Insert in the host window (through the in-game cast, or with host_window=1)",
+            OPTI_LABEL, g_opti_host_module);
+
+    // One consumer, and this side can at least see the files. The host says the rest.
+    char reno[MAX_PATH];
+    sprintf_s(reno, "%srenodx-dlss5*.addon64", h64);
+    WIN32_FIND_DATAA fd;
+    HANDLE f = FindFirstFileA(reno, &fd);
+    const bool renodx = f != INVALID_HANDLE_VALUE;
+    if (renodx) FindClose(f);
+    if (g_chicken_host || renodx)
+        Warn("host64\\ holds OptiScaler AND another neural consumer (%s). OptiScaler captures every NGX call in the "
+             "host, so the second one either talks to OptiScaler or runs its neural pass a second time. Keep exactly "
+             "one and restart the game.", g_chicken_host ? "Deep Fried Chicken" : "renodx-dlss5.addon64");
+}
+
+// Re-read the [DlssNr] headline keys at most every 2 s while the overlay is open. Raw strings:
+// "auto" means OptiScaler's compiled default, and that word is more honest than a guess.
+static void OptiHostCfgRefresh()
+{
+    const UINT64 now = GetTickCount64();
+    if (now - g_opti_ini_read_at < 2000) return;
+    g_opti_ini_read_at = now;
+    GetPrivateProfileStringA("DlssNr",    "Enabled",      "?", g_opti_enabled,   sizeof(g_opti_enabled),   g_opti_ini_path);
+    GetPrivateProfileStringA("DlssNr",    "Preset",       "?", g_opti_preset,    sizeof(g_opti_preset),    g_opti_ini_path);
+    GetPrivateProfileStringA("DlssNr",    "Style",        "?", g_opti_style,     sizeof(g_opti_style),     g_opti_ini_path);
+    GetPrivateProfileStringA("DlssNr",    "Intensity",    "?", g_opti_intensity, sizeof(g_opti_intensity), g_opti_ini_path);
+    GetPrivateProfileStringA("DlssNr",    "WorkingScale", "?", g_opti_scale,     sizeof(g_opti_scale),     g_opti_ini_path);
+    GetPrivateProfileStringA("DlssNr",    "Passes",       "?", g_opti_passes,    sizeof(g_opti_passes),    g_opti_ini_path);
+    GetPrivateProfileStringA("Upscalers", "Dx12Upscaler", "?", g_opti_upscaler,  sizeof(g_opti_upscaler),  g_opti_ini_path);
+}
+
+// dlss5-feed.addon64 in host64\ -- the one wrong file that looks right.
+//
+// host64\ is a 64-bit ReShade install, so a 64-bit add-on dropped in it does load, and
+// "copy the whole release into host64\" is an easy way to get there. What loads is the
+// add-on for a 64-bit GAME, inside the helper that is already this add-on's server: it
+// opens a second NGX session on its own private device and detours nvngx over the neural
+// consumer's own hooks, in the one process where none of that has ever been tested.
+//
+// The 64-bit add-on now recognises the helper and stays inert (see dlss5-feed.cpp's
+// DllMain), but it says so in host64\dlss5-feed.log -- a file nobody thinks to open,
+// because it has the same name as the game-side log they are already reading. Say it here
+// too, in the log that actually gets attached to reports.
+static void DetectStrayHostAddon()
+{
+    char path[MAX_PATH];
+    GetModuleFileNameA(g_self, path, MAX_PATH);
+    if (char *s = strrchr(path, '\\')) *(s + 1) = '\0';
+    strcat_s(path, "host64\\dlss5-feed.addon64");
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return;
+    Warn("host64\\dlss5-feed.addon64 should not be there. That is the add-on for a 64-bit GAME, and the "
+         "helper's ReShade loads it into the helper process, where it can do nothing useful and gets in the "
+         "way of the neural consumer. host64\\ takes dlss5-feed-host64.exe, a 64-bit ReShade dxgi.dll, the "
+         "neural consumer (renodx-dlss5.addon64 or Deep Fried Chicken) and the nvngx runtimes -- delete "
+         "host64\\dlss5-feed.addon64.");
+}
+
 // Re-read the four headline keys at most every 2 s while the overlay is open.
 static void ChickenCfgRefresh()
 {
@@ -1577,11 +2197,16 @@ static void ChickenCfgRefresh()
     fclose(f);
 }
 
-static bool EnsureHost()
+static const char *HostClientKindName()
 {
-    if (g.pipe != nullptr && HostAlive()) return true;
-    HostClose();
+    return g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : g.is_d3d10 ? "D3D10 (via a D3D11 relay)" : "D3D11";
+}
 
+// Worker side of JOB_CONNECT: spawn the helper, wait for its pipe, shake hands. Everything
+// it opens goes into g_link so the render thread can adopt it -- on failure too, so a
+// half-made link is disposed of by the usual HostClose path rather than by hand here.
+static bool HostWorkerConnect(HANDLE ev)
+{
     char dir[MAX_PATH];
     GetModuleFileNameA(g_self, dir, MAX_PATH);
     if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
@@ -1591,68 +2216,295 @@ static bool EnsureHost()
     sprintf_s(wd, "%shost64", dir);
     if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES)
     {
-        Warn("host64\\dlss5-feed-host64.exe not found next to the add-on");
-        FeedDisable("the 64-bit host is not installed");
+        g_link.fatal = true;
+        strcpy_s(g_link.why, "the 64-bit host is not installed");
         return false;
     }
-    // host_window=0: the host still makes its window (the cast below needs a shown one), but
-    // as a tool window parked behind everything -- --behind; 1: its own plain window.
-    sprintf_s(cmd, "\"%s\" %lu%s", exe, GetCurrentProcessId(), g_cfg.host_window ? "" : " --behind");
+    // host_window=0: the host still makes its window (the cast needs a shown one), but as a
+    // tool window parked behind everything -- --behind; 1: its own plain window.
+    sprintf_s(cmd, "\"%s\" %lu%s%s", exe, GetCurrentProcessId(),
+              g_cfg.host_window ? "" : " --behind",
+              g_cfg.host_gpu_priority ? " --gpu-priority" : "");
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
-    Breadcrumb("spawning the 64-bit host");
     if (!CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, wd, &si, &pi))
     {
         Log("[feed32] CreateProcess failed %lu", GetLastError());
-        FeedDisable("could not start the 64-bit host");
+        g_link.fatal = true;
+        strcpy_s(g_link.why, "could not start the 64-bit host");
         return false;
     }
     CloseHandle(pi.hThread);
-    g.hproc = pi.hProcess;
-    Log("[feed32] host spawned (pid %lu)", pi.dwProcessId);
+    g_link.proc = pi.hProcess;
+    // The command line, not just the pid: when the host exits at its usage line, this is
+    // the half of the evidence that survives -- the host truncates its own log on every
+    // launch, so a later manual run can erase the failing one (issue #46).
+    Log("[feed32] host spawned (pid %lu): %s", pi.dwProcessId, cmd);
 
     char name[128];
     sprintf_s(name, FEED_PIPE_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
-    for (int i = 0; i < 150 && g.pipe == nullptr; ++i)   // up to 15 s (host loads ReShade + NGX)
+    for (int i = 0; i < 150 && g_link.pipe == nullptr; ++i)   // up to 15 s (host loads ReShade + NGX)
     {
-        HANDLE p = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (p != INVALID_HANDLE_VALUE) { g.pipe = p; break; }
-        if (!HostAlive()) { HostLost("exited during startup"); return false; }
-        Sleep(100);
+        // FILE_FLAG_OVERLAPPED: every transfer after this is bounded (see PipeXfer).
+        HANDLE p = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_OVERLAPPED, nullptr);
+        if (p != INVALID_HANDLE_VALUE) { g_link.pipe = p; break; }
+        if (WaitForSingleObject(g_link.proc, 0) != WAIT_TIMEOUT)
+        {
+            // The host's own return value said why (1 = it rejected its arguments, 3 = the
+            // device was removed); it used to be discarded, leaving "went away" as the
+            // whole story.
+            DWORD code = 0;
+            if (GetExitCodeProcess(g_link.proc, &code))
+                sprintf_s(g_link.why, "exited during startup with code %lu%s", code,
+                          code == 1 ? " (it rejected its own command line -- see dlss5-feed-host.log)" : "");
+            else
+                strcpy_s(g_link.why, "exited during startup");
+            return false;
+        }
+        if (WaitForSingleObject(g_link.abort_event, 100) == WAIT_OBJECT_0)
+        { strcpy_s(g_link.why, "cancelled while starting"); return false; }
     }
-    if (g.pipe == nullptr) { HostLost("pipe never appeared"); return false; }
+    if (g_link.pipe == nullptr) { strcpy_s(g_link.why, "pipe never appeared"); return false; }
 
+    // D3D10 is deliberately absent: by the time the host hears from us the frame is
+    // already on a D3D11 relay device, so it IS a D3D11 client -- same kind, same
+    // protocol version, nothing on the host side to change.
     const uint32_t kind = g.is_vulkan ? FEED_CLIENT_VULKAN : g.is_gl ? FEED_CLIENT_GL : FEED_CLIENT_D3D11;
-    const char *kind_name = g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : "D3D11";
     // Hand the host a handle to this process instead of making it OpenProcess(pid): a
     // protective DACL on the game (anti-cheat/DRM; seen on vanilla WoW) denies that with
     // error 5, and this duplication never consults the game's DACL -- both process handles
     // involved are ours (the pseudo-handle, and the one CreateProcess just returned).
     HANDLE self_in_host = nullptr;
-    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), g.hproc, &self_in_host,
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), g_link.proc, &self_in_host,
                          PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, 0))
         Log("[feed32] could not duplicate our process handle into the host (%lu); it will fall back to OpenProcess",
             GetLastError());
     FeedHello hello = { FEED_IPC_MAGIC, FEED_IPC_VERSION, GetCurrentProcessId(), kind,
                         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(self_in_host)) };
     FeedHelloAck ack = {};
-    if (!PipeWrite(&hello, sizeof(hello)) || !PipeRead(&ack, sizeof(ack)) || ack.magic != FEED_IPC_MAGIC)
-    { HostLost("handshake failed"); return false; }
+    if (!PipeXfer(g_link.pipe, ev, true,  &hello, sizeof(hello), kPipeHelloMs) ||
+        !PipeXfer(g_link.pipe, ev, false, &ack,   sizeof(ack),   kPipeHelloMs) ||
+        ack.magic != FEED_IPC_MAGIC)
+    { strcpy_s(g_link.why, "handshake failed"); return false; }
     if (ack.version != FEED_IPC_VERSION)
     {
-        // The message structs after the hello changed size between versions, so a
-        // mismatched pair would not just misbehave, it would desync the pipe. Both
-        // sides refuse rather than guess.
+        // The message structs after the hello changed size between versions, so a mismatched
+        // pair would not just misbehave, it would desync the pipe. Both sides refuse.
         Log("[feed32] the host in host64\\ speaks protocol v%u, this add-on v%u", ack.version, FEED_IPC_VERSION);
-        HostClose();
-        FeedDisable("the host64\\ folder is from a different release -- reinstall both halves together");
+        g_link.fatal = true;
+        strcpy_s(g_link.why, "the host64\\ folder is from a different release -- reinstall both halves together");
         return false;
     }
-    Log("[feed32] host connected (protocol v%u, %s client)", ack.version, kind_name);
-    g.panel_w = ack.panel_width;    // v7: the size the panel texture has to be, if the host has one
-    g.panel_h = ack.panel_height;
+    g_link.panel_w = ack.panel_width;   // v7: the size the panel texture has to be, if any
+    g_link.panel_h = ack.panel_height;
+    return true;
+}
+
+// Worker side of JOB_BUILD: the 'B' exchange, nothing else. g.pipe is set and untouched by
+// the render thread for as long as this job is in flight.
+static bool HostWorkerBuild(HANDLE ev)
+{
+    const BYTE tag = 'B';
+    if (!PipeXfer(g.pipe, ev, true,  const_cast<BYTE *>(&tag), 1, kPipeBuildMs) ||
+        !PipeXfer(g.pipe, ev, true,  &g_link.build, sizeof(g_link.build), kPipeBuildMs) ||
+        !PipeXfer(g.pipe, ev, false, &g_link.ack,   sizeof(g_link.ack),   kPipeBuildMs))
+    { strcpy_s(g_link.why, "build exchange failed"); return false; }
+    return true;
+}
+
+static DWORD WINAPI HostWorker(void *)
+{
+    const ULONGLONG t0 = GetTickCount64();
+    HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    bool ok = false;
+    if (ev == nullptr) strcpy_s(g_link.why, "could not create the worker's I/O event");
+    else ok = g_link.job == JOB_CONNECT ? HostWorkerConnect(ev) : HostWorkerBuild(ev);
+    if (ev != nullptr) CloseHandle(ev);
+    g_link.ms = static_cast<DWORD>(GetTickCount64() - t0);
+    // Last write: everything above must be visible to the render thread before it sees this.
+    InterlockedExchange(&g_link.state, ok ? LINK_DONE : LINK_FAILED);
+    // And the last act: drop the module reference taken in HostLinkStart. This is what makes
+    // it safe for DLL_PROCESS_DETACH to walk away without joining -- the module cannot be
+    // unmapped while this thread is still in it, and FreeLibraryAndExitThread is the one call
+    // that releases the reference and exits atomically. Nothing in this DLL runs after it.
+    const HMODULE ref = g_link.mod_ref;
+    if (ref != nullptr) FreeLibraryAndExitThread(ref, 0);
+    return 0;
+}
+
+static bool HostLinkStart(int job)
+{
+    if (g_link.thread != nullptr) return false;
+    if (g_link.abort_event == nullptr)
+    {
+        g_link.abort_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (g_link.abort_event == nullptr) return false;
+    }
+    ResetEvent(g_link.abort_event);
+    InterlockedExchange(&g_link.abort, 0);
+    g_link.job     = job;
+    g_link.fatal   = false;
+    g_link.why[0]  = '\0';
+    g_link.ms      = 0;
+    g_link.pipe    = nullptr;
+    g_link.proc    = nullptr;
+    // Pin this module for as long as the worker runs in it (see HostWorker's tail).
+    g_link.mod_ref = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                       reinterpret_cast<LPCWSTR>(&HostWorker), &g_link.mod_ref);
+    InterlockedExchange(&g_link.state, LINK_RUNNING);
+    g_link.thread = CreateThread(nullptr, 0, HostWorker, nullptr, 0, nullptr);
+    if (g_link.thread == nullptr)
+    {
+        if (g_link.mod_ref != nullptr) { FreeLibrary(g_link.mod_ref); g_link.mod_ref = nullptr; }
+        InterlockedExchange(&g_link.state, LINK_IDLE);
+        g_build_pending = false;
+        Log("[feed32] could not start the host worker thread (%lu)", GetLastError());
+        return false;
+    }
+    return true;
+}
+
+static void HostLinkJoin()
+{
+    if (g_link.thread == nullptr) return;
+    WaitForSingleObject(g_link.thread, INFINITE);   // it has already published its result
+    CloseHandle(g_link.thread);
+    g_link.thread = nullptr;
+}
+
+// Returns true when the worker is definitely finished, so everything it could have been
+// touching is safe to close. False means an orphan is still running and the CALLER must leak
+// the pipe rather than close it -- see HostClose.
+static bool HostLinkStop()
+{
+    if (g_link.thread == nullptr) { InterlockedExchange(&g_link.state, LINK_IDLE); return true; }
+    InterlockedExchange(&g_link.abort, 1);
+    if (g_link.abort_event != nullptr) SetEvent(g_link.abort_event);
+    // Wakes a transfer that is parked on the pipe; the worker's own OVERLAPPED wait then
+    // returns and it unwinds. Cancel on both handles, since a connect uses its own.
+    if (g.pipe != nullptr)      CancelIoEx(g.pipe, nullptr);
+    if (g_link.pipe != nullptr) CancelIoEx(g_link.pipe, nullptr);
+
+    // NEVER wait from DLL_PROCESS_DETACH. A thread cannot finish exiting while another holds
+    // the loader lock, so a join there blocks for the whole timeout and then unmaps this
+    // module out from under a thread still executing it -- and ReShade unloads and reloads
+    // this add-on per Vulkan instance, so that is a real path, not a theoretical one. The
+    // worker holds its own reference to the module and drops it as its last act
+    // (FreeLibraryAndExitThread), so walking away here is safe.
+    if (g_detaching)
+    {
+        Log("[feed32] detaching with the host worker still running; it holds a reference to this "
+            "module and will unload it when it finishes");
+        return false;
+    }
+    // Otherwise every wait it can be in is bounded and wakes on the abort or the cancel, so
+    // this should return almost at once. If it somehow does not, the one thing that must not
+    // happen is a handle closed or reused under it: leave the orphan and everything it holds
+    // strictly alone. g_link.thread stays set, so HostLinkStart refuses from here on.
+    if (WaitForSingleObject(g_link.thread, 5000) != WAIT_OBJECT_0)
+    {
+        Log("[feed32] the host worker did not stop within 5 s; abandoning it and everything it holds");
+        return false;
+    }
+    CloseHandle(g_link.thread);
+    g_link.thread = nullptr;
+    // It is finished, so anything it half-opened is ours. Break the pipe first and give the
+    // host the same few seconds HostClose does: a host that has just connected still has a
+    // ReShade ini to save, and killing it outright loses the overlay layout.
+    // Only a host that got as far as opening the pipe has an ini worth saving. One still
+    // inside its NGX/ReShade startup has nothing to lose and will not exit on its own, so
+    // waiting the full grace on it just widens the window in which it and its replacement
+    // both want a pipe only one of them can own (issue #58).
+    const bool connected = g_link.pipe != nullptr;
+    if (g_link.pipe != nullptr) { CloseHandle(g_link.pipe); g_link.pipe = nullptr; }
+    if (g_link.proc != nullptr)
+    {
+        const DWORD grace = connected ? 4000u : 0u;
+        if (!connected) Log("[feed32] the host had not connected yet; stopping it without the save grace");
+        if (WaitForSingleObject(g_link.proc, grace) != WAIT_OBJECT_0) TerminateProcess(g_link.proc, 0);
+        CloseHandle(g_link.proc);
+        g_link.proc = nullptr;
+    }
+    InterlockedExchange(&g_link.state, LINK_IDLE);
+    InterlockedExchange(&g_link.abort, 0);
+    if (g_link.abort_event != nullptr) ResetEvent(g_link.abort_event);
+    return true;
+}
+
+// True when the pipe is up and the host is alive. Otherwise it starts (or keeps waiting on)
+// the connect and returns false: the caller renders this frame without a feed, which is the
+// whole point -- this used to be up to 15 s of frozen game.
+static bool HostConnectReady()
+{
+    if (g.pipe != nullptr && HostAlive()) return true;
+
+    if (g_link.state == LINK_RUNNING) return false;
+    if (g_link.state == LINK_IDLE)
+    {
+        if (g.pipe != nullptr || g.hproc != nullptr) HostClose();   // a stale half-link
+        if (HostLinkStart(JOB_CONNECT))
+            Log("[feed32] starting the 64-bit host in the background (the game keeps rendering)");
+        return false;
+    }
+    if (g_link.job != JOB_CONNECT) return false;   // a build result; not ours to consume
+
+    const bool  ok    = g_link.state == LINK_DONE;
+    const DWORD ms    = g_link.ms;
+    const bool  fatal = g_link.fatal;
+    char why[192];
+    strcpy_s(why, g_link.why[0] != '\0' ? g_link.why : "the host could not be started");
+    HostLinkJoin();
+    // Adopt whatever it opened either way, so the failure path disposes of it the usual way.
+    if (g_link.pipe != nullptr) { g.pipe  = g_link.pipe; g_link.pipe = nullptr; }
+    if (g_link.proc != nullptr) { g.hproc = g_link.proc; g_link.proc = nullptr; }
+    InterlockedExchange(&g_link.state, LINK_IDLE);
+
+    if (!ok)
+    {
+        if (fatal) { HostClose(); FeedDisable(why); }
+        else       HostLost(why);
+        return false;
+    }
+    g.panel_w = g_link.panel_w;
+    g.panel_h = g_link.panel_h;
+    Log("[feed32] host connected in %lu ms (protocol v%u, %s client)", ms, FEED_IPC_VERSION, HostClientKindName());
     RestoreGameFocus();   // the replacement host is up; take the foreground back if we lost it
+    return true;
+}
+
+// The build exchange, from the render thread's side.
+enum HostXfer { XFER_NONE, XFER_BUSY, XFER_DONE, XFER_FAILED };
+
+static HostXfer HostBuildPoll(FeedBuildAck *ack)
+{
+    if (g_link.state == LINK_RUNNING) return XFER_BUSY;   // a connect counts as "not now" too
+    if (g_link.job != JOB_BUILD) return XFER_NONE;
+    if (g_link.state == LINK_DONE)
+    {
+        HostLinkJoin();
+        *ack = g_link.ack;
+        InterlockedExchange(&g_link.state, LINK_IDLE);
+        Log("[feed32] the host answered the build in %lu ms", g_link.ms);
+        return XFER_DONE;
+    }
+    if (g_link.state == LINK_FAILED)
+    {
+        HostLinkJoin();
+        InterlockedExchange(&g_link.state, LINK_IDLE);
+        return XFER_FAILED;
+    }
+    return XFER_NONE;
+}
+
+static bool HostBuildSubmit(const FeedBuild &b)
+{
+    if (g_link.state != LINK_IDLE) return false;
+    g_link.build = b;
+    if (!HostLinkStart(JOB_BUILD)) return false;
+    Breadcrumb("waiting for the host's build (off the render thread)");
     return true;
 }
 
@@ -1660,9 +2512,11 @@ static bool EnsureHost()
 // The host's DLSS 5 settings, controlled from the game's own ReShade panel.
 // The renodx add-on reads [RenoDX.DLSS5] from the HOST's ReShade.ini at startup
 // (only its own panel can change them live), so applying = write that ini and
-// cycle the host. The game renders normally during the gap, which is usually a couple of
-// seconds but can reach ~15 s -- the replacement host has to re-init NGX and reload the
-// ~165 MB DLSSNR model before it can serve a frame.
+// cycle the host. The gap is usually a couple of seconds but can reach ~15 s -- the
+// replacement host has to re-init NGX and reload the ~165 MB DLSSNR model before it can
+// serve a frame. The game really does render normally throughout now: the spawn, the
+// handshake and the build all happen on the worker (see "Host process + pipe" above), where
+// they used to hold the render thread for exactly that long.
 // ---------------------------------------------------------------------------
 
 // This table mirrors the DLSS 5 add-on's own panel one-for-one: same order, same
@@ -1757,6 +2611,35 @@ static void HostIniPath(char *out)
         strcpy_s(s + 1, MAX_PATH - (s + 1 - out), "host64\\ReShade.ini");
 }
 
+// The host's own window size: a real resize of its window, swapchain and the panel texture
+// this add-on casts, not just the scaled-picture "Panel size (%)" slider below.
+//
+// Written to the same [DLSS5Host] keys the host reads at startup, so the choice survives a
+// restart AND editing the ini by hand still works -- and, since IPC v8, ALSO sent down the
+// pipe so it applies to the running host straight away. It used to be the ini alone, which
+// meant moving these sliders appeared to do nothing until the user found the "Restart the
+// DLSS 5 host" button further down the page (issue #44).
+static int  g_host_win_w = 900, g_host_win_h;   // 0 = auto (fill the work area), the host's own default
+static bool g_host_win_loaded;
+
+static void ReadHostWindowSize()
+{
+    char p[MAX_PATH];
+    HostIniPath(p);
+    g_host_win_w = GetPrivateProfileIntA("DLSS5Host", "WindowWidth", 900, p);
+    g_host_win_h = GetPrivateProfileIntA("DLSS5Host", "WindowHeight", 0, p);
+}
+
+static void WriteHostWindowSize()
+{
+    char p[MAX_PATH], buf[16];
+    HostIniPath(p);
+    sprintf_s(buf, "%d", g_host_win_w);
+    WritePrivateProfileStringA("DLSS5Host", "WindowWidth", buf, p);
+    sprintf_s(buf, "%d", g_host_win_h);
+    WritePrivateProfileStringA("DLSS5Host", "WindowHeight", buf, p);
+}
+
 // Cache of the host's settings, shown and edited on the ReShade overlay page (Add-ons
 // tab -> DLSS 5 Feed). Loaded from the host's ini on first resolve so the panel always
 // starts from what is actually active, never a stale default.
@@ -1818,22 +2701,52 @@ static void HostClose();   // below
 // it is the right button for any neural consumer, not just RenoDX. HostApplySettings below
 // repeats these steps rather than calling this, because it has to write the host's ini in
 // the middle of the sequence and the order there is load-bearing.
+// The overlay runs on the render thread but OUTSIDE the feed lock, and HostClose drains
+// fences, tears down shared state and stops the worker -- none of which may happen beside a
+// frame that is using them. So the buttons only record what they want; FeedFrame consumes
+// it at the top of the next frame, inside the lock.
+enum { HOST_REQ_NONE = 0, HOST_REQ_RESTART, HOST_REQ_APPLY, HOST_REQ_WINSIZE, HOST_REQ_OVERLAY };
+static volatile LONG g_host_request;
+static char          g_host_request_why[160];
+
+// True while a host process has been spawned but has not finished its handshake. HostAlive()
+// is false for that whole window -- the process handle only reaches g.hproc when the connect
+// job completes -- so without this, nothing in the add-on can tell "no host" from "a host is
+// on its way", and the overlay offered to start a second one. Issue #58: the reporter's host
+// needs about 11 s to reach its first connection, and pressing the button in that gap killed
+// the starter and spawned a rival for a pipe only one of them can own.
+static bool HostStarting() { return g_link.state == LINK_RUNNING; }
+
+static void HostRequest(int req, const char *why)
+{
+    if (req == HOST_REQ_RESTART && HostStarting())
+    {
+        Warn("a host is already starting -- waiting for it rather than spawning a second one");
+        return;
+    }
+    if (why != nullptr) strcpy_s(g_host_request_why, why);
+    InterlockedExchange(&g_host_request, req);
+    CaptureGameFocus();   // spent once the replacement host has connected
+}
+
+// Note both of these still pay HostClose's shutdown wait (up to 4 s, so the old helper's
+// ReShade can save its ini before the replacement claims the pipe -- the pipe name is per
+// game PID and only one instance may own it, so the two cannot overlap). What they no longer
+// pay is the START: that is the worker's, and the game renders through it.
 static void HostRestart(const char *why)
 {
-    CaptureGameFocus();   // spent once the replacement host has connected
     HostClose();          // drains the in-flight frame and releases the shared fences
     g.built = false;
     g.disabled = false;
     g.consecutive_fails = 0;
     g_retry_at = 0;
     g_disable_why[0] = '\0';
-    Warn("%s -- restarting the host (up to 15 s)", why);
+    Warn("%s -- the replacement starts in the background", why);
 }
 
 static void HostApplySettings()
 {
     LogHostNR("applying DLSS 5 host settings");
-    CaptureGameFocus();   // spent once the replacement host has connected
 
     // Order matters: the host's ReShade saves its ini ON EXIT and would clobber our
     // values -- close the host first (HostClose drains the in-flight frame and
@@ -1845,7 +2758,82 @@ static void HostApplySettings()
     g.disabled = false;
     g.consecutive_fails = 0;
     g_retry_at = 0;
-    Warn("DLSS 5 settings applied -- restarting the host (up to 15 s)");
+    Warn("DLSS 5 settings applied -- the replacement host starts in the background");
+}
+
+// v8: resize the running host's window, without restarting it.
+//
+// The panel texture the cast draws is created by THIS side at FeedHelloAck::panel_* size and
+// handed over in the build, so a window resize makes it the wrong size. Rather than invent a
+// host-to-game notification for that, the size we just asked for is adopted here and the
+// build marked stale: the host applies the 'W' and the rebuild in pipe order, off the one
+// pipe, so the texture it receives is already the new size. CastPanelAvailable() covers the
+// frame or two in between with "waiting for the panel texture", which it already does after
+// every other rebuild.
+static void HostApplyWindowSize()
+{
+    if (g.pipe == nullptr) return;   // nothing running; the ini write is all that is needed
+
+    int want_h = g_host_win_h;
+    if (want_h == 0)
+    {
+        RECT wa = {}, deco = {};
+        if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0) && wa.bottom > wa.top)
+        {
+            AdjustWindowRect(&deco, WS_OVERLAPPEDWINDOW, FALSE);
+            want_h = (wa.bottom - wa.top) - (deco.bottom - deco.top);
+        }
+    }
+    if (want_h < 300) want_h = 300; else if (want_h > 8000) want_h = 8000;
+    int want_w = g_host_win_w;
+    if (want_w < 300) want_w = 300; else if (want_w > 4000) want_w = 4000;
+    want_w &= ~1; want_h &= ~1;
+
+#pragma pack(push, 1)
+    struct { BYTE tag; FeedWindowMsg wm; } msg = { 'W', { static_cast<uint32_t>(want_w), static_cast<uint32_t>(want_h) } };
+#pragma pack(pop)
+    if (!PipeWrite(&msg, sizeof(msg))) { HostLost("the window resize could not be sent"); return; }
+
+    CastRelease();   // the thumbnail registration; it is re-made against the resized window
+    CastAdoptPanelSize(static_cast<unsigned>(want_w), static_cast<unsigned>(want_h), "the sliders");
+    // The host has not resized yet, so for a moment its window still reads the old size;
+    // CastLayout's poll must not "correct" the size we just asked for back to that.
+    g_panel_poll_quiet_until = GetTickCount64() + 2500;
+}
+
+// v9: ask the running host to open ReShade's overlay in its own window -- the panel these
+// buttons cast into the game. The host opens it once when it starts and, before v9, nothing
+// could ask it again, so closing it made the consumer's panel unreachable for the session.
+//
+// It has to be the host that posts the key. CastPostKey forwards a press and its release in
+// the same frame, and ReShade reads a key that goes down and up inside one frame as never
+// pressed -- which is why pressing the overlay key over the cast does nothing. The host
+// spreads the two edges across its own pumps, the same sequence it uses at startup.
+// Toggle ReShade's overlay in the HOST window -- the window the panel casts. The host presses its
+// own overlay key, a toggle; there is no way from here to read whether the overlay is currently up
+// (the host is not a ReShade add-on, it only posts the key) and other things flip it too -- the
+// host's own Home key, and Home forwarded through the cast while the cursor is over the panel. So
+// this claims nothing about the result: the cast is the readout, the placeholder banner when the
+// overlay is closed and the tuning panel when it is open. One press flips it; press again if it
+// went the wrong way.
+static void HostToggleOverlay()
+{
+    if (g.pipe == nullptr) { Warn("the DLSS 5 host is not running, so it has no overlay to toggle"); return; }
+    const BYTE tag = 'O';
+    if (!PipeWrite(&tag, sizeof(tag))) { HostLost("the overlay request could not be sent"); return; }
+    Log("[feed32] asked the host to toggle ReShade's overlay in its window");
+}
+
+static bool HostRequestPending() { return g_host_request != HOST_REQ_NONE; }
+
+// Called from OnPresent, on the render thread and inside the feed lock.
+static void HostConsumeRequest()
+{
+    const LONG req = InterlockedExchange(&g_host_request, HOST_REQ_NONE);
+    if (req == HOST_REQ_RESTART) HostRestart(g_host_request_why);
+    else if (req == HOST_REQ_APPLY) HostApplySettings();
+    else if (req == HOST_REQ_WINSIZE) HostApplyWindowSize();
+    else if (req == HOST_REQ_OVERLAY) HostToggleOverlay();
 }
 
 // ---------------------------------------------------------------------------
@@ -1895,6 +2883,15 @@ static void ReleaseShared()
             if (g.gl_panel_tex != 0) { any = true; g.gl_panel_tex = 0; g.gl_panel_memobj = 0; }
             if (any) Log("[feed32] the GL context is not current here; the imported textures are left to the driver");
         }
+    }
+    // D3D10: the bridges are sized by the build, so they go out with it. Unbind first --
+    // the relay may still hold the Output's render target view or a guide SRV from the
+    // last frame, and a released view that is still bound is exactly what the debug layer
+    // catches and a release driver quietly tolerates until it does not.
+    if (g.d10.ok)
+    {
+        if (g.d10.relay_ctx != nullptr) { g.d10.relay_ctx->ClearState(); g.d10.relay_ctx->Flush(); }
+        for (int i = 0; i < FEED_SLOTS; ++i) FeedD3D10ReleaseBridge(&g.d10_bridge[i]);
     }
     SafeRelease(g.output_srv);
     g.sr_active = false;              // the next build decides again
@@ -2035,7 +3032,19 @@ static bool MakeBlitShaders()
 
 static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DXGI_FORMAT bb_fmt)
 {
+    // The exchange with the host runs on the worker, so this function is entered twice per
+    // build: once to prepare and hand it over, and once more -- some frames later -- to
+    // finish with the ack. Everything before the hand-over is the same code it always was.
+    FeedBuildAck ack = {};
+    const HostXfer st = HostBuildPoll(&ack);
+    if (st == XFER_BUSY)   { g_build_pending = true;  return false; }
+    if (st == XFER_FAILED) { g_build_pending = false; HostLost("build exchange failed"); return false; }
+    if (st != XFER_DONE)
+    {
     Breadcrumb("building the shared textures");
+    // Connect first, and off this thread: nothing below is worth doing without a host, and
+    // re-creating the shared textures on every frame of a 15 s spawn would be worse still.
+    if (!HostConnectReady()) { g_build_pending = true; return false; }
     ReleaseShared();
 
     g.width      = w;
@@ -2047,7 +3056,7 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     // Transport test copies Color->Output host-side with CopyResource: same format then.
     g.output_fmt = g_cfg.mode == 1 ? g.color_fmt : OutputFormatFor(g.color_fmt);
     if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
-    { FeedDisable("unsupported backbuffer format"); return false; }
+    { g_build_pending = false; FeedDisable("unsupported backbuffer format"); return false; }
     const bool hdr      = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
 
@@ -2063,6 +3072,17 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     g.output_height = want_sr ? backbuffer_h : h;
     g.jitter_index  = 0;
     g.jitter_x = g.jitter_y = 0.0f;
+
+    // host_creates=1 in the cfg forces the route a feature-level 10.x device is pushed onto,
+    // on a device that does not need it. It is the only way to exercise that path on a healthy
+    // FL11 machine -- issue #43 shipped a fallback nobody here could run. Parse-only, not
+    // written back, not on the overlay: a diagnostic, like the 64-bit side's jitter_sign.
+    if (g_cfg.host_creates == 1 && !g.host_creates)
+    {
+        g.host_creates = true;
+        g.no_uav       = true;   // the interesting half: it is what makes the Output differ
+        Log("[feed32] host_creates=1: forcing the host to create the shared set (issue #43 test path)");
+    }
 
     if (!g.host_creates)
     {
@@ -2082,19 +3102,16 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
             // handles in; this side opens them (OpenSharedResource1 needs no bind flags
             // of its own), and where UAVs are the problem the host keeps the Output's UAV
             // on its side and copies into a plain shared texture.
-            static const char *const slot_name[FEED_SLOTS] = { "Color", "Output", "Depth", "MV" };
             const D3D_FEATURE_LEVEL fl = g.dev->GetFeatureLevel();
             ReleaseShared();
             g.host_creates = true;
             g.no_uav       = failed == FEED_OUTPUT || fl < D3D_FEATURE_LEVEL_11_0;
             Log("[feed32] the game's D3D11 device (feature level %d_%d) refused the shared %s texture; the host will "
                 "create the shared set instead%s",
-                (fl >> 12) & 0xF, (fl >> 8) & 0xF, slot_name[failed],
+                (fl >> 12) & 0xF, (fl >> 8) & 0xF, FeedSlotName(failed),
                 g.no_uav ? ", keeping the DLSS output's UAV on its own side (this device cannot bind one)" : "");
         }
     }
-
-    if (!EnsureHost()) return false;
 
     FeedBuild b = {};
     b.width          = w;
@@ -2108,53 +3125,110 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
     if (want_sr) { b.target_width = g.output_width; b.target_height = g.output_height; }
+    if (g_cfg.async_home) b.client_flags |= FEED_BUILD_ASYNC_HOME;
     if (g.host_creates)
-        b.client_flags = FEED_BUILD_HOST_CREATES | (g.no_uav ? FEED_BUILD_OUTPUT_NO_UAV : 0);
+        b.client_flags |= FEED_BUILD_HOST_CREATES | (g.no_uav ? FEED_BUILD_OUTPUT_NO_UAV : 0);
     else
         for (int i = 0; i < FEED_SLOTS; ++i)
             b.tex[i] = reinterpret_cast<uintptr_t>(g.tex_handle[i]);
-    b.panel_tex = CastMakePanel();   // v7: the in-game panel's texture (0 when the host has none)
+    // v7: the in-game panel's texture (0 when the host has none). Not when the host creates
+    // the set -- it then makes the panel too and ignores this field, so making one here would
+    // only burn a texture nobody writes; CastAdoptHostPanel11 opens the host's from the ack.
+    b.panel_tex = g.host_creates ? 0 : CastMakePanel();
 
-    Breadcrumb("asking the host to build");
-    BYTE tag = 'B';
-    FeedBuildAck ack = {};
-    if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
-    { HostLost("build exchange failed"); return false; }
+    // Hand it to the worker and let the frame go. The ack lands on a later frame, which is
+    // where this function picks up again.
+    if (!HostBuildSubmit(b)) { g_build_pending = false; FeedFail("could not hand the build to the host"); return false; }
+    g_build_pending = true;
+    Log("[feed32] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer fmt=%u (depth reversed=%d, mode=%d) "
+        "-- handed to the host, the game keeps rendering",
+        w, h, g_cfg.work_resolution, backbuffer_w, backbuffer_h, bb_fmt, g.depth_reversed ? 1 : 0, g_cfg.mode);
+    return false;
+    }
+
+    // ---- the host has answered: everything below runs with `ack` in hand ----
+    //
+    // Finish against what was actually BUILT, not against this frame's arguments. The caller
+    // re-derives those from the current backbuffer every frame, and the resolution can have
+    // changed while the build was in flight -- finishing against the new size would size the
+    // staging texture and the RTVs for one resolution and the shared set for another. The
+    // prepare half recorded the real ones, and nothing else writes them. A build that has
+    // been overtaken is spotted by the caller's own size test on the very next frame and
+    // simply rebuilt.
+    g_build_pending = false;
+    w = g.width;                     h = g.height;
+    backbuffer_w = g.backbuffer_width; backbuffer_h = g.backbuffer_height;
+    bb_fmt = g.bb_fmt;
+
+    // Take ownership of every handle the host duplicated in, BEFORE any early return can drop
+    // it. The host fills ack.tex[] whenever it created the textures, whether or not the
+    // feature create that follows succeeded -- so a build that fails here used to leak four
+    // handles, plus the panel's, every attempt. ReleaseShared() closes g.tex_handle[], and
+    // BuildShared starts with a ReleaseShared(), so a retry is covered. (The GL and Vulkan
+    // builds have always done this; the D3D11 host-creates path never did.)
+    if (g.host_creates)
+        for (int i = 0; i < FEED_SLOTS; ++i)
+            g.tex_handle[i] = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.tex[i]));
+
     if (!ack.ok && (ack.flags & FEED_ACK_SR_UNAVAILABLE) != 0)
     {
         // The host found no DLSS preset for this ratio: build again as DLAA + FSR 1, once.
         Log("[feed32] work_upscale=2: no DLSS preset covers %ux%u -> %ux%u; staying on DLAA + FSR 1 for this size", w, h, backbuffer_w, backbuffer_h);
         g.sr_unavailable = true;
+        if (ack.panel_tex != 0) CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex)));
         return BuildShared(w, h, backbuffer_w, backbuffer_h, bb_fmt);
     }
     if (!ack.ok)
     {
         Log("[feed32] host build failed (ngx 0x%08X)", ack.ngx_result);
+        if (ack.panel_tex != 0) CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex)));
         return false;
     }
 
     if (g.host_creates)
     {
-        // The handles are already duplicated into this process; ReleaseShared closes them.
+        // The handles were taken above; ReleaseShared closes them.
         ID3D11Device1 *dev1 = nullptr;
         if (FAILED(g.dev->QueryInterface(__uuidof(ID3D11Device1), reinterpret_cast<void **>(&dev1))) || dev1 == nullptr)
-        { FeedDisable("ID3D11Device1 unavailable, so the host-created textures cannot be opened (Windows 8+ D3D11.1 runtime required)"); return false; }
+        {
+            if (ack.panel_tex != 0) CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex)));
+            FeedDisable("ID3D11Device1 unavailable, so the host-created textures cannot be opened (Windows 8+ D3D11.1 runtime required)");
+            return false;
+        }
+        // Try every slot before giving up. Returning on the first failure meant a report
+        // only ever named one slot and never said whether the rest would have opened --
+        // and that single line was the entire evidence for issue #43. The host logs the
+        // D3D12 flags it used for each; together the two say which flag a device refuses.
+        int  failed_mask = 0;
+        char failed_names[64] = "";
+        char opened_names[64] = "";
+        static_assert(sizeof(failed_names) == sizeof(opened_names), "both lists share one size below");
         for (int i = 0; i < FEED_SLOTS; ++i)
         {
-            g.tex_handle[i] = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.tex[i]));
             const HRESULT hr = g.tex_handle[i] != nullptr
                 ? dev1->OpenSharedResource1(g.tex_handle[i], __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&g.tex[i]))
                 : E_HANDLE;
+            char *const names = FAILED(hr) ? failed_names : opened_names;
+            if (names[0] != '\0') strcat_s(names, sizeof(failed_names), ", ");
+            strcat_s(names, sizeof(failed_names), FeedSlotName(i));
             if (FAILED(hr))
             {
-                Log("[feed32] OpenSharedResource1(tex %d) failed 0x%08X -- this device cannot open the host's textures either",
-                    i, hr);
-                dev1->Release();
-                ReleaseShared();
-                FeedDisable("the shared textures cannot be created on the game's device or opened from the host's");
-                return false;
+                failed_mask |= 1 << i;
+                Log("[feed32] OpenSharedResource1(%s) failed 0x%08X", FeedSlotName(i), hr);
             }
         }
+        if (failed_mask != 0)
+        {
+            Log("[feed32] this device cannot open the host's shared textures: %s failed; %s opened. "
+                "host64\\dlss5-feed-host.log lists the D3D12 flags each was created with.",
+                failed_names, opened_names[0] != '\0' ? opened_names : "none");
+            if (ack.panel_tex != 0) CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex)));
+            dev1->Release();
+            ReleaseShared();
+            FeedDisable("the shared textures cannot be created on the game's device or opened from the host's");
+            return false;
+        }
+        CastAdoptHostPanel11(dev1, ack);   // the host made the panel too; ours would never be written
         dev1->Release();
         if (ack.output_fmt != 0 && static_cast<DXGI_FORMAT>(ack.output_fmt) != g.output_fmt)
         {
@@ -2193,19 +3267,29 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         sd.Height           = backbuffer_h;
         sd.MipLevels        = 1;
         sd.ArraySize        = 1;
-        sd.Format           = bb_fmt;          // exact backbuffer format, so CopyResource accepts it
+        // Typeless, not bb_fmt: CopyResource still accepts the backbuffer (same type group)
+        // and the typed g.color_fmt view below becomes legal even for an sRGB backbuffer (#85).
+        sd.Format           = TypelessColorFormat(bb_fmt);
         sd.SampleDesc.Count = 1;
         sd.Usage            = D3D11_USAGE_DEFAULT;
         sd.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(g.dev->CreateTexture2D(&sd, nullptr, &g.color_stage)))
-        { Log("[feed32] work-resolution staging texture failed (%ux%u fmt=%u)", backbuffer_w, backbuffer_h, bb_fmt); ReleaseShared(); return false; }
+        { Log("[feed32] work-resolution staging texture failed (%ux%u fmt=%u)", backbuffer_w, backbuffer_h, sd.Format); ReleaseShared(); return false; }
 
+        // g.color_fmt, not bb_fmt: an sRGB view would apply the sRGB->linear conversion on
+        // sample and change what DLSS is fed. The 100% path copies raw bits; this matches it.
         D3D11_SHADER_RESOURCE_VIEW_DESC ss = {};
-        ss.Format              = g.color_fmt;  // typed view, in case the backbuffer is TYPELESS
+        ss.Format              = g.color_fmt;
         ss.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
         ss.Texture2D.MipLevels = 1;
-        if (FAILED(g.dev->CreateShaderResourceView(g.color_stage, &ss, &g.color_stage_srv)))
-        { Log("[feed32] work-resolution staging SRV failed"); ReleaseShared(); return false; }
+        const HRESULT ssr = g.dev->CreateShaderResourceView(g.color_stage, &ss, &g.color_stage_srv);
+        if (FAILED(ssr))
+        {
+            Log("[feed32] work-resolution staging SRV failed 0x%08X: a fmt=%u view on a fmt=%u "
+                "texture (backbuffer fmt=%u)", ssr, g.color_fmt, sd.Format, bb_fmt);
+            ReleaseShared();
+            return false;
+        }
 
         Log("[feed32] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
 
@@ -2247,7 +3331,9 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     Log("[feed32] shared set ready: %ux%u (%d%% of %ux%u) color fmt=%u output fmt=%u (host ngx 0x%08X, %s)",
         w, h, g_cfg.work_resolution, backbuffer_w, backbuffer_h,
         g.color_fmt, g.output_fmt, ack.ngx_result, g_cfg.mode == 1 ? "transport" : "DLSS");
-    if (want_sr && (ack.flags & FEED_ACK_SR_ACTIVE) != 0)
+    // g.sr_requested is what the prepare half asked for; `want_sr` itself is out of scope
+    // here, since the two halves are now separated by the worker's round trip.
+    if (g.sr_requested && (ack.flags & FEED_ACK_SR_ACTIVE) != 0)
     {
         g.sr_active  = true;
         g.sr_quality = ack.sr_quality;
@@ -2256,7 +3342,7 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         Log("[feed32] work_upscale=2: DLSS %s, %ux%u -> %ux%u, Halton(2,3) over %u phases",
             SrQualityName(g.sr_quality), w, h, backbuffer_w, backbuffer_h, g.jitter_phases);
     }
-    else if (want_sr)
+    else if (g.sr_requested)
         Log("[feed32] work_upscale=2 was asked for but the host built DLAA (an older host?); expand-back stays spatial");
     if (g.host_creates)
         Log("[feed32] the shared set is host-created and opened here%s", g.no_uav ? "; the DLSS output is copied into it host-side" : "");
@@ -2275,7 +3361,16 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
 
 static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handle)
 {
+    // Same two-part shape as BuildShared: prepare and hand over, then finish with the ack a
+    // few frames later. See the comment there.
+    FeedBuildAck ack = {};
+    const HostXfer st = HostBuildPoll(&ack);
+    if (st == XFER_BUSY)   { g_build_pending = true;  return false; }
+    if (st == XFER_FAILED) { g_build_pending = false; HostLost("build exchange failed"); return false; }
+    if (st != XFER_DONE)
+    {
     Breadcrumb("building the shared textures (OpenGL)");
+    if (!HostConnectReady()) { g_build_pending = true; return false; }
     ReleaseShared();
 
     g.width  = w;
@@ -2286,11 +3381,9 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
     g.color_fmt  = GlSafeColorFormat(TypedColorFormat(bb_fmt));
     g.output_fmt = g_cfg.mode == 1 ? g.color_fmt : GlSafeColorFormat(OutputFormatFor(g.color_fmt));
     if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
-    { FeedDisable("unsupported backbuffer format"); return false; }
+    { g_build_pending = false; FeedDisable("unsupported backbuffer format"); return false; }
     const bool hdr      = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
-
-    if (!EnsureHost()) return false;
 
     FeedBuild b = {};
     b.width          = w;
@@ -2303,13 +3396,21 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
+    if (g_cfg.async_home) b.client_flags |= FEED_BUILD_ASYNC_HOME;
     // b.tex stays zero: on this path the host creates, and answers with its handles.
 
-    Breadcrumb("asking the host to build (OpenGL)");
-    BYTE tag = 'B';
-    FeedBuildAck ack = {};
-    if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
-    { HostLost("build exchange failed"); return false; }
+    if (!HostBuildSubmit(b)) { g_build_pending = false; FeedFail("could not hand the build to the host"); return false; }
+    g_build_pending = true;
+    Log("[feed32] building: %ux%u backbuffer fmt=%u (OpenGL, depth reversed=%d, mode=%d) "
+        "-- handed to the host, the game keeps rendering",
+        w, h, bb_fmt, g.depth_reversed ? 1 : 0, g_cfg.mode);
+    return false;
+    }
+
+    // ---- the host has answered ----
+    // Against what was built, not this frame's arguments -- see BuildShared.
+    g_build_pending = false;
+    w = g.width; h = g.height; bb_fmt = g.bb_fmt;
 
     // Own the duplicated handles before any early return can drop them -- see the same
     // step in BuildSharedVk for why the failing build is exactly when this bites.
@@ -2441,7 +3542,16 @@ static bool EnsureVulkanLoaded(reshade::api::effect_runtime *rt)
 
 static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
+    // Same two-part shape as BuildShared: prepare and hand over, then finish with the ack a
+    // few frames later. See the comment there.
+    FeedBuildAck ack = {};
+    const HostXfer st = HostBuildPoll(&ack);
+    if (st == XFER_BUSY)   { g_build_pending = true;  return false; }
+    if (st == XFER_FAILED) { g_build_pending = false; HostLost("build exchange failed"); return false; }
+    if (st != XFER_DONE)
+    {
     Breadcrumb("building the shared textures (Vulkan)");
+    if (!HostConnectReady()) { g_build_pending = true; return false; }
     ReleaseShared();
 
     g.width  = w;
@@ -2453,6 +3563,7 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
     {
         Log("[feed32] backbuffer format %u (%s) is not supported", bb_fmt, FeedFmtName(bb_fmt));
+        g_build_pending = false;
         FeedDisable("unsupported backbuffer format");
         return false;
     }
@@ -2460,10 +3571,9 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     // then. Otherwise ask for the channel order the backbuffer has, so the way home is a
     // raw vkCmdCopyImage -- the host gets the final say (see ack.output_fmt below).
     const DXGI_FORMAT want_output = g_cfg.mode == 1 ? g.color_fmt : FeedFmtOutputFor(g.color_fmt);
+    g.output_fmt = want_output;   // what we asked for; the finish half compares the ack against it
     const bool hdr      = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : FeedFmtIsHdr(g.color_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
-
-    if (!EnsureHost()) return false;
 
     FeedBuild b = {};
     b.width          = w;
@@ -2476,13 +3586,25 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
+    // Under async_home the game copies home the PREVIOUS frame's result and is never
+    // waiting on the evaluate the host is running, so the host may take its own time to
+    // get a present slot rather than dropping the present. That drop is what starved the
+    // neural consumer on DXVK (issue #15).
+    if (g_cfg.async_home) b.client_flags |= FEED_BUILD_ASYNC_HOME;
     // b.tex stays zero: on this path the host creates, and answers with its handles.
 
-    Breadcrumb("asking the host to build (Vulkan)");
-    BYTE tag = 'B';
-    FeedBuildAck ack = {};
-    if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
-    { HostLost("build exchange failed"); return false; }
+    if (!HostBuildSubmit(b)) { g_build_pending = false; FeedFail("could not hand the build to the host"); return false; }
+    g_build_pending = true;
+    Log("[feed32] building: %ux%u backbuffer %s (Vulkan, depth reversed=%d, mode=%d) "
+        "-- handed to the host, the game keeps rendering",
+        w, h, FeedFmtName(bb_fmt), g.depth_reversed ? 1 : 0, g_cfg.mode);
+    return false;
+    }
+
+    // ---- the host has answered ----
+    // Against what was built, not this frame's arguments -- see BuildShared.
+    g_build_pending = false;
+    w = g.width; h = g.height; bb_fmt = g.bb_fmt;
 
     // Take ownership of the duplicated handles NOW, before any early return can drop
     // them on the floor. The host duplicates all four into this process and fills
@@ -2502,10 +3624,11 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 
     // The host owns the Output format: only its device can be asked whether a typed UAV
     // store to BGRA8 exists on this GPU, and it falls back to RGBA8 where it does not.
-    g.output_fmt = ack.output_fmt != 0 ? static_cast<DXGI_FORMAT>(ack.output_fmt) : want_output;
-    if (g.output_fmt != want_output)
+    const DXGI_FORMAT requested = g.output_fmt;   // the prepare half's want_output, out of scope here
+    g.output_fmt = ack.output_fmt != 0 ? static_cast<DXGI_FORMAT>(ack.output_fmt) : requested;
+    if (g.output_fmt != requested)
         Log("[feed32] the host created the Output as %s, not the requested %s",
-            FeedFmtName(g.output_fmt), FeedFmtName(want_output));
+            FeedFmtName(g.output_fmt), FeedFmtName(requested));
 
     // The fences are per session, not per build: import them once.
     if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
@@ -2810,11 +3933,19 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
     const double span_ms = 1000.0 * double(exit - g.span_start) / double(g.qpf);
     const double cpu_ms  = 1000.0 * double(g.cpu_ticks) / double(g.qpf);
     const double n       = double(g.timed_frames);
-    Log("[feed32] 600 frames: feed CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) | feed is %.0f%% of the frame",
-        cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms);
+    // The pipe write is inside cpu_ms, so splitting it out is what separates "the feed is
+    // slow" from "the host is not reading, so our write is blocking" (#15). How far ahead of
+    // the host we actually are is the other half, and the host counts that itself -- see the
+    // "client queued up to N frames ahead" figure in dlss5-feed-host.log.
+    Log("[feed32] 600 frames: feed CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) | feed is %.0f%% "
+        "of the frame | pipe write %.2f ms mean, %.2f ms worst",
+        cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms,
+        g_pipe_write_ms_sum / n, g_pipe_write_ms_max);
     g.cpu_ticks = 0;
     g.timed_frames = 0;
     g.span_start = exit;
+    g_pipe_write_ms_sum = 0.0;
+    g_pipe_write_ms_max = 0.0;
 }
 
 static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *desc)
@@ -2928,11 +4059,11 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
             ok = false;                       // backing off after a failed build
         else
         {
-            Log("[feed32] building: %ux%u backbuffer fmt=%u (OpenGL, depth reversed=%d, mode=%d)",
-                w, h, bbf, g.depth_reversed ? 1 : 0, g_cfg.mode);
             ok = BuildSharedGl(w, h, bbf, bb_res.handle);
             if (ok) g.consecutive_fails = 0;
-            else if (!g.disabled) FeedFail("shared build");
+            // A build that is merely still with the host is not a failure: no backoff, and
+            // no log line for it -- this runs every frame until the ack lands.
+            else if (!g_build_pending && !g.disabled) FeedFail("shared build");
         }
     }
 
@@ -3097,6 +4228,14 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         Log("[feed32] the game recreated its Vulkan device; rebuilding on the new one");
         g.fence_wait_queued = false;
         for (int i = 0; i < FEED_SLOTS; ++i) { g.vk_img[i] = VK_NULL_HANDLE; g.vk_mem[i] = VK_NULL_HANDLE; }
+        // The cast's panel image is an import of the old device too, and it has to be dropped
+        // HERE: `g.vk = {}` below clears the entry points, and ReleaseShared's panel cleanup
+        // is gated on g.vk.ok, so it would be skipped. Leaving them set meant the next build
+        // saw a panel already imported (early return, new handle leaked) and CastVkDrawPanel
+        // blitted a VkImage belonging to a destroyed device.
+        g.vk_panel     = VK_NULL_HANDLE;
+        g.vk_panel_mem = VK_NULL_HANDLE;
+        g.vk_panel_init = false;
         g.vk = {};
         g.vk_sem_in = g.vk_sem_out = VK_NULL_HANDLE;
         g.rs_fence_in = g.rs_fence_out = {};
@@ -3116,11 +4255,9 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             ok = false;                       // backing off after a failed build
         else
         {
-            Log("[feed32] building: %ux%u backbuffer %s (Vulkan, depth reversed=%d, mode=%d)",
-                w, h, FeedFmtName(bbf), g.depth_reversed ? 1 : 0, g_cfg.mode);
             ok = BuildSharedVk(w, h, bbf);
             if (ok) g.consecutive_fails = 0;
-            else if (!g.disabled) FeedFail("shared build");
+            else if (!g_build_pending && !g.disabled) FeedFail("shared build");   // see the OpenGL path
         }
     }
 
@@ -3324,6 +4461,276 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     TimingTick(t0.QuadPart, t1.QuadPart);
 }
 
+static ID3D10Texture2D *AsTexture2D10(ID3D10Resource *res, D3D10_TEXTURE2D_DESC *desc)
+{
+    if (res == nullptr) return nullptr;
+    ID3D10Texture2D *tex = nullptr;
+    if (FAILED(res->QueryInterface(__uuidof(ID3D10Texture2D), reinterpret_cast<void **>(&tex))) || tex == nullptr)
+        return nullptr;
+    tex->GetDesc(desc);
+    return tex;
+}
+
+// The D3D10 bridges are native-sized -- the resample to the work resolution happens on
+// the relay, out of the Color bridge, exactly as it happens out of the game's own texture
+// on D3D11. Built after the shared set so a failure here backs off the same way.
+static bool BuildD3D10Bridges(UINT native_w, UINT native_h)
+{
+    for (int i = 0; i < FEED_SLOTS; ++i) FeedD3D10ReleaseBridge(&g.d10_bridge[i]);
+
+    const struct { int slot; DXGI_FORMAT fmt; bool rtv; } want[FEED_SLOTS] = {
+        { FEED_COLOR,  g.color_fmt,              false },
+        { FEED_OUTPUT, g.color_fmt,              true  },   // the blit chain draws into this one
+        { FEED_DEPTH,  DXGI_FORMAT_R32_FLOAT,    false },
+        { FEED_MV,     DXGI_FORMAT_R16G16_FLOAT, false },
+    };
+    for (int i = 0; i < FEED_SLOTS; ++i)
+    {
+        if (!FeedD3D10MakeBridge(&g.d10, &g.d10_bridge[want[i].slot], native_w, native_h, want[i].fmt, want[i].rtv))
+        {
+            Log("[feed32] D3D10 %s bridge failed at %s: 0x%08X",
+                FeedSlotName(want[i].slot), g.d10.where != nullptr ? g.d10.where : "?", g.d10.hr);
+            return false;
+        }
+    }
+
+    Log("[feed32] D3D10 bridges built: %ux%u, colour %s", native_w, native_h, FeedFmtName(g.color_fmt));
+    return true;
+}
+
+// The frame comes home in two hops. The relay draws the finished image into the Output
+// bridge -- the same blit chain every other client uses, scaling and FSR1 included --
+// and then the game's own device copies that bridge into its render target. The D3D10
+// side binds nothing: no shader, no viewport, no render target. That matters more here
+// than anywhere else in this file, because D3D10 has no ID3D10DeviceContext and state
+// lives directly on the device, so anything we set the game would silently inherit.
+static bool BlitHome10(ID3D10Resource *dst)
+{
+    FeedD3D10Bridge *out = &g.d10_bridge[FEED_OUTPUT];
+    if (out->rtv11 == nullptr) return false;
+    BlitOutputToBackbuffer(g.d10.relay_ctx, out->rtv11);
+    return FeedD3D10Collect(&g.d10, out, dst);   // drains the relay before the game copies
+}
+
+// The Direct3D 10 sibling of FeedFrameDispatch's D3D11 branch. Everything from
+// CopyOrResampleInputs onwards is that same client running on the private relay device;
+// what is new is only the two API crossings at either end. See src/feed_d3d10.h.
+static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource_view rtv)
+{
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+
+    reshade::api::device *dev_api = rt->get_device();
+
+    if (ApplyPendingWorkResolution()) g.built = false;
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+
+    // One-time: stand up the relay. This is the only place the game's own device is
+    // interrogated for anything but a copy, and it goes after the gate above so that
+    // mode=0 does not leave a private D3D11 device sitting in the game's process.
+    if (!g.d10.ok)
+    {
+        if (!FeedD3D10Open(&g.d10, reinterpret_cast<ID3D10Device *>(dev_api->get_native())))
+        {
+            char why[256];
+            _snprintf_s(why, sizeof(why), _TRUNCATE, "Direct3D 10: %s failed (0x%08X)",
+                        g.d10.where != nullptr ? g.d10.where : "?", g.d10.hr);
+            FeedDisable(why);
+            return;
+        }
+        g.d10_dev = g.d10.game;
+        g.dev     = g.d10.relay;   // not owned: g.d10 owns it, and FeedD3D10Close ends it
+        Log("[feed32] Direct3D 10.1 game: private D3D11 relay device created on adapter LUID %08lX:%08lX, "
+            "feature level %d_%d",
+            static_cast<unsigned long>(g.d10.luid.HighPart), static_cast<unsigned long>(g.d10.luid.LowPart),
+            (g.d10.relay_fl >> 12) & 0xF, (g.d10.relay_fl >> 8) & 0xF);
+        if (FAILED(g.d10.relay_ctx->QueryInterface(__uuidof(ID3D11DeviceContext4),
+                                                   reinterpret_cast<void **>(&g.ctx4))))
+        { FeedDisable("ID3D11DeviceContext4 unavailable on the relay device (Windows 10 1703+ required)"); return; }
+        // No ID3D11Multithread step, and no D3D10 equivalent of one: the relay is ours, it
+        // is only ever driven from the render thread inside FeedEnter/FeedLeave, and the
+        // game's device is free-threaded in D3D10 by definition.
+    }
+
+    ID3D11DeviceContext *ctx = g.d10.relay_ctx;
+
+    reshade::api::resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
+    if (g.mv_var.handle != 0)    rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
+    if (g.depth_var.handle != 0) rt->get_texture_binding(g.depth_var, &d_srv, &d_srgb);
+    if (mv_srv.handle == 0 || d_srv.handle == 0)
+    {
+        if (!g.missing_reported)
+        {
+            g.missing_reported = true;
+            Warn("DLSS5_Feed.fx textures not found. Install DLSS5_Feed.fx + a texMotionVectors provider and enable both.");
+        }
+        return;
+    }
+
+    auto *color_res = reinterpret_cast<ID3D10Resource *>(dev_api->get_resource_from_view(rtv).handle);
+    auto *mv_res    = reinterpret_cast<ID3D10Resource *>(dev_api->get_resource_from_view(mv_srv).handle);
+    auto *depth_res = reinterpret_cast<ID3D10Resource *>(dev_api->get_resource_from_view(d_srv).handle);
+
+    D3D10_TEXTURE2D_DESC cd = {}, md = {}, dd = {};
+    ID3D10Texture2D *color = AsTexture2D10(color_res, &cd);
+    ID3D10Texture2D *mv    = AsTexture2D10(mv_res, &md);
+    ID3D10Texture2D *depth = AsTexture2D10(depth_res, &dd);
+    if (color == nullptr || mv == nullptr || depth == nullptr)
+    { SafeRelease(color); SafeRelease(mv); SafeRelease(depth); return; }
+
+    bool ok = true;
+    if (cd.Width != md.Width || cd.Height != md.Height || cd.Width != dd.Width || cd.Height != dd.Height ||
+        cd.SampleDesc.Count != 1 || md.Format != DXGI_FORMAT_R16G16_FLOAT || dd.Format != DXGI_FORMAT_R32_FLOAT)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[feed32] input mismatch: color %ux%u fmt=%u samp=%u | mv %ux%u fmt=%u | depth %ux%u fmt=%u (D3D10)",
+                cd.Width, cd.Height, cd.Format, cd.SampleDesc.Count, md.Width, md.Height, md.Format,
+                dd.Width, dd.Height, dd.Format);
+        }
+        ok = false;
+    }
+
+    // Same rounding rule as the D3D11 path; see the note there.
+    const bool sr_wanted = g_cfg.work_upscale == 2 && g_cfg.mode == 2 && g_cfg.work_resolution < 100;
+    const UINT work_w = sr_wanted ? ScaledExtentUp(cd.Width,  g_cfg.work_resolution) : ScaledExtent(cd.Width,  g_cfg.work_resolution);
+    const UINT work_h = sr_wanted ? ScaledExtentUp(cd.Height, g_cfg.work_resolution) : ScaledExtent(cd.Height, g_cfg.work_resolution);
+    const bool size_changed = work_w != g.width || work_h != g.height ||
+                              cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height;
+    if (size_changed) g.sr_unavailable = false;
+    const bool want_sr = sr_wanted && !g.sr_unavailable && (work_w != cd.Width || work_h != cd.Height);
+    if (ok && (!g.built || size_changed || cd.Format != g.bb_fmt || want_sr != g.sr_requested))
+    {
+        if (GetTickCount64() < g_retry_at)
+            ok = false;
+        else
+        {
+            ok = BuildShared(work_w, work_h, cd.Width, cd.Height, cd.Format);
+            // BuildShared sets g.built on its own, so a bridge failure has to clear it or
+            // the next frame would sail past this block and copy out of null bridges.
+            if (ok && !BuildD3D10Bridges(cd.Width, cd.Height)) { g.built = false; ok = false; }
+            if (ok) g.consecutive_fails = 0;
+            else if (!g_build_pending && !g.disabled) FeedFail("shared build");
+        }
+    }
+
+    if (ok && g.built && g.d10_bridge[FEED_COLOR].tex11 != nullptr && g.d10_bridge[FEED_OUTPUT].rtv11 != nullptr)
+    {
+        if (!HostAlive()) { HostLost("process died"); }
+        else
+        {
+            const bool async_home = g_cfg.async_home != 0;
+            if (async_home && g.sent_n != 0)
+            {
+                Breadcrumb("waiting for the previous result");
+                g.ctx4->Wait(g.fence_out, g.sent_n);
+                g.fence_wait_queued = true;
+                g.wait_n            = g.sent_n;
+            }
+
+            if (g.sr_active)
+            {
+                if (g.need_reset || g_cfg.reset_every) g.jitter_index = 0;
+                HaltonJitter(g.jitter_index, g.jitter_phases, &g.jitter_x, &g.jitter_y);
+            }
+
+            // Cross into the relay's world. Queue all three copies on the game's device
+            // and then pay for ONE drain: with no fence to hand the relay, an event query
+            // is the only thing that can say the copies have landed, and it stops the
+            // whole device -- so doing it three times would cost three pipeline bubbles
+            // for one frame's worth of ordering.
+            Breadcrumb("handing the frame to the relay device");
+            FeedD3D10Deposit(&g.d10, &g.d10_bridge[FEED_COLOR], color_res);
+            FeedD3D10Deposit(&g.d10, &g.d10_bridge[FEED_MV],    mv_res);
+            FeedD3D10Deposit(&g.d10, &g.d10_bridge[FEED_DEPTH], depth_res);
+            const bool got = FeedD3D10SyncGame(&g.d10);
+
+            bool prepared = false;
+            if (got)
+            {
+                Breadcrumb("preparing work-resolution inputs");
+                prepared = CopyOrResampleInputs(ctx,
+                                                g.d10_bridge[FEED_COLOR].tex11,
+                                                g.d10_bridge[FEED_MV].tex11,
+                                                g.d10_bridge[FEED_DEPTH].tex11,
+                                                g.d10_bridge[FEED_MV].srv11,
+                                                g.d10_bridge[FEED_DEPTH].srv11,
+                                                cd.Width, cd.Height);
+            }
+            if (!got || !prepared)
+            {
+                FeedFail(got ? "work-resolution resample" : "D3D10 input sync");
+                SafeRelease(color); SafeRelease(mv); SafeRelease(depth);
+                QueryPerformanceCounter(&t1);
+                TimingTick(t0.QuadPart, t1.QuadPart);
+                return;
+            }
+
+            const UINT64 n = ++g.frame_n;
+            const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+            g.need_reset = false;
+
+            // As on D3D11, the blit home goes before the in-fence signal: the relay's
+            // context is in-order, so the host's permission to overwrite Output cannot
+            // pass our read of it.
+            const bool carried = async_home && g.out_valid;
+            bool home_ok = true;
+            if (carried) home_ok = BlitHome10(color_res);
+
+            g.ctx4->Signal(g.fence_in, n);
+            ctx->Flush();
+
+            const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset),
+                                      g.sr_active ? g.jitter_x : 0.0f, g.sr_active ? g.jitter_y : 0.0f };
+            const bool sent = PipeWriteFrame(fm);
+            if (sent && g.sr_active) ++g.jitter_index;
+            if (!sent)
+                HostLost("frame message failed");
+            else if (!home_ok)
+                FeedFail("D3D10 blit home");
+            else if (async_home)
+            {
+                g.sent_n    = n;
+                g.out_valid = true;
+                if (carried)
+                {
+                    const UINT64 done = ++g.frames_done;
+                    g.consecutive_fails = 0;
+                    if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                        Log("[feed32] frame %llu delivered (%ux%u, reset=%d, D3D10)", done, g.width, g.height, reset);
+                }
+            }
+            else
+            {
+                Breadcrumb("waiting for the host's result");
+                g.ctx4->Wait(g.fence_out, n);
+                g.fence_wait_queued = true;
+                g.wait_n            = n;
+                g.sent_n            = n;
+                if (!BlitHome10(color_res)) FeedFail("D3D10 blit home");
+                else
+                {
+                    g.out_valid = true;
+                    const UINT64 done = ++g.frames_done;
+                    g.consecutive_fails = 0;
+                    if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                        Log("[feed32] frame %llu delivered (%ux%u, reset=%d, D3D10)", done, g.width, g.height, reset);
+                }
+            }
+        }
+    }
+
+    SafeRelease(color);
+    SafeRelease(mv);
+    SafeRelease(depth);
+
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
 static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::command_list *cl,
                               reshade::api::resource_view rtv)
 {
@@ -3335,8 +4742,13 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
     { g.is_gl = true; FeedFrameGl(rt, rtv); return; }
     if (dev_api->get_api() == reshade::api::device_api::vulkan)
     { g.is_vulkan = true; FeedFrameVk(rt, cl, rtv); return; }
+    // D3D10 goes through a private D3D11 relay device and never touches cl: on this API
+    // ReShade's command list IS the device (there are no deferred contexts), so the cast
+    // below would be an ID3D10Device wearing a D3D11 vtable. Claim the frame first.
+    if (dev_api->get_api() == reshade::api::device_api::d3d10)
+    { g.is_d3d10 = true; FeedFrame10(rt, rtv); return; }
     if (dev_api->get_api() != reshade::api::device_api::d3d11)
-    { FeedDisable("only Direct3D 11, OpenGL and Vulkan games are supported by the 32-bit add-on"); return; }
+    { FeedDisable("only Direct3D 10, Direct3D 11, OpenGL and Vulkan games are supported by the 32-bit add-on"); return; }
 
     auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cl->get_native());
     if (ctx == nullptr || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
@@ -3421,11 +4833,9 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
             ok = false;                       // backing off after a failed build
         else
         {
-            Log("[feed32] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer fmt=%u (depth reversed=%d, mode=%d)",
-                work_w, work_h, g_cfg.work_resolution, cd.Width, cd.Height, cd.Format, g.depth_reversed ? 1 : 0, g_cfg.mode);
             ok = BuildShared(work_w, work_h, cd.Width, cd.Height, cd.Format);
             if (ok) g.consecutive_fails = 0;
-            else if (!g.disabled) FeedFail("shared build");
+            else if (!g_build_pending && !g.disabled) FeedFail("shared build");   // see the OpenGL path
         }
     }
 
@@ -3532,6 +4942,7 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
 // caller per frame. See the Smooth Motion note next to FeedEnter.
 static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
+    // Overlay host requests are drained in OnPresent, which runs whether or not this does.
     if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
 
     if (!FeedEnter()) return;   // logs the dropped call, with its thread id
@@ -3579,7 +4990,9 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
 
     char v[16] = {};
     g.depth_reversed = true;
-    if (rt->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", v))
+    // Per-effect scope first, like the provider lookup: see the 64-bit add-on's note.
+    if (rt->get_preprocessor_definition_for_effect(kEffectFile, "RESHADE_DEPTH_INPUT_IS_REVERSED", v) ||
+        rt->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", v))
         g.depth_reversed = atoi(v) != 0;
 
     g.handles_ok = g.technique.handle != 0 && g.mv_var.handle != 0 && g.depth_var.handle != 0;
@@ -3622,18 +5035,130 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     if (g_mv_problem[0]) Warn("%s", g_mv_problem);
 }
 
+// ---------------------------------------------------------------------------
+// Which effect runtime is ours -- the 32-bit half of issue #1, which the 64-bit add-on
+// fixed in 0.11.0-beta.2 and this one never got.
+//
+// A process can hold several ReShade effect runtimes. NVIDIA Smooth Motion is the common
+// cause: its present interposer creates its OWN device and an invisible proxy swapchain
+// ("InvisibleWindowClassNvPresent"), so ReShade builds a runtime on each and gives them
+// separate configs -- the first gets ReShade.ini (the user's preset), the second
+// ReShade2.ini. The old rule here was "the last runtime to initialise is ours", which
+// bound to whichever came second, resolved DLSS5_Feed.fx as MISSING there, and then
+// silently ignored every render of the technique on the other one: a healthy-looking log
+// and no neural rendering at all. The rule now matches the 64-bit add-on's -- the runtime
+// that RENDERS DLSS5_Feed is ours.
+// ---------------------------------------------------------------------------
+struct RuntimeSlot
+{
+    reshade::api::effect_runtime  *rt;
+    reshade::api::effect_technique technique;    // this runtime's DLSS5_Feed, or 0
+    void                          *dev;          // native device, for the log
+    char                           wclass[48];   // window class of the swapchain's HWND
+    bool                           proxy;        // Smooth Motion's invisible proxy swapchain
+    ULONGLONG                      last_resolve; // GetTickCount64 of the last find_technique from the render path
+};
+static RuntimeSlot g_runtimes[6];
+static int         g_runtime_count;
+static ULONGLONG   g_bound_last_render;   // GetTickCount64 of the bound runtime's last DLSS5_Feed render
+
+static RuntimeSlot *FindRuntime(reshade::api::effect_runtime *rt)
+{
+    for (int i = 0; i < g_runtime_count; ++i)
+        if (g_runtimes[i].rt == rt) return &g_runtimes[i];
+    return nullptr;
+}
+
+static RuntimeSlot *TrackRuntime(reshade::api::effect_runtime *rt)
+{
+    RuntimeSlot *s = FindRuntime(rt);
+    if (s == nullptr)
+    {
+        if (g_runtime_count == static_cast<int>(sizeof(g_runtimes) / sizeof(g_runtimes[0])))
+            --g_runtime_count;   // overflow: recycle the last slot rather than lose track
+        s = &g_runtimes[g_runtime_count++];
+        *s = {};
+        s->rt = rt;
+        reshade::api::device *dev = rt->get_device();
+        s->dev = dev != nullptr ? reinterpret_cast<void *>(dev->get_native()) : nullptr;
+        HWND hwnd = static_cast<HWND>(rt->get_hwnd());
+        if (hwnd != nullptr && !GetClassNameA(hwnd, s->wclass, sizeof(s->wclass))) s->wclass[0] = '\0';
+        if (hwnd == nullptr) strcpy_s(s->wclass, "(no window)");
+        s->proxy = strstr(s->wclass, "NvPresent") != nullptr;
+    }
+    s->technique = rt->find_technique(kEffectFile, kTechnique);
+    return s;
+}
+
+static void UntrackRuntime(reshade::api::effect_runtime *rt)
+{
+    for (int i = 0; i < g_runtime_count; ++i)
+        if (g_runtimes[i].rt == rt)
+        {
+            g_runtimes[i] = g_runtimes[--g_runtime_count];
+            g_runtimes[g_runtime_count] = {};
+            return;
+        }
+}
+
+// This side captures g.dev from the first frame's immediate context and never re-checks it,
+// so adopting a runtime on a DIFFERENT device once the shared set is built would feed the
+// wrong device's textures. In the case this fix is for, that cannot happen: the runtime
+// rendering the technique is the game's, and it is adopted before anything is built. Refuse
+// the other case rather than pretend it works.
+static bool RuntimeDeviceCompatible(const RuntimeSlot *slot)
+{
+    if (slot == nullptr || slot->dev == nullptr) return true;
+    // On D3D10 g.dev is the private relay, which no runtime will ever report as its own.
+    // The device that has to match is the game's -- the one the bridges were made on.
+    if (g.is_d3d10) return g.d10_dev == nullptr || slot->dev == static_cast<void *>(g.d10_dev);
+    return g.dev == nullptr || reinterpret_cast<ID3D11Device *>(slot->dev) == g.dev;
+}
+
+// enabled=0 means enabled=0. Everything below this line queries the runtime, reads files,
+// loads dbghelp, scans modules or draws -- none of which a user who set enabled=0 to take
+// this add-on out of the picture expects to still be happening (issue #44, and README's
+// "0 disables everything"). Only the overlay page stays, so the checkbox can undo it.
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
-    g.runtime = rt;
-    ResolveHandles(rt);
+    if (!g_cfg.enabled) return;
+    RuntimeSlot *slot = TrackRuntime(rt);
     DetectSmoothMotion();   // a present interposer can arrive after this add-on did
+    // Not in DllMain (LoadLibrary under the loader lock) and not in the exception filter
+    // (ReShade refuses a LoadLibrary from there): this is what makes a dump possible.
+    FeedResolveDbghelp();
     static int inits = 0;
-    if (++inits <= 8) Log("[feed32] effect runtime %p initialised", (void *)rt);
+    if (++inits <= 8)
+        Log("[feed32] effect runtime %p initialised (device %p, window class '%s'%s; %d runtime%s in this process)",
+            (void *)rt, slot->dev, slot->wclass,
+            slot->proxy ? " -- NVIDIA Smooth Motion's proxy swapchain" : "",
+            g_runtime_count, g_runtime_count == 1 ? "" : "s");
+    else if (inits == 9)
+        Log("[feed32] (further runtime init/destroy messages suppressed)");
+
+    // Bind: the first runtime, or a re-init of the bound one. Another runtime only takes
+    // over when the bound one has no DLSS5_Feed and this one does; otherwise it is tracked,
+    // and OnRenderTechnique adopts it the moment it renders the technique.
+    if (g.runtime == nullptr || rt == g.runtime || (g.technique.handle == 0 && slot->technique.handle != 0))
+    {
+        g.runtime = rt;
+        ResolveHandles(rt);
+    }
 }
 
 static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 {
-    if (rt != g.runtime) return;
+    // Logged before the bound test: with several runtimes churning, a log that only ever
+    // reported the bound one could never show the topology changing underneath.
+    const bool was_bound = rt == g.runtime;
+    UntrackRuntime(rt);
+    static int destroys = 0;
+    if (++destroys <= 8)
+        Log("[feed32] effect runtime %p destroyed%s (%d runtime%s left)", (void *)rt,
+            was_bound ? " -- it was the bound one" : "", g_runtime_count, g_runtime_count == 1 ? "" : "s");
+    else if (destroys == 9)
+        Log("[feed32] (further runtime init/destroy messages suppressed)");
+    if (!was_bound) return;
     CastRelease();   // the thumbnail is registered on this runtime's window
     // The shared textures live on the game's device and survive runtime churn; keep them.
     g.runtime = nullptr;
@@ -3643,8 +5168,13 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 
 static void OnReloadedEffects(reshade::api::effect_runtime *rt)
 {
-    if (rt == g.runtime || g.runtime == nullptr)
+    if (!g_cfg.enabled) return;
+    RuntimeSlot *slot = TrackRuntime(rt);
+    if (rt == g.runtime || g.runtime == nullptr || (g.technique.handle == 0 && slot->technique.handle != 0))
     {
+        if (g.runtime != nullptr && rt != g.runtime)
+            Log("[feed32] effect runtime %p takes over from %p: its reload produced DLSS5_Feed.fx, the bound one has none",
+                (void *)rt, (void *)g.runtime);
         g.runtime = rt;
         ResolveHandles(rt);
         // A reload recompiles the MV provider, which writes zero vectors until its own
@@ -3657,7 +5187,86 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
                               reshade::api::command_list *cl, reshade::api::resource_view rtv,
                               reshade::api::resource_view /*rtv_srgb*/)
 {
-    if (rt != g.runtime || g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    if (!g_cfg.enabled) return;
+    if (rt != g.runtime)
+    {
+        // Another runtime is rendering DLSS5_Feed. Adopt it -- unless the bound one rendered
+        // the technique within the last second, in which case both are drawing it and
+        // flip-flopping every frame would rebuild the session each time.
+        RuntimeSlot *slot = FindRuntime(rt);
+        // A slot's technique handle is only written by TrackRuntime (init and reload). One
+        // that changes without either reaching us leaves the slot stale for the rest of the
+        // session, and the feed stops with nothing logged until a swapchain re-init. Cheap
+        // to re-resolve, throttled to once a second per runtime.
+        if (slot != nullptr && technique.handle != slot->technique.handle)
+        {
+            const ULONGLONG t = GetTickCount64();
+            if (t - slot->last_resolve >= 1000)
+            {
+                slot->last_resolve = t;
+                const reshade::api::effect_technique fresh = rt->find_technique(kEffectFile, kTechnique);
+                if (fresh.handle != slot->technique.handle)
+                {
+                    Log("[feed32] effect runtime %p: DLSS5_Feed handle changed under us (%llu -> %llu); re-resolved",
+                        (void *)rt, (unsigned long long)slot->technique.handle, (unsigned long long)fresh.handle);
+                    slot->technique = fresh;
+                }
+            }
+        }
+        // Still not this runtime's DLSS5_Feed: it is one of the other techniques in the
+        // preset, which arrive here constantly and are nothing to report.
+        if (slot == nullptr || slot->technique.handle == 0 || technique.handle != slot->technique.handle) return;
+        const ULONGLONG now = GetTickCount64();
+        if (g.technique.handle != 0 && now - g_bound_last_render < 1000)
+        {
+            static int both = 0;
+            if (++both <= 3)
+                Log("[feed32] effect runtime %p (window class '%s') also renders DLSS5_Feed; feeding %p only%s",
+                    (void *)rt, slot->wclass, (void *)g.runtime, both == 3 ? " (further notices suppressed)" : "");
+            return;
+        }
+        if (!RuntimeDeviceCompatible(slot))
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                Log("[feed32] effect runtime %p renders DLSS5_Feed but on device %p, and the shared set is already "
+                    "built on %p; staying on %p. Restart the game if the wrong window is being processed.",
+                    (void *)rt, slot->dev, (void *)g.dev, (void *)g.runtime);
+            }
+            return;
+        }
+        Log("[feed32] binding to effect runtime %p (device %p, window class '%s'): it is the one rendering DLSS5_Feed; %p was bound",
+            (void *)rt, slot->dev, slot->wclass, (void *)g.runtime);
+        g.runtime = rt;
+        ResolveHandles(rt);
+        g.need_reset = true;
+    }
+    if (g.technique.handle == 0 || technique.handle != g.technique.handle)
+    {
+        // Nearly every render arriving here is one of the OTHER techniques in the user's
+        // preset -- ordinary, and silent. The case worth catching is the same stale-handle
+        // hole one level up: g.technique no longer matching the bound runtime's DLSS5_Feed
+        // drops every one of ITS renders forever, with nothing in the frame path to
+        // re-resolve it. Ask ReShade at most once a second, and only speak when the fresh
+        // handle proves this render was ours after all.
+        const ULONGLONG t = GetTickCount64();
+        static ULONGLONG last_bound_resolve = 0;
+        if (rt == g.runtime && t - last_bound_resolve >= 1000)
+        {
+            last_bound_resolve = t;
+            const reshade::api::effect_technique fresh = rt->find_technique(kEffectFile, kTechnique);
+            if (fresh.handle == technique.handle && fresh.handle != g.technique.handle)
+            {
+                Log("[feed32] bound runtime %p: DLSS5_Feed handle changed under us (%llu -> %llu); re-resolving",
+                    (void *)rt, (unsigned long long)g.technique.handle, (unsigned long long)fresh.handle);
+                ResolveHandles(rt);
+            }
+        }
+        if (g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    }
+    g_bound_last_render = GetTickCount64();
     FeedFrame(rt, cl, rtv);
 }
 
@@ -3665,7 +5274,9 @@ static void OnDestroyDevice(reshade::api::device *dev)
 {
     const bool ours = (g.dev != nullptr && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev) ||
                       (g.is_gl && dev->get_api() == reshade::api::device_api::opengl) ||
-                      (g.is_vulkan && dev == g.rs_dev);
+                      (g.is_vulkan && dev == g.rs_dev) ||
+                      // g.dev is the RELAY on D3D10, so it never matches the game's device
+                      (g.is_d3d10 && dev->get_api() == reshade::api::device_api::d3d10);
     if (!ours) return;
 
     Log("[feed32] game device destroyed; shutting down");
@@ -3701,6 +5312,11 @@ static void OnDestroyDevice(reshade::api::device *dev)
     SafeRelease(g.rcas_ps);
     SafeRelease(g.fsr_cb);
     g.fsr_ok = false;
+    // Last, because everything released above -- the blit shaders, the constant buffers,
+    // ctx4 -- was created on the relay and must not outlive it.
+    FeedD3D10Close(&g.d10);
+    g.d10_dev  = nullptr;
+    g.is_d3d10 = false;
     g.dev = nullptr;
 }
 
@@ -3724,22 +5340,45 @@ static void HelpMarker(const char *desc)
     }
 }
 
-static void DrawOverlay(reshade::api::effect_runtime *)
+static void DrawOverlay(reshade::api::effect_runtime *rt)
 {
     bool dirty = false;
     bool enabled = g_cfg.enabled != 0;
-    if (ImGui::Checkbox("Enabled", &enabled)) { g_cfg.enabled = enabled ? 1 : 0; dirty = true; }
+    if (ImGui::Checkbox("Enabled", &enabled))
+    {
+        g_cfg.enabled = enabled ? 1 : 0;
+        dirty = true;
+        // Turning it back on has to re-adopt the runtime by hand. Every other adoption path
+        // is an event that has already fired for this runtime and will not fire again --
+        // init, an effect reload, a resolution change -- so without this the add-on would
+        // sit inert until one of those happened to come round.
+        if (enabled && rt != nullptr) { Log("[feed32] enabled from the overlay; re-adopting the effect runtime"); OnInitEffectRuntime(rt); }
+        else if (!enabled) Log("[feed32] disabled from the overlay: no frames are fed and nothing is queried. "
+                               "An already-installed Vulkan interop hook stays until the game exits.");
+    }
 
     ImGui::Separator();
     ImGui::TextUnformatted("Status");
     ImGui::Text("Feed: %s", g.disabled ? "disabled" : g.built ? "built" : "not built");
     if (g.disabled && g_disable_why[0])
         ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "Stopped: %s", g_disable_why);
-    ImGui::Text("Render API: %s", g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : "Direct3D 11");
+    ImGui::Text("Render API: %s", g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" :
+                                  g.is_d3d10 ? "Direct3D 10.1 (through a private Direct3D 11 relay device)" :
+                                  "Direct3D 11");
     ImGui::Text("Handoff: %s", g_cfg.async_home ? "pipelined (+1 frame)" : "same frame");
     ImGui::Text("Host process: %s", HostAlive() ? "running" : "not running");
     if (g_chicken_host)
         ImGui::Text("Neural consumer: Deep Fried Chicken %s (in host64\\)", g_chicken_host_ver);
+    if (g_opti_host)
+    {
+        if (g_opti_host_nr && !g_chicken_host)
+            ImGui::Text("Neural consumer: %s (host64\\%s)", OPTI_LABEL, g_opti_host_module);
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "Neural consumer: %s (host64\\%s)%s",
+                               g_opti_host_nr ? OPTI_LABEL : "OptiScaler WITHOUT the neural-rendering fork -- no neural pass",
+                               g_opti_host_module,
+                               g_chicken_host ? " -- Deep Fried Chicken is ALSO in host64\\; keep exactly one" : "");
+    }
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
     ImGui::TextWrapped("Motion vectors: %s", g_mv_status);
     if (g_mv_problem[0])
@@ -3755,6 +5394,16 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g.consecutive_fails = 0;
         g_retry_at = 0;
         g_disable_why[0] = '\0';
+        // HostClose() keeps g.built on the D3D11 path (the game owns those textures, so a
+        // replacement host can re-open them). But if the host is what died, "built" with no
+        // host means the frame path skips the rebuild and then trips over the dead host on
+        // the very next frame -- disabled again, and only "Restart the host" ever recovered.
+        // A build is cheap here; the host it needs gets spawned by EnsureHost as usual.
+        if (!HostAlive() && g.built)
+        {
+            g.built = false;
+            Log("[feed32] re-enable: the host is gone, so the shared set is rebuilt from scratch");
+        }
         Log("[feed32] re-enabled from the overlay");
     }
 
@@ -3857,15 +5506,37 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::SameLine(); HelpMarker("Drawn by the desktop compositor: windowed or borderless games only.");
     ImGui::SameLine();
+    // The texture mode hands a shader resource view to the GAME's ImGui backend, and on
+    // D3D10 that backend wants an ID3D10 view while ours is the relay's D3D11 one. There
+    // is no conversion to make: offer only the thumbnail there, and say why.
+    if (g.is_d3d10) ImGui::BeginDisabled();
     if (ImGui::Button(shown_tex ? "Hide the DLSS 5 panel " : "Show as texture (fullscreen too)"))
     {
         g_cast_wanted = !shown_tex;
         if (g_cfg.cast_mode != 1) { g_cfg.cast_mode = 1; dirty = true; }
         Log("[feed32] cast: %s (overlay, texture)", g_cast_wanted ? "shown" : "hidden");
     }
-    ImGui::SameLine(); HelpMarker("Drawn by this game's ReShade from a copy of the host's frame: works in exclusive "
-                                  "fullscreen and on any monitor. The panel appears once the feed has built (its "
-                                  "texture is set up with the first build).");
+    if (g.is_d3d10) ImGui::EndDisabled();
+    ImGui::SameLine(); HelpMarker(g.is_d3d10
+                                  ? "Not available on Direct3D 10: the panel would have to be handed to this game's "
+                                    "ReShade as a Direct3D 11 texture. Use the button on the left, or host_window=1."
+                                  : "Drawn by this game's ReShade from a copy of the host's frame: works in exclusive "
+                                    "fullscreen and on any monitor. The panel appears once the feed has built (its "
+                                    "texture is set up with the first build).");
+    // What the two buttons above cast is the host's ReShade overlay. The host opens it once
+    // when it starts; close it and there was no way back, because the overlay key does not
+    // survive the trip through the cast (see HostToggleOverlay).
+    ImGui::SameLine();
+    if (!HostAlive()) ImGui::BeginDisabled();
+    if (ImGui::Button("Toggle ReShade in host")) HostRequest(HOST_REQ_OVERLAY, nullptr);
+    if (!HostAlive()) ImGui::EndDisabled();
+    ImGui::SameLine(); HelpMarker("Toggles ReShade's overlay inside the host window -- the window this panel casts. "
+                                  "The host opens it by itself at startup; use this to get it back after you close "
+                                  "it. This panel is the readout: the host's placeholder banner shows when the "
+                                  "overlay is closed, the tuning panel when it is open. One press flips it; press "
+                                  "again if it went the wrong way. There is no current-state label because the host "
+                                  "is not a ReShade add-on -- this side cannot read whether the overlay is up, and "
+                                  "the host's own Home key flips it too.");
     ImGui::TextDisabled("%s", g_cast_status);
     if (ImGui::SliderInt("Panel size (%)", &g_cfg.cast_scale, 25, 300)) dirty = true;
     ImGui::SameLine(); HelpMarker("Relative to the largest size that fits this window (the host's tab column at 1:1, "
@@ -3884,10 +5555,49 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         ImGui::SameLine(); HelpMarker("A key that shows and hides the panel without opening this overlay. "
                                       "Saved as cast_key in dlss5-feed.cfg.");
     }
+    {
+        static const char *const kAnchors[] = { "Top-left", "Top-right", "Bottom-left", "Bottom-right" };
+        int anchor = g_cfg.cast_anchor < 0 || g_cfg.cast_anchor > 3 ? 1 : g_cfg.cast_anchor;
+        if (ImGui::Combo("Panel corner", &anchor, kAnchors, 4)) { g_cfg.cast_anchor = anchor; dirty = true; }
+        ImGui::SameLine(); HelpMarker("Which corner of the game window the cast panel sits in. It used to be "
+                                      "the top-right and only that. Saved as cast_anchor in dlss5-feed.cfg.");
+    }
     bool show_host_window = g_cfg.host_window != 0;
     if (ImGui::Checkbox("Show the DLSS 5 host window", &show_host_window)) { g_cfg.host_window = show_host_window ? 1 : 0; dirty = true; }
     ImGui::SameLine(); HelpMarker("The helper process's own separate window, the old way in. Not needed for the "
                                   "in-game panel above. Takes effect when the host is next started.");
+    bool gpu_priority = g_cfg.host_gpu_priority != 0;
+    if (ImGui::Checkbox("Give the helper GPU scheduling priority", &gpu_priority))
+    { g_cfg.host_gpu_priority = gpu_priority ? 1 : 0; dirty = true; }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Asks the GPU scheduler to favour the helper process, which can clear\n"
+                          "periodic multi-second stalls where the helper is being preempted\n"
+                          "(reported on GTA IV under DXVK).\n\n"
+                          "Off by default: realtime GPU priority can starve the game itself.\n"
+                          "Takes effect when the helper next starts.");
+
+    if (!g_host_win_loaded) { ReadHostWindowSize(); g_host_win_loaded = true; }
+    bool win_size_touched = false, win_size_released = false;
+    if (ImGui::SliderInt("Host window width", &g_host_win_w, 300, 4000)) win_size_touched = true;
+    if (ImGui::IsItemDeactivatedAfterEdit()) win_size_released = true;
+    ImGui::SameLine(); HelpMarker("A REAL resize of the host window, its swapchain and the panel texture cast "
+                                  "above -- ReShade's own tab column actually gets more room to lay out in, "
+                                  "not just a bigger-drawn copy of the same pixels like \"Panel size (%)\" "
+                                  "below. Applied to the running host as soon as you move the "
+                                  "slider, and saved to host64\\ReShade.ini's [DLSS5Host] section so it "
+                                  "survives a restart. You can also drag the host window's own border.");
+    if (ImGui::SliderInt("Host window height (0 = auto, full screen)", &g_host_win_h, 0, 8000)) win_size_touched = true;
+    if (ImGui::IsItemDeactivatedAfterEdit()) win_size_released = true;
+    ImGui::SameLine(); HelpMarker("0 fills the primary monitor's work area (the default). This window is "
+                                  "normally hidden behind the game, never shown on the desktop at OS size, so "
+                                  "taller than the screen is fine if you want more room and less scrolling.");
+    if (win_size_touched) WriteHostWindowSize();
+    // Applied to the RUNNING host too, not just saved for its next start -- but on RELEASE,
+    // not per tick: every value the slider passes through is a full swapchain resize and a
+    // ReShade runtime recreate on the host, and the first Fable test queued twenty of them
+    // from one drag. Deferred to the render thread: the pipe is written there, under the
+    // feed lock, and this callback is not.
+    if (win_size_released) HostRequest(HOST_REQ_WINSIZE, nullptr);
 
     if (ImGui::CollapsingHeader("Advanced"))
     {
@@ -3895,7 +5605,28 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         if (ImGui::SliderInt("Log first N frames", &g_cfg.log_frames, 0, 20)) dirty = true;
     }
 
-    if (g_chicken_host)
+    if (g_opti_host)
+    {
+        // OptiScaler reads OptiScaler.ini, not [RenoDX.DLSS5]; mirroring that panel here would be a lie.
+        ImGui::Separator();
+        ImGui::TextUnformatted("OptiScaler DLSS-NR settings (on the host)");
+        ImGui::TextWrapped("OptiScaler has its own menu with every neural-rendering control (preset, style, intensity, "
+                           "local structure and tone, colour, white point, working scale, passes, captures). It opens "
+                           "with Insert in the host window: press \"Show the DLSS 5 panel in-game\" above and then "
+                           "Insert, or run with host_window=1. Its settings live in host64\\OptiScaler.ini; the "
+                           "headline ones are shown here read-only.");
+        OptiHostCfgRefresh();
+        ImGui::Text("Current (host64\\OptiScaler.ini): Enabled=%s  Preset=%s  Style=%s  Intensity=%s  WorkingScale=%s  "
+                    "Passes=%s  Dx12Upscaler=%s",
+                    g_opti_enabled, g_opti_preset, g_opti_style, g_opti_intensity, g_opti_scale, g_opti_passes,
+                    g_opti_upscaler);
+        if (_stricmp(g_opti_enabled, "true") != 0 && strcmp(g_opti_enabled, "1") != 0)
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f),
+                               "[DlssNr] Enabled is %s: the neural pass is OFF and OptiScaler only upscales. Turn it on in "
+                               "its menu (Insert), or set Enabled=true in host64\\OptiScaler.ini and restart the game.",
+                               g_opti_enabled);
+    }
+    else if (g_chicken_host)
     {
         // Chicken does not read [RenoDX.DLSS5]; mirroring that panel here would be a lie.
         ImGui::Separator();
@@ -3985,7 +5716,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
         ImGui::Spacing();
         if (ImGui::Button("Apply to the DLSS 5 host"))
-            HostApplySettings();
+            HostRequest(HOST_REQ_APPLY, nullptr);
         ImGui::SameLine();
         if (ImGui::Button("Reload from host"))
         {
@@ -3993,7 +5724,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             LogHostNR("host DLSS 5 settings reloaded from the overlay page");
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("(applying restarts the helper process; up to 15 s without DLSS)");
+        ImGui::TextDisabled("(applying restarts the helper; a brief pause while it saves, then it comes back in the background)");
     }   // end of the RenoDX-only settings mirror
 
     // Host process controls, both consumers. The helper is a separate process: it can die,
@@ -4002,15 +5733,32 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     // effect of "Apply to the DLSS 5 host".
     ImGui::Separator();
     ImGui::TextUnformatted("Host process");
-    if (ImGui::Button(HostAlive() ? "Restart the DLSS 5 host" : "Start the DLSS 5 host"))
-        HostRestart(HostAlive() ? "host restart requested from the overlay"
-                                : "host start requested from the overlay");
+    // The label used to come from HostAlive() alone, which is false for the whole of a
+    // host's startup -- so during the very window in which pressing it does the most damage
+    // it read "Start the DLSS 5 host" and looked like the right thing to do (issue #58).
+    const bool starting = HostStarting();
+    ImGui::BeginDisabled(starting);
+    if (ImGui::Button(starting              ? "The DLSS 5 host is starting..."
+                      : HostAlive()         ? "Restart the DLSS 5 host"
+                                            : "Start the DLSS 5 host"))
+        HostRequest(HOST_REQ_RESTART, HostAlive() ? "host restart requested from the overlay"
+                                                  : "host start requested from the overlay");
+    ImGui::EndDisabled();
     ImGui::SameLine();
-    if (HostAlive())
-        ImGui::TextDisabled("(running -- restarting costs up to 15 s without DLSS)");
+    if (starting)
+        ImGui::TextDisabled("(already on its way -- a second one cannot have the pipe)");
+    else if (HostAlive())
+        ImGui::TextDisabled("(running -- the replacement starts in the background; only its shutdown pauses the game)");
     else
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
                            "not running -- press this to start it again");
+    // What the worker is doing, so the wait is visible rather than mysterious.
+    if (g_link.state == LINK_RUNNING)
+        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%s",
+                           g_link.job == JOB_CONNECT ? "starting the host and shaking hands (the game keeps rendering)"
+                                                     : "waiting for the host to build (the game keeps rendering)");
+    else if (g_build_pending)
+        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "a build is in progress");
     ImGui::TextDisabled("Its own log is host64\\dlss5-feed-host.log; the neural consumer's panel lives in "
                         "its window (\"Show the DLSS 5 panel in-game\" above brings it here).");
 
@@ -4024,8 +5772,18 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 // extensions can still be added from in-process -- see feed_vk_hook.h.
 static bool OnCreateDevice(reshade::api::device_api api, uint32_t & /*api_version*/)
 {
+    // Gated on enabled: this is the one thing here that patches another module's code
+    // (MinHook trampolines over vulkan-1's exports) and appends extensions to every device
+    // the game creates. It used to run at enabled=0, which made "set enabled=0 and see if
+    // it still crashes" a test that proved nothing (issue #44). It cannot be installed
+    // later either -- the game's vkCreateDevice has been and gone -- so turning the add-on
+    // back on from the overlay needs a restart to get the Vulkan transport, and says so.
     if (api == reshade::api::device_api::vulkan)
-        FeedVkHookInstall();
+    {
+        if (g_cfg.enabled) FeedVkHookInstall();
+        else Log("[feed32] enabled=0: the Vulkan interop hook is NOT installed. Turning this add-on "
+                 "back on mid-session cannot install it -- a Vulkan game needs a restart with enabled=1.");
+    }
     return false;   // never change the requested API version
 }
 
@@ -4058,7 +5816,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         }
         CfgWriteDefault();
         CfgReload();
+        // Said once, plainly, because "enabled=0 but it still crashed" is only evidence if
+        // the reader knows what enabled=0 actually leaves behind (issue #44).
+        if (!g_cfg.enabled)
+            Log("[feed32] enabled=0: no frames are fed, no runtime is queried, no textures are created and "
+                "the Vulkan interop hook is not installed. The add-on stays registered so the overlay's "
+                "Enabled checkbox can undo this; nothing else runs.");
         DetectChickenHost();
+        DetectOptiHost();       // after DetectChickenHost: it warns when both are in host64
+        DetectStrayHostAddon();
 
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
@@ -4074,6 +5840,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        // First, before anything else can fault: CrashFilter lives in code that is about to
+        // be unmapped. ReShade reloads add-ons per Vulkan instance (see feed_vk_hook.h), so
+        // leaving it installed means a later crash jumps into freed memory and the game's own
+        // handler never sees the real fault.
+        SetUnhandledExceptionFilter(g_prev_filter);
+        // We are under the loader lock: HostLinkStop must not try to join the worker here.
+        g_detaching = true;
         CastRelease();
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_present>(OnPresent);
@@ -4090,6 +5863,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         HostClose();
         reshade::unregister_addon(module);
         Log("shut down cleanly.");
+        // Last, after the final Log: these are re-initialised on every attach, and ReShade
+        // attaches this add-on again per Vulkan instance, so not deleting them leaks one pair
+        // per load cycle. Nothing may log or feed past this point.
+        DeleteCriticalSection(&g_feed_cs);
+        DeleteCriticalSection(&g_log_cs);
     }
     return TRUE;
 }

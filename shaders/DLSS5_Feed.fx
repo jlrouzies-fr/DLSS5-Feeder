@@ -59,6 +59,16 @@
 
 #include "ReShade.fxh"
 
+// D3D9 is not a target. The add-on attaches to D3D10/11/12, OpenGL and Vulkan runtimes only,
+// so if ReShade is on its DirectX 9 backend the effect could never be fed anyway -- and the
+// geometric-fit solver below cannot compile there (SM3 has no tex2Dfetch and must unroll the
+// [loop]s over dynamically indexed arrays, which is the "error X3531: can't unroll loops
+// marked with loop attribute" of issue #56). Say which of those two facts the user is looking
+// at, because the compiler error alone sends people hunting through their shader list.
+#if __RENDERER__ < 0xA000
+    #error "DLSS5_Feed needs D3D10 or newer, and ReShade has loaded its DirectX 9 backend. For a D3D9 game the dgVoodoo2 wrapper must be in effect first (check DisableAndPassThru=false in dgVoodoo.conf); see the README's 'Install for a DirectX 9 game' section. A 64-bit D3D9 game does not need this add-on at all -- renodx-dlss handles those on its own."
+#endif
+
 // Expose ReShade's completed frame to the add-on as an SRV. The 64-bit D3D11 path
 // uses this only when its work-resolution control is below 100%; no extra pass or
 // copy is introduced by this declaration.
@@ -214,7 +224,8 @@ uniform float GEOM_MASK_REJECTED <
     ui_label = "Mask strength on rejected flow";
     ui_tooltip = "Where the provider disagreed with the model but did not win the structure test (fire, smoke,\n"
                  "flicker), the geometric vector is used; this is how strongly DLSS is additionally asked to\n"
-                 "favour the current frame there. 0 = pure history (smoothest), 1 = mostly current frame.";
+                 "favour the current frame there. 0 = pure history (smoothest), 1 = mostly current frame.\n\n"
+                 "Also used by the static test's first frame when hysteresis holds its vector back.";
 > = 0.35;
 
 uniform bool MV_VALIDATE <
@@ -233,6 +244,18 @@ uniform bool VALIDATE_STATIC <
                  "flickering light does not count as motion. When 'did not move' wins, the vector is zeroed\n"
                  "and the pixel is NOT masked -- a static wall wants its full history, which is what smooths\n"
                  "the flicker. This is the test for the flickering-wall case.";
+> = true;
+
+uniform bool STATIC_HYSTERESIS <
+    ui_category = "Validation (flicker / flames / disocclusion)";
+    ui_label = "Static test: require two frames in a row";
+    ui_tooltip = "The static test has no memory: on a low-contrast surface under a slow pan it can win on\n"
+                 "one frame and lose on the next, so the vector alternates between the provider's and zero\n"
+                 "and DLSS alternately reprojects and does not -- a flicker/judder that comes and goes.\n"
+                 "With this on, the vector is only zeroed where the test won on this frame AND the last;\n"
+                 "on the first frame the provider's vector is kept and the pixel is masked instead, so\n"
+                 "DLSS leans on the current frame rather than reprojecting from nowhere.\n"
+                 "Turn it off to compare against the old (per-frame) behaviour.";
 > = true;
 
 uniform float STATIC_BIAS <
@@ -331,7 +354,7 @@ uniform int DEBUG_VIEW <
                "Provider confidence (LumeniteFX only; white = confident)\0"
                "Validation mask (white = vector distrusted, DLSS uses current frame)\0"
                "Validation mask over the image\0"
-               "Validation tests over the image (red = luma, green = depth, blue = consistency, yellow = static wins)\0"
+               "Validation tests over the image (red = luma, green = depth, blue = consistency, yellow = vector zeroed, orange = static held back)\0"
                "Geometry model vectors (colour = direction, brightness = speed)\0"
                "Geometry decision over the image (green = model, red = provider won as moving object, blue = provider rejected)\0"
                "Geometry fit quality (grey = inlier share; top strip = fit error, black 0 px .. white 8 px)\0";
@@ -355,6 +378,18 @@ texture DLSS5_PrevMV    { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format =
 sampler sDLSS5_PrevLuma  { Texture = DLSS5_PrevLuma;  AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
 sampler sDLSS5_PrevDepth { Texture = DLSS5_PrevDepth; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT;  MagFilter = POINT;  MipFilter = POINT; };
 sampler sDLSS5_PrevMV    { Texture = DLSS5_PrevMV;    AddressU = Clamp; AddressV = Clamp; MinFilter = POINT;  MagFilter = POINT;  MipFilter = POINT; };
+
+// The static-hypothesis decision, this frame and last. The test has no memory of its own,
+// so on a low-contrast surface under a slow pan it can win on one frame and lose on the
+// next; the vector then alternates between the provider's and zero, and DLSS alternately
+// reprojects and does not. That is a flicker/judder that no consumer can smooth out, and
+// it comes and goes with the surface (The Surge 2, 2026-09-02). Guides writes StaticNow,
+// History copies it into PrevStatic, and the next frame's Guides reads that -- a texture
+// cannot be sampled and written in the same pass, which is why it takes two of them.
+texture DLSS5_StaticNow  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R8; };
+texture DLSS5_PrevStatic { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R8; };
+sampler sDLSS5_StaticNow  { Texture = DLSS5_StaticNow;  AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+sampler sDLSS5_PrevStatic { Texture = DLSS5_PrevStatic; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
 
 // Camera-model fit: a sparse sample grid of (x, y, w, valid | u, v), and the solved model as
 // six 1x1 RGBA32F texels (18 parameters + fit statistics).
@@ -522,8 +557,15 @@ bool FitIsUsable()
 }
 
 // Pass 1: sample the provider's flow and the depth on a sparse grid.
+//
+// ReShade cannot skip a whole pass on a uniform, so both fit passes start by checking the
+// one uniform that decides whether anything downstream will ever read them. It matters:
+// PS_FitSolve is a ONE-pixel shader that runs 2 x 920 iterations with two fetches each and
+// a 9x9 Gauss-Jordan solve -- a long serial latency chain on a single lane, every frame,
+// for a result only GeometryDecide consumes. GEOM_ENABLE is off by default.
 void PS_FitSamples(float4 vpos : SV_Position, float2 uv : TEXCOORD, out float4 A : SV_Target0, out float4 B : SV_Target1)
 {
+    if (!GEOM_ENABLE) { A = 0.0; B = 0.0; return; }
     const float2 suv = (floor(vpos.xy) + 0.5) / float2(DLSS5_FIT_W, DLSS5_FIT_H);
     const float  d   = ReShade::GetLinearizedDepth(suv);
     const float2 mv  = ProviderMV(suv);
@@ -539,6 +581,9 @@ void PS_FitSolve(float4 vpos : SV_Position, float2 uv : TEXCOORD,
                  out float4 P0 : SV_Target0, out float4 P1 : SV_Target1, out float4 P2 : SV_Target2,
                  out float4 P3 : SV_Target3, out float4 P4 : SV_Target4, out float4 P5 : SV_Target5)
 {
+    // See PS_FitSamples. P5.z is the sample count FitIsUsable() tests against 40, so a zeroed
+    // P5 also reads as "no usable fit" for anything that looks at it anyway.
+    if (!GEOM_ENABLE) { P0 = 0.0; P1 = 0.0; P2 = 0.0; P3 = 0.0; P4 = 0.0; P5 = 0.0; return; }
     float p[18];
     [unroll] for (int z = 0; z < 18; ++z) p[z] = 0.0;
     float inlier = 0.0, rms = 0.0, used = 0.0;
@@ -674,13 +719,14 @@ float RawDepth(float2 uv)
 
 void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
                       out float2 mv_out : SV_Target0, out float mask : SV_Target1,
-                      out float depth : SV_Target2)
+                      out float depth : SV_Target2, out float static_now : SV_Target3)
 {
     // Providers hand out "delta UV": previous position = uv + mv. DLSS wants the same
     // direction, in pixels.
     const float2 flow = ProviderMV(uv);
     float2 mv = flow;
     float  distrust = 0.0;
+    static_now = 0.0;   // the geometry path does not run the static test
 
     if (GEOM_ENABLE && FitIsUsable())
     {
@@ -704,24 +750,45 @@ void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
     else if (MV_VALIDATE)
     {
         const float4 bad = ValidateTests(uv, flow);
-        const float  zero_vector = max(bad.y, max(bad.z, bad.w));   // wrong target, or static explains it: treat as static
-        distrust = max(bad.x, max(bad.y, bad.z));                    // appearance changed / wrong target: favour the current frame
-        mv = flow * (1.0 - zero_vector);
+        static_now = bad.w;   // the raw decision, for next frame's hysteresis
+
+        // The static test may only zero the vector once it has won twice in a row. On the
+        // first win the provider's vector is kept and the pixel is masked instead: "prefer
+        // the current frame here" is a safe answer either way, where a zeroed vector on a
+        // pixel that really is moving smears and a full vector on a pixel that really is
+        // static flickers.
+        float static_zero = bad.w;
+        if (STATIC_HYSTERESIS && bad.w > 0.5)
+        {
+            const float won_before = tex2Dlod(sDLSS5_PrevStatic, float4(uv, 0.0, 0.0)).x;
+            if (won_before <= 0.5) { static_zero = 0.0; distrust = max(distrust, GEOM_MASK_REJECTED); }
+        }
+
+        // Hard decision, not a blend: half a vector points at neither where the pixel came
+        // from nor where it is, so DLSS would warp history in from a place that means
+        // nothing. The soft scores stay in the mask, which IS a continuous quantity.
+        const bool zero_vector = max(bad.y, max(bad.z, static_zero)) > 0.5;
+        distrust = max(distrust, max(bad.x, max(bad.y, bad.z)));   // appearance changed / wrong target
+        mv = zero_vector ? float2(0.0, 0.0) : flow;
     }
 
     mv_out = mv * float2(BUFFER_WIDTH, BUFFER_HEIGHT) * MV_SIGN * MV_SCALE;
-    mask   = distrust * MASK_STRENGTH;
+    mask   = saturate(distrust) * MASK_STRENGTH;
     depth  = RawDepth(uv);
 }
 
 // End of the technique: this frame becomes next frame's history. The raw provider vector is
 // stored (not the validated one), so one distrusted frame does not poison the next test.
+// prev_static carries this frame's static decision over to the next (the Guides pass cannot
+// both sample and write one texture, so it lands here).
 void PS_StoreHistory(float4 vpos : SV_Position, float2 uv : TEXCOORD,
-                     out float luma : SV_Target0, out float depth : SV_Target1, out float2 mv : SV_Target2)
+                     out float luma : SV_Target0, out float depth : SV_Target1, out float2 mv : SV_Target2,
+                     out float prev_static : SV_Target3)
 {
     luma  = Luma(uv);
     depth = ReShade::GetLinearizedDepth(uv);
     mv    = ProviderMV(uv);
+    prev_static = tex2Dfetch(sDLSS5_StaticNow, int2(vpos.xy)).x;
 }
 
 float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
@@ -756,9 +823,18 @@ float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     if (DEBUG_VIEW == 5)
     {
         // Recomputed here against the same history the feed pass used this frame.
-        const float4 bad = ValidateTests(uv, ProviderMV(uv));
-        const float3 img = tex2Dlod(sDLSS5_ColorInput, float4(uv, 0.0, 0.0)).rgb * 0.5;
-        return saturate(img + bad.xyz * 0.9 + bad.w * float3(0.6, 0.6, 0.0));
+        const float2 flow = ProviderMV(uv);
+        const float4 bad  = ValidateTests(uv, flow);
+        const float3 img  = tex2Dlod(sDLSS5_ColorInput, float4(uv, 0.0, 0.0)).rgb * 0.5;
+        // Yellow is what the feed pass ACTUALLY did, not what the static test proposed: with
+        // hysteresis on, a test that won only this frame keeps its vector. Watch a slow pan
+        // over a flat surface -- yellow that blinks on and off frame by frame is the flicker.
+        const bool  moved  = length(flow * BUFFER_SCREEN_SIZE) > 0.5;
+        const bool  zeroed = moved && length(tex2Dlod(sDLSS5_MV, float4(uv, 0.0, 0.0)).xy) < 1e-4;
+        // Dim orange: the static test won this frame but hysteresis kept the vector (masked instead).
+        const bool  held   = moved && !zeroed && tex2Dlod(sDLSS5_StaticNow, float4(uv, 0.0, 0.0)).x > 0.5;
+        return saturate(img + bad.xyz * 0.9 + (zeroed ? float3(0.6, 0.6, 0.0) : float3(0.0, 0.0, 0.0))
+                                            + (held   ? float3(0.35, 0.18, 0.0) : float3(0.0, 0.0, 0.0)));
     }
     if (DEBUG_VIEW == 6)
     {
@@ -802,8 +878,8 @@ technique DLSS5_Feed
 {
     pass FitSamples    { VertexShader = PostProcessVS; PixelShader = PS_FitSamples;    RenderTarget0 = DLSS5_FitA; RenderTarget1 = DLSS5_FitB; }
     pass FitSolve      { VertexShader = PostProcessVS; PixelShader = PS_FitSolve;      RenderTarget0 = DLSS5_Cam0; RenderTarget1 = DLSS5_Cam1; RenderTarget2 = DLSS5_Cam2; RenderTarget3 = DLSS5_Cam3; RenderTarget4 = DLSS5_Cam4; RenderTarget5 = DLSS5_Cam5; }
-    pass Guides        { VertexShader = PostProcessVS; PixelShader = PS_MotionVectors; RenderTarget0 = DLSS5_MV; RenderTarget1 = DLSS5_Mask; RenderTarget2 = DLSS5_Depth; }
-    pass History       { VertexShader = PostProcessVS; PixelShader = PS_StoreHistory;  RenderTarget0 = DLSS5_PrevLuma; RenderTarget1 = DLSS5_PrevDepth; RenderTarget2 = DLSS5_PrevMV; }
+    pass Guides        { VertexShader = PostProcessVS; PixelShader = PS_MotionVectors; RenderTarget0 = DLSS5_MV; RenderTarget1 = DLSS5_Mask; RenderTarget2 = DLSS5_Depth; RenderTarget3 = DLSS5_StaticNow; }
+    pass History       { VertexShader = PostProcessVS; PixelShader = PS_StoreHistory;  RenderTarget0 = DLSS5_PrevLuma; RenderTarget1 = DLSS5_PrevDepth; RenderTarget2 = DLSS5_PrevMV; RenderTarget3 = DLSS5_PrevStatic; }
     DLSS5_MV_REQUEST_PASS   // Launchpad only: ask it to compute optical flow again next frame
 }
 

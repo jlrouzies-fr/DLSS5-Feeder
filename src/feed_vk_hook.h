@@ -53,6 +53,10 @@ static int                g_vk_hook_devices;          // how many vkCreateDevice
 // VK_QUEUE_FAMILY_EXTERNAL (FeedVkExternalTransfer) need its family index.
 // VK_QUEUE_FAMILY_IGNORED until a vkCreateDevice has been seen.
 static uint32_t g_vk_gfx_family = VK_QUEUE_FAMILY_IGNORED;
+// The physical device the game's VkDevice was created from. ReShade only hands out
+// the VkDevice, but importing D3D12 memory needs vkGetPhysicalDeviceMemoryProperties
+// to pick a memory type that is actually device-local (see FeedVkImportImage).
+static VkPhysicalDevice g_vk_phys = VK_NULL_HANDLE;
 
 // ---------------------------------------------------------------------------
 // vkQueuePresentKHR hook -- the pacer detector.
@@ -82,39 +86,110 @@ static bool                  g_vk_pacer_warned;
 // (Plain long long: single writer, and a torn read only misprints one log line.)
 static volatile LONG64       g_vk_feed_frames;
 
+// Presents already counted when the FIRST frame was fed. Everything between the hook
+// going in and the feed starting -- menus, the shader compile, loading screens -- is
+// the game presenting on its own, and counting it as surplus accused the driver of
+// pacing frames it never touched (The Surge 2, 2026-09-02: "1.57x" at frame 121,
+// decaying to 1.01x as the honest 1:1 ratio outgrew the ~68-present head start).
+static volatile LONG64       g_vk_presents_base;
+
+// The other half of that base, and the reason #13 saw "1.25x" then "3.81x" on a machine with
+// Smooth Motion switched off. Presents are counted by a raw hook with no enable gate; frames
+// fed are counted only on the delivered-frame path, which every pause stops. So a pause runs
+// the numerator on and freezes the denominator, and the ratio climbs on its own until it
+// crosses the accusation threshold. Both ends have to be rebased when the feed comes back.
+static volatile LONG64       g_vk_fed_base;
+static ULONGLONG             g_vk_last_tick_ms;      // wall clock of the previous delivered frame
+static ULONGLONG             g_vk_pacer_grace_until; // no accusation until the ratio has re-earned it
+
+// ---------------------------------------------------------------------------
+// Keeping a trampoline alive while somebody is standing on it (#62).
+//
+// MH_RemoveHook frees the trampoline MinHook allocated for the original bytes. If any
+// other thread is inside one of the hook bodies below at that moment -- past the null
+// check, about to call through -- it calls a freed, unmapped address. That is an
+// EXECUTE access violation at an address in no loaded module, on the feed thread, with
+// the graphics DLLs still on the stack: exactly what X4 Foundations reports on "Exit to
+// Desktop", and exactly what a log saying "hook removed / shut down cleanly" is unable
+// to rule out, because the teardown DID run -- just not in an order that guaranteed
+// nothing was still in flight.
+//
+// So: count entries, and let the teardown DISABLE first (MH_DisableHook puts the original
+// bytes back, so no new call can reach these bodies at all), then wait for the count to
+// fall to zero, and only then free. The counter does not need to gate anything itself --
+// disabling is what closes the door; the count is what tells us the room is empty.
+// ---------------------------------------------------------------------------
+static volatile LONG  g_vk_hook_inflight;   // threads currently inside a hook body
+
+struct FeedVkHookGate
+{
+    FeedVkHookGate()  { InterlockedIncrement(&g_vk_hook_inflight); }
+    ~FeedVkHookGate() { InterlockedDecrement(&g_vk_hook_inflight); }
+};
+
 static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookQueuePresent(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
 {
+    // Holds the trampoline alive for the duration of this call (#62).
+    FeedVkHookGate gate;
+    const PFN_vkQueuePresentKHR orig = g_vk_present_orig;
+    if (orig == nullptr) return VK_SUCCESS;   // torn down under us; nothing safe to call
     const LONG64 presents = InterlockedIncrement64(&g_vk_presents);
     if (pPresentInfo != nullptr && pPresentInfo->swapchainCount > 0 && pPresentInfo->pImageIndices != nullptr)
         g_vk_last_image = pPresentInfo->pImageIndices[0];
 
     // The pacer signature. Only meaningful once the feed has run for a while, and
     // only said once: a real pacer keeps the ratio up for the whole session.
-    const LONG64 fed = g_vk_feed_frames;
-    if (!g_vk_pacer_warned && fed > 120 && presents > fed + fed / 4)
+    const LONG64 fed   = g_vk_feed_frames - g_vk_fed_base;
+    const LONG64 since = presents - g_vk_presents_base;
+    if (!g_vk_pacer_warned && GetTickCount64() >= g_vk_pacer_grace_until &&
+        fed > 120 && since > fed + fed / 4)
     {
         g_vk_pacer_warned = true;
         Log("[feed] an external frame pacer is presenting this swapchain: %lld presents against %lld frames fed "
-            "(%.2fx). NVIDIA Smooth Motion does exactly this, and on Vulkan it lives inside the driver, so no "
-            "module check can see it. This combination is NOT verified and is the subject of issues #1 and #10 "
-            "-- if the image holds old frames or corrupts, turn Smooth Motion off for THIS API only in NVIDIA "
-            "Profile Inspector: \"Smooth Motion - Enabled APIs\" (0xB0CC0875), clear bit 4 for Vulkan.",
-            static_cast<long long>(presents), static_cast<long long>(fed),
-            fed > 0 ? static_cast<double>(presents) / static_cast<double>(fed) : 0.0);
+            "since the first fed frame (%.2fx). NVIDIA Smooth Motion does exactly this, and on Vulkan it lives "
+            "inside the driver, so no module check can see it. This combination is NOT verified and is the "
+            "subject of issues #1 and #10 -- if the image holds old frames or corrupts, turn Smooth Motion off "
+            "for THIS API only in NVIDIA Profile Inspector: \"Smooth Motion - Enabled APIs\" (0xB0CC0875), "
+            "clear bit 4 for Vulkan.",
+            static_cast<long long>(since), static_cast<long long>(fed),
+            fed > 0 ? static_cast<double>(since) / static_cast<double>(fed) : 0.0);
     }
-    return g_vk_present_orig(queue, pPresentInfo);
+    return orig(queue, pPresentInfo);
 }
 
 // Called by the feed once per delivered frame; also drives the periodic report.
 static void FeedVkPresentTick(unsigned long long fed_frames, int every)
 {
     g_vk_feed_frames = static_cast<LONG64>(fed_frames);
+    // The first frame the feed ever delivered starts the comparison: presents before it
+    // belong to the game alone.
+    if (fed_frames == 1) { g_vk_presents_base = g_vk_presents; g_vk_fed_base = 0; }
+
+    // A gap between two delivered frames this long is a pause, not a slow frame -- the feed
+    // was off (enabled=0, the overlay tickbox, a disable) while the game kept presenting.
+    // Everything the game presented in that gap belongs to the game, exactly as the frames
+    // before the first fed one do, so rebase both ends rather than let the surplus accumulate
+    // into an accusation (#13).
+    const ULONGLONG now = GetTickCount64();
+    if (g_vk_last_tick_ms != 0 && now - g_vk_last_tick_ms > 250)
+    {
+        const ULONGLONG gap = now - g_vk_last_tick_ms;
+        g_vk_presents_base     = g_vk_presents;
+        g_vk_fed_base          = static_cast<LONG64>(fed_frames) - 1;
+        g_vk_pacer_grace_until = now + 2000;
+        Log("[feed] present probe rebased: the feed was paused for %llu ms and the game kept "
+            "presenting; those presents are not surplus", static_cast<unsigned long long>(gap));
+    }
+    g_vk_last_tick_ms = now;
+
     if (g_vk_present_orig == nullptr || every <= 0 || (fed_frames % static_cast<unsigned long long>(every)) != 0)
         return;
-    const LONG64 presents = g_vk_presents;
-    Log("[feed] present probe: %lld presents / %llu frames fed (%.2fx), last swapchain image index %u",
-        static_cast<long long>(presents), fed_frames,
-        fed_frames > 0 ? static_cast<double>(presents) / static_cast<double>(fed_frames) : 0.0,
+    const LONG64 since = g_vk_presents - g_vk_presents_base;
+    const LONG64 fed   = static_cast<LONG64>(fed_frames) - g_vk_fed_base;
+    Log("[feed] present probe: %lld presents / %lld frames fed since the last rebase (%.2fx), "
+        "last swapchain image index %u",
+        static_cast<long long>(since), static_cast<long long>(fed),
+        fed > 0 ? static_cast<double>(since) / static_cast<double>(fed) : 0.0,
         g_vk_last_image);
 }
 
@@ -123,8 +198,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice ph
                                                              const VkAllocationCallbacks *pAllocator,
                                                              VkDevice *pDevice)
 {
+    // Holds the trampoline alive for the duration of this call (#62).
+    FeedVkHookGate gate;
+    const PFN_vkCreateDevice orig_create = g_vk_create_device_orig;
+    if (orig_create == nullptr) return VK_ERROR_INITIALIZATION_FAILED;   // torn down under us
     ++g_vk_hook_devices;
-    if (pCreateInfo == nullptr) return g_vk_create_device_orig(physicalDevice, pCreateInfo, pAllocator, pDevice);
+    if (pCreateInfo == nullptr) return orig_create(physicalDevice, pCreateInfo, pAllocator, pDevice);
 
     // What does the driver actually offer? The enumerate entry point is a plain
     // vulkan-1.dll export; no GIPA needed.
@@ -233,13 +312,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice ph
         Log("[feed]   %-40s %s", want,
             already(want) ? "(app)" : driver_has(want) ? "ADDED" : "unsupported by driver");
 
-    VkResult r = g_vk_create_device_orig(physicalDevice, &ci, pAllocator, pDevice);
+    g_vk_phys = physicalDevice;
+    VkResult r = orig_create(physicalDevice, &ci, pAllocator, pDevice);
     if (r != VK_SUCCESS && (added > 0 || !have_timeline_feature))
     {
         // A driver that advertised an extension but refuses it is not worth arguing
         // with: retry untouched so the hook can never stop a game from starting.
         Log("[feed] vkCreateDevice failed (%d) with the added extensions; retrying with the app's original create info", r);
-        r = g_vk_create_device_orig(physicalDevice, pCreateInfo, pAllocator, pDevice);
+        r = orig_create(physicalDevice, pCreateInfo, pAllocator, pDevice);
     }
     Log("[feed] vkCreateDevice -> %d", r);
     return r;
@@ -309,18 +389,70 @@ static bool FeedVkHookInstall()
     return true;
 }
 
+// Close the door and wait for the room to empty (#62).
+//
+// Disabling restores the original bytes, so no NEW call can enter a hook body; the
+// in-flight count then tells us when the threads already inside have left. Only after
+// that is it safe to free the trampolines.
+//
+// Call this from the device-destroy path, where waiting is legal. FeedVkHookRemove runs
+// from DllMain, where it is not: there it degrades to a short bounded spin, which is
+// still better than freeing under a live call, but the real fix is to have quiesced
+// already by the time the DLL goes away.
+static void FeedVkHookQuiesce(int budget_ms)
+{
+    if (g_vk_present_target != nullptr)       MH_DisableHook(g_vk_present_target);
+    if (g_vk_create_device_target != nullptr) MH_DisableHook(g_vk_create_device_target);
+
+    // Sleep(0)/yield rather than a lock: this can run under the loader lock, where taking
+    // any lock a hook body might hold is how a shutdown deadlocks instead of crashing.
+    for (int waited = 0; waited < budget_ms; ++waited)
+    {
+        if (InterlockedCompareExchange(&g_vk_hook_inflight, 0, 0) == 0) return;
+        Sleep(1);
+    }
+    if (InterlockedCompareExchange(&g_vk_hook_inflight, 0, 0) != 0)
+        Log("[feed] Vulkan hooks: %ld call(s) still inside after %d ms; not freeing the trampolines",
+            static_cast<long>(g_vk_hook_inflight), budget_ms);
+}
+
+// Called when the game's device goes away, while it is still legal to wait. By the time
+// DllMain runs, this has already done the waiting.
+static void FeedVkHookQuiesceOnDeviceDestroy()
+{
+    if (g_vk_create_device_target == nullptr && g_vk_present_target == nullptr) return;
+    FeedVkHookQuiesce(200);
+}
+
 // From DllMain(DLL_PROCESS_DETACH). See the header comment for why this is mandatory.
 static void FeedVkHookRemove()
 {
     if (g_vk_create_device_target == nullptr) return;
+
+    // Disable and drain BEFORE freeing anything. Short budget: this runs under the loader
+    // lock. FeedVkHookQuiesceOnDeviceDestroy has normally drained it already.
+    FeedVkHookQuiesce(50);
+    if (InterlockedCompareExchange(&g_vk_hook_inflight, 0, 0) != 0)
+    {
+        // Leaving the hooks disabled-but-not-removed is the lesser evil ONLY if this DLL
+        // stays mapped, which at DLL_PROCESS_DETACH it does not. Freeing under a live call
+        // is what #62 crashes on, so prefer leaking the trampoline: the detour bytes are
+        // already restored, so nothing jumps into this module any more.
+        Log("[feed] Vulkan hooks: unloading with calls still in flight; the detours are disabled "
+            "but the trampolines are deliberately not freed");
+        g_vk_present_target       = nullptr;
+        g_vk_present_orig         = nullptr;
+        g_vk_create_device_target = nullptr;
+        g_vk_create_device_orig   = nullptr;
+        return;
+    }
+
     if (g_vk_present_target != nullptr)
     {
-        MH_DisableHook(g_vk_present_target);
         MH_RemoveHook(g_vk_present_target);
         g_vk_present_target = nullptr;
         g_vk_present_orig   = nullptr;
     }
-    MH_DisableHook(g_vk_create_device_target);
     MH_RemoveHook(g_vk_create_device_target);
     MH_Uninitialize();
     g_vk_create_device_target = nullptr;
