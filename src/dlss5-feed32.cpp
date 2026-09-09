@@ -59,7 +59,7 @@
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 #include "feed_opti.h"      // OptiScaler DLSS-NR: only the file scan and the ini reader are used here (it lives in host64 too)
 
-#define FEED_VERSION "0.14.0-beta.5"
+#define FEED_VERSION "0.15.0"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -308,6 +308,10 @@ struct Cfg
                            // style differ. #15 used host_window as an A/B for "does the helper's present
                            // cost anything", and both arms presented every evaluate, so it measured
                            // nothing. Only --hide, which the add-on never passes, suppresses the window.
+    int   host_gpu_priority; // 1 = pass --gpu-priority, asking the GPU scheduler to favour the
+                           // helper process. Off by default: it can starve the game it is meant to
+                           // help, and it only matters where the helper is being preempted (#83,
+                           // GTA IV under DXVK: multi-second stalls the reporter fixed by hand).
     int   work_resolution; // 50..100 percent of each backbuffer axis; the game stays native-sized
     int   work_upscale;    // expand-back of the work-size output: 0 = bilinear, 1 = AMD FSR 1
                            // (EASU + RCAS), 2 = DLSS Super Resolution on synthetic jitter (D3D11
@@ -338,7 +342,8 @@ struct Cfg
                            // that does not need it. Parse-only, not written back, not on the overlay.
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 100, 0, 1, 0 };
+//                                        host_window --v  v-- host_gpu_priority (off)
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 100, 0, 1, 0 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -405,9 +410,9 @@ static void CfgWriteDefault()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\n",
+               "host_window=%d\nhost_gpu_priority=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale, g_cfg.cast_mode,
             g_cfg.cast_anchor);
     fclose(f);
@@ -418,7 +423,7 @@ static void CfgWriteDefault()
 // diagnostics this way -- see its CfgSave.)
 static const char *const kCfgSavedKeys[] = {
     "enabled", "mode", "hdr", "depth_inverted", "flags", "reset_every", "log_frames",
-    "host_window", "work_resolution", "work_upscale", "work_sharpness", "async_home",
+    "host_window", "host_gpu_priority", "work_resolution", "work_upscale", "work_sharpness", "async_home",
     "mv_scale_x", "mv_scale_y", "cast_key", "cast_scale", "cast_mode", "cast_anchor",
 };
 
@@ -465,9 +470,9 @@ static void CfgSave()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\n",
+               "host_window=%d\nhost_gpu_priority=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale, g_cfg.cast_mode,
             g_cfg.cast_anchor);
     if (!carried.empty()) fputs(carried.c_str(), f);
@@ -529,6 +534,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "reset_every")    == 0) next.reset_every    = iv;
         else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
         else if (_stricmp(key, "host_window")    == 0) next.host_window    = iv;
+        else if (_stricmp(key, "host_gpu_priority") == 0) next.host_gpu_priority = iv;
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
         else if (_stricmp(key, "work_upscale")   == 0) next.work_upscale   = iv;
         else if (_stricmp(key, "work_sharpness") == 0) next.work_sharpness = val;
@@ -556,10 +562,10 @@ static bool CfgReload()   // true when a build-affecting value changed
         // handoff contract, and no DXVK report could be triaged without asking the reporter
         // what they had set (issue #15). The 64-bit side has always printed its full set.
         Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d log_frames=%d "
-            "host_window=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f async_home=%d "
+            "host_window=%d host_gpu_priority=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f async_home=%d "
             "mv_scale=%.3f,%.3f cast_key=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale,
             g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.host_creates);
     }
@@ -794,6 +800,28 @@ static DXGI_FORMAT TypedColorFormat(DXGI_FORMAT f)
         return DXGI_FORMAT_R11G11B10_FLOAT;
     default:
         return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+// The typeless member of a backbuffer format's family. A D3D11 view format must match its
+// resource exactly unless the resource is typeless, so a work-resolution staging copy made
+// in the raw backbuffer format cannot carry the ..._UNORM view TypedColorFormat asks for
+// when the backbuffer is ..._UNORM_SRGB. Formats with no typeless member come back
+// unchanged -- they are their own family, and the typed view already matches. (#85)
+static DXGI_FORMAT TypelessColorFormat(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    default:
+        return f;
     }
 }
 
@@ -2194,7 +2222,9 @@ static bool HostWorkerConnect(HANDLE ev)
     }
     // host_window=0: the host still makes its window (the cast needs a shown one), but as a
     // tool window parked behind everything -- --behind; 1: its own plain window.
-    sprintf_s(cmd, "\"%s\" %lu%s", exe, GetCurrentProcessId(), g_cfg.host_window ? "" : " --behind");
+    sprintf_s(cmd, "\"%s\" %lu%s%s", exe, GetCurrentProcessId(),
+              g_cfg.host_window ? "" : " --behind",
+              g_cfg.host_gpu_priority ? " --gpu-priority" : "");
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
@@ -3237,19 +3267,29 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         sd.Height           = backbuffer_h;
         sd.MipLevels        = 1;
         sd.ArraySize        = 1;
-        sd.Format           = bb_fmt;          // exact backbuffer format, so CopyResource accepts it
+        // Typeless, not bb_fmt: CopyResource still accepts the backbuffer (same type group)
+        // and the typed g.color_fmt view below becomes legal even for an sRGB backbuffer (#85).
+        sd.Format           = TypelessColorFormat(bb_fmt);
         sd.SampleDesc.Count = 1;
         sd.Usage            = D3D11_USAGE_DEFAULT;
         sd.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(g.dev->CreateTexture2D(&sd, nullptr, &g.color_stage)))
-        { Log("[feed32] work-resolution staging texture failed (%ux%u fmt=%u)", backbuffer_w, backbuffer_h, bb_fmt); ReleaseShared(); return false; }
+        { Log("[feed32] work-resolution staging texture failed (%ux%u fmt=%u)", backbuffer_w, backbuffer_h, sd.Format); ReleaseShared(); return false; }
 
+        // g.color_fmt, not bb_fmt: an sRGB view would apply the sRGB->linear conversion on
+        // sample and change what DLSS is fed. The 100% path copies raw bits; this matches it.
         D3D11_SHADER_RESOURCE_VIEW_DESC ss = {};
-        ss.Format              = g.color_fmt;  // typed view, in case the backbuffer is TYPELESS
+        ss.Format              = g.color_fmt;
         ss.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
         ss.Texture2D.MipLevels = 1;
-        if (FAILED(g.dev->CreateShaderResourceView(g.color_stage, &ss, &g.color_stage_srv)))
-        { Log("[feed32] work-resolution staging SRV failed"); ReleaseShared(); return false; }
+        const HRESULT ssr = g.dev->CreateShaderResourceView(g.color_stage, &ss, &g.color_stage_srv);
+        if (FAILED(ssr))
+        {
+            Log("[feed32] work-resolution staging SRV failed 0x%08X: a fmt=%u view on a fmt=%u "
+                "texture (backbuffer fmt=%u)", ssr, g.color_fmt, sd.Format, bb_fmt);
+            ReleaseShared();
+            return false;
+        }
 
         Log("[feed32] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
 
@@ -5526,6 +5566,15 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     if (ImGui::Checkbox("Show the DLSS 5 host window", &show_host_window)) { g_cfg.host_window = show_host_window ? 1 : 0; dirty = true; }
     ImGui::SameLine(); HelpMarker("The helper process's own separate window, the old way in. Not needed for the "
                                   "in-game panel above. Takes effect when the host is next started.");
+    bool gpu_priority = g_cfg.host_gpu_priority != 0;
+    if (ImGui::Checkbox("Give the helper GPU scheduling priority", &gpu_priority))
+    { g_cfg.host_gpu_priority = gpu_priority ? 1 : 0; dirty = true; }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Asks the GPU scheduler to favour the helper process, which can clear\n"
+                          "periodic multi-second stalls where the helper is being preempted\n"
+                          "(reported on GTA IV under DXVK).\n\n"
+                          "Off by default: realtime GPU priority can starve the game itself.\n"
+                          "Takes effect when the helper next starts.");
 
     if (!g_host_win_loaded) { ReadHostWindowSize(); g_host_win_loaded = true; }
     bool win_size_touched = false, win_size_released = false;

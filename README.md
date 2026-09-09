@@ -2,27 +2,12 @@
 
 [![AI-DECLARATION: copilot](https://img.shields.io/badge/䷼%20AI--DECLARATION-copilot-fee2e2?labelColor=fee2e2)](AI-DECLARATION.md)
 
-> ## ⚠️ Read this before you install: it is usually the *combination*, not the game
+> ## ⚠️ Read this before you install
 >
-> This project is a bridge between three things it does not control — **your NVIDIA driver**, the
-> **NVIDIA NGX runtimes** (`nvngx_dlssnr.dll`, `nvngx_dlss.dll`) and a third-party **neural
-> consumer** (`renodx-dlss5.addon64` or Deep Fried Chicken). Most reports here are not "game X does
-> not work"; they are one of those three not getting on with another. The tables below are what has
-> actually been measured, and what has not.
->
-> **Check your own combination in about fifteen seconds, with no game running:**
-> ```
-> host64\dlss5-feed-host64.exe --test          (32-bit games; the helper is in host64\)
-> ```
-> `--test finished: 300/300 evaluates succeeded` means the driver, the runtimes and the consumer all
-> work together. Anything less prints the fault and the module chain that produced it.
->
-> ### 1. Driver × neural consumer
->
-> Measured with `--test` on one RTX 5090, same files throughout, changing only the consumer —
-> **through the 64-bit helper**, i.e. the 32-bit game path. A 64-bit game runs the consumer's detour
-> in-process through the same code and is expected to behave the same, but has **not** been measured.
-> **Blank cells are not claims** — they are combinations nobody has run.
+> **Some combinations of driver, NGX runtime and neural consumer do not work — it is usually the
+> combination, not the game.** Check yours in fifteen seconds, with no game running:
+> `host64\dlss5-feed-host64.exe --test` (`300/300 evaluates succeeded` means you are fine). The
+> scenarios we know about:
 >
 > | neural consumer | driver **616.56** | driver **616.64** |
 > |---|---|---|
@@ -33,61 +18,12 @@
 > | `renodx-dlss5` **v4.6** (lazy-adoption engine) | — | ❌ 1/300 |
 > | `renodx-dlss5` **v4.7** (lazy-adoption engine) | ✅ 300/300 | ❌ 0/300 |
 >
-> **The one row measured on both drivers is v4.7, and it flips.** That is what pins the driver
-> rather than the machine. One real-game log on **616.86** shows the same v4.7 failure, so it is not
-> fixed there — but 616.86 has only that one data point. On 616.64+ the neural evaluate faults
-> inside NVIDIA's own NGX runtime:
+> Blank cells are combinations nobody has run. Measured with `--test` on one RTX 5090 through the
+> 64-bit helper. On 616.64+ the evaluate faults inside NVIDIA's own `nvngx_dlssnr.dll`
+> ([#54](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/54)) — **any one of these works:** Deep
+> Fried Chicken, a classic-engine `renodx-dlss5`, or driver 616.56.
 >
-> ```
-> evaluate raised 0xC0000005 in D3D12Core.dll
->     D3D12Core.dll <- nvngx_dlssnr.dll <- _nvngx.dll <- renodx-dlss5.addon64 <- dlss5-feed-host64.exe
-> ```
->
-> Nothing on this side is in that chain past the call itself. 616.64 also changed what NGX answers
-> about the feature that path creates (`NotImplemented` on 616.56 → `supported` on 616.64), so the
-> driver moved and the v4.6+ engine did not survive it. **Any one of these works:** Deep Fried
-> Chicken, a classic-engine `renodx-dlss5` build, or driver 616.56. See
-> [#54](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/54).
->
-> ### 2. The NGX runtimes
->
-> | file | what it is | builds seen in reports |
-> |---|---|---|
-> | `nvngx_dlssnr.dll` | the neural-rendering model — **DLSS 5 cannot run without it** | NVIDIA `310.8.0.0`, NVIDIA `310.8.2.0`, ShortFuse repack `310.8.SF.0` |
-> | `nvngx_dlss.dll` | the DLSS super-resolution runtime | `310.8.0.0`, `310.9.0.0`, and older DLSS **v3** builds such as `3.8.10.0` |
->
-> **Telling NVIDIA's build from ShortFuse's repack:** not by the version number and not by
-> `OriginalFilename` — both report `310.8.0.0` and both carry `CL 38718415`. The field that differs
-> is the *stated* **FileVersion** string: `310,8,0,0` (NVIDIA) versus `310.8.SF.0` (ShortFuse).
-> 0.14.0-beta.2 logs it, and `Verify-DLSS5Feeder.ps1` prints it.
->
-> **The `.SF` repack is not known to break anything.** It was the leading hypothesis in
-> [#47](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/47) and was then eliminated by
-> counter-example. Do not swap runtimes on the strength of that thread alone.
->
-> A `3.x` `nvngx_dlss.dll` beside a `310.x` `nvngx_dlssnr.dll` has been seen in reports. Whether the
-> mismatch matters is **unknown** — no test has isolated it. If yours are mismatched, it is worth
-> mentioning when you report.
->
-> ### 3. Known-open, and not caused by your install
->
-> | symptom | where | status |
-> |---|---|---|
-> | `NVSDK_NGX_D3D12_Init -> 0xBAD00001` on a 64-bit game, while the same files succeed for 32-bit games | [#47](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/47) | Open, **per-game**. GPU architecture, driver, data path, adapter, model build and game provenance have each been eliminated by counter-example. It does not reproduce on the maintainer's hardware, so from 0.14.0-beta.6 the instrument moves to you: set `DLSS5_FEED_NGX_MATRIX=1` and see **[DIAGNOSE-47.md](DIAGNOSE-47.md)**, which walks adapter × DRED × feature level in one run and says what each outcome means. |
-> | Works for minutes, then the neural pass stops; log says `device removed … 0x887A0006` | [#57](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/57), [#63](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/63) | Open. A GPU hang in **this project's own private queue** (three DRED nodes = the three-frame ring), with no page fault. 0.14.0-beta.5 names every D3D12 object and brackets the frame into `copy-in` / `ngx-evaluate` / `copy-home`, so the next breadcrumb says which phase hung. |
-> | `feature 18 create failed … 0xBAD00001` on a GTX/RTX 20-series card | [#73](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/73) | **Not a bug.** DLSS 5 neural rendering has a minimum GPU architecture that Turing and older are below. 0.14.0-beta.5 says so in the log instead of leaving you to read the support bits. |
-> | Severe flicker or a frozen image on 64-bit **Vulkan** | [#13](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/13) | Open. Narrowed: the transport is clean, the depth guide reaching NGX is a constant. |
->
-> ### 4. If you report something
->
-> Attach `dlss5-feed.log`, `ReShade.log`, and for a 32-bit game `host64\dlss5-feed-host.log` — from
-> the **same run**. Run `Verify-DLSS5Feeder.ps1` in the game folder and paste its output; it prints
-> the driver, both runtime identities, the consumer and its engine generation, which is most of the
-> above in one go. A report without the host log cannot usually be answered.
->
-> Use **0.14.0-beta.2 or newer**: builds before 0.14.0 logged every C++ crash identically as
-> `KERNELBASE.dll` with no way to name the thrower, and beta.2 fixes the crash that followed the
-> driver fault.
+> Use **0.14.0-beta.2 or newer**, and run `Verify-DLSS5Feeder.ps1` in the game folder before reporting anything.
 
 ## Description
 
@@ -1144,6 +1080,7 @@ if you prefer editing the file directly:
 | `sync_home` | 0 | **Diagnostic, Vulkan (64-bit).** 1 = flush and CPU-wait for the copy home before returning, which serialises the frame. For isolating ordering problems only; it costs frame time by design. |
 | `async_home` | 1 | **32-bit games only.** 1 = pipelined handoff: each frame carries the DLSS output of the frame *before* it, so the game never waits for the helper process inside a frame — this is what lifts the ~35 fps ceiling of the original same-frame contract (issue #15). Costs one frame of latency on the DLSS output, which the temporal history hides. 0 = the original same-frame behaviour. Also on the overlay as "Pipelined handoff". |
 | `host_window` | 0 | **32-bit games only.** 0 keeps the helper's window behind the game, off the taskbar, and lets the overlay's "Show the DLSS 5 panel in-game" button cast its tuning panel into the game window; 1 gives the helper its own visible window instead (press Home there). Read when the helper is started. **Not a hide switch:** at 0 the window is still created, still shown and still presented on every evaluate — only its z-order and window style differ. So it is not an A/B for "does the helper's presenting cost anything"; only launching the helper by hand with `--hide` is. |
+| `host_gpu_priority` | 0 | **32-bit games only.** `1` asks the GPU scheduler to favour the helper process (`D3DKMTSetProcessSchedulingPriorityClass`, realtime class), passed to it as `--gpu-priority` when it starts. Worth trying only for periodic multi-second stalls that persist with everything else at defaults — reported on GTA IV under DXVK, where the reporter had already proved it with Process Lasso. **Off by default on purpose:** realtime GPU priority can starve the very game it is meant to help, and the call needs privilege that may not be granted. The helper logs which of the two happened on every start. |
 | `cast_key` | 0 | **32-bit games only.** Virtual-key code that shows/hides the cast DLSS 5 panel in-game; 0 = none. Set it from the overlay page with "Set key" rather than by hand. |
 | `cast_scale` | 100 | **32-bit games only.** Size of the cast panel, 25..300 % of the largest size that fits the game window (above 100 % it may run past the window's edges). Also on the overlay as "Panel size". |
 | `cast_mode` | 0 | **32-bit games only.** How the cast panel is drawn: 0 = a desktop-compositor thumbnail of the helper's window (windowed / borderless games, any API); 1 = a shared copy of the helper's frame drawn by the game's ReShade or blitted onto its backbuffer (works in exclusive fullscreen; D3D11, OpenGL and Vulkan). The two overlay buttons set it. |
@@ -1223,6 +1160,23 @@ Common cases:
   (the legacy CNN presets clamp history harder).
 * **Nothing happens, no `dlss5-feed.log`** — ReShade's architecture does not match the game's
   (a 64-bit `dxgi.dll` cannot load into a 32-bit game, and vice versa).
+* **`D3D12CreateDevice failed 0x887E0003` / the session never opens** (issues
+  [#61](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/61),
+  [#81](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/81)) — `0x887E0003` is
+  `D3D12_ERROR_INVALID_REDIST`, and it is **not** about your GPU, driver or this add-on. A game
+  whose exe exports `D3D12SDKVersion`/`D3D12SDKPath` (Unity titles commonly do) points Direct3D 12
+  at a game-local `D3D12\` folder — the Agility SDK redist — for **every** device created in that
+  process, ours included. If that folder is empty, or holds a `D3D12Core.dll` of a version the game
+  did not ask for, every create in the process fails with this code. Everything else looks healthy,
+  which is what makes it confusing: the shaders compile, the consumer arms, and only the device
+  create goes wrong.
+
+  **The test that settles it:** rename the game's `D3D12` folder to `D3D12_off` and relaunch. If the
+  game still starts and the session opens, that was it. If the game refuses to start without it, the
+  redist is genuinely in use and damaged — verify the game's files through its launcher. Nothing in
+  this project can work around it, because the redirection applies process-wide before our first
+  call. Since 0.14.0-beta.3 the log names the code and reports what that folder contains, and
+  `Verify-DLSS5Feeder.ps1` warns about it before you launch.
 * **"ran out of video memory" with dgVoodoo** — raise `VRAM` in `dgVoodoo.conf`; the default 256 MB
   is a virtual limit unrelated to your real GPU.
 * **Vulkan game: "the Vulkan interop entry points are missing"** — the add-on's `vkCreateDevice`

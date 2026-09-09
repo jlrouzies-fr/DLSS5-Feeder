@@ -1825,7 +1825,19 @@ static bool InitDisguise()
 
     HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                                reinterpret_cast<void **>(&h.dev));
-    if (FAILED(hr)) { Log("[host] D3D12CreateDevice failed 0x%08X (%s)", hr, FeedHrName(hr)); return false; }
+    if (FAILED(hr))
+    {
+        Log("[host] D3D12CreateDevice failed 0x%08X (%s)", hr, FeedHrName(hr));
+        // The add-on names this one for the game process (#61); say it here too, because the
+        // 32-bit path fails HERE and its reporters only ever see this log. This exe exports no
+        // D3D12SDKVersion, so a redist error means an Agility folder next to THIS exe, or
+        // something injected into this process pointing Direct3D 12 at one (#81).
+        if (static_cast<unsigned long>(hr) == 0x887E0003ul)
+            Log("[host] D3D12_ERROR_INVALID_REDIST: Direct3D 12 was pointed at an Agility SDK redist "
+                "it could not load. This helper asks for none, so look for a D3D12\\ folder next to "
+                "dlss5-feed-host64.exe and rename it, or for an injector that sets one.");
+        return false;
+    }
 
     D3D12_COMMAND_QUEUE_DESC qd = {};
     h.dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&h.pump_queue));
@@ -2371,16 +2383,21 @@ static ID3D12Resource *MakeTex(UINT w, UINT h_, DXGI_FORMAT fmt, bool uav)
 // for a host-creating client (OpenGL, Vulkan) this host owns the only one. Where the
 // support is missing, fall back to RGBA and let the game's copy home convert: wrong
 // channel order beats a feature that cannot be created at all.
+// Asks about whatever is actually being requested, not only BGRA8: R8G8B8A8_UNORM is the one
+// format whose typed UAV store is required, so everything else has to be checked or NGX fails
+// the create with 0xBAD0000B on hardware that lacks it (#84, an R10G10B10A2 swapchain).
 static DXGI_FORMAT ResolveOutputFormatHost(DXGI_FORMAT want)
 {
-    if (want != DXGI_FORMAT_B8G8R8A8_UNORM || h.dev == nullptr) return want;
+    if (want == DXGI_FORMAT_R8G8B8A8_UNORM || h.dev == nullptr) return want;
     D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {};
     fs.Format = want;
     if (SUCCEEDED(h.dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
         (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0)
         return want;
-    Log("[host] B8G8R8A8_UNORM has no typed UAV store on this device; the output stays R8G8B8A8_UNORM "
-        "(the game's copy home will convert, so expect the washed-out image of issue #11)");
+    Log("[host] %s has no typed UAV store on this device; the output stays R8G8B8A8_UNORM and the "
+        "game's copy home will convert%s", FeedFmtName(want),
+        want == DXGI_FORMAT_B8G8R8A8_UNORM ? " (expect the washed-out image of issue #11)"
+                                           : " (a create would otherwise fail 0xBAD0000B, see #84)");
     return DXGI_FORMAT_R8G8B8A8_UNORM;
 }
 
@@ -3316,6 +3333,52 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// ---------------------------------------------------------------------------------------
+// Optional: ask the GPU scheduler to favour this process (#83)
+//
+// A reporter on GTA IV under DXVK hit multi-second stalls every ~30 s and fixed them by
+// raising this helper's GPU scheduling priority with Process Lasso. The helper renders
+// nothing of its own -- it holds one queue that the game is blocked on -- so letting it be
+// preempted by whatever else wants the GPU shows up directly as a stall in the game.
+//
+// Off unless asked for. Realtime GPU priority can starve the very game it is meant to help,
+// which is why the reporter suggested it be optional, and why this is a flag and not a
+// default. D3DKMTSetProcessSchedulingPriorityClass is in gdi32 but in no public import
+// library, so it is resolved by name; the call also needs privilege that may not be
+// granted, so the result is logged either way rather than assumed.
+// ---------------------------------------------------------------------------------------
+typedef enum _FEED_D3DKMT_PRIORITY_CLASS
+{
+    FEED_D3DKMT_PRIORITY_IDLE = 0,
+    FEED_D3DKMT_PRIORITY_BELOW_NORMAL,
+    FEED_D3DKMT_PRIORITY_NORMAL,
+    FEED_D3DKMT_PRIORITY_ABOVE_NORMAL,
+    FEED_D3DKMT_PRIORITY_HIGH,
+    FEED_D3DKMT_PRIORITY_REALTIME
+} FEED_D3DKMT_PRIORITY_CLASS;
+
+static void RaiseGpuSchedulingPriority()
+{
+    typedef LONG (WINAPI *PFN_SetPrio)(HANDLE, FEED_D3DKMT_PRIORITY_CLASS);
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    if (gdi == nullptr) gdi = LoadLibraryW(L"gdi32.dll");
+    auto set_prio = gdi != nullptr
+        ? reinterpret_cast<PFN_SetPrio>(GetProcAddress(gdi, "D3DKMTSetProcessSchedulingPriorityClass"))
+        : nullptr;
+    if (set_prio == nullptr)
+    {
+        Log("[host] gpu_priority: D3DKMTSetProcessSchedulingPriorityClass not available; left alone");
+        return;
+    }
+    const LONG st = set_prio(GetCurrentProcess(), FEED_D3DKMT_PRIORITY_REALTIME);
+    if (st == 0)
+        Log("[host] gpu_priority: GPU scheduling priority raised to REALTIME for this helper. "
+            "If the game itself now stutters, turn host_gpu_priority back off (#83)");
+    else
+        Log("[host] gpu_priority: the GPU scheduler refused the change (status 0x%08X); "
+            "priority is unchanged and nothing else is affected", st);
+}
+
 int main(int argc, char **argv)
 {
     // A run with no arguments is somebody double-clicking this exe to find out what it is --
@@ -3371,13 +3434,14 @@ int main(int argc, char **argv)
     // helper, and process exit restores the resolution anyway.
     timeBeginPeriod(1);
 
-    bool  test = false, hide = false, behind = false;
+    bool  test = false, hide = false, behind = false, gpu_priority = false;
     DWORD pid = 0;
     for (int i = 1; i < argc; ++i)
     {
         if      (strcmp(argv[i], "--test") == 0) test = true;
         else if (strcmp(argv[i], "--hide") == 0) hide = true;
         else if (strcmp(argv[i], "--behind") == 0) behind = true;
+        else if (strcmp(argv[i], "--gpu-priority") == 0) gpu_priority = true;
         // First numeric token wins. This used to be a bare assignment, so ANY later token
         // the parser did not recognise ran through strtoul, came back 0, and silently
         // overwrote an already-parsed pid -- turning a good command line into the usage
@@ -3387,11 +3451,13 @@ int main(int argc, char **argv)
     }
     if (!test && pid == 0)
     {
-        Log("usage: dlss5-feed-host64 --test | dlss5-feed-host64 <game pid> [--hide | --behind]");
+        Log("usage: dlss5-feed-host64 --test | dlss5-feed-host64 <game pid> [--hide | --behind] "
+            "[--gpu-priority]");
         return 1;
     }
     g_show_window = !test && !hide;   // the visible window carries the DLSS 5 add-on's tuning panel
     g_behind      = g_show_window && behind;
+    if (gpu_priority) RaiseGpuSchedulingPriority();
 
     DetectRenodxAddon();   // must run BEFORE ReShade loads, so an EnableHooks write is read
     DetectToolkitAddon();

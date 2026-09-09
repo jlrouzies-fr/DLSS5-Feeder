@@ -309,7 +309,18 @@ struct FeedNgxVerdict
     // feed_opti.h tells that the calls were routed to OptiScaler rather than to the driver.
     unsigned         ss_min_arch;
     char             ss_min_os[32];
+    // The adapter's PCI vendor id, read straight from DXGI_ADAPTER_DESC. NGX is NVIDIA's
+    // runtime; on anything else every answer below is a foregone conclusion, and saying so
+    // beats letting the PlatformError branch tell an AMD owner to go hunting for overlays
+    // (#82: the host printed "AMD Radeon RX 9060 XT" two lines above "not your GPU").
+    unsigned         vendor_id;
 };
+
+// NGX will never run here, whatever else the probe found. 0x10DE is NVIDIA.
+static bool FeedNgxNoNvidiaAdapter(const FeedNgxVerdict &v)
+{
+    return v.asked && v.vendor_id != 0 && v.vendor_id != 0x10DEu;
+}
 
 // NGX refused a pure capability question, before any device was involved. Not the GPU and
 // not the driver: something in THIS PROCESS is blocking NGX.
@@ -328,6 +339,11 @@ static bool FeedNgxAdapterTooOld(const FeedNgxVerdict &v)
 // unless NGX actually said hardware.
 static const char *FeedNgxWhyNot(const FeedNgxVerdict &v)
 {
+    // First, ahead of everything: no other verdict can be true on a non-NVIDIA adapter, and
+    // the in-process one actively misleads there.
+    if (FeedNgxNoNvidiaAdapter(v))
+        return "NGX is NVIDIA's runtime and this is not an NVIDIA GPU -- no build of this project, "
+               "and no combination of runtimes, can make DLSS 5 neural rendering run on this adapter";
     if (FeedNgxBlockedInProcess(v))
         return "NGX refused even the capability query in this process, before any device existed -- "
                "this is not your GPU and not your driver. Something else loaded into this game "
@@ -347,6 +363,14 @@ static void FeedLogNgxFeatureRequirements(void (*log)(const char *, ...), const 
     if (out != nullptr) { FeedNgxVerdict blank = {}; *out = blank; }
     if (adapter == nullptr) { log("[%s] NGX feature requirements: no adapter to ask about", tag); return; }
     if (out != nullptr) out->asked = true;
+
+    DXGI_ADAPTER_DESC ad = {};
+    const bool have_desc = SUCCEEDED(adapter->GetDesc(&ad));
+    if (out != nullptr && have_desc) out->vendor_id = ad.VendorId;
+    if (have_desc && ad.VendorId != 0x10DEu)
+        log("[%s]   *** This adapter is not an NVIDIA GPU (PCI vendor 0x%04X). NGX is NVIDIA's "
+            "runtime: nothing below can succeed, and no runtime or add-on changes that. ***",
+            tag, ad.VendorId);
 
     struct Probe { NVSDK_NGX_Feature id; const char *name; };
     const Probe probes[] = {
@@ -375,7 +399,10 @@ static void FeedLogNgxFeatureRequirements(void (*log)(const char *, ...), const 
             // This query touches no device and creates no feature. PlatformError here means
             // NGX has already declined to answer anything in this process, and everything
             // that fails afterwards is a consequence rather than a cause (#47, #72).
-            if (static_cast<unsigned>(r) == 0xBAD00002u)
+            if (static_cast<unsigned>(r) == 0xBAD00002u && have_desc && ad.VendorId != 0x10DEu)
+                log("[%s]   PlatformError on a non-NVIDIA adapter is simply NGX declining to run here. "
+                    "Nothing in this process is blocking it", tag);
+            else if (static_cast<unsigned>(r) == 0xBAD00002u)
                 log("[%s]   NGX answered a pure capability question with PlatformError: it is refusing this "
                     "PROCESS, not this GPU or driver. Look for another overlay, injector, anti-cheat or "
                     "NGX consumer loaded into the game", tag);

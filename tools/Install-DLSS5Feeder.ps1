@@ -14,8 +14,8 @@
          bitness, the 64-bit host helper for 32-bit games, the shader, the Vulkan fallback
          layer, and the verification script.
       4. The ReShade framework headers and LumeniteFX (the recommended motion-vector provider).
-      5. The neural consumer -- Deep Fried Chicken by default -- and the two NVIDIA NGX
-         runtimes, in the folder where the 64-bit code runs (the game folder, or host64\).
+      5. The neural consumer -- the RenoDX DLSS 5 add-on by default -- and the two NVIDIA
+         NGX runtimes, in the folder where the 64-bit code runs (the game folder, or host64\).
       6. ReShade.ini and ReShadePreset.ini with the provider selected and both techniques
          enabled in the right order (merged into existing files, which are backed up first).
       7. dgVoodoo2 for Direct3D 8/9 games, configured the way the README says.
@@ -46,11 +46,17 @@
     D3D8 (both via dgVoodoo2). Default: Auto.
 
 .PARAMETER Consumer
-    Which neural consumer does the DLSS 5 work: DFC (Deep Fried Chicken), RenoDX (Krish's
-    renodx-dlss5 add-on) or OptiScaler (the OptiScaler_DLSSNR fork, installed as winmm.dll
-    beside ReShade and set up to run its neural pass on the feed). All three are downloaded
-    automatically. Omitted, the script asks at the start; with -Yes and no choice given it
-    takes Deep Fried Chicken.
+    Which neural consumer does the DLSS 5 work: RenoDX (Krish's renodx-dlss5 add-on),
+    DFC (Deep Fried Chicken) or OptiScaler (the OptiScaler_DLSSNR fork, installed as
+    winmm.dll beside ReShade and set up to run its neural pass on the feed).
+
+    RenoDX and OptiScaler are downloaded automatically. Deep Fried Chicken is NOT: its
+    author does not publish the files, so choosing it prints its Discord invite, asks you
+    to drop Deep-Fried-Chicken-*.zip in the cache folder, and waits. Pass it non-
+    interactively with -DfcZip.
+
+    Omitted, the script asks at the start; with -Yes and no choice given it takes RenoDX,
+    which is the only one it can fetch unattended.
 
 .PARAMETER MvProvider
     DLSS5_MV_PROVIDER value: 3 (LumeniteFX Kernel, default) or 4 (LumeniteFX QuantMotion).
@@ -64,7 +70,8 @@
     download when found there (matched by name): DLSS5-Feeder-*.zip,
     ReShade_Setup_*_Addon.exe, Deep-Fried-Chicken*.zip, nvngx_dlssnr.dll, nvngx_dlss.dll,
     renodx-dlss5*.addon64, OptiScaler-DLSSNR*.zip, LumeniteFX*.zip, dgVoodoo2_*.zip,
-    ReShade.fxh, ReShadeUI.fxh, DrawText.fxh.
+    ReShade.fxh, ReShadeUI.fxh, DrawText.fxh. The NGX runtimes and the RenoDX add-on are
+    also accepted as the .zip they are published in.
 
 .PARAMETER FeederZip, DfcZip, DlssNrDll, DlssDll, RenoDxAddon, OptiScalerZip, ReShadeSetup, LumeniteZip, DgVoodooZip
     Explicit path or URL for one piece, overriding both -LocalFiles and the defaults.
@@ -151,9 +158,17 @@ $ProgressPreference = 'SilentlyContinue'
 # ---------------------------------------------------------------------------------------
 # Where things come from. Edit here when a link moves.
 #
-# The three Discord CDN links carry an "ex=" expiry (hex Unix time) and stop working after
-# it; the script decodes it and says so rather than reporting a bare 403/404. Fresh links
-# are in the Discord servers the README points at.
+# The NGX runtimes and the RenoDX add-on used to come from Discord CDN links. Those carry
+# an "ex=" expiry (hex Unix time) and Discord now stamps them roughly 24 HOURS out, so the
+# installer broke about a day after every release (#75). They are now pinned GitHub release
+# assets instead, which do not expire.
+#
+# Pinned by exact tag on purpose, not "latest": these are the builds this release was tested
+# against, and a new upstream build appearing overnight must not silently change what a user
+# gets. Bump the tag here when a newer one has been tried.
+#
+# Deep Fried Chicken is the exception and has no URL: its author does not publish the files
+# publicly. Choosing it takes the guided manual route in the consumer step below.
 # ---------------------------------------------------------------------------------------
 
 $Sources = @{
@@ -164,10 +179,10 @@ $Sources = @{
     CompatIni       = 'https://raw.githubusercontent.com/crosire/reshade-shaders/list/Compatibility.ini'
     Lumenite        = 'https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/mainline'
     DgVoodoo        = 'https://api.github.com/repos/dege-diosg/dgVoodoo2/releases/latest'
-    Dfc             = 'https://cdn.discordapp.com/attachments/1543936250657120366/1544601537844879410/Deep-Fried-Chicken-v1.4.8-alpha.zip?ex=6a99c287&is=6a987107&hm=9460267dc5be8024653c5d1feb6fff6f5d00f55bf2ab0262ffcfd285e1b7d143&'
-    DlssNr          = 'https://cdn.discordapp.com/attachments/1543976771920330884/1543982044797866107/nvngx_dlssnr.dll?ex=6a9a2495&is=6a98d315&hm=a0a12bd2e4d7ae4c7e915a21e1570c594af0e2cf2e15195d9dbf8a693f45ca99&'
-    Dlss            = 'https://cdn.discordapp.com/attachments/1543348014691651676/1544918856697643089/nvngx_dlss.dll?ex=6a9a414e&is=6a98efce&hm=17a6973ef6de0d211b7b3fe00362d851685156e73aab3e38670e00563332b22a&'
-    RenoDxDlss5     = 'https://cdn.discordapp.com/attachments/1542647972695904317/1544338777399365762/renodx-dlss5.addon64?ex=6a9a1f50&is=6a98cdd0&hm=2a695add57b27c6d7fd1ad2a70e2d3c4f49586a3d5c30f84cc33be3513d41de8&'
+    # No public download; see Get-ChickenManually.
+    DlssNr          = 'https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.8.0/nvngx_dlssnr_310.8.0.zip'
+    Dlss            = 'https://github.com/RankFTW/rhi-repo/releases/download/dlss-310.9.1/nvngx_dlss_310.9.1.zip'
+    RenoDxDlss5     = 'https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-4.70/renodx-dlss5_4.70.zip'
     OptiScalerReleases = 'https://api.github.com/repos/Dagherbou/OptiScaler_DLSSNR/releases'
     OptiScalerHome     = 'https://github.com/Dagherbou/OptiScaler_DLSSNR/releases'
     DfcDiscord      = 'https://discord.gg/g2v2XGqvR'
@@ -970,6 +985,115 @@ function Resolve-Piece
 # to open directly, so Open-Zip finds the archive start the way the setup itself does.
 # ---------------------------------------------------------------------------------------
 
+# A pinned GitHub release asset that wraps exactly one file (the NGX runtimes and the
+# RenoDX add-on all ship this way). Downloads it, extracts that one entry into the cache
+# and returns the extracted path -- so every caller downstream still receives a plain
+# path to a .dll / .addon64 and nothing else had to learn about archives.
+#
+# An override or a -LocalFiles hit that is already the bare file is taken as-is: people
+# who have been collecting these by hand have the loose file, not the zip.
+# Deep Fried Chicken has no public download and no stable URL: its author does not want the
+# files mirrored. So the installer never fetches it -- it looks in every place a person who
+# just downloaded it would plausibly have put it, and otherwise asks.
+function Find-ChickenZip
+{
+    param([string] $Explicit)
+
+    if ($Explicit) {
+        if (Test-FileHere $Explicit) { Report -Status 'Ok' -Text ('Deep Fried Chicken: using ' + $Explicit); return $Explicit }
+        Report -Status 'Warn' -Text ('Deep Fried Chicken: -DfcZip points at nothing: ' + $Explicit)
+    }
+
+    $where = New-Object System.Collections.ArrayList
+    if ($LocalFiles) { $null = $where.Add($LocalFiles) }
+    $null = $where.Add($script:Cache)
+    if ($gameDir) { $null = $where.Add($gameDir) }
+    $null = $where.Add($PSScriptRoot)
+    try { $null = $where.Add((Join-Safe $env:USERPROFILE 'Downloads')) } catch { }
+
+    foreach ($d in $where) {
+        if (-not $d -or -not (Test-DirHere $d)) { continue }
+        try {
+            $hit = Get-ChildItem -LiteralPath $d -File -Filter 'Deep-Fried-Chicken*.zip' -ErrorAction SilentlyContinue |
+                   Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($hit) { Report -Status 'Ok' -Text ('Deep Fried Chicken: found ' + $hit.FullName); return $hit.FullName }
+        }
+        catch { }
+    }
+    return $null
+}
+
+# The guided hand-fetch. Prints where to go and where to put it, then waits on Enter and
+# looks again, rather than failing and making the user start the installer over.
+function Get-ChickenManually
+{
+    $target = if ($script:Cache) { $script:Cache } else { $PSScriptRoot }
+    for ($try = 1; $try -le 3; $try++) {
+        Write-Host ''
+        Write-Chunk '  Deep Fried Chicken has to be fetched by hand.' 'Yellow'
+        Write-Chunk '  Its author does not publish the files, so nothing can download it for you.' 'DarkGray'
+        Write-Host ''
+        Write-Chunk '   1. Open its Discord:  ' 'Gray' -NoNewline
+        Write-Chunk $Sources.DfcDiscord 'Cyan'
+        Write-Chunk '   2. Download the latest  Deep-Fried-Chicken-*.zip' 'Gray'
+        Write-Chunk '   3. Put that file in this folder:' 'Gray'
+        Write-Chunk ('      ' + $target) 'White'
+        Write-Chunk '      (the game folder or your Downloads folder work too)' 'DarkGray'
+        Write-Host ''
+        Write-Chunk '  Press Enter when the file is there, or type  q  to stop. ' 'Cyan' -NoNewline
+        try { $a = Read-Host } catch { $a = 'q' }
+        # No "switch to RenoDX" here on purpose: the consumer decides what has already been
+        # downloaded and what must never be installed beside it, and changing it this late
+        # would leave half of those decisions made for the other one. Stopping and re-running
+        # with option 1 is the honest way out.
+        if ($a.Trim().ToLowerInvariant() -eq 'q') {
+            Stop-Install 'Deep Fried Chicken was not provided.' `
+                         'Nothing was installed for the neural consumer.' `
+                         'Re-run and choose 1 (RenoDX DLSS 5), which this installer can download for you.'
+        }
+        $found = Find-ChickenZip -Explicit ''
+        if ($found) { return $found }
+        Write-Chunk ('  Still no Deep-Fried-Chicken-*.zip in ' + $target + ' (or the other places checked).') 'Yellow'
+    }
+    return $null
+}
+
+function Resolve-PieceZipped
+{
+    param([string] $Label, [string] $Explicit, [string] $LocalPattern, [string] $DefaultUrl,
+          [string] $CacheName, [string] $InnerName)
+
+    $inner = Join-Safe $script:Cache $InnerName
+    if (-not $Explicit -and (Test-FileHere $inner)) {
+        Report -Status 'Ok' -Text ($Label + ': using the copy already in the cache')
+        return $inner
+    }
+
+    $got = Resolve-Piece -Label $Label -Explicit $Explicit -LocalPattern $LocalPattern `
+                         -DefaultUrl $DefaultUrl -CacheName $CacheName
+    if (-not $got) { return $null }
+    if ([IO.Path]::GetExtension($got) -ne '.zip') { return $got }
+
+    try {
+        $z = Open-Zip $got
+        try {
+            $e = Find-ZipEntry $z ('(^|/)' + [regex]::Escape($InnerName) + '$')
+            if (-not $e) {
+                Report -Status 'Fail' -Text ($Label + ': ' + $InnerName + ' is not inside ' + $got)
+                return $null
+            }
+            Expand-ZipEntry $e $inner
+        }
+        finally { $z.Dispose() }
+    }
+    catch {
+        Report -Status 'Fail' -Text ($Label + ': could not extract ' + $InnerName) -Detail $_.Exception.Message
+        return $null
+    }
+    return $inner
+}
+
+
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
@@ -1331,28 +1455,33 @@ Write-Host $script:Cache
 
 # Which neural consumer? Asked here, before anything is downloaded, because the answer
 # decides what gets fetched and what must never be installed beside it.
+# RenoDX is first and is the default: it is the only one of the three this installer can
+# actually fetch. Deep Fried Chicken is not published anywhere public -- its author does not
+# want the files mirrored -- so choosing it means a guided manual step rather than a download,
+# and making it the default meant every unattended run stopped to ask a human (#75).
 if ($Consumer -eq 'Ask') {
     if ($Yes) {
-        $Consumer = 'DFC'
+        $Consumer = 'RenoDX'
     }
     else {
         Write-Host ''
         Write-Chunk '  Neural consumer -- the add-on that turns the feed into neural rendering.' 'White'
-        Write-Chunk '   1. Deep Fried Chicken  ' 'Gray' -NoNewline
-        Write-Chunk 'recommended; negotiates with the feeder over its own interop ABI' 'DarkGray'
-        Write-Chunk '   2. RenoDX DLSS 5       ' 'Gray' -NoNewline
-        Write-Chunk 'Krish''s renodx-dlss5 add-on' 'DarkGray'
+        Write-Chunk '   1. RenoDX DLSS 5       ' 'Gray' -NoNewline
+        Write-Chunk 'recommended; Krish''s renodx-dlss5 add-on, downloaded for you' 'DarkGray'
+        Write-Chunk '   2. Deep Fried Chicken  ' 'Gray' -NoNewline
+        Write-Chunk 'negotiates with the feeder over its own interop ABI -- you must fetch it by hand from its Discord' 'DarkGray'
         Write-Chunk '   3. OptiScaler DLSS-NR  ' 'Gray' -NoNewline
         Write-Chunk 'the OptiScaler_DLSSNR fork: it takes the feed''s DLSS call, upscales, then runs the neural pass (menu on Insert)' 'DarkGray'
         Write-Chunk '  Exactly one of them may be installed: each goes inert, or misbehaves, beside the others.' 'DarkGray'
         Write-Chunk '  Which one? [1/2/3, Enter for 1] ' 'Cyan' -NoNewline
         try { $a = Read-Host } catch { $a = '' }
         switch ($a.Trim()) {
-            '2'          { $Consumer = 'RenoDX' }
-            'renodx'     { $Consumer = 'RenoDX' }
+            '2'          { $Consumer = 'DFC' }
+            'dfc'        { $Consumer = 'DFC' }
+            'chicken'    { $Consumer = 'DFC' }
             '3'          { $Consumer = 'OptiScaler' }
             'optiscaler' { $Consumer = 'OptiScaler' }
-            default      { $Consumer = 'DFC' }
+            default      { $Consumer = 'RenoDX' }
         }
     }
 }
@@ -1695,24 +1824,31 @@ $dfcPath = $null
 $renoPath = $null
 $optiPath = $null
 if ($Consumer -eq 'DFC') {
-    $dfcPath = Resolve-Piece -Label 'Deep Fried Chicken' -Explicit $DfcZip -LocalPattern 'Deep-Fried-Chicken*.zip' -DefaultUrl $Sources.Dfc -CacheName 'Deep-Fried-Chicken.zip'
-    if (-not $dfcPath -and -not $DfcZip) {
-        # Was the download eaten by Defender? Then the .zip never landed; the download reports
-        # the block, and Get-MpThreatDetection confirms it.
-        $det = Get-DefenderDetection (Join-Safe $script:Cache 'Deep-Fried-Chicken.zip')
+    $dfcPath = Find-ChickenZip -Explicit $DfcZip
+    # Nothing to download: the author does not publish these files, so the only routes are a
+    # copy the user already has, or the user fetching one now. Ask, wait, and re-check --
+    # printing an invite and failing in the same breath just sends them round again (#75).
+    if (-not $dfcPath -and -not $Yes) { $dfcPath = Get-ChickenManually }
+    # A zip fetched by hand can still be quarantined after it lands: Chicken hooks NGX with
+    # Detours and heuristics dislike that. If the file we just found has gone, that is what
+    # happened -- offer the same exclusion as before, for the same one folder.
+    if ($dfcPath -and -not (Test-FileHere $dfcPath)) {
+        $det = Get-DefenderDetection $dfcPath
         if ($det) {
-            $ok = Request-DefenderExclusion -Paths @($script:Cache, $gameDir) -Because 'It blocked the Deep Fried Chicken download into the cache folder.'
-            if ($ok) { $dfcPath = Resolve-Piece -Label 'Deep Fried Chicken (retry)' -Explicit $DfcZip -LocalPattern 'Deep-Fried-Chicken*.zip' -DefaultUrl $Sources.Dfc -CacheName 'Deep-Fried-Chicken.zip' }
+            $ok = Request-DefenderExclusion -Paths @($script:Cache, $gameDir) -Because 'It removed the Deep Fried Chicken archive after it was downloaded.'
+            if ($ok) { $dfcPath = Find-ChickenZip -Explicit $DfcZip }
         }
+        else { $dfcPath = $null }
     }
     if (-not $dfcPath) {
         Report -Status 'Fail' -Text 'Deep Fried Chicken is not available.' `
-               -Detail ('Get the zip from its Discord (' + $Sources.DfcDiscord + ') and pass it with -DfcZip, or drop it in -LocalFiles.')
+               -Detail ('It has no public download. Join ' + $Sources.DfcDiscord + ', get Deep-Fried-Chicken-*.zip, then re-run with -DfcZip <path> -- or choose the RenoDX consumer, which this installer can fetch for you.')
     }
 }
 elseif ($Consumer -eq 'RenoDX') {
-    $renoPath = Resolve-Piece -Label 'RenoDX DLSS 5 add-on' -Explicit $RenoDxAddon -LocalPattern 'renodx-dlss5*.addon64' `
-                              -DefaultUrl $Sources.RenoDxDlss5 -CacheName 'renodx-dlss5.addon64'
+    $renoPath = Resolve-PieceZipped -Label 'RenoDX DLSS 5 add-on' -Explicit $RenoDxAddon `
+                                    -LocalPattern 'renodx-dlss5*' -DefaultUrl $Sources.RenoDxDlss5 `
+                                    -CacheName 'renodx-dlss5.zip' -InnerName 'renodx-dlss5.addon64'
     if (-not $renoPath) {
         Report -Status 'Fail' -Text 'renodx-dlss5.addon64 is not available.' `
                -Detail ('Get it from the RenoDX Discord (' + $Sources.RenoDxDiscord + ') or the RHI installer, and pass it with -RenoDxAddon or via -LocalFiles.')
@@ -1760,8 +1896,8 @@ else {
 }
 
 # 3f. NVIDIA runtimes
-$dlssNrPath = Resolve-Piece -Label 'nvngx_dlssnr.dll' -Explicit $DlssNrDll -LocalPattern 'nvngx_dlssnr.dll' -DefaultUrl $Sources.DlssNr -CacheName 'nvngx_dlssnr.dll'
-$dlssPath   = Resolve-Piece -Label 'nvngx_dlss.dll'   -Explicit $DlssDll   -LocalPattern 'nvngx_dlss.dll'   -DefaultUrl $Sources.Dlss   -CacheName 'nvngx_dlss.dll'
+$dlssNrPath = Resolve-PieceZipped -Label 'nvngx_dlssnr.dll' -Explicit $DlssNrDll -LocalPattern 'nvngx_dlssnr*' -DefaultUrl $Sources.DlssNr -CacheName 'nvngx_dlssnr.zip' -InnerName 'nvngx_dlssnr.dll'
+$dlssPath   = Resolve-PieceZipped -Label 'nvngx_dlss.dll'   -Explicit $DlssDll   -LocalPattern 'nvngx_dlss.dll'   -DefaultUrl $Sources.Dlss   -CacheName 'nvngx_dlss.zip'   -InnerName 'nvngx_dlss.dll'
 if (-not $dlssNrPath) { Report -Status 'Fail' -Text 'nvngx_dlssnr.dll is not available.' -Detail ('It is on the RenoDX Discord (' + $Sources.RenoDxDiscord + '). Pass it with -DlssNrDll.') }
 if (-not $dlssPath)   { Report -Status 'Fail' -Text 'nvngx_dlss.dll is not available.'   -Detail 'Any DLSS-enabled game ships one, or use DLSS Swapper. Pass it with -DlssDll.' }
 

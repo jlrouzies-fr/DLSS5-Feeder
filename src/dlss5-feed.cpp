@@ -63,7 +63,7 @@
 #include "feed_opti.h" // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 
-#define FEED_VERSION "0.14.0-beta.5"
+#define FEED_VERSION "0.15.0"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -811,6 +811,13 @@ static bool DetectSmoothMotion()
 // ---------------------------------------------------------------------------
 
 static CRITICAL_SECTION g_feed_cs;
+// Whether ID3D11Multithread protection is actually ON for the game's immediate context.
+// g_feed_cs serializes OUR uses of it; only D3D11's own lock keeps the GAME's render thread
+// from tearing the device state BlitOutputToBackbuffer saves and restores around its draw.
+// Where that lock could not be turned on, an off-thread Present is not something this
+// add-on can survive -- see FeedThreadTrace (#86).
+static bool             g_ctx_protected = false;
+static void FeedDisable(const char *why);   // defined with the rest of the failure handling
 static bool             g_feed_busy    = false;   // guarded by g_feed_cs
 static DWORD            g_feed_thread  = 0;       // first thread seen in FeedFrame
 static int              g_feed_offthread_logged = 0;
@@ -835,6 +842,15 @@ static void FeedThreadTrace()
         Log("[feed] frame fed from thread %lu, not the usual %lu -- Present is off-thread%s%s", tid, g_feed_thread,
             g_smooth_motion ? " (Smooth Motion is loaded)" : "",
             g_feed_offthread_logged == 8 ? "; further thread changes not logged" : "");
+        // Two threads on an unprotected immediate context is a data race on the device state
+        // this add-on saves and restores around its own draw, and the fault it produces lands
+        // inside the driver with no module of ours on the stack. Stop rather than keep going:
+        // the game renders normally without us, which is a far better outcome than a crash
+        // nobody can attribute (#86).
+        if (!g_ctx_protected)
+            FeedDisable("Present is arriving on more than one thread and Direct3D 11 multithread "
+                        "protection could not be enabled on this device -- continuing would race the "
+                        "game's own use of its immediate context");
     }
 }
 
@@ -1520,6 +1536,35 @@ static DXGI_FORMAT TypedColorFormat(DXGI_FORMAT f)
     }
 }
 
+// The typeless member of a backbuffer format's family, for a texture that must be BOTH a
+// CopyResource destination for the backbuffer AND readable through a view of a different
+// type in the same family. A D3D11 view format has to match its resource exactly unless
+// the resource is typeless, so a staging copy created in the raw backbuffer format cannot
+// carry the ..._UNORM view TypedColorFormat asks for when the backbuffer is ..._UNORM_SRGB
+// -- CreateShaderResourceView returns E_INVALIDARG, and every work_resolution below 100%
+// failed on every sRGB swapchain (#85, Dying Light).
+//
+// Formats with no typeless member come back unchanged: they are already their own family,
+// so the typed view matches and there was never a problem to solve.
+static DXGI_FORMAT TypelessColorFormat(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8X8_TYPELESS;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    default:
+        return f;
+    }
+}
+
 // DLSS writes its Output through a UAV; BGRA/X8 variants are not reliably UAV-typed, so
 // they get an RGBA8 output and the copy-back blit takes care of the channel order.
 // The output must keep the backbuffer's channel order. When it does not, the copy
@@ -1585,21 +1630,29 @@ static UINT HomeTexelBytes(DXGI_FORMAT f)
     }
 }
 
-// NGX writes the output through a UAV, and typed UAV *stores* to B8G8R8A8_UNORM are an
-// optional D3D12 feature. Where the device lacks it, fall back to RGBA and the
-// converting copy home -- wrong colours beat a feature that cannot be created at all.
+// NGX writes the output through a UAV, and typed UAV *stores* are an optional D3D12 feature
+// for every format except R8G8B8A8_UNORM (which is required, and is therefore the fallback).
+// Where the device lacks the store, CreateFeature fails with 0xBAD0000B and nothing works;
+// a converted copy home beats a feature that cannot be created at all.
+//
+// This used to ask only about B8G8R8A8_UNORM, so an R10G10B10A2 swapchain -- which
+// OutputFormatFor passes straight through -- went to NGX unchecked on hardware that mostly
+// cannot typed-UAV-store it. That is the shape of #84 (Project CARS 3, R10 swapchain,
+// CreateFeature -> 0xBAD0000B). Ask about whatever we are actually about to request.
 static DXGI_FORMAT ResolveOutputFormat(DXGI_FORMAT color_typed, ID3D12Device *dev12)
 {
     const DXGI_FORMAT want = OutputFormatFor(color_typed);
-    if (want != DXGI_FORMAT_B8G8R8A8_UNORM || dev12 == nullptr) return want;
+    if (want == DXGI_FORMAT_R8G8B8A8_UNORM || dev12 == nullptr) return want;
 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {};
     fs.Format = want;
     const bool ok = SUCCEEDED(dev12->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
                     (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0;
     if (ok) return want;
-    Log("[feed] B8G8R8A8_UNORM has no typed UAV store on this device; output stays R8G8B8A8_UNORM "
-        "(the copy home converts, so expect the washed-out image of issue #11)");
+    Log("[feed] %s has no typed UAV store on this device; output stays R8G8B8A8_UNORM and the copy "
+        "home converts%s", FormatName(want),
+        want == DXGI_FORMAT_B8G8R8A8_UNORM ? " (expect the washed-out image of issue #11)"
+                                           : " (a create would otherwise fail 0xBAD0000B, see #84)");
     return DXGI_FORMAT_R8G8B8A8_UNORM;
 }
 
@@ -1668,12 +1721,16 @@ static bool CK(const char *label)
     return false;
 }
 
-static void FeedFail(const char *what)
+// `detail`, when given, replaces "repeated failures" in the line the player actually sees.
+// A resource build fails deterministically -- the three attempts are identical by
+// construction -- so "stopped: repeated failures" named nothing, and #85's reporter went
+// looking at the add-on instead of at the one setting that was wrong.
+static void FeedFail(const char *what, const char *detail = nullptr)
 {
     Log("[feed] failure: %s", what);
     FeedDrainInfoQueue("on failure");
     if (++g.consecutive_fails >= 3)
-        FeedDisable("repeated failures");
+        FeedDisable(detail != nullptr && detail[0] != 0 ? detail : "repeated failures");
 }
 
 // ---------------------------------------------------------------------------
@@ -3133,14 +3190,21 @@ static bool MakeBlitShaders()
     auto compile = m != nullptr ? reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
     if (compile == nullptr) { Log("[feed] d3dcompiler_47.dll unavailable"); return false; }
 
+    // Shader Model 4 on purpose, not 5. CreateVertexShader/CreatePixelShader reject a _5_0
+    // blob outright on a feature level 10_x device (E_INVALIDARG), and these sources need
+    // nothing above SM4 -- SV_VertexID, SampleLevel, four render targets, one cbuffer. The
+    // 32-bit twin has been compiling the identical sources at _4_0 in the field all along
+    // (dlss5-feed32.cpp:2982), while this path asked for _5_0 and so could never build
+    // resources for a feature level 10 game at all: Metro Last Light Redux reported it as
+    // "blit shader creation failed 0x80070057", one line after the textures had succeeded.
     ID3DBlob *vs = nullptr, *ps = nullptr, *resample = nullptr, *err = nullptr;
-    HRESULT hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, &err);
+    HRESULT hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "vs", "vs_4_0", 0, 0, &vs, &err);
     if (FAILED(hr)) { Log("[feed] blit VS compile failed 0x%08X: %s", hr, err ? (const char *)err->GetBufferPointer() : ""); SafeRelease(err); return false; }
     SafeRelease(err);
-    hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, &err);
+    hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "ps", "ps_4_0", 0, 0, &ps, &err);
     if (FAILED(hr)) { Log("[feed] blit PS compile failed 0x%08X: %s", hr, err ? (const char *)err->GetBufferPointer() : ""); SafeRelease(err); SafeRelease(vs); return false; }
     SafeRelease(err);
-    hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "ps_resample", "ps_5_0", 0, 0, &resample, &err);
+    hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "ps_resample", "ps_4_0", 0, 0, &resample, &err);
     if (FAILED(hr)) { Log("[feed] resample PS compile failed 0x%08X: %s", hr, err ? (const char *)err->GetBufferPointer() : ""); SafeRelease(err); SafeRelease(vs); SafeRelease(ps); return false; }
     SafeRelease(err);
 
@@ -3150,7 +3214,15 @@ static bool MakeBlitShaders()
     vs->Release();
     ps->Release();
     resample->Release();
-    if (FAILED(hr)) { Log("[feed] blit shader creation failed 0x%08X", hr); return false; }
+    if (FAILED(hr))
+    {
+        // The feature level belongs on this line: it is what decides whether a shader profile
+        // is accepted at all, and without it the message names nothing (#70).
+        const D3D_FEATURE_LEVEL fl = g.dev11 != nullptr ? g.dev11->GetFeatureLevel() : D3D_FEATURE_LEVEL_11_0;
+        Log("[feed] blit shader creation failed 0x%08X (%s) on a feature level %d_%d device",
+            hr, FeedHrName(hr), (fl >> 12) & 0xF, (fl >> 8) & 0xF);
+        return false;
+    }
 
     D3D11_SAMPLER_DESC sd = {};
     sd.Filter   = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
@@ -3170,8 +3242,8 @@ static bool MakeBlitShaders()
 
     // FSR 1 is optional: a failure here only pins work_upscale to the bilinear path.
     ID3DBlob *easu = nullptr, *rcas = nullptr;
-    hr = compile(kFsr1Src, sizeof(kFsr1Src) - 1, "feedfsr1", nullptr, nullptr, "ps_easu", "ps_5_0", 0, 0, &easu, &err);
-    if (SUCCEEDED(hr)) { SafeRelease(err); hr = compile(kFsr1Src, sizeof(kFsr1Src) - 1, "feedfsr1", nullptr, nullptr, "ps_rcas", "ps_5_0", 0, 0, &rcas, &err); }
+    hr = compile(kFsr1Src, sizeof(kFsr1Src) - 1, "feedfsr1", nullptr, nullptr, "ps_easu", "ps_4_0", 0, 0, &easu, &err);
+    if (SUCCEEDED(hr)) { SafeRelease(err); hr = compile(kFsr1Src, sizeof(kFsr1Src) - 1, "feedfsr1", nullptr, nullptr, "ps_rcas", "ps_4_0", 0, 0, &rcas, &err); }
     if (SUCCEEDED(hr)) hr = g.dev11->CreatePixelShader(easu->GetBufferPointer(), easu->GetBufferSize(), nullptr, &g.easu_ps);
     if (SUCCEEDED(hr)) hr = g.dev11->CreatePixelShader(rcas->GetBufferPointer(), rcas->GetBufferSize(), nullptr, &g.rcas_ps);
     if (SUCCEEDED(hr)) { cbd.ByteWidth = sizeof(FsrConstants); hr = g.dev11->CreateBuffer(&cbd, nullptr, &g.fsr_cb); }
@@ -3402,19 +3474,32 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
         sd.Height     = backbuffer_h;
         sd.MipLevels  = 1;
         sd.ArraySize  = 1;
-        sd.Format     = bb_fmt;              // exact backbuffer format, so CopyResource accepts it
+        // Typeless, not bb_fmt: CopyResource still accepts the backbuffer (same type group)
+        // and the typed g.color_fmt view below becomes legal even when the backbuffer is
+        // ..._UNORM_SRGB, which it could not be on a fully typed resource (#85).
+        sd.Format     = TypelessColorFormat(bb_fmt);
         sd.SampleDesc.Count = 1;
         sd.Usage      = D3D11_USAGE_DEFAULT;
         sd.BindFlags  = D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(g.dev11->CreateTexture2D(&sd, nullptr, &g.color_stage)))
-        { Log("[feed] work-resolution staging texture failed (%ux%u %s)", backbuffer_w, backbuffer_h, FormatName(bb_fmt)); ReleaseFrameResources(); return false; }
+        { Log("[feed] work-resolution staging texture failed (%ux%u %s)", backbuffer_w, backbuffer_h, FormatName(sd.Format)); ReleaseFrameResources(); return false; }
 
+        // The view stays at g.color_fmt rather than bb_fmt on purpose. An sRGB view would
+        // apply the sRGB->linear conversion on sample and change what DLSS is fed; the
+        // 100% path copies raw bits, and this path has to match it.
         D3D11_SHADER_RESOURCE_VIEW_DESC ss = {};
-        ss.Format              = g.color_fmt;   // typed view, in case the backbuffer is TYPELESS
+        ss.Format              = g.color_fmt;
         ss.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
         ss.Texture2D.MipLevels = 1;
-        if (FAILED(g.dev11->CreateShaderResourceView(g.color_stage, &ss, &g.color_stage_srv)))
-        { Log("[feed] work-resolution staging SRV failed"); ReleaseFrameResources(); return false; }
+        const HRESULT ssr = g.dev11->CreateShaderResourceView(g.color_stage, &ss, &g.color_stage_srv);
+        if (FAILED(ssr))
+        {
+            Log("[feed] work-resolution staging SRV failed 0x%08X (%s): a %s view on a %s texture "
+                "(backbuffer %s)", ssr, FeedHrName(ssr), FormatName(g.color_fmt), FormatName(sd.Format),
+                FormatName(bb_fmt));
+            ReleaseFrameResources();
+            return false;
+        }
 
         Log("[feed] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
 
@@ -3830,7 +3915,17 @@ static void FeedLogAgilityFolder()
     wchar_t probe[MAX_PATH] = {};
     swprintf_s(probe, L"%sD3D12", dir);
     const DWORD attr = GetFileAttributesW(probe);
-    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) == 0) return;
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) == 0)
+    {
+        // Say so rather than returning mute. INVALID_REDIST with no game-local folder means
+        // the redist is being pointed at from somewhere else (a launcher, a mod loader, an
+        // absolute D3D12SDKPath), and a bare hex line left #81 with nothing to act on.
+        Log("[feed] D3D12_ERROR_INVALID_REDIST, but this game folder has no D3D12\\ (Agility SDK) "
+            "folder. Something else in the process is redirecting Direct3D 12 at an SDK redist "
+            "it cannot load -- a launcher, a mod loader, or an absolute D3D12SDKPath in the exe. "
+            "Every D3D12 device in this process fails the same way, ours included.");
+        return;
+    }
 
     swprintf_s(probe, L"%sD3D12\\*", dir);
     WIN32_FIND_DATAW fd = {};
@@ -3848,7 +3943,11 @@ static void FeedLogAgilityFolder()
         FindClose(h);
     }
     if (core)
-        Log("[feed] the game folder has a D3D12\\ (Agility SDK) folder with D3D12Core.dll and %d file(s).", files);
+        Log("[feed] the game folder has a D3D12\\ (Agility SDK) folder WITH D3D12Core.dll and %d "
+            "file(s), so the version there does not match what the game asked Direct3D 12 for. "
+            "Every device in this process fails to create, ours included -- rename that folder and "
+            "relaunch. If the game then refuses to start, it genuinely needs the redist and this "
+            "combination cannot work until its files are repaired (verify the game files).", files);
     else
         Log("[feed] the game folder has a D3D12\\ (Agility SDK) folder with %d file(s) and NO D3D12Core.dll. "
             "If the game points D3D12 at it, every device in this process fails to create -- try renaming "
@@ -4340,11 +4439,25 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         // already had it on is left exactly as it was.
         if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11Multithread), reinterpret_cast<void **>(&g.mt))) && g.mt != nullptr)
         {
-            g.mt_was_on = g.mt->SetMultithreadProtected(TRUE) != FALSE;
+            g.mt_was_on     = g.mt->SetMultithreadProtected(TRUE) != FALSE;
+            g_ctx_protected = true;
             Log("[feed] D3D11 multithread protection enabled (the game had it %s)", g.mt_was_on ? "on" : "off");
         }
         else
-            Log("[feed] ID3D11Multithread unavailable; the immediate context stays unprotected");
+        {
+            g_ctx_protected = false;
+            // Not merely a note. If a present-path interposer is already loaded we know a
+            // second thread will drive this context, and we cannot make that safe -- so refuse
+            // here rather than crash later inside the driver. Without an interposer the single
+            // -threaded case is still fine, and FeedThreadTrace catches it if that changes.
+            if (g_smooth_motion)
+                FeedDisable("Direct3D 11 multithread protection is unavailable on this device and a "
+                            "present-path interposer (Smooth Motion) is loaded -- the two together "
+                            "would race the game's immediate context");
+            else
+                Log("[feed] ID3D11Multithread unavailable; the immediate context stays unprotected. "
+                    "Safe while Present stays on one thread -- if it does not, the feed will stop");
+        }
 
         if (g.queue == nullptr || g.list == nullptr) { Log("[feed] D3D12 queue/list creation failed"); goto fail; }
 
@@ -6983,7 +7096,18 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
             FormatName(md.Format), FormatName(dd.Format), g.depth_reversed ? 1 : 0,
             (bfl >> 12) & 0xF, (bfl >> 8) & 0xF);
         ok = BuildResources(work_w, work_h, cd.Width, cd.Height, cd.Format);
-        if (!ok) FeedFail("resource build");
+        if (!ok)
+        {
+            // Name the setting when it is the one thing that distinguishes this build from a
+            // working one. Below 100% the build makes resources it does not make at all at
+            // 100%, so that is where a build-only failure most often comes from (#85).
+            char why[128] = "";
+            if (g_cfg.work_resolution < 100)
+                _snprintf_s(why, sizeof(why), _TRUNCATE,
+                            "resource build failed at %d%% work resolution -- try work_resolution=100",
+                            g_cfg.work_resolution);
+            FeedFail("resource build", why);
+        }
         else g.consecutive_fails = 0;
     }
 
