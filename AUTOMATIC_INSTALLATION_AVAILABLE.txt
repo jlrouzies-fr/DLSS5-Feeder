@@ -17,7 +17,12 @@ HOW TO USE IT
        powershell.exe -ExecutionPolicy Bypass -File .\Install-DLSS5Feeder.ps1
 
 5. Confirm the executable it proposes, and answer which neural consumer you
-   want (Deep Fried Chicken, or Krish's RenoDX DLSS 5 add-on).
+   want: Krish's RenoDX DLSS 5 add-on (the default, and the only one the
+   installer can download for you), OptiScaler DLSS-NR, or Deep Fried Chicken.
+
+   Deep Fried Chicken is not published anywhere public, so choosing it asks you
+   to fetch the zip from its Discord and drop it in the folder it names; it then
+   waits for you rather than failing.
 
 Or point it at the game from anywhere:
 
