@@ -2,7 +2,17 @@
 
 [![AI-DECLARATION: copilot](https://img.shields.io/badge/䷼%20AI--DECLARATION-copilot-fee2e2?labelColor=fee2e2)](AI-DECLARATION.md)
 
-> ## ⚠️ Read this before you install
+**[↓ Jump to the Table of Contents](#contents)**
+
+> ## ⚠️ Careful of fake malicious websites
+> 
+> We got information that some **malicious** websites were making users download ZIP using similar name as this project, e.g. `DLSS5-Feeder-v0.7.0.zip.`
+> 
+> The only official release of DLSS 5 Feeder is on this GitHub, so be careful! 
+> 
+> *Thank to NIGos for the [report](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/88).*
+
+> ## ⚠️ Nvidia Driver can cause issues with some addons
 >
 > **Some combinations of driver, NGX runtime and neural consumer do not work — it is usually the
 > combination, not the game.** Check yours in fifteen seconds, with no game running:
