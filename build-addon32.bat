@@ -11,7 +11,9 @@ if not exist build mkdir build
 if not exist build\x86 mkdir build\x86
 setlocal
 call "%~dp0tools\vcvars.bat" amd64_x86 || exit /b 1
-cl /nologo /LD /EHsc /O2 /MD /W3 /std:c++20 /Iexternal\reshade\include /Iexternal\imgui /Iexternal\vulkan /Iexternal\minhook\include /Fobuild\x86\ /Fdbuild\x86\ ^
+for /f %%I in ('git rev-parse --short HEAD 2^>nul') do set FEED_BUILD_ID=%%I
+if not defined FEED_BUILD_ID set FEED_BUILD_ID=unknown
+cl /nologo /LD /EHsc /O2 /MD /W3 /std:c++20 /DFEED_BUILD_ID=\"%FEED_BUILD_ID%\" /Iexternal\reshade\include /Iexternal\imgui /Iexternal\vulkan /Iexternal\minhook\include /Fobuild\x86\ /Fdbuild\x86\ ^
    src\dlss5-feed32.cpp ^
    external\minhook\src\buffer.c external\minhook\src\hook.c external\minhook\src\trampoline.c external\minhook\src\hde\hde32.c ^
    /link /OUT:build\dlss5-feed.addon32 d3d11.lib dwmapi.lib kernel32.lib user32.lib advapi32.lib

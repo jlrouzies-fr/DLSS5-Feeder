@@ -42,6 +42,10 @@
 #include "../src/feed_dfc.h"   // Deep Fried Chicken interop ABI 1 (producer side, HostMode=1 here)
 #include "../src/feed_opti.h"  // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
 
+#ifndef FEED_BUILD_ID
+#define FEED_BUILD_ID "unknown"
+#endif
+
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
@@ -1029,6 +1033,7 @@ struct HostFault
     bool  via_consumer;      // the neural consumer's own code is on that chain
 };
 static HostFault g_ngx_fault;
+static __int64 g_reshade_log_start;
 
 static bool ContainsNoCase(const char *hay, const char *needle)
 {
@@ -1037,6 +1042,61 @@ static bool ContainsNoCase(const char *hay, const char *needle)
     for (const char *p = hay; *p != '\0'; ++p)
         if (_strnicmp(p, needle, n) == 0) return true;
     return false;
+}
+
+static void CaptureReShadeLogStart()
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    if (char *slash = strrchr(path, '\\')) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "ReShade.log");
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "rb") == 0 && f != nullptr)
+    {
+        _fseeki64(f, 0, SEEK_END);
+        g_reshade_log_start = _ftelli64(f);
+        fclose(f);
+    }
+}
+
+// "feature ready" below describes the feeder's synthetic DLSS feature. It does not
+// prove that RenoDX/Chicken/OptiScaler created or evaluated neural feature 18. Report
+// the consumer's own outcome from this process's ReShade log after startup settles.
+static void LogNeuralConsumerOutcome()
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    if (char *slash = strrchr(path, '\\')) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "ReShade.log");
+
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "rb") != 0 || f == nullptr)
+    {
+        Log("[host] neural consumer outcome: consumer did not intercept (ReShade.log is unavailable)");
+        return;
+    }
+    _fseeki64(f, 0, SEEK_END);
+    const __int64 size = _ftelli64(f);
+    const __int64 session_start = size >= g_reshade_log_start ? g_reshade_log_start : 0;
+    const __int64 session_size = size - session_start;
+    const __int64 keep = session_size > 8 * 1024 * 1024 ? 8 * 1024 * 1024 : session_size;
+    if (keep > 0) _fseeki64(f, size - keep, SEEK_SET);
+    std::vector<char> data(static_cast<size_t>(keep > 0 ? keep : 0) + 1, '\0');
+    if (keep > 0) fread(data.data(), 1, static_cast<size_t>(keep), f);
+    fclose(f);
+
+    const char *log = data.data();
+    const bool feature18 = ContainsNoCase(log, "feature 18") || ContainsNoCase(log, "DLSSD");
+    const bool evaluated = ContainsNoCase(log, "evaluation succeeded") ||
+                           ContainsNoCase(log, "feature 18 evaluated") ||
+                           ContainsNoCase(log, "DLSSD evaluate succeeded");
+    const bool failed = feature18 && (ContainsNoCase(log, "0xBAD00001") ||
+                                      ContainsNoCase(log, "feature 18 creation failed") ||
+                                      ContainsNoCase(log, "failed to create feature 18"));
+    if (feature18 && evaluated)
+        Log("[host] neural consumer outcome: neural feature active (feature 18 created and evaluated)");
+    else if (failed)
+        Log("[host] neural consumer outcome: consumer intercepted DLSS but feature 18 failed");
+    else
+        Log("[host] neural consumer outcome: consumer did not intercept (no feature-18 create/evaluate evidence after 300 feeder evaluations)");
 }
 
 static int NoteNgxFault(EXCEPTION_POINTERS *ep)
@@ -2069,6 +2129,14 @@ static bool InitNgx()
     info.PathListInfo.Path   = search;
     info.PathListInfo.Length = 1;
 
+    static bool opti_first_call_delay_done = false;
+    if (g_opti.present && !opti_first_call_delay_done)
+    {
+        opti_first_call_delay_done = true;
+        Log("[host] OptiScaler is mapped; allowing 1500 ms for its asynchronous nvngx redirect before the first NGX call");
+        Sleep(1500);
+        Log("[host] OptiScaler redirect grace finished; the requirements fingerprint below verifies which implementation answered");
+    }
     // Before the attempt, not only after a failure: a machine where NGX works records what
     // it answers here too, and the working cases are the control the failing ones need.
     NgxAskWhy(data_path, &info);
@@ -2706,6 +2774,8 @@ static int Serve(DWORD game_pid)
     // not race that (a 15 ms miss latched STANDBY in Blacklist), so hold it briefly.
     UINT64 hold_until = GetTickCount64() + 800;
     UINT64 evaluated  = 0;
+    UINT64 outcome_frames = 0;
+    bool   outcome_logged = false;
     bool   warm_done  = g_renodx_lazy || g_opti.routed;   // v45+ adopts missed creates on its own; OptiScaler IS the callee; Chicken: see the build below
     UINT64 opti_frames = 0;
     int    build_fails = 0;
@@ -3005,6 +3075,8 @@ static int Serve(DWORD game_pid)
             }
 
             evaluated = 0;
+            outcome_frames = 0;
+            outcome_logged = false;
             // No warm-up without NGX, with v45+, or when Chicken already had its detours ARMED
             // at this create (then it saw it). Otherwise the block below waits for ARMED.
             warm_done = transport_only || g_renodx_lazy || g_opti.routed || (g_chicken_present && !g_chicken_created_unarmed);
@@ -3119,6 +3191,11 @@ static int Serve(DWORD game_pid)
             if (done)
             {
                 h.queue->Signal(h.fence_out, fm.n);
+                if (!transport_only && !outcome_logged && ++outcome_frames >= 300)
+                {
+                    outcome_logged = true;
+                    LogNeuralConsumerOutcome();
+                }
                 if (g_opti.routed && !g_opti_backend.checked && ++opti_frames == 2)
                     OptiBackendCheck(&Log, "host", g_opti.upscaler, &g_opti_backend);
                 // One warm-up re-create per build. RenoDX: it misses the very first create
@@ -3306,7 +3383,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
     // the thrown type and the module chain are (feed_crash.h).
     char detail[640];
     FeedCrashDescribe(ep != nullptr ? ep->ExceptionRecord : nullptr, detail, sizeof(detail));
-    Log("### CRASH RECORDED ###  exception 0x%08X%s at %p in %ls%s", code, detail, addr, owner,
+    Log("### EXCEPTION RECORDED ###  exception 0x%08X%s at %p in %ls%s (the next exception handler decides whether the process continues)", code, detail, addr, owner,
         mod == GetModuleHandleW(nullptr) ? " (inside this host)" : "");
     char stack[512];
     FeedCrashStackModules(ep != nullptr ? ep->ContextRecord : nullptr, stack, sizeof(stack));
@@ -3422,11 +3499,12 @@ int main(int argc, char **argv)
     }
     SetUnhandledExceptionFilter(&CrashFilter);
 
-    Log("dlss5-feed-host64 (built %s %s)", __DATE__, __TIME__);
+    Log("dlss5-feed-host64 commit %s (built %s %s)", FEED_BUILD_ID, __DATE__, __TIME__);
     // Logged before it is parsed, so a log that ends at the usage line says WHY: "no
     // arguments" and "an argument zeroed the pid" used to be indistinguishable (issue #46).
     Log("[host] command line (argc=%d): %s", argc, GetCommandLineA());
     Log("[host] log file: %s", g_log_path);
+    CaptureReShadeLogStart();
 
     // Every Sleep in this process is a frame-pacing decision: at the default 15.6 ms
     // timer tick a Sleep(1) lands at 15.6 ms, and the serve loop's poll alone used to

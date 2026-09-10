@@ -1448,8 +1448,13 @@ if (-not (Test-Path -LiteralPath $agilityDir -PathType Container)) {
 else {
     $agilityFiles = @(Get-ChildItem -LiteralPath $agilityDir -File -ErrorAction SilentlyContinue)
     $agilityCore  = @($agilityFiles | Where-Object { $_.Name -ieq 'D3D12Core.dll' })
+    $agilityInventory = ($agilityFiles | ForEach-Object {
+        $fv = $_.VersionInfo.FileVersion
+        $_.Name + '  version=' + $(if ($fv) { $fv } else { '?' }) + '  bytes=' + $_.Length
+    }) -join '; '
     if ($agilityCore.Count -gt 0) {
-        Report -Status 'Ok' -Text ('Game-local D3D12\ (Agility SDK) folder with D3D12Core.dll (' + $agilityFiles.Count + ' file(s)).')
+        Report -Status 'Ok' -Text ('Game-local D3D12\ (Agility SDK) folder with D3D12Core.dll (' + $agilityFiles.Count + ' file(s)).') `
+               -Detail $agilityInventory
     }
     else {
         Report -Status 'Warn' -Text ('Game-local D3D12\ folder with ' + $agilityFiles.Count + ' file(s) and NO D3D12Core.dll.') `

@@ -54,12 +54,18 @@
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 #include "feed_gl.h"   // raw-OpenGL interop, the same header the 64-bit add-on uses
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
+static void FeedOnVkDeviceGeneration();
+#define FEED_VK_DEVICE_GENERATION_CALLBACK FeedOnVkDeviceGeneration
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
+#undef FEED_VK_DEVICE_GENERATION_CALLBACK
 #include "feed_d3d10.h"     // D3D10.1 <-> D3D11 keyed-mutex bridge + the private relay device
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 #include "feed_opti.h"      // OptiScaler DLSS-NR: only the file scan and the ini reader are used here (it lives in host64 too)
 
 #define FEED_VERSION "0.15.1"
+#ifndef FEED_BUILD_ID
+#define FEED_BUILD_ID "unknown"
+#endif
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -76,6 +82,7 @@ extern "C" __declspec(dllexport) const char *DESCRIPTION =
 static HMODULE          g_self;
 static char             g_log_path[MAX_PATH];
 static CRITICAL_SECTION g_log_cs;
+static volatile LONG    g_reshade_generation_closed;
 
 static void Log(const char *fmt, ...)
 {
@@ -189,8 +196,8 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
     // thrower (feed_crash.h; the module chain needs x64 unwind tables, so not on this side).
     char detail[640];
     FeedCrashDescribe(ep != nullptr ? ep->ExceptionRecord : nullptr, detail, sizeof(detail));
-    Log("### CRASH RECORDED ###  exception 0x%08X%s at %p in %ls; this add-on was last doing: %s%s "
-        "(later faults in this process are not recorded)", code, detail, addr,
+    Log("### EXCEPTION RECORDED ###  exception 0x%08X%s at %p in %ls; this add-on was last doing: %s%s "
+        "(the next exception handler decides whether the process continues; later faults are not recorded)", code, detail, addr,
         owner, g_where, mod == g_self ? " (inside this add-on)" : "");
     WriteCrashDump(ep);
     return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
@@ -916,8 +923,10 @@ struct HostLink
     bool          fatal;        // true = FeedDisable(why), false = HostLost(why)
     char          why[192];
     DWORD         ms;           // how long the job took, for the log
+    UINT64        generation;   // runtime generation that submitted a JOB_BUILD
 };
 static HostLink g_link;
+static UINT64   g_runtime_generation = 1;
 
 // How long we are willing to wait for the host at each step. The first two are the worker's,
 // so the game never feels them. The last one IS on the frame path: 21 bytes into a 1 KB pipe
@@ -2476,7 +2485,7 @@ static bool HostConnectReady()
 }
 
 // The build exchange, from the render thread's side.
-enum HostXfer { XFER_NONE, XFER_BUSY, XFER_DONE, XFER_FAILED };
+enum HostXfer { XFER_NONE, XFER_BUSY, XFER_DONE, XFER_FAILED, XFER_STALE };
 
 static HostXfer HostBuildPoll(FeedBuildAck *ack)
 {
@@ -2485,6 +2494,22 @@ static HostXfer HostBuildPoll(FeedBuildAck *ack)
     if (g_link.state == LINK_DONE)
     {
         HostLinkJoin();
+        if (g_link.generation != g_runtime_generation)
+        {
+            if ((g_link.build.client_flags & FEED_BUILD_HOST_CREATES) != 0)
+            {
+                for (int i = 0; i < FEED_SLOTS; ++i)
+                    if (g_link.ack.tex[i] != 0)
+                        CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(g_link.ack.tex[i])));
+                if (g_link.ack.panel_tex != 0)
+                    CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(g_link.ack.panel_tex)));
+            }
+            InterlockedExchange(&g_link.state, LINK_IDLE);
+            Log("[feed32] discarded a host build from runtime generation %llu; current generation is %llu",
+                static_cast<unsigned long long>(g_link.generation),
+                static_cast<unsigned long long>(g_runtime_generation));
+            return XFER_STALE;
+        }
         *ack = g_link.ack;
         InterlockedExchange(&g_link.state, LINK_IDLE);
         Log("[feed32] the host answered the build in %lu ms", g_link.ms);
@@ -2503,6 +2528,7 @@ static bool HostBuildSubmit(const FeedBuild &b)
 {
     if (g_link.state != LINK_IDLE) return false;
     g_link.build = b;
+    g_link.generation = g_runtime_generation;
     if (!HostLinkStart(JOB_BUILD)) return false;
     Breadcrumb("waiting for the host's build (off the render thread)");
     return true;
@@ -4357,6 +4383,13 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             const UINT64 n = ++g.frame_n;
             const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
             g.need_reset = false;
+            if (n <= static_cast<UINT64>(g_cfg.log_frames))
+                Log("[feed32] Vulkan capture frame %llu: backbuffer image=0x%llX, last presented index=%u, command buffer=0x%llX, "
+                    "queue family=%u, presents seen=%lld, color import=0x%llX, output import=0x%llX",
+                    static_cast<unsigned long long>(n), static_cast<unsigned long long>(FeedVkValue(bb_img)), g_vk_last_image,
+                    static_cast<unsigned long long>(FeedVkValue(cb)), gfx_family, static_cast<long long>(g_vk_presents),
+                    static_cast<unsigned long long>(FeedVkValue(g.vk_img[FEED_COLOR])),
+                    static_cast<unsigned long long>(FeedVkValue(g.vk_img[FEED_OUTPUT])));
             // Presents-vs-frames probe (feed_vk_hook.h): the 64-bit add-on has published its
             // frame count to it since 0.9.0; this side never did, so a DXVK user could not
             // tell an external pacer from a slow host (issue #15).
@@ -5159,6 +5192,9 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
     else if (destroys == 9)
         Log("[feed32] (further runtime init/destroy messages suppressed)");
     if (!was_bound) return;
+    ++g_runtime_generation;
+    Log("[feed32] runtime generation advanced to %llu; asynchronous results from the destroyed runtime will be discarded",
+        static_cast<unsigned long long>(g_runtime_generation));
     CastRelease();   // the thumbnail is registered on this runtime's window
     // The shared textures live on the game's device and survive runtime churn; keep them.
     g.runtime = nullptr;
@@ -5272,6 +5308,8 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
 
 static void OnDestroyDevice(reshade::api::device *dev)
 {
+    if (dev->get_api() == reshade::api::device_api::vulkan)
+        InterlockedExchange(&g_reshade_generation_closed, 1);
     const bool ours = (g.dev != nullptr && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev) ||
                       (g.is_gl && dev->get_api() == reshade::api::device_api::opengl) ||
                       (g.is_vulkan && dev == g.rs_dev) ||
@@ -5787,6 +5825,58 @@ static bool OnCreateDevice(reshade::api::device_api api, uint32_t & /*api_versio
     return false;   // never change the requested API version
 }
 
+static void RegisterReShadeCallbacks()
+{
+    reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
+    reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
+    reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+    reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
+    reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
+    reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+    reshade::register_event<reshade::addon_event::reshade_present>(OnPresent);
+    reshade::register_event<reshade::addon_event::reshade_overlay>(OnOverlay);
+    reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
+    reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnOpenOverlay);
+    reshade::register_overlay(nullptr, DrawOverlay);
+}
+
+static void UnregisterReShadeCallbacks()
+{
+    reshade::unregister_overlay(nullptr, DrawOverlay);
+    reshade::unregister_event<reshade::addon_event::reshade_present>(OnPresent);
+    reshade::unregister_event<reshade::addon_event::reshade_overlay>(OnOverlay);
+    reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
+    reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnOpenOverlay);
+    reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
+    reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
+    reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+    reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
+    reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
+    reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+}
+
+// ReShade owns add-on registrations per Vulkan instance, while Windows may keep this
+// DLL mapped across consecutive instances. The persistent vkCreateDevice hook reaches
+// this point after the next instance's add-on scan and before its runtime is created.
+static void FeedOnVkDeviceGeneration()
+{
+    if (InterlockedCompareExchange(&g_reshade_generation_closed, 0, 1) != 1) return;
+    if (g_runtime_count != 0)
+    {
+        Log("[feed32] another Vulkan device was created while %d effect runtime(s) remain active; keeping the current ReShade registration",
+            g_runtime_count);
+        return;
+    }
+    if (!reshade::register_addon(g_self))
+    {
+        Log("[feed32] a new Vulkan device generation appeared, but ReShade rejected late add-on registration; will retry on the next device");
+        InterlockedExchange(&g_reshade_generation_closed, 1);
+        return;
+    }
+    RegisterReShadeCallbacks();
+    Log("[feed32] renewed ReShade add-on registration for a new Vulkan device generation while the DLL remained mapped");
+}
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
@@ -5807,7 +5897,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 
         if (!reshade::register_addon(module)) return FALSE;
         g_prev_filter = SetUnhandledExceptionFilter(&CrashFilter);
-        Log("dlss5-feed32 %s (built %s %s) attached%s.", FEED_VERSION, __DATE__, __TIME__,
+        Log("dlss5-feed32 %s commit %s (built %s %s) attached%s.", FEED_VERSION, FEED_BUILD_ID, __DATE__, __TIME__,
             reattached ? " AGAIN in the same process (ReShade loaded the add-on a second time; the log above is the earlier attach)" : "");
         {
             wchar_t exe[MAX_PATH] = {};
@@ -5826,17 +5916,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         DetectOptiHost();       // after DetectChickenHost: it warns when both are in host64
         DetectStrayHostAddon();
 
-        reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
-        reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
-        reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
-        reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
-        reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
-        reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
-        reshade::register_event<reshade::addon_event::reshade_present>(OnPresent);
-        reshade::register_event<reshade::addon_event::reshade_overlay>(OnOverlay);
-        reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
-        reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnOpenOverlay);
-        reshade::register_overlay(nullptr, DrawOverlay);
+        RegisterReShadeCallbacks();
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
@@ -5848,17 +5928,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // We are under the loader lock: HostLinkStop must not try to join the worker here.
         g_detaching = true;
         CastRelease();
-        reshade::unregister_overlay(nullptr, DrawOverlay);
-        reshade::unregister_event<reshade::addon_event::reshade_present>(OnPresent);
-        reshade::unregister_event<reshade::addon_event::reshade_overlay>(OnOverlay);
-        reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
-        reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnOpenOverlay);
-        reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
-        reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
-        reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
-        reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
-        reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
-        reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        UnregisterReShadeCallbacks();
         FeedVkHookRemove();   // before this code is unmapped -- ReShade reloads add-ons per Vulkan instance
         HostClose();
         reshade::unregister_addon(module);

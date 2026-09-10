@@ -203,6 +203,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice ph
     const PFN_vkCreateDevice orig_create = g_vk_create_device_orig;
     if (orig_create == nullptr) return VK_ERROR_INITIALIZATION_FAILED;   // torn down under us
     ++g_vk_hook_devices;
+#ifdef FEED_VK_DEVICE_GENERATION_CALLBACK
+    // The 32-bit add-on can remain mapped while ReShade tears down one Vulkan
+    // instance and constructs another. Its DllMain will not run again in that case,
+    // so let it renew registration before the new device produces runtime events.
+    FEED_VK_DEVICE_GENERATION_CALLBACK();
+#endif
     if (pCreateInfo == nullptr) return orig_create(physicalDevice, pCreateInfo, pAllocator, pDevice);
 
     // What does the driver actually offer? The enumerate entry point is a plain

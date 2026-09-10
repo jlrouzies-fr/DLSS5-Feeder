@@ -406,6 +406,10 @@ static void FeedLogNgxFeatureRequirements(void (*log)(const char *, ...), const 
                 log("[%s]   NGX answered a pure capability question with PlatformError: it is refusing this "
                     "PROCESS, not this GPU or driver. Look for another overlay, injector, anti-cheat or "
                     "NGX consumer loaded into the game", tag);
+            else if (is_nr && static_cast<unsigned>(r) == 0xBAD0000Cu)
+                log("[%s]   *** The installed NVIDIA driver reports feature 18 as OutOfDate. Plain DLSS/DLAA "
+                    "may still initialise, but DLSS 5 neural rendering is unavailable until the driver is "
+                    "updated to 616.56 or newer. ***", tag);
             continue;
         }
         char why[192];

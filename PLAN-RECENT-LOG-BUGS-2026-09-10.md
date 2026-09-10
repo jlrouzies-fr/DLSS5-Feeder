@@ -54,6 +54,33 @@ Before producing another release, add the build commit/hash to the first line of
 threads call two materially different folders “0.14” or “0.15.1”; a semantic version alone cannot prove
 which post-tag fixes are present.
 
+## Implementation status
+
+All repository-side actions supported by the supplied evidence are now implemented on
+`fix/recent-log-bugs-2026-09-10`. Reports whose logs identify an unsupported environment, an upstream
+consumer failure, or an already shipped fix are recorded as such rather than receiving speculative
+changes in unrelated code.
+
+| Issues | Repository result | Remaining acceptance evidence |
+|---|---|---|
+| #93 | D3D11 fence waits are guarded; failures/exceptions automatically use the bounded CPU fallback. Breadcrumbs isolate wait, blit, and state restore. Failed submissions cannot blit fence value zero. | Dark Souls SDR/HDR teleport stress run. |
+| #91 | The persistent Vulkan device hook renews ReShade callback/overlay registration after a prior device generation closes, before the next device produces runtime events. | Max Payne 2 two-instance run. |
+| #89 | Host reports a session-local three-way neural-consumer outcome after 300 evaluations, so feeder success can no longer hide a feature-18 failure. The attached `0xBAD00001` remains a consumer/runtime failure. | Same-folder RenoDX/DFC A/B. |
+| #84 | In-game and host paths give a detected OptiScaler proxy a one-time 1500 ms redirect grace before the first NGX resolution, then verify routing with the existing fingerprint. The R10 UAV fallback was already fixed by `a96093f`. | Project CARS 3 routing fingerprint and R10 output. |
+| #57, #63 | Existing DRED phase contexts are retained, and every D3D12 transition in the affected input/output path now reports its resource name and before/after state when `DLSS5_FEED_D3D12_DEBUG=1`. The old logs do not identify whether the fault is in copy-in, NGX, or copy-home, so changing valid simultaneous-access promotion/decay would be speculative. | Current FiveM/Batman phase trace, then a targeted fix and 30-minute stress run. |
+| #15 | The current branch already bounds pipe backlog and present-debt repayment and records both pipe and allocator latency. No safe coalescing rule can be selected until those paired metrics identify the stalled side. | One current async/synchronous pacing trace. |
+| #13 | The four confirmed control defects remain fixed. The Vulkan trace now correlates backbuffer/import image handles, present image index/count, command buffer, and queue family during the diagnostic window. | Passthrough 1/2 trace from Detroit. |
+| #62 | A guarded Vulkan fault now invalidates the entire game-device generation without calling its possibly faulted dispatch table, preventing later callbacks from reusing stale images/semaphores. Hook draining remains in place. | X4 user-mode dump; a hypervisor BSOD requires a driver/hypervisor fix. |
+| #74 | Async host builds carry a runtime generation. Results from a destroyed runtime are discarded before handles or device objects are adopted. Feature-18 `OutOfDate` now names driver 616.56 as the minimum. | Retest on a supported driver; the supplied game fault is on 610.88. |
+| #81 | Existing `0x887E0003` Agility diagnosis is retained; the verifier now prints every local redist filename, version, and size to expose incomplete/mixed folders. | Current verifier/log from The Long Dark. |
+| #44 | Exception-filter records now say `EXCEPTION RECORDED` and explicitly defer the process outcome to the next handler, so a handled `std::bad_alloc` no longer claims a fatal crash. Resize fixes were already present. | Repeat resize run. |
+| #70 | Fixed by `a96093f` (SM4 shaders for feature level 10.1); retained unchanged. | Reporter confirmation on current build. |
+| #85 | Fixed by `a96093f` (typeless sRGB staging) and reporter-confirmed; retained unchanged. | None. |
+| #47 | The complete adapter × DRED × feature-level matrix and process diagnostics are already implemented. The attached old logs contain no matrix result, so there is no evidence-based production axis to change. | One `DLSS5_FEED_NGX_MATRIX=1` run. |
+
+The build scripts now embed `git rev-parse --short HEAD` in the first line of the 64-bit add-on,
+32-bit add-on, and host logs, removing version-folder ambiguity from every retest.
+
 ## #93 — Dark Souls Remastered crashes in SDR while waiting for D3D12 output
 
 ### Evidence
@@ -69,13 +96,15 @@ which post-tag fixes are present.
 
 ### Fix plan
 
-Implementation started on `fix/recent-log-bugs-2026-09-10`:
+Implemented on `fix/recent-log-bugs-2026-09-10`:
 
 - The D3D11 path now records separate breadcrumbs for the cross-API wait, output blit, and D3D11
   state restoration, plus the signal/completed fence values, frame slot, output format, scratch-output
   state, and synchronization mode during the configured diagnostic frames.
 - `sync_home=1` now selects a bounded CPU wait for D3D11 as the planned A/B fallback. A timeout reports
   both fence values and checks device removal/DRED before the frame is abandoned.
+- The normal path now checks the HRESULT from `ID3D11DeviceContext4::Wait`, guards a driver exception,
+  and automatically uses that CPU fallback when the cross-API wait fails.
 - A failed `EndCommands()` submission now skips the D3D11 wait and blit instead of using fence value
   zero and potentially presenting stale output.
 - The 64-bit add-on builds successfully. The Dark Souls SDR/HDR runtime A/B remains required because
