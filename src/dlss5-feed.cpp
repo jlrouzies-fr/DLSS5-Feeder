@@ -964,11 +964,8 @@ struct Cfg
                            // copies, so the whole frame is ONE queue submit -- the shape a
                            // normal game has, and the one structural difference left between
                            // us and a game an in-driver frame pacer is happy with.
-    int   sync_home;       // Vulkan transport: 1 = flush and CPU-wait for the copy home to
-                           // FINISH before the technique callback returns, i.e. before the
-                           // game presents. Costs a full GPU drain every frame. It exists to
-                           // answer one question: does an external consumer of the swapchain
-                           // image (a driver frame pacer) read it before our writes land?
+    int   sync_home;       // Vulkan: flush and CPU-wait for copy home. D3D11: CPU-wait for
+                           // the D3D12 result instead of enqueueing a cross-API D3D11 fence wait.
     int   passthrough;     // diagnostic: mode-2 with the NGX evaluate swapped for a plain
                            // CopyResource(OUTPUT <- COLOR) -- the whole transport runs, DLSS
                            // does not. Separates "transport lags" from "DLSS output lags".
@@ -2044,6 +2041,44 @@ static void DrainGpu()
             Log("[feed] timed out draining the queue before teardown");
     }
     for (int i = 0; i < Feed::kFrames; ++i) g.alloc_fence[i] = 0;
+}
+
+// Diagnostic alternative to the D3D11 GPU-side wait used by the interop path. Some
+// drivers can fault while enqueueing that cross-API wait; sync_home=1 lets the D3D12
+// queue retire normally and confirms completion on the CPU before D3D11 reads Output.
+static bool WaitForD3D12ResultCpu(UINT64 value)
+{
+    if (value == 0 || g.fence12 == nullptr || g.fence_event == nullptr) return false;
+    if (g.fence12->GetCompletedValue() >= value) return true;
+
+    ResetEvent(g.fence_event);
+    const HRESULT armed = g.fence12->SetEventOnCompletion(value, g.fence_event);
+    if (FAILED(armed))
+    {
+        Log("[feed] could not arm the D3D12 result fence wait (value %llu, 0x%08X)",
+            static_cast<unsigned long long>(value), armed);
+        return false;
+    }
+
+    const DWORD timeout = static_cast<DWORD>(g_cfg.gpu_timeout_ms);
+    const DWORD wait = WaitForSingleObject(g.fence_event, timeout);
+    const UINT64 completed = g.fence12->GetCompletedValue();
+    if (wait == WAIT_OBJECT_0 && completed >= value) return true;
+
+    Log("[feed] D3D12 result fence did not reach %llu within %u ms (completed %llu, wait 0x%08X)",
+        static_cast<unsigned long long>(value), timeout,
+        static_cast<unsigned long long>(completed), wait);
+    if (g.dev12 != nullptr)
+    {
+        const HRESULT removed = g.dev12->GetDeviceRemovedReason();
+        if (FAILED(removed))
+        {
+            Log("[feed] the D3D12 device was removed (0x%08X) while waiting for the result", removed);
+            FeedDumpDred(removed);
+            FeedDisable("the D3D12 device was removed (see dlss5-feed.log)");
+        }
+    }
+    return false;
 }
 
 // NGX can access-violate inside its own code or inside the DLSS 5 add-on (a leaked, closed-source
@@ -5982,6 +6017,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
         ctx->Draw(3, 0);
     }
 
+    Breadcrumb("restoring D3D11 state after the output blit");
     ID3D11ShaderResourceView *no_srv = nullptr;
     ctx->PSSetShaderResources(0, 1, &no_srv);
     ctx->OMSetRenderTargets(1, &old_rtv, old_dsv);
@@ -7630,7 +7666,13 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 FeedEndPhase(g.list);
                 const UINT64 v_out = EndCommands();
 
-                if (NVSDK_NGX_FAILED(re))
+                if (v_out == 0)
+                {
+                    Log("[feed] the D3D12 output submission failed; skipping the D3D11 wait and blit");
+                    g.frame_ready = false;
+                    ok = false;
+                }
+                else if (NVSDK_NGX_FAILED(re))
                 {
                     Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
                     FeedFail("evaluate");
@@ -7639,25 +7681,58 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 }
                 else
                 {
-                    Breadcrumb("waiting for the D3D12 result");
-                    g.ctx4->Wait(g.fence11, v_out);
-                    BlitOutputToBackbuffer(ctx, rtv11);
-                    const UINT64 n = ++g.frames_done;
-                    g.consecutive_fails = 0;
-                    if (g.sr_active) ++g.jitter_index;
-                    if (n <= static_cast<UINT64>(g_cfg.log_frames) || (n % 1800) == 0)
-                        Log("[feed] frame %llu delivered (%ux%u at %d%% -> %ux%u, reset=%d%s, jitter %+.3f,%+.3f)", n,
-                            g.width, g.height, g_cfg.work_resolution,
-                            g.backbuffer_width, g.backbuffer_height, reset,
-                            g.sr_active ? ", DLSS SR" : "", g.jitter_x, g.jitter_y);
-
-                    // The DLSS 5 add-on sometimes latches STANDBY/FAILED on the very first create and only
-                    // recovers on a fresh one; re-create once after the pipeline has settled.
-                    if (WarmupRebuildDue(n))
+                    bool result_ready = true;
+                    if (g_cfg.sync_home != 0)
                     {
-                        g.warmup_done = true;
+                        static bool said_cpu_wait = false;
+                        if (!said_cpu_wait)
+                        {
+                            Log("[feed] sync_home=1: CPU-waiting for D3D12 output before the D3D11 blit");
+                            said_cpu_wait = true;
+                        }
+                        Breadcrumb("CPU-waiting for the D3D12 result");
+                        result_ready = WaitForD3D12ResultCpu(v_out);
+                    }
+                    else
+                    {
+                        Breadcrumb("enqueueing the D3D11 wait for the D3D12 result");
+                        g.ctx4->Wait(g.fence11, v_out);
+                    }
+
+                    if (!result_ready)
+                    {
+                        FeedFail("D3D12 result wait");
                         g.frame_ready = false;
-                        Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu)", n);
+                        ok = false;
+                    }
+                    else
+                    {
+                        if (g.frames_done < static_cast<UINT64>(g_cfg.log_frames))
+                            Log("[feed] D3D11 output handoff: signal=%llu completed=%llu slot=%d output=%s scratch=%d sync_home=%d",
+                                static_cast<unsigned long long>(v_out),
+                                static_cast<unsigned long long>(g.fence12->GetCompletedValue()),
+                                g.frame_slot, FormatName(g.output_fmt), g.out_scratch != nullptr,
+                                g_cfg.sync_home != 0);
+                        Breadcrumb("blitting the D3D12 output into the D3D11 backbuffer");
+                        BlitOutputToBackbuffer(ctx, rtv11);
+                        Breadcrumb("D3D11 output blit complete");
+                        const UINT64 n = ++g.frames_done;
+                        g.consecutive_fails = 0;
+                        if (g.sr_active) ++g.jitter_index;
+                        if (n <= static_cast<UINT64>(g_cfg.log_frames) || (n % 1800) == 0)
+                            Log("[feed] frame %llu delivered (%ux%u at %d%% -> %ux%u, reset=%d%s, jitter %+.3f,%+.3f)", n,
+                                g.width, g.height, g_cfg.work_resolution,
+                                g.backbuffer_width, g.backbuffer_height, reset,
+                                g.sr_active ? ", DLSS SR" : "", g.jitter_x, g.jitter_y);
+
+                        // The DLSS 5 add-on sometimes latches STANDBY/FAILED on the very first create and only
+                        // recovers on a fresh one; re-create once after the pipeline has settled.
+                        if (WarmupRebuildDue(n))
+                        {
+                            g.warmup_done = true;
+                            g.frame_ready = false;
+                            Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu)", n);
+                        }
                     }
                 }
                 }
