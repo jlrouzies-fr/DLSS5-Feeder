@@ -62,7 +62,7 @@ static void FeedOnVkDeviceGeneration();
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 #include "feed_opti.h"      // OptiScaler DLSS-NR: only the file scan and the ini reader are used here (it lives in host64 too)
 
-#define FEED_VERSION "0.15.1"
+#define FEED_VERSION "1.16.0-beta.1"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif
