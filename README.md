@@ -12,6 +12,15 @@
 > 
 > *Thank to NIGos for the [report](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/88).*
 
+> ## ℹ️ Does not work with your game? Read this part
+> 
+> Please note that I cannot test every games reported in the issues (as I simply do not own them or don't have time to try all).
+>
+> If you are really looking for a specific game to work, see to get like a Claude Pro subscription, install it and ask it the following:
+>
+> "Here is my game folder: [GAME PATH] ; I am using https://github.com/jlrouzies-fr/DLSS5-Feeder but sadly it doesn't work well. Can you help clone it, check the different logs, and implement a fix? Then if you implement a legitimate fix, make a pull request."
+>  
+
 > ## ⚠️ Nvidia Driver can cause issues with some addons
 >
 > **Some combinations of driver, NGX runtime and neural consumer do not work — it is usually the
