@@ -64,7 +64,10 @@
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 #include "feed_pq12.h" // the D3D12 PQ<->linear pass, for the transports with no shaders of their own
 
-#define FEED_VERSION "0.15.1"
+#define FEED_VERSION "1.16.0-beta.2"
+#ifndef FEED_BUILD_ID
+#define FEED_BUILD_ID "unknown"
+#endif
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -180,7 +183,13 @@ static void WriteCrashDump(EXCEPTION_POINTERS *ep)
     // this file rather than fail with a sharing violation (error 32).
     HANDLE f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) { Log("[feed] could not create %s (error %lu)", path, GetLastError()); return; }
+    // MINIDUMP_EXCEPTION_INFORMATION is declared under pshpack4 (minidumpapiset.h): on x64 the
+    // pointer sits at offset 4. Unpacked, dbghelp read a garbage pointer and every 64-bit dump
+    // failed with 0x800703E6 (#97).
+#pragma pack(push, 4)
     struct { DWORD tid; EXCEPTION_POINTERS *ep; BOOL client; } info = { GetCurrentThreadId(), ep, FALSE };
+#pragma pack(pop)
+    static_assert(sizeof(info) == sizeof(DWORD) + sizeof(void *) + sizeof(BOOL), "must match MINIDUMP_EXCEPTION_INFORMATION");
     // MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithDataSegs | MiniDumpWithHandleData
     const int type = 0x0040 | 0x0001 | 0x0004;
     const BOOL  ok  = write(GetCurrentProcess(), GetCurrentProcessId(), f, type, ep != nullptr ? &info : nullptr, nullptr, nullptr);
@@ -282,6 +291,9 @@ static void RenodxFindBanner(const char *buf, DWORD size, char *out, size_t out_
             continue;
         DWORD end = i + 4;
         while (end < size && digit(buf[end])) ++end;
+        // rhi-repo's "renodx-dlss5-4.55" tag carries a three-part banner, "v4.1.5" (#90).
+        if (end + 1 < size && buf[end] == '.' && digit(buf[end + 1]))
+            for (++end; end < size && digit(buf[end]); ++end) {}
         if (end < size && buf[end] == '\0' && end - i < out_size)
         {
             memcpy(out, buf + i, end - i);
@@ -871,7 +883,10 @@ static unsigned         g_feed_reentries = 0;
 // off-thread Present (Smooth Motion's pacer thread above all) and is the single
 // most useful line in the log when diagnosing this class of report. Called with
 // g_feed_cs held, so the counters below need no synchronization of their own.
-static void FeedThreadTrace()
+// The stop below guards a D3D11 immediate context only: the D3D12 and Vulkan paths record
+// on the command list ReShade hands to that Present, under g_feed_cs, and rebuild their
+// session when the device changes -- stopping them on a thread change was a false stop (#96).
+static void FeedThreadTrace(bool shared_immediate_context)
 {
     const DWORD tid = GetCurrentThreadId();
     if (g_feed_thread == 0)
@@ -890,7 +905,7 @@ static void FeedThreadTrace()
         // inside the driver with no module of ours on the stack. Stop rather than keep going:
         // the game renders normally without us, which is a far better outcome than a crash
         // nobody can attribute (#86).
-        if (!g_ctx_protected)
+        if (shared_immediate_context && !g_ctx_protected)
             FeedDisable("Present is arriving on more than one thread and Direct3D 11 multithread "
                         "protection could not be enabled on this device -- continuing would race the "
                         "game's own use of its immediate context");
@@ -964,11 +979,8 @@ struct Cfg
                            // copies, so the whole frame is ONE queue submit -- the shape a
                            // normal game has, and the one structural difference left between
                            // us and a game an in-driver frame pacer is happy with.
-    int   sync_home;       // Vulkan transport: 1 = flush and CPU-wait for the copy home to
-                           // FINISH before the technique callback returns, i.e. before the
-                           // game presents. Costs a full GPU drain every frame. It exists to
-                           // answer one question: does an external consumer of the swapchain
-                           // image (a driver frame pacer) read it before our writes land?
+    int   sync_home;       // Vulkan: flush and CPU-wait for copy home. D3D11: CPU-wait for
+                           // the D3D12 result instead of enqueueing a cross-API D3D11 fence wait.
     int   passthrough;     // diagnostic: mode-2 with the NGX evaluate swapped for a plain
                            // CopyResource(OUTPUT <- COLOR) -- the whole transport runs, DLSS
                            // does not. Separates "transport lags" from "DLSS output lags".
@@ -2046,6 +2058,56 @@ static void DrainGpu()
     for (int i = 0; i < Feed::kFrames; ++i) g.alloc_fence[i] = 0;
 }
 
+// Diagnostic alternative to the D3D11 GPU-side wait used by the interop path. Some
+// drivers can fault while enqueueing that cross-API wait; sync_home=1 lets the D3D12
+// queue retire normally and confirms completion on the CPU before D3D11 reads Output.
+static bool WaitForD3D12ResultCpu(UINT64 value)
+{
+    if (value == 0 || g.fence12 == nullptr || g.fence_event == nullptr) return false;
+    if (g.fence12->GetCompletedValue() >= value) return true;
+
+    ResetEvent(g.fence_event);
+    const HRESULT armed = g.fence12->SetEventOnCompletion(value, g.fence_event);
+    if (FAILED(armed))
+    {
+        Log("[feed] could not arm the D3D12 result fence wait (value %llu, 0x%08X)",
+            static_cast<unsigned long long>(value), armed);
+        return false;
+    }
+
+    const DWORD timeout = static_cast<DWORD>(g_cfg.gpu_timeout_ms);
+    const DWORD wait = WaitForSingleObject(g.fence_event, timeout);
+    const UINT64 completed = g.fence12->GetCompletedValue();
+    if (wait == WAIT_OBJECT_0 && completed >= value) return true;
+
+    Log("[feed] D3D12 result fence did not reach %llu within %u ms (completed %llu, wait 0x%08X)",
+        static_cast<unsigned long long>(value), timeout,
+        static_cast<unsigned long long>(completed), wait);
+    if (g.dev12 != nullptr)
+    {
+        const HRESULT removed = g.dev12->GetDeviceRemovedReason();
+        if (FAILED(removed))
+        {
+            Log("[feed] the D3D12 device was removed (0x%08X) while waiting for the result", removed);
+            FeedDumpDred(removed);
+            FeedDisable("the D3D12 device was removed (see dlss5-feed.log)");
+        }
+    }
+    return false;
+}
+
+static HRESULT SafeD3D11FenceWait(ID3D11DeviceContext4 *ctx, ID3D11Fence *fence,
+                                  UINT64 value, DWORD *code)
+{
+    *code = 0;
+    __try { return ctx->Wait(fence, value); }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *code = GetExceptionCode();
+        return E_FAIL;
+    }
+}
+
 // NGX can access-violate inside its own code or inside the DLSS 5 add-on (a leaked, closed-source
 // snippet), especially across a resolution or device change. SEH keeps that from taking the game
 // down -- it becomes a graceful disable instead. These wrappers hold no C++ objects, so __try is
@@ -2329,6 +2391,14 @@ static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *de
         char dir8[MAX_PATH] = {};
         WideCharToMultiByte(CP_UTF8, 0, data_path, -1, dir8, MAX_PATH, nullptr, nullptr);
         FeedLogNgxRuntimes(&Log, "feed", dir8);
+    }
+    static bool opti_first_call_delay_done = false;
+    if (g_opti.present && !opti_first_call_delay_done)
+    {
+        opti_first_call_delay_done = true;
+        Log("[feed] OptiScaler is mapped; allowing 1500 ms for its asynchronous nvngx redirect before the first NGX call");
+        Sleep(1500);
+        Log("[feed] OptiScaler redirect grace finished; the requirements fingerprint below verifies which implementation answered");
     }
     // And what NGX says it supports on this adapter, before the attempt rather than only
     // after a failure -- a machine where init succeeds is the control the failing ones need.
@@ -3063,6 +3133,15 @@ static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOU
     b.Transition.StateAfter  = to;
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     g.list->ResourceBarrier(1, &b);
+}
+
+static void BarrierNamed(const char *name, ID3D12Resource *res,
+                         D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+{
+    if (g_debug_layer_on)
+        Log("[feed] D3D12 barrier: %s resource=%p state 0x%X -> 0x%X", name, res,
+            static_cast<unsigned>(from), static_cast<unsigned>(to));
+    Barrier(res, from, to);
 }
 
 // The scale that puts paper white at linear 1.0, and its inverse.
@@ -5982,6 +6061,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
         ctx->Draw(3, 0);
     }
 
+    Breadcrumb("restoring D3D11 state after the output blit");
     ID3D11ShaderResourceView *no_srv = nullptr;
     ctx->PSSetShaderResources(0, 1, &no_srv);
     ctx->OMSetRenderTargets(1, &old_rtv, old_dsv);
@@ -6299,6 +6379,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 Breadcrumb("running the same-device evaluate");
                 DWORD ecode = 0;
                 NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+                UINT64 submitted = 0;
                 if (ecode != 0)
                     AbortCommands();  // never execute a list NGX crashed while recording
                 else
@@ -6306,7 +6387,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                     // linear -> PQ on this same list, so it is submitted with the evaluate and
                     // lands before the copy home that ReShade records next on the same queue.
                     BridgeEncodePrivate12();
-                    EndCommands();
+                    submitted = EndCommands();
                 }
 
                 if (ecode != 0)
@@ -6314,6 +6395,14 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                     Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
                     FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
                     g.frame_ready = false;
+                }
+                else if (submitted == 0)
+                {
+                    // EndCommands already counted the failure. Output holds no result for this
+                    // frame: copying it home would show a stale image and clear the strike count,
+                    // so a list that never closes would never stop the feed (#104). The backbuffer
+                    // still holds the game's frame; the !restored path below hands it back.
+                    Log("[feed] the same-device evaluate was not submitted; keeping the game's frame");
                 }
                 else if (NVSDK_NGX_FAILED(re))
                 {
@@ -6755,10 +6844,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                         Barrier(g.tex12[d.slot], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
                     }
                 }
-                Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                BarrierNamed("Color", g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                BarrierNamed("Depth", g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                BarrierNamed("MV", g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                if (g.mask_ok) BarrierNamed("Mask", g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 GuideProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                  g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -7273,10 +7362,10 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
                 // Enqueued only once the list is open: a Wait left on the queue after a failed
                 // BeginCommands sits on a queue that is already stuck (#63).
                 g.queue->Wait(g.fence12_in, n);
-                Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                BarrierNamed("Color", g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                BarrierNamed("Depth", g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                BarrierNamed("MV", g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                if (g.mask_ok) BarrierNamed("Mask", g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 GuideProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                  g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -7557,17 +7646,18 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 // was already stuck, and the feed kept re-arming against it every frame.
                 g.queue->Wait(g.fence12, v_in);
                 FeedBeginPhase(g.list, L"dlss5-feed copy-in");
-                Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                BarrierNamed("Color", g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                BarrierNamed("Depth", g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                BarrierNamed("MV", g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                if (g.mask_ok) BarrierNamed("Mask", g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 GuideProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                  g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 // #70: when the device refused a shared UAV texture, DLSS writes our private
                 // one and the shared Output receives a copy below. Only the resource NGX
                 // actually writes gets promoted to UNORDERED_ACCESS.
                 ID3D12Resource *const nr_out = g.out_scratch != nullptr ? g.out_scratch : g.tex12[SLOT_OUTPUT];
-                Barrier(nr_out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                BarrierNamed(g.out_scratch != nullptr ? "private Output" : "Output", nr_out,
+                             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 FeedEndPhase(g.list);
 
                 const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
@@ -7612,25 +7702,31 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 else
                 {
                 FeedBeginPhase(g.list, L"dlss5-feed copy-home");
-                Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-                Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-                Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-                if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                BarrierNamed("Color", g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                BarrierNamed("Depth", g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                BarrierNamed("MV", g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                if (g.mask_ok) BarrierNamed("Mask", g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                 if (g.out_scratch != nullptr)
                 {
                     // #70: land the private result in the shared texture the game opened. The
                     // shared target is promoted to COPY_DEST implicitly (SIMULTANEOUS_ACCESS),
                     // and both decay to COMMON when this submission completes -- the same shape
                     // the 64-bit helper uses for D3D11 clients that cannot open a UAV texture.
-                    Barrier(g.out_scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    BarrierNamed("private Output", g.out_scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
                     g.list->CopyResource(g.tex12[SLOT_OUTPUT], g.out_scratch);
                 }
                 else
-                    Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+                    BarrierNamed("Output", g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
                 FeedEndPhase(g.list);
                 const UINT64 v_out = EndCommands();
 
-                if (NVSDK_NGX_FAILED(re))
+                if (v_out == 0)
+                {
+                    Log("[feed] the D3D12 output submission failed; skipping the D3D11 wait and blit");
+                    g.frame_ready = false;
+                    ok = false;
+                }
+                else if (NVSDK_NGX_FAILED(re))
                 {
                     Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
                     FeedFail("evaluate");
@@ -7639,25 +7735,67 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 }
                 else
                 {
-                    Breadcrumb("waiting for the D3D12 result");
-                    g.ctx4->Wait(g.fence11, v_out);
-                    BlitOutputToBackbuffer(ctx, rtv11);
-                    const UINT64 n = ++g.frames_done;
-                    g.consecutive_fails = 0;
-                    if (g.sr_active) ++g.jitter_index;
-                    if (n <= static_cast<UINT64>(g_cfg.log_frames) || (n % 1800) == 0)
-                        Log("[feed] frame %llu delivered (%ux%u at %d%% -> %ux%u, reset=%d%s, jitter %+.3f,%+.3f)", n,
-                            g.width, g.height, g_cfg.work_resolution,
-                            g.backbuffer_width, g.backbuffer_height, reset,
-                            g.sr_active ? ", DLSS SR" : "", g.jitter_x, g.jitter_y);
-
-                    // The DLSS 5 add-on sometimes latches STANDBY/FAILED on the very first create and only
-                    // recovers on a fresh one; re-create once after the pipeline has settled.
-                    if (WarmupRebuildDue(n))
+                    bool result_ready = true;
+                    if (g_cfg.sync_home != 0)
                     {
-                        g.warmup_done = true;
+                        static bool said_cpu_wait = false;
+                        if (!said_cpu_wait)
+                        {
+                            Log("[feed] sync_home=1: CPU-waiting for D3D12 output before the D3D11 blit");
+                            said_cpu_wait = true;
+                        }
+                        Breadcrumb("CPU-waiting for the D3D12 result");
+                        result_ready = WaitForD3D12ResultCpu(v_out);
+                    }
+                    else
+                    {
+                        Breadcrumb("enqueueing the D3D11 wait for the D3D12 result");
+                        DWORD wait_exception = 0;
+                        const HRESULT wait_hr = SafeD3D11FenceWait(g.ctx4, g.fence11, v_out, &wait_exception);
+                        if (wait_exception != 0 || FAILED(wait_hr))
+                        {
+                            Log("[feed] D3D11 cross-API fence wait %s 0x%08X; falling back to a CPU D3D12 fence wait",
+                                wait_exception != 0 ? "raised exception" : "failed",
+                                wait_exception != 0 ? wait_exception : wait_hr);
+                            Breadcrumb("CPU-waiting after the D3D11 cross-API wait failed");
+                            result_ready = WaitForD3D12ResultCpu(v_out);
+                        }
+                    }
+
+                    if (!result_ready)
+                    {
+                        FeedFail("D3D12 result wait");
                         g.frame_ready = false;
-                        Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu)", n);
+                        ok = false;
+                    }
+                    else
+                    {
+                        if (g.frames_done < static_cast<UINT64>(g_cfg.log_frames))
+                            Log("[feed] D3D11 output handoff: signal=%llu completed=%llu slot=%d output=%s scratch=%d sync_home=%d",
+                                static_cast<unsigned long long>(v_out),
+                                static_cast<unsigned long long>(g.fence12->GetCompletedValue()),
+                                g.frame_slot, FormatName(g.output_fmt), g.out_scratch != nullptr,
+                                g_cfg.sync_home != 0);
+                        Breadcrumb("blitting the D3D12 output into the D3D11 backbuffer");
+                        BlitOutputToBackbuffer(ctx, rtv11);
+                        Breadcrumb("D3D11 output blit complete");
+                        const UINT64 n = ++g.frames_done;
+                        g.consecutive_fails = 0;
+                        if (g.sr_active) ++g.jitter_index;
+                        if (n <= static_cast<UINT64>(g_cfg.log_frames) || (n % 1800) == 0)
+                            Log("[feed] frame %llu delivered (%ux%u at %d%% -> %ux%u, reset=%d%s, jitter %+.3f,%+.3f)", n,
+                                g.width, g.height, g_cfg.work_resolution,
+                                g.backbuffer_width, g.backbuffer_height, reset,
+                                g.sr_active ? ", DLSS SR" : "", g.jitter_x, g.jitter_y);
+
+                        // The DLSS 5 add-on sometimes latches STANDBY/FAILED on the very first create and only
+                        // recovers on a fresh one; re-create once after the pipeline has settled.
+                        if (WarmupRebuildDue(n))
+                        {
+                            g.warmup_done = true;
+                            g.frame_ready = false;
+                            Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu)", n);
+                        }
                     }
                 }
                 }
@@ -7695,7 +7833,26 @@ static void FeedFrameVkGuarded(reshade::api::effect_runtime *rt, reshade::api::c
     __except (NoteNgxFault("the Vulkan transport", GetExceptionInformation()), EXCEPTION_EXECUTE_HANDLER)
     {
         // The command buffer is ReShade's, not ours, and we cannot know how much of this
-        // frame was recorded -- so stop feeding rather than record another one.
+        // frame was recorded. Invalidate every game-device object without calling through
+        // the possibly faulted Vulkan dispatch table, so no later callback can reuse this
+        // generation's images, memory, semaphores, queue, or command buffer (#62).
+        for (int i = 0; i < SLOT_COUNT; ++i)
+        {
+            g.vk_img[i] = VK_NULL_HANDLE;
+            g.vk_mem[i] = VK_NULL_HANDLE;
+            g.vk_in_buf[i] = VK_NULL_HANDLE;
+            g.vk_in_mem[i] = VK_NULL_HANDLE;
+        }
+        g.vk_home_buf = VK_NULL_HANDLE;
+        g.vk_home_mem = VK_NULL_HANDLE;
+        g.vk_sem_in = g.vk_sem_out = VK_NULL_HANDLE;
+        g.rs_fence_in = g.rs_fence_out = {};
+        g.rs_queue = nullptr;
+        g.rs_dev = nullptr;
+        g.vk = {};
+        g.vk_layout_init = false;
+        g.vk_released = false;
+        g.session_ready = false;
         g.frame_ready = false;
         FeedDisable("the Vulkan transport faulted (the feed is off; the game keeps running)");
     }
@@ -7765,7 +7922,8 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
     if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
 
     if (!FeedEnter()) return;   // logs the dropped call, with its thread id
-    FeedThreadTrace();
+    const reshade::api::device_api api = rt->get_device()->get_api();
+    FeedThreadTrace(api != reshade::api::device_api::d3d12 && api != reshade::api::device_api::vulkan);
     FeedFrameDispatch(rt, cl, rtv);
     FeedLeave();
 }
@@ -8463,7 +8621,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (!reshade::register_addon(module)) return FALSE;
 
         g_prev_filter = SetUnhandledExceptionFilter(&CrashFilter);
-        Log("dlss5-feed %s (built %s %s) attached.", FEED_VERSION, __DATE__, __TIME__);
+        Log("dlss5-feed %s commit %s (built %s %s) attached.", FEED_VERSION, FEED_BUILD_ID, __DATE__, __TIME__);
         {
             char mopt[8] = {};
             g_ngx_matrix = GetEnvironmentVariableA("DLSS5_FEED_NGX_MATRIX", mopt, sizeof(mopt)) != 0 && mopt[0] == '1';

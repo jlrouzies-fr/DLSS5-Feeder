@@ -1448,8 +1448,13 @@ if (-not (Test-Path -LiteralPath $agilityDir -PathType Container)) {
 else {
     $agilityFiles = @(Get-ChildItem -LiteralPath $agilityDir -File -ErrorAction SilentlyContinue)
     $agilityCore  = @($agilityFiles | Where-Object { $_.Name -ieq 'D3D12Core.dll' })
+    $agilityInventory = ($agilityFiles | ForEach-Object {
+        $fv = $_.VersionInfo.FileVersion
+        $_.Name + '  version=' + $(if ($fv) { $fv } else { '?' }) + '  bytes=' + $_.Length
+    }) -join '; '
     if ($agilityCore.Count -gt 0) {
-        Report -Status 'Ok' -Text ('Game-local D3D12\ (Agility SDK) folder with D3D12Core.dll (' + $agilityFiles.Count + ' file(s)).')
+        Report -Status 'Ok' -Text ('Game-local D3D12\ (Agility SDK) folder with D3D12Core.dll (' + $agilityFiles.Count + ' file(s)).') `
+               -Detail $agilityInventory
     }
     else {
         Report -Status 'Warn' -Text ('Game-local D3D12\ folder with ' + $agilityFiles.Count + ' file(s) and NO D3D12Core.dll.') `
@@ -1587,6 +1592,16 @@ function Report-FeedLog
     # "DLSS5_Feed.fx is not loaded" is logged once at attach, before ReShade has compiled any
     # effect. If that same run went on to deliver frames, it was only the start-up transient.
     if ($delivered) { $bad = @($bad | Where-Object { $_ -notmatch '(?i)DLSS5_Feed\.fx is not loaded' }) }
+
+    # The overlay's Enabled checkbox (saved as enabled= in dlss5-feed.cfg) is the user's own
+    # switch, not a fault. Only its last state counts, and it needs the way back (#102).
+    $toggle = @($lines | Where-Object { $_ -match '(?i)(disabled from the overlay|enabled=0: no frames are fed|enabled from the overlay|enabled=1 read back from dlss5-feed\.cfg)' }) | Select-Object -Last 1
+    $switchedOff = [bool]($toggle -and ($toggle -match '(?i)(disabled from the overlay|enabled=0: no frames are fed)'))
+    $bad = @($bad | Where-Object { $_ -notmatch '(?i)disabled from the overlay' })
+    if ($switchedOff) {
+        Report -Status 'Fail' -Text ($Label + ': the add-on is switched off (enabled=0), so nothing is fed to the neural consumer.') `
+               -Action 'In the game: ReShade overlay > Add-ons > DLSS 5 Feed > tick Enabled (or set enabled=1 in dlss5-feed.cfg beside the add-on), then restart the game.'
+    }
     $bad = @($bad | Select-Object -Last 5)
 
     if ($bad.Count -gt 0) {
@@ -1602,7 +1617,7 @@ function Report-FeedLog
             }
         }
     }
-    else {
+    elseif (-not $switchedOff) {
         Report -Status 'Ok' -Text ($Label + ': no warnings or disable reasons in the log.')
     }
 }
