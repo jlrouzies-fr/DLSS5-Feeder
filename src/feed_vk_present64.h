@@ -12,6 +12,29 @@ struct FeedVkPresentContext
     reshade::api::command_queue *graphics = nullptr;
 };
 static thread_local FeedVkPresentContext *g_vk_present_context;
+
+// The loader-export hook is the outer context provider when present dispatch passes
+// through vulkan-1.dll. A small TLS stack keeps nested calls safe without locks/heap work.
+static thread_local FeedVkPresentContext g_vk_loader_present_stack[4];
+static thread_local FeedVkPresentContext *g_vk_loader_present_previous[4];
+static thread_local unsigned g_vk_loader_present_depth;
+
+static bool FeedVkPresentEnter(VkQueue queue, const VkPresentInfoKHR *info)
+{
+    if (g_vk_loader_present_depth >= 4) return false;
+    const unsigned i = g_vk_loader_present_depth++;
+    g_vk_loader_present_previous[i] = g_vk_present_context;
+    g_vk_loader_present_stack[i] = { queue, info, false, nullptr };
+    g_vk_present_context = &g_vk_loader_present_stack[i];
+    return true;
+}
+
+static void FeedVkPresentLeave()
+{
+    if (g_vk_loader_present_depth == 0) return;
+    const unsigned i = --g_vk_loader_present_depth;
+    g_vk_present_context = g_vk_loader_present_previous[i];
+}
 static PFN_vkQueuePresentKHR g_vk_frame_present_orig;
 static void *g_vk_frame_present_target;
 
@@ -35,20 +58,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkFramePresent(VkQueue queue, const Vk
 
 static void FeedVkFramePresentRemove();
 
-static bool FeedVkFramePresentInstall(reshade::api::effect_runtime *rt)
+static bool FeedVkFramePresentInstallDevice(VkDevice device)
 {
-    if (rt->get_device()->get_api() != reshade::api::device_api::vulkan) return true;
+    if (!device) return false;
     HMODULE loader = GetModuleHandleW(L"vulkan-1.dll");
     const auto gdpa = loader ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(loader, "vkGetDeviceProcAddr")) : nullptr;
-    void *target = gdpa ? reinterpret_cast<void *>(gdpa(FeedVkDispatch<VkDevice>(rt->get_device()->get_native()), "vkQueuePresentKHR")) : nullptr;
+    void *target = gdpa ? reinterpret_cast<void *>(gdpa(device, "vkQueuePresentKHR")) : nullptr;
     if (!target) return false;
     if (g_vk_frame_present_target == target) return true;
-    // A different dispatch entry than the one we hold means a new device (or a changed
-    // layer chain) -- re-hook rather than reporting failure and leaving the old device's
-    // entry hooked, which is what returning false here used to do.
+    // A different dispatch entry means a new device or a changed layer chain.
     if (g_vk_frame_present_target) FeedVkFramePresentRemove();
-    // The device dispatch entry includes ReShade and catches engines bypassing
-    // the loader export used by the old, counting-only present hook.
+    // The device-dispatch entry includes ReShade and catches engines bypassing the loader export.
     MH_STATUS status = MH_Initialize();
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) return false;
     status = MH_CreateHook(target, reinterpret_cast<void *>(&FeedVkFramePresent), reinterpret_cast<void **>(&g_vk_frame_present_orig));
@@ -56,7 +76,6 @@ static bool FeedVkFramePresentInstall(reshade::api::effect_runtime *rt)
     if (status != MH_OK)
     {
         Log("[feed] Vulkan present dependency hook failed: %s", MH_StatusToString(status));
-        // Do not remove another owner's hook if CreateHook returned ALREADY_CREATED.
         if (g_vk_frame_present_orig) MH_RemoveHook(target);
         g_vk_frame_present_orig = nullptr;
         return false;
@@ -64,6 +83,12 @@ static bool FeedVkFramePresentInstall(reshade::api::effect_runtime *rt)
     g_vk_frame_present_target = target;
     Log("[feed] Vulkan present dependency hook installed at device dispatch %p", target);
     return true;
+}
+
+static bool FeedVkFramePresentInstall(reshade::api::effect_runtime *rt)
+{
+    if (rt->get_device()->get_api() != reshade::api::device_api::vulkan) return true;
+    return FeedVkFramePresentInstallDevice(FeedVkDispatch<VkDevice>(rt->get_device()->get_native()));
 }
 
 static void FeedVkFramePresentRemove()
