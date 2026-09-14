@@ -33,6 +33,12 @@
 
 static void Log(const char *fmt, ...);   // dlss5-feed.cpp
 
+#ifdef _WIN64
+static bool FeedVkPresentEnter(VkQueue queue, const VkPresentInfoKHR *info);
+static void FeedVkPresentLeave();
+static bool FeedVkFramePresentInstallDevice(VkDevice device);
+#endif
+
 static const char *kFeedVkWanted[] = {
     VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
@@ -133,6 +139,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookQueuePresent(VkQueue queue, cons
     FeedVkHookGate gate;
     const PFN_vkQueuePresentKHR orig = g_vk_present_orig;
     if (orig == nullptr) return VK_SUCCESS;   // torn down under us; nothing safe to call
+#ifdef _WIN64
+    const bool present_context_entered = FeedVkPresentEnter(queue, pPresentInfo);
+#endif
     const LONG64 presents = InterlockedIncrement64(&g_vk_presents);
     if (pPresentInfo != nullptr && pPresentInfo->swapchainCount > 0 && pPresentInfo->pImageIndices != nullptr)
         g_vk_last_image = pPresentInfo->pImageIndices[0];
@@ -154,7 +163,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookQueuePresent(VkQueue queue, cons
             static_cast<long long>(since), static_cast<long long>(fed),
             fed > 0 ? static_cast<double>(since) / static_cast<double>(fed) : 0.0);
     }
-    return orig(queue, pPresentInfo);
+    const VkResult result = orig(queue, pPresentInfo);
+#ifdef _WIN64
+    if (present_context_entered) FeedVkPresentLeave();
+#endif
+    return result;
 }
 
 // Called by the feed once per delivered frame; also drives the periodic report.
@@ -327,6 +340,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice ph
         Log("[feed] vkCreateDevice failed (%d) with the added extensions; retrying with the app's original create info", r);
         r = orig_create(physicalDevice, pCreateInfo, pAllocator, pDevice);
     }
+#ifdef _WIN64
+    if (r == VK_SUCCESS && pDevice != nullptr)
+    {
+        if (!FeedVkFramePresentInstallDevice(*pDevice))
+            Log("[feed] Vulkan present dependency hook could not be installed on the new device");
+    }
+#endif
     Log("[feed] vkCreateDevice -> %d", r);
     return r;
 }
