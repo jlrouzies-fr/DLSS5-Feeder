@@ -75,6 +75,7 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <cstring>
+#include "feed_compat.h"
 
 // A drain that never returns would hang the game's render thread for good, so both waits
 // are bounded and the caller treats a false as a failed frame. Two seconds is the same
@@ -140,16 +141,27 @@ static bool FeedD3D10Open(FeedD3D10 *d, ID3D10Device *game_device)
     adapter->GetDesc(&ad);
     d->luid = ad.AdapterLuid;
 
-    // Feature level 11_0 is the floor, not a preference: the Output slot is created with
-    // a UAV bind, which is a feature-level 11 feature, and the whole point of the relay
-    // is to be the modern device the game is not. Naming an explicit adapter means the
-    // driver type has to be UNKNOWN.
-    static const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+    // Older GPUs still sometimes expose D3D11 at 10_1/10_0 even when they cannot run the
+    // FL11_0 relay path. The bridge itself only needs the basic D3D11 resource-copy and
+    // event-query flow, while the downstream shared-output fallback keeps the UAV on the
+    // host side when the device is too old. We centralise that compatibility rule in
+    // feed_compat.h and try each usable legacy level in order.
+    static const D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    };
     hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
                            levels, (UINT)(sizeof(levels) / sizeof(levels[0])),
                            D3D11_SDK_VERSION, &d->relay, &d->relay_fl, &d->relay_ctx);
     adapter->Release();
     if (FAILED(hr)) { FeedD3D10Fail(d, "D3D11CreateDevice (relay)", hr); return false; }
+    if (FeedGpuIsLegacyAdapter(d->relay_fl))
+    {
+        Log("[feed10] legacy GPU fallback: relay created at feature level %s, using the older-device path",
+            FeedGpuFeatureLevelName(d->relay_fl));
+    }
 
     D3D10_QUERY_DESC qd10;
     memset(&qd10, 0, sizeof(qd10));

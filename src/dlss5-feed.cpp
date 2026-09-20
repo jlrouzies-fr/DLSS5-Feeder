@@ -63,8 +63,9 @@
 #include "feed_opti.h" // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 #include "feed_pq12.h" // the D3D12 PQ<->linear pass, for the transports with no shaders of their own
+#include "feed_compat.h"
+#include "version.h"
 
-#define FEED_VERSION "1.16.0-beta.4"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif
@@ -267,6 +268,8 @@ static bool g_renodx_present = false;
 static bool g_renodx_lazy    = false;
 static bool g_renodx_v46     = false;
 static bool g_renodx_v47     = false;
+static FeedGpuCapability g_gpu_cap;
+static bool g_gpu_cap_checked = false;
 
 // Does the add-on's string table hold this literal? The terminator is part of the
 // match, so a marker key can never be found inside a longer string that starts with
@@ -8398,6 +8401,16 @@ static void HelpMarker(const char *desc)
 
 static void DrawOverlay(reshade::api::effect_runtime *rt)
 {
+    if (!g_gpu_cap_checked)
+    {
+        g_gpu_cap = FeedDetectRealGpuCapability();
+        g_gpu_cap_checked = true;
+        Log("[feed] real GPU detection: %s / %s / VRAM %llu MB / %s",
+            g_gpu_cap.name.c_str(), g_gpu_cap.vendor.c_str(),
+            static_cast<unsigned long long>(g_gpu_cap.vram_mb),
+            FeedGpuStatusString(g_gpu_cap.status));
+    }
+
     bool dirty = false;
     // Settings that only take effect when the DLSS feature is created. Saving them is not
     // enough: CfgReload() diffs the FILE against g_cfg, and the overlay writes straight into
@@ -8419,6 +8432,25 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
 
     ImGui::Separator();
     ImGui::TextUnformatted("Status");
+    ImGui::Text("GPU: %s", g_gpu_cap.name.empty() ? "detecting..." : g_gpu_cap.name.c_str());
+    ImGui::Text("Vendor: %s", g_gpu_cap.vendor.empty() ? "unknown" : g_gpu_cap.vendor.c_str());
+    if (g_gpu_cap.vram_mb != 0)
+        ImGui::Text("VRAM: %llu MB", static_cast<unsigned long long>(g_gpu_cap.vram_mb));
+    if (!g_gpu_cap.driver_version.empty())
+        ImGui::Text("Driver: %s", g_gpu_cap.driver_version.c_str());
+    ImGui::Text("Compatibility: %s", FeedGpuStatusString(g_gpu_cap.status));
+    ImGui::Text("DLSS 5: %s", g_gpu_cap.dlss5Supported ? "supported" : "not supported");
+    if (g_gpu_cap.fallbackActive || g_gpu_cap.legacyGpu || g_gpu_cap.status == FeedGpuStatus::Legacy ||
+        g_gpu_cap.status == FeedGpuStatus::Unsupported)
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f),
+                           "Compatibility warning: this GPU is outside the DLSS 5-supported set; fallback mode is active.");
+    }
+    else if (g_gpu_cap.status == FeedGpuStatus::Supported)
+    {
+        ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.5f, 1.0f),
+                           "Compatibility: supported hardware detected; normal DLSS 5 path is allowed.");
+    }
     ImGui::Text("Session: %s", g.disabled ? "disabled" : g.session_ready ? "open" : "not started");
     if (g.disabled && g_disable_why[0])
         ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "Stopped: %s", g_disable_why);
@@ -8691,6 +8723,18 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         }
         CfgWriteDefault();
         CfgReload();
+        g_gpu_cap = FeedDetectRealGpuCapability();
+        g_gpu_cap_checked = true;
+        Log("[feed] startup GPU capability: %s | vendor=%s | vram=%llu MB | driver=%s | status=%s | fallback=%s | dlss5=%s",
+            g_gpu_cap.name.c_str(), g_gpu_cap.vendor.c_str(),
+            static_cast<unsigned long long>(g_gpu_cap.vram_mb),
+            g_gpu_cap.driver_version.empty() ? "unknown" : g_gpu_cap.driver_version.c_str(),
+            FeedGpuStatusString(g_gpu_cap.status),
+            g_gpu_cap.fallbackActive ? "yes" : "no",
+            g_gpu_cap.dlss5Supported ? "yes" : "no");
+        if (g_gpu_cap.status == FeedGpuStatus::Legacy || g_gpu_cap.status == FeedGpuStatus::Unsupported)
+            Warn("real GPU detection indicates a legacy or unsupported GPU for DLSS 5: %s (%s); fallback mode is active.",
+                 g_gpu_cap.name.c_str(), g_gpu_cap.vendor.c_str());
         // Said once, plainly, because "enabled=0 but it still crashed" is only evidence if
         // the reader knows what enabled=0 actually leaves behind (issue #44).
         if (!g_cfg.enabled)

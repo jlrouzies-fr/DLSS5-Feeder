@@ -59,10 +59,11 @@ static void FeedOnVkDeviceGeneration();
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 #undef FEED_VK_DEVICE_GENERATION_CALLBACK
 #include "feed_d3d10.h"     // D3D10.1 <-> D3D11 keyed-mutex bridge + the private relay device
+#include "feed_compat.h"    // shared compatibility rules for legacy GPUs across the project
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 #include "feed_opti.h"      // OptiScaler DLSS-NR: only the file scan and the ini reader are used here (it lives in host64 too)
+#include "version.h"
 
-#define FEED_VERSION "1.16.0-beta.4"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif
@@ -3171,30 +3172,44 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
 
     if (!g.host_creates)
     {
-        int failed = -1;
-        if      (!MakeShared(FEED_COLOR,  w, h, g.color_fmt,              false, true))  failed = FEED_COLOR;
-        else if (!MakeShared(FEED_OUTPUT, g.output_width, g.output_height, g.output_fmt, true, false)) failed = FEED_OUTPUT;
-        else if (!MakeShared(FEED_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,    false, true))  failed = FEED_DEPTH;
-        else if (!MakeShared(FEED_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false, true))  failed = FEED_MV;
-        if (failed >= 0)
+        const D3D_FEATURE_LEVEL fl = g.dev->GetFeatureLevel();
+        if (FeedGpuNeedsHostCreatedOutput(fl))
         {
-            // The game's device will not create what the host needs to open. Seen on a
-            // feature-level 10.x device (NFS Most Wanted 2012, issue #33): Color went
-            // through and Output -- the one slot with a UAV bind -- came back E_INVALIDARG,
-            // because UAVs are a feature-level 11 feature. Retrying the same desc every
-            // 30 s forever was the old behaviour. Instead, switch to the route the GL and
-            // Vulkan clients always use: the host creates the set on D3D12 and hands the
-            // handles in; this side opens them (OpenSharedResource1 needs no bind flags
-            // of its own), and where UAVs are the problem the host keeps the Output's UAV
-            // on its side and copies into a plain shared texture.
-            const D3D_FEATURE_LEVEL fl = g.dev->GetFeatureLevel();
+            // Older GPUs frequently expose D3D11 but not the UAV feature set the direct-output
+            // path expects. Prefer the host-created shared set immediately rather than failing,
+            // which keeps the output write on the D3D12 side and avoids the FL11-only UAV path.
             ReleaseShared();
             g.host_creates = true;
-            g.no_uav       = failed == FEED_OUTPUT || fl < D3D_FEATURE_LEVEL_11_0;
-            Log("[feed32] the game's D3D11 device (feature level %d_%d) refused the shared %s texture; the host will "
-                "create the shared set instead%s",
-                (fl >> 12) & 0xF, (fl >> 8) & 0xF, FeedSlotName(failed),
-                g.no_uav ? ", keeping the DLSS output's UAV on its own side (this device cannot bind one)" : "");
+            g.no_uav       = true;
+            Log("[feed32] legacy GPU fallback: feature level %s is below FL11_0, using the host-created shared set and moving the DLSS output UAV to the host side",
+                FeedGpuFeatureLevelName(fl));
+        }
+        else
+        {
+            int failed = -1;
+            if      (!MakeShared(FEED_COLOR,  w, h, g.color_fmt,              false, true))  failed = FEED_COLOR;
+            else if (!MakeShared(FEED_OUTPUT, g.output_width, g.output_height, g.output_fmt, true, false)) failed = FEED_OUTPUT;
+            else if (!MakeShared(FEED_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,    false, true))  failed = FEED_DEPTH;
+            else if (!MakeShared(FEED_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false, true))  failed = FEED_MV;
+            if (failed >= 0)
+            {
+                // The game's device will not create what the host needs to open. Seen on a
+                // feature-level 10.x device (NFS Most Wanted 2012, issue #33): Color went
+                // through and Output -- the one slot with a UAV bind -- came back E_INVALIDARG,
+                // because UAVs are a feature-level 11 feature. Retrying the same desc every
+                // 30 s forever was the old behaviour. Instead, switch to the route the GL and
+                // Vulkan clients always use: the host creates the set on D3D12 and hands the
+                // handles in; this side opens them (OpenSharedResource1 needs no bind flags
+                // of its own), and where UAVs are the problem the host keeps the Output's UAV
+                // on its side and copies into a plain shared texture.
+                ReleaseShared();
+                g.host_creates = true;
+                g.no_uav       = failed == FEED_OUTPUT || FeedGpuNeedsHostCreatedOutput(fl);
+                Log("[feed32] the game's D3D11 device (feature level %s) refused the shared %s texture; the host will "
+                    "create the shared set instead%s",
+                    FeedGpuFeatureLevelName(fl), FeedSlotName(failed),
+                    g.no_uav ? ", keeping the DLSS output's UAV on its own side (this device cannot bind one)" : "");
+            }
         }
     }
 
