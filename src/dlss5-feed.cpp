@@ -5588,6 +5588,56 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 // rendered on an NVIDIA GPU, where DLSS could not run anyway.
 // ---------------------------------------------------------------------------
 
+// #121: the fences are imported when the session opens and the textures only when the first
+// frame builds, so a failed fence import ended the session without anyone learning whether the
+// MEMORY half of the interop works on that machine. Under Wine/Proton that is the one fact
+// deciding whether a CPU-synchronised fallback is possible at all, so ask it here, with a
+// throwaway 64x64 texture made exactly the way MakeSharedTexGl makes the real ones.
+static void ProbeGlMemoryImport()
+{
+    const char *wine = FeedGlWineVersion();
+    if (wine != nullptr)
+        Log("[feed] running under Wine %s: it advertises GL_EXT_semaphore_win32 / GL_EXT_memory_object_win32 "
+            "whatever the host's GL driver can do with a Win32 handle, so the extension gate cannot see this", wine);
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width            = 64;
+    rd.Height           = 64;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    ID3D12Resource *res = nullptr;
+    HANDLE shared = nullptr;
+    HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                  nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&res));
+    if (SUCCEEDED(hr)) hr = g.dev12->CreateSharedHandle(res, nullptr, GENERIC_ALL, nullptr, &shared);
+    if (FAILED(hr))
+        Log("[feed] memory-import probe: could not make the throwaway shared D3D12 texture (0x%08X), so it says nothing", hr);
+    else
+    {
+        const D3D12_RESOURCE_ALLOCATION_INFO ai = g.dev12->GetResourceAllocationInfo(0, 1, &rd);
+        GLuint tex = 0, mem = 0;
+        if (FeedGlImportImage(&g.gl, shared, ai.SizeInBytes, 64, 64, FeedGlFormat(rd.Format), &tex, &mem))
+        {
+            Log("[feed] memory-import probe: a D3D12 texture DOES import into GL here (GL_HANDLE_TYPE_D3D12_RESOURCE_EXT, "
+                "%llu bytes) -- only the fence half of the interop is missing", static_cast<unsigned long long>(ai.SizeInBytes));
+            g.gl.DeleteTextures(1, &tex);
+            g.gl.DeleteMemoryObjectsEXT(1, &mem);
+        }
+        else
+            Log("[feed] memory-import probe: a D3D12 texture does NOT import into GL either (failed at %s, GL error 0x%04X) "
+                "-- no part of the D3D12<->GL interop works on this driver", g.gl.import_stage, g.gl.import_err);
+    }
+    if (shared != nullptr) CloseHandle(shared);
+    if (res != nullptr) res->Release();
+}
+
 static bool InitSessionGl(reshade::api::effect_runtime *rt)
 {
     Breadcrumb("opening the D3D12 session (OpenGL transport)");
@@ -5726,13 +5776,20 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
     }
 
     g.gl_sem_in  = FeedGlImportFence(&g.gl, g.fence_in_handle);
+    const GLenum sem_in_err = g.gl.import_err;
     g.gl_sem_out = FeedGlImportFence(&g.gl, g.fence_out_handle);
     Log("[feed] D3D12 fence -> GL semaphore import (GL_HANDLE_TYPE_D3D12_FENCE_EXT): in=%s out=%s",
         g.gl_sem_in ? "OK" : "FAILED", g.gl_sem_out ? "OK" : "FAILED");
     if (g.gl_sem_in == 0 || g.gl_sem_out == 0)
     {
+        Log("[feed] the fence import failed at %s, GL error 0x%04X (in) / 0x%04X (out)",
+            g.gl.import_stage, sem_in_err, g.gl.import_err);
+        ProbeGlMemoryImport();
+        const char *wine = FeedGlWineVersion();
         ShutdownSession();
-        FeedDisable("cross-API fence import failed (see dlss5-feed.log)");
+        FeedDisable(wine != nullptr ?
+            "the GL driver under Wine/Proton cannot import a D3D12 fence (#121; see dlss5-feed.log)" :
+            "cross-API fence import failed (see dlss5-feed.log)");
         return false;
     }
 
@@ -5794,9 +5851,9 @@ static bool MakeSharedTexGl(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
                            static_cast<GLsizei>(w), static_cast<GLsizei>(h), glf,
                            &g.gl_tex[slot], &g.gl_memobj[slot]))
     {
-        Log("[feed] texture import FAILED: %s %ux%u %s (GL_HANDLE_TYPE_D3D12_RESOURCE_EXT, %llu bytes, GL error 0x%04X)",
+        Log("[feed] texture import FAILED: %s %ux%u %s (GL_HANDLE_TYPE_D3D12_RESOURCE_EXT, %llu bytes) at %s, GL error 0x%04X",
             kSlotName[slot], w, h, FormatName(fmt), static_cast<unsigned long long>(ai.SizeInBytes),
-            FeedGlDrainErrors(&g.gl));
+            g.gl.import_stage, g.gl.import_err);
         return false;
     }
     Log("[feed] %-6s %ux%u %s shared D3D12 (%llu bytes) -> imported as GL texture %u",
@@ -8563,7 +8620,11 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         if (g_work_resolution_ui < 100 || g_cfg.work_resolution < 100)
         {
             ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
-            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+            // Through "%s": TextColored takes a FORMAT string, and this text's "100% the" and
+            // "100% and" are an invalid conversion and a read of a double that was never passed.
+            // The CRT's invalid-parameter handler took the game down the moment the slider left
+            // 100 and this block was drawn (#123).
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s",
                                "Below 100% the whole image is rendered smaller and stretched back, so it looks "
                                "blurry. For a sharp image, leave this at 100% and feed a DLSS 5 neural rendering "
                                "mod that can lower the resolution of the neural pass alone, such as OptiScaler "

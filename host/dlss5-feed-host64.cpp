@@ -106,6 +106,18 @@ static bool  g_cast_on      = false;
 static float g_cast_scale   = 0.0f;
 static UINT  g_cast_msg     = 0;   // RegisterWindowMessage, resolved on the first 'C'
 
+// The wheel for a cast panel in a game that keeps its mouse from ReShade (#118). The add-on
+// cannot register a raw-input sink -- registration is per process, so it would replace the
+// game's own -- but this process has no input of its own to lose. The add-on posts
+// DLSS5_FEED_CAST_WHEEL (wParam 1/0) while the cursor is over the panel AND it cannot see the
+// wheel itself; only then is a raw notch turned into the WM_MOUSEWHEEL it would have forwarded.
+// Never otherwise: in every other game the add-on forwards the wheel, and both would scroll twice.
+static const UINT g_wheel_msg = RegisterWindowMessageW(L"DLSS5_FEED_CAST_WHEEL");
+static bool   g_wheel_wanted     = false;   // the add-on's last word
+static bool   g_wheel_registered = false;   // the sink exists (it is never taken down: it costs nothing idle)
+static bool   g_wheel_refused    = false;   // something else in this process owns raw mouse input
+static LPARAM g_wheel_at         = 0;       // the last forwarded WM_MOUSEMOVE: where the panel's cursor is
+
 // Present accounting (issue #15). The neural consumer wants one Present per evaluate; when
 // DWM holds every back buffer the per-evaluate Present cannot happen on the spot, and the
 // deficit is what makes it decline passes. A raw skip counter could not be compared against
@@ -1046,6 +1058,13 @@ static void HostEnableDred(const char *ini)
         "D3D12CreateDevice fails below, set Dred=0 again");
 }
 
+// The name DRED reports for the list every frame is recorded into. That list is handed to
+// NVSDK_NGX_D3D12_EvaluateFeature, so NGX's DLSS dispatches AND a neural consumer's inline pass
+// are recorded into it too: a hang inside it is a hang in one of the three, and only the ops
+// around the stuck one say which. Until #119 the helper named no list at all and labelled every
+// unnamed one "not this helper's", which sent the reading of a real log the wrong way.
+static const wchar_t *const kFrameListName = L"dlss5-feed-host frame list (the helper's copies + NGX's DLSS + a consumer's inline pass)";
+
 static void HostDumpDred()
 {
     if (!g_dred_armed || h.dev == nullptr) return;
@@ -1068,12 +1087,29 @@ static void HostDumpDred()
             const bool finished = last >= node->BreadcrumbCount;
             Log("[host] DRED node %d: queue='%ls' list='%ls' executed %u of %u ops%s", node_index,
                 node->pCommandQueueDebugNameW ? node->pCommandQueueDebugNameW : L"(unnamed)",
-                node->pCommandListDebugNameW ? node->pCommandListDebugNameW : L"(unnamed -- not this helper's: NGX's or the consumer's)",
+                node->pCommandListDebugNameW ? node->pCommandListDebugNameW : L"(unnamed: a list this helper did not create -- NGX's own, the consumer's own, or DXGI's)",
                 last, node->BreadcrumbCount, finished ? " (finished)" : "");
             if (finished || node->pCommandHistory == nullptr) continue;
-            // The op at 'last' is the one that had not finished. The common ones by name, the
-            // rest by their D3D12_AUTO_BREADCRUMB_OP number (d3d12.h).
-            for (UINT32 i = last > 12 ? last - 12 : 0; i < node->BreadcrumbCount && i <= last; ++i)
+            // The list's shape: a frame that hangs and one that does not can be told apart by it.
+            {
+                UINT32 n_dispatch = 0, n_barrier = 0, n_copy = 0, n_other = 0;
+                for (UINT32 i = 0; i < node->BreadcrumbCount; ++i)
+                {
+                    const D3D12_AUTO_BREADCRUMB_OP op = node->pCommandHistory[i];
+                    if (op == D3D12_AUTO_BREADCRUMB_OP_DISPATCH) ++n_dispatch;
+                    else if (op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER) ++n_barrier;
+                    else if (op == D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE || op == D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION ||
+                             op == D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION) ++n_copy;
+                    else ++n_other;
+                }
+                Log("[host] DRED   the list holds %u Dispatch, %u ResourceBarrier, %u copy and %u other ops",
+                    n_dispatch, n_barrier, n_copy, n_other);
+            }
+            // The op at 'last' is the first the GPU had not completed. A ResourceBarrier there is
+            // not itself GPU work that can hang: the driver batches it with what follows, so the
+            // ops AFTER it are printed too -- the first Dispatch or copy among them is the suspect.
+            // The common ones by name, the rest by their D3D12_AUTO_BREADCRUMB_OP number (d3d12.h).
+            for (UINT32 i = last > 12 ? last - 12 : 0; i < node->BreadcrumbCount && i <= last + 8; ++i)
             {
                 const D3D12_AUTO_BREADCRUMB_OP op = node->pCommandHistory[i];
                 const char *name = op == D3D12_AUTO_BREADCRUMB_OP_DISPATCH          ? "Dispatch"
@@ -1153,7 +1189,10 @@ static void AbortCommands()   // never execute a list NGX crashed in
     h.list = nullptr;
     if (SUCCEEDED(h.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, h.alloc[h.frame_slot], nullptr,
                                            __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&h.list))))
+    {
+        h.list->SetName(kFrameListName);
         h.list->Close();
+    }
 }
 
 // Deep Fried Chicken interop marker (feed_dfc.h): the complete tuple must be on the
@@ -1373,9 +1412,90 @@ static bool HostResize(int new_w, int new_h, const char *why);   // defined with
 static bool g_sizing;                    // inside a border drag: WM_SIZE is coalesced until it ends
 static int  g_sizing_w, g_sizing_h;
 
+// Registered from the window's own thread, on the add-on's first request. A registration that
+// is already there belongs to something else loaded into this process (a consumer's own wheel
+// workaround is the known case): replacing it would silence that, so it is left alone.
+static void WheelSinkRegister(HWND w)
+{
+    if (g_wheel_registered || g_wheel_refused) return;
+    RAWINPUTDEVICE have[8] = {};
+    UINT n = 8;
+    const UINT got = GetRegisteredRawInputDevices(have, &n, sizeof(RAWINPUTDEVICE));
+    for (UINT i = 0; got != static_cast<UINT>(-1) && i < got; ++i)
+        if (have[i].usUsagePage == 0x01 && have[i].usUsage == 0x02 && have[i].hwndTarget != w)
+        {
+            g_wheel_refused = true;
+            Log("[host] cast wheel: raw mouse input is already registered in this process (target window %p, "
+                "flags 0x%lX) -- leaving it to whoever did that; the wheel is theirs to forward",
+                (void *)have[i].hwndTarget, static_cast<unsigned long>(have[i].dwFlags));
+            return;
+        }
+    RAWINPUTDEVICE dev = {};
+    dev.usUsagePage = 0x01;   // generic desktop
+    dev.usUsage     = 0x02;   // mouse
+    dev.dwFlags     = RIDEV_INPUTSINK;   // delivered while the GAME has the focus, which is always
+    dev.hwndTarget  = w;
+    if (RegisterRawInputDevices(&dev, 1, sizeof(dev)))
+    {
+        g_wheel_registered = true;
+        Log("[host] cast wheel: raw-input sink registered; the wheel is forwarded to this window while the "
+            "add-on reports the cursor over the panel in a game that hides its mouse from ReShade");
+    }
+    else
+    {
+        g_wheel_refused = true;
+        Log("[host] cast wheel: RegisterRawInputDevices failed (%lu); the panel stays without a wheel in this game",
+            GetLastError());
+    }
+}
+
 static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 {
     if (m == WM_CLOSE) { ShowWindow(w, SW_HIDE); return 0; }   // closing only hides; the feed lives on
+    if (m == WM_MOUSEMOVE) g_wheel_at = lp;   // falls through: only remembered
+    if (g_wheel_msg != 0 && m == g_wheel_msg)
+    {
+        g_wheel_wanted = wp != 0;
+        if (g_wheel_wanted) WheelSinkRegister(w);
+        return 0;
+    }
+    if (m == WM_INPUT)
+    {
+        // Turned into a message on the spot, not counted for later: a notch made while nobody
+        // wants it must be dropped, or it arrives in a burst the next time the panel opens.
+        RAWINPUT ri = {};
+        UINT size = sizeof(ri);
+        static int acc = 0;   // raw wheel units not yet made into a notch
+        if (!g_wheel_wanted || !g_cast_on) acc = 0;
+        else if (
+            GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1) &&
+            ri.header.dwType == RIM_TYPEMOUSE && (ri.data.mouse.usButtonFlags & RI_MOUSE_WHEEL) != 0)
+        {
+            // WM_MOUSEWHEEL carries SCREEN coordinates, and ReShade makes them its ImGui mouse
+            // position: the panel's cursor mapped into this window's screen space, exactly as the
+            // add-on does for the wheel it can see.
+            POINT s = { static_cast<short>(LOWORD(g_wheel_at)), static_cast<short>(HIWORD(g_wheel_at)) };
+            ClientToScreen(w, &s);
+            // Whole notches only. A high-resolution wheel reports a run of small deltas (-1 at
+            // a time was measured here), and ReShade divides each message's delta by WHEEL_DELTA
+            // as an INTEGER: forwarded as they come, every one of them rounds to nothing.
+            acc += static_cast<short>(ri.data.mouse.usButtonData);
+            int notches = 0;
+            for (; acc >= WHEEL_DELTA && notches < 16; acc -= WHEEL_DELTA, ++notches)
+                PostMessageW(w, WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), MAKELPARAM(s.x, s.y));
+            for (; acc <= -WHEEL_DELTA && notches > -16; acc += WHEEL_DELTA, --notches)
+                PostMessageW(w, WM_MOUSEWHEEL, MAKEWPARAM(0, static_cast<WORD>(-WHEEL_DELTA)), MAKELPARAM(s.x, s.y));
+            if (acc >= WHEEL_DELTA || acc <= -WHEEL_DELTA) acc = 0;   // past the cap: dropped, not owed
+            static int said = 0;
+            if (notches != 0 && said < 6)
+            {
+                ++said;
+                Log("[host] cast wheel: %d notch(es) from raw input -> WM_MOUSEWHEEL at client %d,%d",
+                    notches, static_cast<short>(LOWORD(g_wheel_at)), static_cast<short>(HIWORD(g_wheel_at)));
+            }
+        }
+        return DefWindowProcW(w, m, wp, lp);   // WM_INPUT must reach DefWindowProc to be cleaned up
+    }
     // WS_OVERLAPPEDWINDOW has always let the user drag this window's border; until now
     // nothing answered, so the swapchain kept its original size and DWM stretched it.
     if (m == WM_GETMINMAXINFO)
@@ -1565,7 +1685,7 @@ static void InitBanner()
     if (g_pump_alloc != nullptr)
         h.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_pump_alloc, nullptr,
                                  __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g_pump_list));
-    if (g_pump_list != nullptr) g_pump_list->Close();
+    if (g_pump_list != nullptr) { g_pump_list->SetName(L"dlss5-feed-host banner list"); g_pump_list->Close(); }
     h.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g_pump_fence));
     h.swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_swap3));
     Log("[host] banner ready");
@@ -1576,7 +1696,7 @@ static void InitBanner()
     if (g_panel_alloc != nullptr)
         h.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_panel_alloc, nullptr,
                                  __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g_panel_list));
-    if (g_panel_list != nullptr) g_panel_list->Close();
+    if (g_panel_list != nullptr) { g_panel_list->SetName(L"dlss5-feed-host panel copy list"); g_panel_list->Close(); }
     h.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g_panel_fence));
     g_panel_ready = g_panel_list != nullptr && g_panel_fence != nullptr;
     if (g_panel_ready)
@@ -2160,7 +2280,7 @@ static bool InitDisguise()
     if (h.alloc[0] != nullptr)
         h.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, h.alloc[0], nullptr,
                                  __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&h.list));
-    if (h.list != nullptr) h.list->Close();
+    if (h.list != nullptr) { h.list->SetName(kFrameListName); h.list->Close(); }
     h.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&h.fence));
     h.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (h.list == nullptr || h.fence == nullptr) { Log("[host] list/fence creation failed"); return false; }

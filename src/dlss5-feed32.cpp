@@ -1222,6 +1222,14 @@ static POINT      g_cast_cursor = { -1, -1 };   // the mouse position this frame
 static POINT      g_cast_rs_last   = { -2, -2 };   // ReShade's previous reading, to see it move
 static int        g_cast_rs_still  = 0;            // consecutive frames it has not moved
 static bool       g_cast_real_mouse = false;       // using GetCursorPos instead
+// The wheel in that mode (#118). A game that keeps its mouse from ReShade keeps the wheel from
+// it too, and a raw-input sink registered HERE would replace the game's own registration --
+// RegisterRawInputDevices is per process. The host has no input of its own to lose, so it
+// registers the sink, and only while this side says it is needed: DLSS5_FEED_CAST_WHEEL, posted
+// to the host window on change, wParam 1 = "the cursor is over the panel and I cannot see the
+// wheel", 0 = "stop". Never on while ReShade tracks the mouse, or each notch would scroll twice.
+static bool       g_cast_wheel_sink = false;       // what the host was last told
+static UINT       g_cast_wheel_msg  = 0;
 static const int  kCastRsStillFrames = 60;
 // How far apart the two readings must be before the real one is believed. Where ReShade
 // DOES track the mouse they agree to within rounding, and a mouse merely at rest must not
@@ -1296,6 +1304,7 @@ static void CastHostLost()
     CastRelease();
     g_cast_hwnd   = nullptr;
     g_cast_placed = false;
+    g_cast_wheel_sink = false;   // a new host starts with its sink off
 }
 
 // cast_mode=1: the panel texture (IPC v7), created on the game's D3D11 device at the size
@@ -1385,7 +1394,8 @@ static void CastImportPanelGl(const FeedBuildAck &ack)
     if (g.panel_w == 0 || g.gl_panel_tex != 0) { CloseHandle(hnd); return; }
     if (!FeedGlImportImage(&g.gl, hnd, ack.panel_size, static_cast<GLsizei>(g.panel_w), static_cast<GLsizei>(g.panel_h),
                            GL_RGBA8, &g.gl_panel_tex, &g.gl_panel_memobj))
-        Log("[feed32] cast: panel import FAILED (GL error 0x%04X); texture mode unavailable", FeedGlDrainErrors(&g.gl));
+        Log("[feed32] cast: panel import FAILED at %s (GL error 0x%04X); texture mode unavailable",
+            g.gl.import_stage, g.gl.import_err);
     else
         Log("[feed32] cast: host panel texture imported (OpenGL, %ux%u)", g.panel_w, g.panel_h);
     CloseHandle(hnd);
@@ -1564,8 +1574,18 @@ static const struct { uint32_t idx; UINT down, up; } kCastButtons[] = {
 // Release everything the host still believes is held. Called when the cursor leaves the
 // panel and whenever the panel is taken down, so no key or button can stay stuck in ReShade
 // x64's ImGui after this side stops forwarding.
+static void CastWheelSink(bool want)
+{
+    if (want == g_cast_wheel_sink || g_cast_hwnd == nullptr || !IsWindow(g_cast_hwnd)) return;
+    if (g_cast_wheel_msg == 0) g_cast_wheel_msg = RegisterWindowMessageW(L"DLSS5_FEED_CAST_WHEEL");
+    if (g_cast_wheel_msg == 0) return;
+    PostMessageW(g_cast_hwnd, g_cast_wheel_msg, want ? 1u : 0u, 0);
+    g_cast_wheel_sink = want;
+}
+
 static void CastFlushInput()
 {
+    CastWheelSink(false);   // every way off the panel comes through here
     int keys = 0, buttons = 0;
     for (UINT vk = 0; vk < 256; ++vk)
         if (g_cast_key_down[vk]) { g_cast_key_down[vk] = false; ++keys; CastPostKey(WM_KEYUP, vk, true); }
@@ -1800,8 +1820,9 @@ static void CastInput(reshade::api::effect_runtime *rt)
             ++g_cast_rs_said;
             Log("[feed32] cast: ReShade's mouse position has not moved for %d frames while the real cursor is at "
                 "%ld,%ld -- this game does not feed ReShade mouse messages, so the panel now follows GetCursorPos "
-                "and GetAsyncKeyState (issue #118). The wheel still cannot be read here: it never reaches the "
-                "game window either", g_cast_rs_still, real.x, real.y);
+                "and GetAsyncKeyState (issue #118). The wheel never reaches the game window either, so while "
+                "the cursor is over the panel the host is asked to read it from raw input itself",
+                g_cast_rs_still, real.x, real.y);
         }
     }
     if (g_cast_real_mouse && have_real) p = real;
@@ -1883,6 +1904,7 @@ static void CastInput(reshade::api::effect_runtime *rt)
         }
     }
     g_cast_hover = true;
+    CastWheelSink(g_cast_real_mouse);
 
     // Press and release land on different frames by construction -- what ImGui needs
     // to see a click.
@@ -3733,12 +3755,49 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
         g.fence_in_handle  = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_in));
         g.fence_out_handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_out));
         g.gl_sem_in  = FeedGlImportFence(&g.gl, g.fence_in_handle);
+        const GLenum sem_in_err = g.gl.import_err;
         g.gl_sem_out = FeedGlImportFence(&g.gl, g.fence_out_handle);
         Log("[feed32] D3D12 fence -> GL semaphore import: in=%s out=%s",
             g.gl_sem_in ? "OK" : "FAILED", g.gl_sem_out ? "OK" : "FAILED");
         if (g.gl_sem_in == 0 || g.gl_sem_out == 0)
-        { FeedDisable("cross-process fence import failed -- most often the host opened a different GPU than "
-                      "the game (multi-GPU machine, #100): force both onto the same adapter (see dlss5-feed.log)"); return false; }
+        {
+            Log("[feed32] the fence import failed at %s, GL error 0x%04X (in) / 0x%04X (out)",
+                g.gl.import_stage, sem_in_err, g.gl.import_err);
+            // #121: the textures are imported after the fences, so this failure used to end the
+            // build without anyone learning whether the MEMORY half of the interop works here.
+            // Under Wine/Proton that is the fact deciding whether a CPU-synchronised fallback is
+            // possible at all. The host's handles are already in hand: try each, say, let go.
+            const char *wine = FeedGlWineVersion();
+            if (wine != nullptr)
+                Log("[feed32] running under Wine %s: it advertises GL_EXT_semaphore_win32 / GL_EXT_memory_object_win32 "
+                    "whatever the host's GL driver can do with a Win32 handle, so the extension gate cannot see this", wine);
+            static const DXGI_FORMAT kProbeFmt[FEED_SLOTS] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
+                                                               DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT };
+            for (int i = 0; i < FEED_SLOTS; ++i)
+            {
+                const DXGI_FORMAT f = i == FEED_COLOR ? g.color_fmt : i == FEED_OUTPUT ? g.output_fmt : kProbeFmt[i];
+                const GLenum glf = FeedGlFormat(f);
+                if (glf == 0 || g.tex_handle[i] == nullptr || ack.tex_size[i] == 0) continue;
+                GLuint tex = 0, mem = 0;
+                if (FeedGlImportImage(&g.gl, g.tex_handle[i], ack.tex_size[i], static_cast<GLsizei>(w),
+                                      static_cast<GLsizei>(h), glf, &tex, &mem))
+                {
+                    Log("[feed32] memory-import probe: slot %d (%s, %llu bytes) DOES import into GL -- only the "
+                        "fence half of the interop is missing", i, FeedFmtName(f), static_cast<unsigned long long>(ack.tex_size[i]));
+                    g.gl.DeleteTextures(1, &tex);
+                    g.gl.DeleteMemoryObjectsEXT(1, &mem);
+                }
+                else
+                    Log("[feed32] memory-import probe: slot %d (%s, %llu bytes) does NOT import into GL either "
+                        "(failed at %s, GL error 0x%04X)", i, FeedFmtName(f),
+                        static_cast<unsigned long long>(ack.tex_size[i]), g.gl.import_stage, g.gl.import_err);
+            }
+            FeedDisable(wine != nullptr ?
+                "the GL driver under Wine/Proton cannot import a D3D12 fence (#121; see dlss5-feed.log)" :
+                "cross-process fence import failed -- most often the host opened a different GPU than "
+                "the game (multi-GPU machine, #100): force both onto the same adapter (see dlss5-feed.log)");
+            return false;
+        }
     }
 
     static const DXGI_FORMAT kFmt[FEED_SLOTS] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
@@ -3752,8 +3811,13 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
                                static_cast<GLsizei>(w), static_cast<GLsizei>(h), glf,
                                &g.gl_tex[i], &g.gl_memobj[i]))
         {
-            Log("[feed32] texture import FAILED: slot %d %ux%u fmt=%u (%llu bytes, GL error 0x%04X)",
-                i, w, h, f, static_cast<unsigned long long>(ack.tex_size[i]), FeedGlDrainErrors(&g.gl));
+            if (glf == 0 || g.tex_handle[i] == nullptr || ack.tex_size[i] == 0)
+                Log("[feed32] texture import FAILED: slot %d %ux%u fmt=%u (%llu bytes) -- %s",
+                    i, w, h, f, static_cast<unsigned long long>(ack.tex_size[i]),
+                    glf == 0 ? "no GL internal format for it" : "the host sent no handle or size for it");
+            else
+                Log("[feed32] texture import FAILED: slot %d %ux%u fmt=%u (%llu bytes) at %s, GL error 0x%04X",
+                    i, w, h, f, static_cast<unsigned long long>(ack.tex_size[i]), g.gl.import_stage, g.gl.import_err);
             ReleaseShared();
             return false;
         }
@@ -5770,7 +5834,11 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         if (g_work_resolution_ui < 100 || g_cfg.work_resolution < 100)
         {
             ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
-            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+            // Through "%s": TextColored takes a FORMAT string, and this text's "100% the" and
+            // "100% and" are an invalid conversion and a read of a double that was never passed.
+            // The CRT's invalid-parameter handler took the game down the moment the slider left
+            // 100 and this block was drawn (#123).
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s",
                                "Below 100% the whole image is rendered smaller and stretched back, so it looks "
                                "blurry. For a sharp image, leave this at 100% and feed a DLSS 5 neural rendering "
                                "mod that can lower the resolution of the neural pass alone, such as OptiScaler "
