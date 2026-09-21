@@ -1139,7 +1139,7 @@ Subclass the helper window or run a message hook to see it; nothing outside the 
 told. `dlss5-feed-host.log` carries the same state in words, with the destination rectangle in the
 game's client pixels and the corner it is anchored to.
 
-**The mouse wheel in a game that hides its mouse from ReShade** (Castlevania: Lords of Shadow 2 is
+**The mouse wheel in a game that hides its mouse from ReShade**, since 1.16.0-beta.7 (Castlevania: Lords of Shadow 2 is
 the measured one, #118). Such a game keeps the wheel from ReShade as well as the pointer, and the
 add-on cannot register a raw-input sink of its own: `RegisterRawInputDevices` is per process, so it
 would replace the game's registration and break the game's own mouse. The helper has no input to
@@ -1200,7 +1200,7 @@ above, and not fixable by moving anything to another GPU. Wine advertises `GL_EX
 and `GL_EXT_memory_object_win32`, so the extension gate passes, but the Linux GL driver underneath
 only implements the file-descriptor forms of those extensions and cannot import a D3D12 fence
 handle; `glImportSemaphoreWin32HandleEXT` fails and the feed stops (#121). The D3D11, D3D12 and
-Vulkan transports are unaffected on the same machine. From the build after 1.16.0-beta.6 the log
+Vulkan transports are unaffected on the same machine. Since 1.16.0-beta.7 the log
 names this case, prints the GL error, and probes whether a D3D12 *texture* imports
 (`memory-import probe: ...`) -- that one line decides whether a slower CPU-synchronised fallback is
 possible at all there, so please include it in a report.
