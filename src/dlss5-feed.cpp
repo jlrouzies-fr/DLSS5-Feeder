@@ -38,6 +38,7 @@
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 #include <cstdio>
+#include <share.h>
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
@@ -64,7 +65,7 @@
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 #include "feed_pq12.h" // the D3D12 PQ<->linear pass, for the transports with no shaders of their own
 
-#define FEED_VERSION "1.16.0-beta.4"
+#define FEED_VERSION "1.16.0-beta.7"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif
@@ -1316,8 +1317,10 @@ static bool ProviderCompileError(const char *file, char *out, size_t out_size)
     char path[MAX_PATH];
     GetModuleFileNameA(g_self, path, MAX_PATH);
     if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "ReShade.log");
-    FILE *f = nullptr;
-    if (fopen_s(&f, path, "rb") != 0 || f == nullptr) return false;
+    // _fsopen with _SH_DENYNO, not fopen_s: fopen_s asks that nobody else write the file, and
+    // ReShade holds its log open for writing, so that open failed every time (#119).
+    FILE *f = _fsopen(path, "rb", _SH_DENYNO);
+    if (f == nullptr) return false;
     fseek(f, 0, SEEK_END);
     const long size = ftell(f);
     const long take = size < 512 * 1024 ? size : 512 * 1024;   // the tail is where the last reload is
@@ -2304,6 +2307,41 @@ static void LogAdapterIdentity(const char *who, ID3D12Device *dev)
         (unsigned long)luid.HighPart, (unsigned long)luid.LowPart, vendor, device, driver);
 }
 
+// Where a fault inside NVSDK_NGX_D3D12_Init came from: the module the exception address is
+// in, and the chain it was called through. That is the whole question whenever the same
+// files initialise NGX perfectly inside host64 and throw in the game (#47, #120), and until
+// now the log could only guess at it. Empty when nothing has faulted.
+static char g_ngx_init_fault[320] = "";
+
+static int NgxInitFilter(EXCEPTION_POINTERS *ep, DWORD *code)
+{
+    const EXCEPTION_RECORD *rec = ep != nullptr ? ep->ExceptionRecord : nullptr;
+    *code = rec != nullptr ? rec->ExceptionCode : 0;
+
+    char mod[MAX_PATH] = "";
+    FeedCrashModuleOf(rec != nullptr ? rec->ExceptionAddress : nullptr, mod, sizeof(mod));
+    char stack[192] = "";
+    if (ep != nullptr) FeedCrashStackModules(ep->ContextRecord, stack, sizeof(stack));
+    _snprintf_s(g_ngx_init_fault, sizeof(g_ngx_init_fault), _TRUNCATE, " in %s%s%s", mod,
+                stack[0] != 0 ? ", called through " : "", stack);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// The four openers all report a faulted init the same way, and the one thing that was never
+// in the line is who faulted. 0x80000003 gets its own words because it is not a memory
+// fault: it is EXCEPTION_BREAKPOINT, an int 3 that was executed -- an assertion, or a jump
+// that landed in padding. This add-on issues none; WHOSE it is, the module above says (#120).
+static void LogNgxInitFault(DWORD code)
+{
+    Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught)%s -- %s; the feed stays off for this run",
+        code, g_ngx_init_fault,
+        code == 0x80000003u
+            ? "0x80000003 is EXCEPTION_BREAKPOINT: an int 3 was executed (an assertion, or a jump into padding), "
+              "not a memory fault. This add-on issues none; the module named here did. To tell a neural "
+              "consumer's NGX hook from the driver, start the game once with the consumer removed"
+            : "a module inside that call faulted during init; the chain above names it");
+}
+
 static NVSDK_NGX_Result SafeNgxInitOnce(const wchar_t *data_path, ID3D12Device *dev,
                                         const NVSDK_NGX_FeatureCommonInfo *info, DWORD *code)
 {
@@ -2316,7 +2354,7 @@ static NVSDK_NGX_Result SafeNgxInitOnce(const wchar_t *data_path, ID3D12Device *
                                                     "1.0", data_path, dev, info, NVSDK_NGX_Version_API);
         return r;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NVSDK_NGX_Result_Fail; }
+    __except (NgxInitFilter(GetExceptionInformation(), code)) { return NVSDK_NGX_Result_Fail; }
 }
 
 // Three machines report 0xBAD00001 (FeatureNotSupported) from this call while the SAME files
@@ -4803,8 +4841,7 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
         if (ngx_code != 0)
         {
-            Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
-                "process faulted during init; the feed stays off for this run", ngx_code);
+            LogNgxInitFault(ngx_code);
             goto fail;
         }
         Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
@@ -5019,8 +5056,7 @@ static bool InitSession12(reshade::api::effect_runtime *rt)
     DWORD ngx_code = 0;
     NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
     if (ngx_code != 0)
-        Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
-            "process faulted during init; the feed stays off for this run", ngx_code);
+        LogNgxInitFault(ngx_code);
     else
         Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))
@@ -5219,8 +5255,7 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
     DWORD ngx_code = 0;
     NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
     if (ngx_code != 0)
-        Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
-            "process faulted during init; the feed stays off for this run", ngx_code);
+        LogNgxInitFault(ngx_code);
     else
         Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))
@@ -5553,6 +5588,56 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 // rendered on an NVIDIA GPU, where DLSS could not run anyway.
 // ---------------------------------------------------------------------------
 
+// #121: the fences are imported when the session opens and the textures only when the first
+// frame builds, so a failed fence import ended the session without anyone learning whether the
+// MEMORY half of the interop works on that machine. Under Wine/Proton that is the one fact
+// deciding whether a CPU-synchronised fallback is possible at all, so ask it here, with a
+// throwaway 64x64 texture made exactly the way MakeSharedTexGl makes the real ones.
+static void ProbeGlMemoryImport()
+{
+    const char *wine = FeedGlWineVersion();
+    if (wine != nullptr)
+        Log("[feed] running under Wine %s: it advertises GL_EXT_semaphore_win32 / GL_EXT_memory_object_win32 "
+            "whatever the host's GL driver can do with a Win32 handle, so the extension gate cannot see this", wine);
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width            = 64;
+    rd.Height           = 64;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    ID3D12Resource *res = nullptr;
+    HANDLE shared = nullptr;
+    HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                  nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&res));
+    if (SUCCEEDED(hr)) hr = g.dev12->CreateSharedHandle(res, nullptr, GENERIC_ALL, nullptr, &shared);
+    if (FAILED(hr))
+        Log("[feed] memory-import probe: could not make the throwaway shared D3D12 texture (0x%08X), so it says nothing", hr);
+    else
+    {
+        const D3D12_RESOURCE_ALLOCATION_INFO ai = g.dev12->GetResourceAllocationInfo(0, 1, &rd);
+        GLuint tex = 0, mem = 0;
+        if (FeedGlImportImage(&g.gl, shared, ai.SizeInBytes, 64, 64, FeedGlFormat(rd.Format), &tex, &mem))
+        {
+            Log("[feed] memory-import probe: a D3D12 texture DOES import into GL here (GL_HANDLE_TYPE_D3D12_RESOURCE_EXT, "
+                "%llu bytes) -- only the fence half of the interop is missing", static_cast<unsigned long long>(ai.SizeInBytes));
+            g.gl.DeleteTextures(1, &tex);
+            g.gl.DeleteMemoryObjectsEXT(1, &mem);
+        }
+        else
+            Log("[feed] memory-import probe: a D3D12 texture does NOT import into GL either (failed at %s, GL error 0x%04X) "
+                "-- no part of the D3D12<->GL interop works on this driver", g.gl.import_stage, g.gl.import_err);
+    }
+    if (shared != nullptr) CloseHandle(shared);
+    if (res != nullptr) res->Release();
+}
+
 static bool InitSessionGl(reshade::api::effect_runtime *rt)
 {
     Breadcrumb("opening the D3D12 session (OpenGL transport)");
@@ -5621,8 +5706,7 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
     DWORD ngx_code = 0;
     NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
     if (ngx_code != 0)
-        Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
-            "process faulted during init; the feed stays off for this run", ngx_code);
+        LogNgxInitFault(ngx_code);
     else
         Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))
@@ -5692,13 +5776,20 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
     }
 
     g.gl_sem_in  = FeedGlImportFence(&g.gl, g.fence_in_handle);
+    const GLenum sem_in_err = g.gl.import_err;
     g.gl_sem_out = FeedGlImportFence(&g.gl, g.fence_out_handle);
     Log("[feed] D3D12 fence -> GL semaphore import (GL_HANDLE_TYPE_D3D12_FENCE_EXT): in=%s out=%s",
         g.gl_sem_in ? "OK" : "FAILED", g.gl_sem_out ? "OK" : "FAILED");
     if (g.gl_sem_in == 0 || g.gl_sem_out == 0)
     {
+        Log("[feed] the fence import failed at %s, GL error 0x%04X (in) / 0x%04X (out)",
+            g.gl.import_stage, sem_in_err, g.gl.import_err);
+        ProbeGlMemoryImport();
+        const char *wine = FeedGlWineVersion();
         ShutdownSession();
-        FeedDisable("cross-API fence import failed (see dlss5-feed.log)");
+        FeedDisable(wine != nullptr ?
+            "the GL driver under Wine/Proton cannot import a D3D12 fence (#121; see dlss5-feed.log)" :
+            "cross-API fence import failed (see dlss5-feed.log)");
         return false;
     }
 
@@ -5760,9 +5851,9 @@ static bool MakeSharedTexGl(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
                            static_cast<GLsizei>(w), static_cast<GLsizei>(h), glf,
                            &g.gl_tex[slot], &g.gl_memobj[slot]))
     {
-        Log("[feed] texture import FAILED: %s %ux%u %s (GL_HANDLE_TYPE_D3D12_RESOURCE_EXT, %llu bytes, GL error 0x%04X)",
+        Log("[feed] texture import FAILED: %s %ux%u %s (GL_HANDLE_TYPE_D3D12_RESOURCE_EXT, %llu bytes) at %s, GL error 0x%04X",
             kSlotName[slot], w, h, FormatName(fmt), static_cast<unsigned long long>(ai.SizeInBytes),
-            FeedGlDrainErrors(&g.gl));
+            g.gl.import_stage, g.gl.import_err);
         return false;
     }
     Log("[feed] %-6s %ux%u %s shared D3D12 (%llu bytes) -> imported as GL texture %u",
@@ -8523,6 +8614,23 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         else if (g.backbuffer_width != 0)
             ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
                                 g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
+        // The feeder does not run the neural pass; it can only shrink the WHOLE frame it hands
+        // over, and what comes back is stretched over the backbuffer. Shrinking the model's work
+        // alone, with the frame left at full size, is something only the consumer can do.
+        if (g_work_resolution_ui < 100 || g_cfg.work_resolution < 100)
+        {
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+            // Through "%s": TextColored takes a FORMAT string, and this text's "100% the" and
+            // "100% and" are an invalid conversion and a read of a double that was never passed.
+            // The CRT's invalid-parameter handler took the game down the moment the slider left
+            // 100 and this block was drawn (#123).
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s",
+                               "Below 100% the whole image is rendered smaller and stretched back, so it looks "
+                               "blurry. For a sharp image, leave this at 100% and feed a DLSS 5 neural rendering "
+                               "mod that can lower the resolution of the neural pass alone, such as OptiScaler "
+                               "DLSS-NR (WorkingScale under [DlssNr] in OptiScaler.ini).");
+            ImGui::PopTextWrapPos();
+        }
 
         // work_upscale=2 (DLSS reconstruction on synthetic jitter) is deliberately NOT on the
         // overlay: measured on Fable Anniversary it costs as much as 100% -- DLSS SR scales

@@ -80,10 +80,18 @@ add-on rather than two, and there is nothing for this project to add.
 
 | Your game | What to use |
 | --- | --- |
-| 64-bit, DirectX 9 / 11 / 12 | **renodx-dlss** on its own — you do not need DLSS5-Feeder |
+| 64-bit, DirectX 9 / 11 / 12 | **renodx-dlss** on its own — you do not need DLSS5-Feeder (but see below) |
 | **32-bit** (any graphics API) | **DLSS5-Feeder** |
 | **Vulkan** | **DLSS5-Feeder** |
 | **DirectX 9**, and you want the best handling of motion | **DLSS5-Feeder** |
+
+**The first row presumes the game calls DLSS itself.** renodx-dlss works by hooking the DLSS calls a
+game already makes; in a game that has no DLSS of its own there is nothing for it to hook, and it sits
+at `Auto: Waiting` (or `Present: Waiting`) with every counter at zero — `application frame 0`,
+`DLAA/SR 0`, `RR 0`, `Upscaled resource ID: 0x0` — while looking perfectly healthy in the log. That is
+not a fault; it is the add-on having nothing to work with. Monster Hunter: World is a measured example
+(#120). A 64-bit DirectX 9/11/12 game with no native DLSS needs this project to manufacture the frames
+for it, the same as a 32-bit one.
 
 renodx-dlss is not on GitHub. It comes from the RenoDX Discord, `#DLSS5` channel:
 <https://discord.com/invite/renodx>
@@ -246,9 +254,9 @@ a frame. Found during a Metro 2033 Redux run.
 
 ### 4. What this project actually ships, and antivirus warnings
 
-A release here contains exactly **two** files: `DLSS5-Feeder-<version>.zip` and
-`AUTOMATIC_INSTALLATION_AVAILABLE.txt`. Nothing else on the internet is a release of this
-project, whatever it is named.
+A release here contains exactly **three** files: `DLSS5-Feeder-<version>.zip`,
+`AUTOMATIC_INSTALLATION_AVAILABLE.txt` and `CAREFUL_FAKE_MALICIOUS_FEEDER.txt`. Nothing else on
+the internet is a release of this project, whatever it is named.
 
 Several third-party installers repackage this project (and ReShade, and the neural consumers)
 into their own downloads. That is fine and often convenient — but if Windows Defender flags a
@@ -1083,7 +1091,7 @@ if you prefer editing the file directly:
 | --- | --- | --- |
 | `enabled` | 1 | `0` disables everything, and from 0.13.0-beta.1 it means it: no frames are fed, no effect runtime is queried, no textures are created, and the Vulkan interop hook is not installed. Only the overlay page stays, so the **Enabled** checkbox can undo it. Two consequences worth knowing when using it as an A/B: a Vulkan game needs a **restart** with `enabled=1` (the hook can only be installed before the game's `vkCreateDevice`, which has already happened by the time you tick the box), and on a Vulkan game already running with `enabled=1` the hook stays installed until the game exits even after you untick it. Before 0.13.0-beta.1 this switch only stopped the per-frame feed, so "it still crashes with `enabled=0`" did not clear the add-on. |
 | `mode` | 2 | 0 inert · 1 transport test (no NGX; on 32-bit it copies only the left half, so a split screen proves the round trip) · 2 full DLSS path. |
-| `work_resolution` | 100 | **D3D11 only (64-bit and 32-bit).** 50–100% of each backbuffer axis for the private DLAA + Neural Rendering work textures. The Add-ons overlay slider applies once 400 ms after dragging stops. Other paths remain at 100%. A cost knob, not DLSS upscaling — below 100% the image is downsampled, processed, and expanded back (see the troubleshooting FAQ). |
+| `work_resolution` | 100 | **D3D11 only (64-bit and 32-bit).** 50–100% of each backbuffer axis for the private DLAA + Neural Rendering work textures. The Add-ons overlay slider applies once 400 ms after dragging stops. Other paths remain at 100%. A cost knob, not DLSS upscaling — below 100% the image is downsampled, processed, and expanded back (see the troubleshooting FAQ). **For a sharp image keep this at 100%** and lower the neural pass's own resolution in a consumer that supports it, such as OptiScaler DLSS-NR (`WorkingScale` under `[DlssNr]` in `OptiScaler.ini`): the feeder does not run the neural pass, so it can only shrink the whole frame. The overlay says so under the slider. |
 | `work_upscale` | 0 | **D3D11 only.** How the work-size output is expanded back over the backbuffer: `0` bilinear stretch · `1` AMD FSR 1 (EASU + RCAS), visibly crisper at 50–75% than the stretch · `2` **cfg-only experiment, not recommended:** DLSS Super Resolution on synthetic jitter — measured to cost as much as 100% and to shimmer (see the FAQ); on a 32-bit game the helper creates the SR feature (IPC v6: add-on and helper must be from the same build). Overlay checkbox "FSR 1 expand-back" toggles between 0 and 1. Better filters for `work_resolution`, not DLSS Quality: the result can never exceed the native frame. If the FSR shaders fail to compile the log says so and the spatial path stays bilinear. |
 | `work_sharpness` | 0.3 | RCAS strength for `work_upscale` 1 and 2, `0` (off) to `1` (sharpest). At 100% work resolution only the sharpening runs. Overlay slider "Sharpness". |
 | `jitter_sign` | 1 | **Diagnostic for `work_upscale=2`, parse-only.** `1` or `-1`: the sign of the grid shift handed to DLSS. On a static scene the right sign converges to a stable image within a second, the wrong one crawls. Here until the convention is confirmed in a game. |
@@ -1107,18 +1115,54 @@ if you prefer editing the file directly:
 | `buffer_home` | 0 | **Diagnostic, Vulkan (64-bit).** Route the copy home through a staging buffer instead of an image-to-image copy, for layouts a raw copy cannot express. |
 | `sync_home` | 0 | **Diagnostic, Vulkan and D3D11 (64-bit).** 1 = CPU-wait for the D3D12 result before copying it home. On D3D11 this replaces the cross-API GPU fence wait; on Vulkan it also flushes the copy home before returning. For isolating ordering problems only; it serialises the frame and costs frame time by design. |
 | `async_home` | 1 | **32-bit games only.** 1 = pipelined handoff: each frame carries the DLSS output of the frame *before* it, so the game never waits for the helper process inside a frame — this is what lifts the ~35 fps ceiling of the original same-frame contract (issue #15). Costs one frame of latency on the DLSS output, which the temporal history hides. 0 = the original same-frame behaviour. Also on the overlay as "Pipelined handoff". |
-| `host_window` | 0 | **32-bit games only.** 0 keeps the helper's window behind the game, off the taskbar, and lets the overlay's "Show the DLSS 5 panel in-game" button cast its tuning panel into the game window; 1 gives the helper its own visible window instead (press Home there); 2 starts it with no window at all (`--hide`: no in-game panel, no host window, the feed itself unaffected). Read when the helper is started. **At 0 the window is still created, shown and presented on every evaluate** — only its z-order and window style differ — so 0 vs 1 is not an A/B for "does the helper's presenting cost anything"; 2 is. **Exclusive fullscreen:** at 0, if the game's swapchain is exclusive fullscreen when the helper starts, the add-on passes `--hide` by itself and says so in the log. Three 32-bit games froze the instant the helper's window appeared under their fullscreen swapchain (#109, #99, #77), and the desktop compositor cannot draw the cast panel over exclusive fullscreen anyway. Run the game borderless to get the panel. |
+| `host_window` | 0 | **32-bit games only.** 0 keeps the helper's window behind the game, off the taskbar, and lets the overlay's "Show the DLSS 5 panel in-game" button cast its tuning panel into the game window; 1 gives the helper its own visible window instead (press Home there); 2 starts it with no window at all (`--hide`: no in-game panel, no host window, the feed itself unaffected). Read when the helper is started. **At 0 the window is still created, shown and presented on every evaluate** — only its z-order and window style differ — so 0 vs 1 is not an A/B for "does the helper's presenting cost anything"; 2 is. **Exclusive fullscreen:** at 0, if the game's swapchain is exclusive fullscreen when the helper starts, the add-on passes `--hide` by itself and says so in the log. Three 32-bit games froze the instant the helper's window appeared under their fullscreen swapchain (#109, #99, #77), and the desktop compositor cannot draw the cast panel over exclusive fullscreen anyway. Run the game borderless to get the panel. **3** is 0 without that rule: the window stays behind the game and is never turned into `--hide`. It is for wrappers whose swapchain reports fullscreen over what is really a borderless window -- dgVoodoo does this whatever its own `FullScreenMode` says (#118) -- and the overlay offers it as a checkbox when it applies. Do not use 3 on a game that is genuinely exclusive fullscreen. |
 | `host_gpu_priority` | 0 | **32-bit games only.** `1` asks the GPU scheduler to favour the helper process (`D3DKMTSetProcessSchedulingPriorityClass`, realtime class), passed to it as `--gpu-priority` when it starts. Worth trying only for periodic multi-second stalls that persist with everything else at defaults — reported on GTA IV under DXVK, where the reporter had already proved it with Process Lasso. **Off by default on purpose:** realtime GPU priority can starve the very game it is meant to help, and the call needs privilege that may not be granted. The helper logs which of the two happened on every start. |
 | `cast_key` | 0 | **32-bit games only.** Virtual-key code that shows/hides the cast DLSS 5 panel in-game; 0 = none. Set it from the overlay page with "Set key" rather than by hand. |
+| `cast_mods` | 0 | **32-bit games only.** Modifiers that must be held with `cast_key`: 1 = Alt, 2 = Ctrl, 4 = Shift, added together. Hold them while you press the key under "Set key" and they are saved with it. **The match is exact**, so the default 0 means the bare key and `Alt+Shift+<key>` no longer toggles the panel as well — which is what lets another tool own that combination (#118). Before 1.16.0-beta.6 every combination containing the key fired. |
 | `cast_scale` | 100 | **32-bit games only.** Size of the cast panel, 25..300 % of the largest size that fits the game window (above 100 % it may run past the window's edges). Also on the overlay as "Panel size". |
 | `cast_mode` | 0 | **32-bit games only.** How the cast panel is drawn: 0 = a desktop-compositor thumbnail of the helper's window (windowed / borderless games, any API); 1 = a shared copy of the helper's frame drawn by the game's ReShade or blitted onto its backbuffer (works in exclusive fullscreen; D3D11, OpenGL and Vulkan). The two overlay buttons set it. |
 | `cast_anchor` | 1 | **32-bit games only.** Which corner of the game window the cast panel sits in: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right. Before 0.14.0-beta.4 it was always the top-right and there was no way to move it. Also on the overlay as "Panel corner". |
+
+**For neural consumers that draw their own UI in the helper window.** The cast draws the helper's
+window into the game, and what reaches the helper from it is ordinary posted `WM_*` input that says
+nothing about where it came from -- so a consumer with its own window (OptiScaler's menu is one, not
+a ReShade page) could not tell whether it was on screen, and had to tail `dlss5-feed.log` to find out
+(#118). Since 1.16.0-beta.6 the helper posts a registered window message to its own window on every
+change:
+
+```c
+UINT m = RegisterWindowMessageW(L"DLSS5_FEED_CAST");   // wParam: 1 = the panel is on screen, 0 = it is not
+                                                       // lParam: the scale it is drawn at, x1000 (0 when hidden)
+```
+
+Subclass the helper window or run a message hook to see it; nothing outside the helper process is
+told. `dlss5-feed-host.log` carries the same state in words, with the destination rectangle in the
+game's client pixels and the corner it is anchored to.
+
+**The mouse wheel in a game that hides its mouse from ReShade**, since 1.16.0-beta.7 (Castlevania: Lords of Shadow 2 is
+the measured one, #118). Such a game keeps the wheel from ReShade as well as the pointer, and the
+add-on cannot register a raw-input sink of its own: `RegisterRawInputDevices` is per process, so it
+would replace the game's registration and break the game's own mouse. The helper has no input to
+lose, so the sink lives there. While the cursor is over the panel *and* the add-on is in that
+real-cursor mode, it posts `RegisterWindowMessageW(L"DLSS5_FEED_CAST_WHEEL")` to the helper window
+(`wParam` 1 = forward the wheel, 0 = stop); the helper then turns raw wheel input into the same
+`WM_MOUSEWHEEL` the add-on forwards everywhere else, in whole notches. In every other game the sink
+is never registered. **If something else in the helper process has already registered raw mouse
+input** -- a consumer shipping its own wheel workaround -- the helper leaves that registration alone
+and says so in `dlss5-feed-host.log`; it does not take the mouse away from it.
 
 Two more live in a **different file** -- `[DLSS5Host] WindowWidth` and `WindowHeight` in
 `host64\ReShade.ini`, because the helper's own ReShade reads them when it starts. They size the
 helper window, its swapchain and the cast panel texture; `WindowHeight=0` means "fill the work area".
 The overlay's **Host window width / height** sliders write them and apply them to the running helper
 at once, so there is normally no reason to edit them by hand.
+
+A third key there is a diagnostic: `[DLSS5Host] Dred=1` arms D3D12's Device Removed Extended Data in the
+helper before it creates its device. If the helper's device is then removed (`DEVICE_HUNG` in
+`host64\dlss5-feed-host.log`), the log names the queue and the operation that never finished, which
+is what separates the feeder's own work from the neural consumer's pass (#119). It is off by default
+because on some runtimes arming DRED makes `D3D12CreateDevice` itself fail; if the helper stops
+starting with it on, set it back to 0.
 
 In `DLSS5_Feed.fx`'s own UI (settings that only make sense per-shader, not per-session):
 
@@ -1150,6 +1194,16 @@ cannot be shared across adapters, so the import fails and the feed stops with th
 the game and `dlss5-feed-host64.exe` onto the same GPU (Windows Settings > Display > Graphics,
 or the NVIDIA control panel's per-program preferred GPU); a reporter fixed Racedriver GRID
 exactly this way (#100).
+
+**OpenGL games under Proton / Wine (`fence import failed` on a single-GPU machine).** Not the case
+above, and not fixable by moving anything to another GPU. Wine advertises `GL_EXT_semaphore_win32`
+and `GL_EXT_memory_object_win32`, so the extension gate passes, but the Linux GL driver underneath
+only implements the file-descriptor forms of those extensions and cannot import a D3D12 fence
+handle; `glImportSemaphoreWin32HandleEXT` fails and the feed stops (#121). The D3D11, D3D12 and
+Vulkan transports are unaffected on the same machine. Since 1.16.0-beta.7 the log
+names this case, prints the GL error, and probes whether a D3D12 *texture* imports
+(`memory-import probe: ...`) -- that one line decides whether a slower CPU-synchronised fallback is
+possible at all there, so please include it in a report.
 
 | File | Contents |
 | --- | --- |
@@ -1339,7 +1393,10 @@ Common cases:
   rendering run on the smaller image, and the result is expanded back — that is why 50–66% looks
   blurry rather than like DLSS Quality. From 0.12.0 the expand-back can be AMD FSR 1 instead of a
   bilinear stretch (`work_upscale=1`, or the "FSR 1 expand-back" checkbox under the slider): much
-  crisper at 50–75%, still bounded by the native frame. Leave the DLSS 5 add-on's
+  crisper at 50–75%, still bounded by the native frame. If what you want is a cheaper neural pass
+  on a **sharp** frame, keep `work_resolution=100` and use a consumer that can lower the neural
+  pass's resolution by itself, such as OptiScaler DLSS-NR (`[DlssNr] WorkingScale`): the feeder
+  does not run that pass and can only shrink the whole frame. Leave the DLSS 5 add-on's
   `NREnableUpscaling` at 0: with a 1:1 contract it cannot engage, and on v4.6 it parks neural
   rendering for the run. For games that ship DLSS already, use the game's own DLSS (or OptiScaler)
   instead of this feeder.

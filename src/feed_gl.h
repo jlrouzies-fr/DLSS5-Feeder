@@ -208,8 +208,26 @@ struct FeedGl
     char version[64];       // GL_VERSION
     char diag[512];         // how the extension query behaved (see FeedGlSurveyExtensions)
 
+    // Why the last FeedGlImportImage / FeedGlImportFence failed. Both drain the error queue
+    // to find out, so a caller that drained it AGAIN for its log line always printed 0x0000.
+    GLenum      import_err;     // 0 = the call raised nothing (an object name came back 0)
+    const char *import_stage;   // the GL entry point that failed; never null after a failure
+
     bool ok;
 };
+
+// Wine's version string when this process runs under Wine/Proton, nullptr on Windows. It
+// matters here because Wine advertises the _win32 external-object extensions whatever the
+// host's GL driver can do with a Win32 handle (#121), so a failed import means something
+// different there than it does on Windows.
+static const char *FeedGlWineVersion()
+{
+    typedef const char *(__cdecl *PFN_wine_get_version_)(void);
+    const HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    const PFN_wine_get_version_ fn = ntdll == nullptr ? nullptr :
+        reinterpret_cast<PFN_wine_get_version_>(GetProcAddress(ntdll, "wine_get_version"));
+    return fn != nullptr ? fn() : nullptr;
+}
 
 // ---------------------------------------------------------------------------
 // Loading
@@ -463,17 +481,21 @@ static bool FeedGlImportImage(FeedGl *gl, HANDLE d3d12_res_handle, uint64_t size
 {
     *out_tex = 0;
     *out_mem = 0;
+    gl->import_err   = GL_NO_ERROR;
+    gl->import_stage = "the GL loader (interop not available)";
     if (!gl->ok) return false;
     FeedGlDrainErrors(gl);
 
     GLuint mem = 0;
     gl->CreateMemoryObjectsEXT(1, &mem);
-    if (mem == 0) return false;
+    gl->import_stage = "glCreateMemoryObjectsEXT";
+    if (mem == 0) { gl->import_err = FeedGlDrainErrors(gl); return false; }
 
     const GLint dedicated = GL_TRUE;
     gl->MemoryObjectParameterivEXT(mem, GL_DEDICATED_MEMORY_OBJECT_EXT, &dedicated);
     gl->ImportMemoryWin32HandleEXT(mem, size, GL_HANDLE_TYPE_D3D12_RESOURCE_EXT, d3d12_res_handle);
-    if (FeedGlDrainErrors(gl) != 0)
+    gl->import_stage = "glImportMemoryWin32HandleEXT(D3D12_RESOURCE)";
+    if ((gl->import_err = FeedGlDrainErrors(gl)) != 0)
     {
         gl->DeleteMemoryObjectsEXT(1, &mem);
         return false;
@@ -481,7 +503,8 @@ static bool FeedGlImportImage(FeedGl *gl, HANDLE d3d12_res_handle, uint64_t size
 
     GLuint tex = 0;
     gl->GenTextures(1, &tex);
-    if (tex == 0) { gl->DeleteMemoryObjectsEXT(1, &mem); return false; }
+    gl->import_stage = "glGenTextures";
+    if (tex == 0) { gl->import_err = FeedGlDrainErrors(gl); gl->DeleteMemoryObjectsEXT(1, &mem); return false; }
 
     if (gl->TextureStorageMem2DEXT != nullptr)
     {
@@ -501,7 +524,8 @@ static bool FeedGlImportImage(FeedGl *gl, HANDLE d3d12_res_handle, uint64_t size
         gl->TexStorageMem2DEXT(GL_TEXTURE_2D, 1, internal_fmt, w, h, mem, 0);
         gl->BindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prev));
     }
-    if (FeedGlDrainErrors(gl) != 0)
+    gl->import_stage = "glTexStorageMem2DEXT";
+    if ((gl->import_err = FeedGlDrainErrors(gl)) != 0)
     {
         gl->DeleteTextures(1, &tex);
         gl->DeleteMemoryObjectsEXT(1, &mem);
@@ -518,13 +542,17 @@ static bool FeedGlImportImage(FeedGl *gl, HANDLE d3d12_res_handle, uint64_t size
 // FeedGlSetSemaphoreValue before the signal or the wait.
 static GLuint FeedGlImportFence(FeedGl *gl, HANDLE d3d12_fence_handle)
 {
+    gl->import_err   = GL_NO_ERROR;
+    gl->import_stage = "the GL loader (interop not available)";
     if (!gl->ok) return 0;
     FeedGlDrainErrors(gl);
     GLuint sem = 0;
     gl->GenSemaphoresEXT(1, &sem);
-    if (sem == 0) return 0;
+    gl->import_stage = "glGenSemaphoresEXT";
+    if (sem == 0) { gl->import_err = FeedGlDrainErrors(gl); return 0; }
     gl->ImportSemaphoreWin32HandleEXT(sem, GL_HANDLE_TYPE_D3D12_FENCE_EXT, d3d12_fence_handle);
-    if (FeedGlDrainErrors(gl) != 0)
+    gl->import_stage = "glImportSemaphoreWin32HandleEXT(D3D12_FENCE)";
+    if ((gl->import_err = FeedGlDrainErrors(gl)) != 0)
     {
         gl->DeleteSemaphoresEXT(1, &sem);
         return 0;

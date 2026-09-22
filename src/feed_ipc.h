@@ -70,7 +70,16 @@
 #include <cstdint>
 
 #define FEED_IPC_MAGIC   0x35534C44u  // 'DLS5'
-#define FEED_IPC_VERSION 9u
+#define FEED_IPC_VERSION 10u
+
+// Version 10 added the tag 'C' with a FeedCastMsg payload: "the cast panel is now shown at
+// this rectangle in the game, at this scale" (and again with shown=0 when it goes away).
+// The host is otherwise the last to know it is on screen: the cast draws the host's own
+// window into the game, and the input the game forwards arrives as ordinary posted WM_*
+// messages that say nothing about where they came from. A neural consumer that draws its
+// own UI in that window -- OptiScaler's menu is its own window, not a ReShade page -- had
+// to tail dlss5-feed.log to find out (issue #118). The host now logs it and republishes it
+// as a registered window message, so a consumer in the host process can see it directly.
 
 // Version 9 added the tag 'O', with no payload: "open ReShade's overlay in your own window".
 // The host does that for itself once at startup, and until v9 nothing could ask it again, so
@@ -194,6 +203,14 @@ struct FeedBuildAck     // host -> game
 struct FeedWindowMsg    // game -> host ('W'), v8+: resize the host window, live
 {
     uint32_t width, height;   // client-area pixels; height 0 = auto (fill the work area)
+};
+
+struct FeedCastMsg      // game -> host ('C'), v10+: the cast panel's state, on every change
+{
+    uint32_t shown;            // 1 = on screen in the game; 0 = hidden (the rect is then stale)
+    int32_t  left, top, right, bottom;   // where it is drawn, in the GAME window's client pixels
+    float    scale;            // host client pixels -> game pixels; divide by it to map back
+    uint32_t anchor;           // cast_anchor: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right
 };
 
 struct FeedFrameMsg     // game -> host, per frame

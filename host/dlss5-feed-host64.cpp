@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <share.h>
 #include <vector>
 #include <string>
 
@@ -75,6 +76,8 @@ static int  g_win_h = 1080;
 // default) -- pressed once for the user a few frames after the window is up, so the
 // neural consumer's panel is already open when they look at this window. Posted through
 // the message queue, which is where ReShade's WH_GETMESSAGE input hook reads keys.
+// 0 means the user unbound it ([INPUT] KeyOverlay=0,0,0,0, issue #118): nothing is posted
+// then, and neither the caption nor the banner offers a key that does nothing.
 static UINT g_overlay_key = VK_HOME;
 // Whether ReShade actually hooked D3D12CreateDevice in time to proxy this window's device
 // (see InitDisguise). False means there is no ReShade runtime here at all, so the overlay
@@ -83,7 +86,37 @@ static bool g_reshade_hooked = false;
 static int  g_pump_count  = 0;
 // The pump at which to post the overlay key, and again three pumps later. Startup opens the
 // overlay once at 90; tag 'O' (v9) re-arms it so the add-on's button can bring it back.
+// kOverlayNever skips the startup press only -- 'O' still re-arms it (see main, issue #118).
+static const int kOverlayNever = -1000000;
 static int  g_overlay_key_at = 90;
+
+// The cast panel: this window, drawn into the game by the 32-bit add-on (IPC v10, tag 'C').
+// Until v10 nothing here knew it was on screen -- the input it forwards arrives as ordinary
+// posted WM_* messages -- and a neural consumer that draws its own UI in this window had to
+// tail dlss5-feed.log to find out (issue #118). Kept here, logged on every change, and
+// republished as the registered window message below so a consumer can watch for it:
+//
+//     UINT m = RegisterWindowMessageW(L"DLSS5_FEED_CAST");
+//     ... wParam = 1 while the panel is on screen, 0 when it is not
+//     ... lParam = the scale it is drawn at, times 1000 (0 when hidden)
+//
+// It is posted to this window, so a consumer that subclasses it or runs a message hook sees
+// it; nothing outside this process is told.
+static bool  g_cast_on      = false;
+static float g_cast_scale   = 0.0f;
+static UINT  g_cast_msg     = 0;   // RegisterWindowMessage, resolved on the first 'C'
+
+// The wheel for a cast panel in a game that keeps its mouse from ReShade (#118). The add-on
+// cannot register a raw-input sink -- registration is per process, so it would replace the
+// game's own -- but this process has no input of its own to lose. The add-on posts
+// DLSS5_FEED_CAST_WHEEL (wParam 1/0) while the cursor is over the panel AND it cannot see the
+// wheel itself; only then is a raw notch turned into the WM_MOUSEWHEEL it would have forwarded.
+// Never otherwise: in every other game the add-on forwards the wheel, and both would scroll twice.
+static const UINT g_wheel_msg = RegisterWindowMessageW(L"DLSS5_FEED_CAST_WHEEL");
+static bool   g_wheel_wanted     = false;   // the add-on's last word
+static bool   g_wheel_registered = false;   // the sink exists (it is never taken down: it costs nothing idle)
+static bool   g_wheel_refused    = false;   // something else in this process owns raw mouse input
+static LPARAM g_wheel_at         = 0;       // the last forwarded WM_MOUSEMOVE: where the panel's cursor is
 
 // Present accounting (issue #15). The neural consumer wants one Present per evaluate; when
 // DWM holds every back buffer the per-evaluate Present cannot happen on the spot, and the
@@ -263,6 +296,15 @@ static void PrepareHostOverlay()
     GetPrivateProfileStringA("INPUT", "KeyOverlay", "36", buf, sizeof(buf), ini);
     const int k = atoi(buf);   // "36,0,0,0" -> 36; modifiers are ignored, ReShade's default has none
     if (k > 0 && k < 256) g_overlay_key = static_cast<UINT>(k);
+    // "0,0,0,0" is ReShade's way of writing an unbound key, and atoi gives 0 for it. The old
+    // guard read that as "unparsable, keep the default" and posted Home anyway -- harmless
+    // while ReShade ignores it, but the opposite of what the ini says (issue #118). Tell the
+    // two apart by the first character: a leading '0' is a real, deliberate zero.
+    else if (k == 0 && buf[0] == '0')
+    {
+        g_overlay_key = 0;
+        Log("[host] [INPUT] KeyOverlay=%s: ReShade's overlay key is unbound here, so none is posted", buf);
+    }
 
     RefitHostOverlay(ini, false);
 }
@@ -506,6 +548,10 @@ static void DetectStaleD3DCompiler()
     Log("[host] ###############################################################");
 }
 
+// Alex's Toolkit beside this exe. Like the other two consumers it owns a ReShade overlay
+// page, which is the one thing the overlay key is for (issue #118).
+static bool g_toolkit_present = false;
+
 static void DetectToolkitAddon()
 {
     char dir[MAX_PATH], path[MAX_PATH];
@@ -520,6 +566,7 @@ static void DetectToolkitAddon()
         Log("[host] Alex's Toolkit: not present -- DLSS 5 runs a single neural pass");
         return;
     }
+    g_toolkit_present = true;
     char ver[64] = "?";
     const DWORD size = GetFileSize(f, nullptr);
     DWORD got = 0;
@@ -981,6 +1028,132 @@ static void CloseListGuarded()
     __try { h.list->Close(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// Device Removed Extended Data, opt-in: [DLSS5Host] Dred=1 in this folder's ReShade.ini.
+// A hang on this device is this file's work, the neural consumer's inline pass recorded
+// into the same list, or NGX's own -- and "DEVICE_HUNG" alone cannot say which (#119: three
+// consumer versions, the same removal about five seconds after feature 18 first evaluated,
+// and nothing in the log to tell them apart). Off by default because arming DRED before
+// the create is the one thing the add-on does that this helper never did, and on some
+// runtimes it is what makes D3D12CreateDevice fail (#47).
+static bool g_dred_armed = false;
+
+typedef HRESULT (WINAPI *PFN_D3D12GetDebugInterface_)(REFIID, void **);
+
+static void HostEnableDred(const char *ini)
+{
+    if (GetPrivateProfileIntA("DLSS5Host", "Dred", 0, ini) == 0) return;
+    HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+    if (d3d12 == nullptr) d3d12 = LoadLibraryW(L"d3d12.dll");
+    if (d3d12 == nullptr) return;
+    auto get_debug = reinterpret_cast<PFN_D3D12GetDebugInterface_>(GetProcAddress(d3d12, "D3D12GetDebugInterface"));
+    if (get_debug == nullptr) { Log("[host] DRED: no D3D12GetDebugInterface"); return; }
+    ID3D12DeviceRemovedExtendedDataSettings *dred = nullptr;
+    const HRESULT hr = get_debug(__uuidof(ID3D12DeviceRemovedExtendedDataSettings), reinterpret_cast<void **>(&dred));
+    if (FAILED(hr) || dred == nullptr) { Log("[host] DRED: settings unavailable 0x%08X", hr); return; }
+    dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    dred->Release();
+    g_dred_armed = true;
+    Log("[host] DRED: auto-breadcrumbs and page-fault reporting enabled ([DLSS5Host] Dred=1). If "
+        "D3D12CreateDevice fails below, set Dred=0 again");
+}
+
+// The name DRED reports for the list every frame is recorded into. That list is handed to
+// NVSDK_NGX_D3D12_EvaluateFeature, so NGX's DLSS dispatches AND a neural consumer's inline pass
+// are recorded into it too: a hang inside it is a hang in one of the three, and only the ops
+// around the stuck one say which. Until #119 the helper named no list at all and labelled every
+// unnamed one "not this helper's", which sent the reading of a real log the wrong way.
+static const wchar_t *const kFrameListName = L"dlss5-feed-host frame list (the helper's copies + NGX's DLSS + a consumer's inline pass)";
+
+static void HostDumpDred()
+{
+    if (!g_dred_armed || h.dev == nullptr) return;
+    ID3D12DeviceRemovedExtendedData *dred = nullptr;
+    HRESULT hr = h.dev->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData), reinterpret_cast<void **>(&dred));
+    if (FAILED(hr) || dred == nullptr) { Log("[host] DRED: QueryInterface failed 0x%08X", hr); return; }
+
+    Log("[host] ===== DRED: 'feed' is the queue the evaluate (and a neural consumer's inline pass) runs on; "
+        "'pump' only paints and presents this window =====");
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc = {};
+    hr = dred->GetAutoBreadcrumbsOutput(&bc);
+    if (SUCCEEDED(hr))
+    {
+        int node_index = 0;
+        for (const D3D12_AUTO_BREADCRUMB_NODE *node = bc.pHeadAutoBreadcrumbNode;
+             node != nullptr && node_index < 8; node = node->pNext, ++node_index)
+        {
+            const UINT32 last = node->pLastBreadcrumbValue != nullptr ? *node->pLastBreadcrumbValue : 0;
+            // A list that ran to its end is not the one that hung; say so rather than print it.
+            const bool finished = last >= node->BreadcrumbCount;
+            Log("[host] DRED node %d: queue='%ls' list='%ls' executed %u of %u ops%s", node_index,
+                node->pCommandQueueDebugNameW ? node->pCommandQueueDebugNameW : L"(unnamed)",
+                node->pCommandListDebugNameW ? node->pCommandListDebugNameW : L"(unnamed: a list this helper did not create -- NGX's own, the consumer's own, or DXGI's)",
+                last, node->BreadcrumbCount, finished ? " (finished)" : "");
+            if (finished || node->pCommandHistory == nullptr) continue;
+            // The list's shape: a frame that hangs and one that does not can be told apart by it.
+            {
+                UINT32 n_dispatch = 0, n_barrier = 0, n_copy = 0, n_other = 0;
+                for (UINT32 i = 0; i < node->BreadcrumbCount; ++i)
+                {
+                    const D3D12_AUTO_BREADCRUMB_OP op = node->pCommandHistory[i];
+                    if (op == D3D12_AUTO_BREADCRUMB_OP_DISPATCH) ++n_dispatch;
+                    else if (op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER) ++n_barrier;
+                    else if (op == D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE || op == D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION ||
+                             op == D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION) ++n_copy;
+                    else ++n_other;
+                }
+                Log("[host] DRED   the list holds %u Dispatch, %u ResourceBarrier, %u copy and %u other ops",
+                    n_dispatch, n_barrier, n_copy, n_other);
+            }
+            // The op at 'last' is the first the GPU had not completed. A ResourceBarrier there is
+            // not itself GPU work that can hang: the driver batches it with what follows, so the
+            // ops AFTER it are printed too -- the first Dispatch or copy among them is the suspect.
+            // The common ones by name, the rest by their D3D12_AUTO_BREADCRUMB_OP number (d3d12.h).
+            for (UINT32 i = last > 12 ? last - 12 : 0; i < node->BreadcrumbCount && i <= last + 8; ++i)
+            {
+                const D3D12_AUTO_BREADCRUMB_OP op = node->pCommandHistory[i];
+                const char *name = op == D3D12_AUTO_BREADCRUMB_OP_DISPATCH          ? "Dispatch"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT   ? "ExecuteIndirect"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE      ? "CopyResource"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION ? "CopyTextureRegion"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION  ? "CopyBufferRegion"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER   ? "ResourceBarrier"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_RESOLVEQUERYDATA  ? "ResolveQueryData"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED     ? "DrawInstanced"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_PRESENT           ? "Present"
+                                                                                    : "op";
+                Log("[host] DRED   op[%u] %s (%d)%s", i, name, static_cast<int>(op),
+                    i == last ? " <== had not finished" : "");
+            }
+        }
+        if (bc.pHeadAutoBreadcrumbNode == nullptr) Log("[host] DRED: no breadcrumb nodes");
+    }
+    else Log("[host] DRED: GetAutoBreadcrumbsOutput failed 0x%08X", hr);
+
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf = {};
+    hr = dred->GetPageFaultAllocationOutput(&pf);
+    if (SUCCEEDED(hr))
+    {
+        if (pf.PageFaultVA == 0)
+            Log("[host] DRED: no page fault recorded (GPU work that never finished, not an invalid memory access)");
+        else
+        {
+            Log("[host] DRED page fault VA: 0x%llX", static_cast<unsigned long long>(pf.PageFaultVA));
+            int n = 0;
+            for (const D3D12_DRED_ALLOCATION_NODE *a = pf.pHeadExistingAllocationNode; a != nullptr && n < 8; a = a->pNext, ++n)
+                Log("[host] DRED   existing alloc: type %d '%ls'", static_cast<int>(a->AllocationType),
+                    a->ObjectNameW ? a->ObjectNameW : L"(unnamed)");
+            n = 0;
+            for (const D3D12_DRED_ALLOCATION_NODE *a = pf.pHeadRecentFreedAllocationNode; a != nullptr && n < 8; a = a->pNext, ++n)
+                Log("[host] DRED   RECENTLY FREED: type %d '%ls'", static_cast<int>(a->AllocationType),
+                    a->ObjectNameW ? a->ObjectNameW : L"(unnamed)");
+        }
+    }
+    else Log("[host] DRED: GetPageFaultAllocationOutput failed 0x%08X", hr);
+    dred->Release();
+    Log("[host] ===== DRED end =====");
+}
+
 // A removed D3D12 device never comes back: every later OpenSharedHandle fails with
 // DXGI_ERROR_DEVICE_REMOVED, every create stalls, and the window (a swapchain on that
 // device) stops answering. The add-on already respawns a host that exits, so the right
@@ -993,8 +1166,17 @@ static bool DeviceRemoved(const char *where)
     const HRESULT reason = h.dev->GetDeviceRemovedReason();
     if (SUCCEEDED(reason)) return false;
     if (!g_device_removed)
+    {
         Log("[host] the D3D12 device was removed (0x%08X%s) during %s; exiting so the game can respawn a fresh host",
             reason, reason == DXGI_ERROR_DEVICE_HUNG ? " DEVICE_HUNG" : reason == DXGI_ERROR_DEVICE_RESET ? " DEVICE_RESET" : "", where);
+        if (reason == DXGI_ERROR_DEVICE_HUNG)
+            Log("[host] DEVICE_HUNG is GPU work that never finished. If this process's ReShade.log shows the neural "
+                "consumer evaluating feature 18 shortly before, turn neural rendering off in the consumer (or take "
+                "the consumer's .addon64 out of host64\\) and run again: a feed that survives that way puts the hang "
+                "in the consumer's pass or the NVIDIA runtime under it, not in this helper%s",
+                g_dred_armed ? "" : ". [DLSS5Host] Dred=1 in host64\\ReShade.ini makes the next removal name the queue and the op");
+        HostDumpDred();
+    }
     g_device_removed = true;
     return true;
 }
@@ -1007,7 +1189,10 @@ static void AbortCommands()   // never execute a list NGX crashed in
     h.list = nullptr;
     if (SUCCEEDED(h.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, h.alloc[h.frame_slot], nullptr,
                                            __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&h.list))))
+    {
+        h.list->SetName(kFrameListName);
         h.list->Close();
+    }
 }
 
 // Deep Fried Chicken interop marker (feed_dfc.h): the complete tuple must be on the
@@ -1052,8 +1237,9 @@ static void CaptureReShadeLogStart()
     char path[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, path, MAX_PATH);
     if (char *slash = strrchr(path, '\\')) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "ReShade.log");
-    FILE *f = nullptr;
-    if (fopen_s(&f, path, "rb") == 0 && f != nullptr)
+    // _fsopen with _SH_DENYNO, not fopen_s: see LogNeuralConsumerOutcome.
+    FILE *f = _fsopen(path, "rb", _SH_DENYNO);
+    if (f != nullptr)
     {
         _fseeki64(f, 0, SEEK_END);
         g_reshade_log_start = _ftelli64(f);
@@ -1070,10 +1256,17 @@ static void LogNeuralConsumerOutcome()
     GetModuleFileNameA(nullptr, path, MAX_PATH);
     if (char *slash = strrchr(path, '\\')) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "ReShade.log");
 
-    FILE *f = nullptr;
-    if (fopen_s(&f, path, "rb") != 0 || f == nullptr)
+    // fopen_s opens with _SH_SECURE, which for a read asks that nobody else WRITE the file --
+    // and ReShade holds its log open for writing for the life of the process, so that open
+    // failed with a sharing violation every time ReShade was really there. Every real install
+    // therefore got "consumer did not intercept (ReShade.log is unavailable)" 300 frames in,
+    // over a consumer that had created and evaluated feature 18 (#119). And "could not read
+    // the log" is not "did not intercept": say only what is known.
+    FILE *f = _fsopen(path, "rb", _SH_DENYNO);
+    if (f == nullptr)
     {
-        Log("[host] neural consumer outcome: consumer did not intercept (ReShade.log is unavailable)");
+        Log("[host] neural consumer outcome: unknown (this process's ReShade.log could not be opened, error %d; "
+            "read host64\\ReShade.log for feature 18 yourself)", errno);
         return;
     }
     _fseeki64(f, 0, SEEK_END);
@@ -1219,9 +1412,90 @@ static bool HostResize(int new_w, int new_h, const char *why);   // defined with
 static bool g_sizing;                    // inside a border drag: WM_SIZE is coalesced until it ends
 static int  g_sizing_w, g_sizing_h;
 
+// Registered from the window's own thread, on the add-on's first request. A registration that
+// is already there belongs to something else loaded into this process (a consumer's own wheel
+// workaround is the known case): replacing it would silence that, so it is left alone.
+static void WheelSinkRegister(HWND w)
+{
+    if (g_wheel_registered || g_wheel_refused) return;
+    RAWINPUTDEVICE have[8] = {};
+    UINT n = 8;
+    const UINT got = GetRegisteredRawInputDevices(have, &n, sizeof(RAWINPUTDEVICE));
+    for (UINT i = 0; got != static_cast<UINT>(-1) && i < got; ++i)
+        if (have[i].usUsagePage == 0x01 && have[i].usUsage == 0x02 && have[i].hwndTarget != w)
+        {
+            g_wheel_refused = true;
+            Log("[host] cast wheel: raw mouse input is already registered in this process (target window %p, "
+                "flags 0x%lX) -- leaving it to whoever did that; the wheel is theirs to forward",
+                (void *)have[i].hwndTarget, static_cast<unsigned long>(have[i].dwFlags));
+            return;
+        }
+    RAWINPUTDEVICE dev = {};
+    dev.usUsagePage = 0x01;   // generic desktop
+    dev.usUsage     = 0x02;   // mouse
+    dev.dwFlags     = RIDEV_INPUTSINK;   // delivered while the GAME has the focus, which is always
+    dev.hwndTarget  = w;
+    if (RegisterRawInputDevices(&dev, 1, sizeof(dev)))
+    {
+        g_wheel_registered = true;
+        Log("[host] cast wheel: raw-input sink registered; the wheel is forwarded to this window while the "
+            "add-on reports the cursor over the panel in a game that hides its mouse from ReShade");
+    }
+    else
+    {
+        g_wheel_refused = true;
+        Log("[host] cast wheel: RegisterRawInputDevices failed (%lu); the panel stays without a wheel in this game",
+            GetLastError());
+    }
+}
+
 static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 {
     if (m == WM_CLOSE) { ShowWindow(w, SW_HIDE); return 0; }   // closing only hides; the feed lives on
+    if (m == WM_MOUSEMOVE) g_wheel_at = lp;   // falls through: only remembered
+    if (g_wheel_msg != 0 && m == g_wheel_msg)
+    {
+        g_wheel_wanted = wp != 0;
+        if (g_wheel_wanted) WheelSinkRegister(w);
+        return 0;
+    }
+    if (m == WM_INPUT)
+    {
+        // Turned into a message on the spot, not counted for later: a notch made while nobody
+        // wants it must be dropped, or it arrives in a burst the next time the panel opens.
+        RAWINPUT ri = {};
+        UINT size = sizeof(ri);
+        static int acc = 0;   // raw wheel units not yet made into a notch
+        if (!g_wheel_wanted || !g_cast_on) acc = 0;
+        else if (
+            GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1) &&
+            ri.header.dwType == RIM_TYPEMOUSE && (ri.data.mouse.usButtonFlags & RI_MOUSE_WHEEL) != 0)
+        {
+            // WM_MOUSEWHEEL carries SCREEN coordinates, and ReShade makes them its ImGui mouse
+            // position: the panel's cursor mapped into this window's screen space, exactly as the
+            // add-on does for the wheel it can see.
+            POINT s = { static_cast<short>(LOWORD(g_wheel_at)), static_cast<short>(HIWORD(g_wheel_at)) };
+            ClientToScreen(w, &s);
+            // Whole notches only. A high-resolution wheel reports a run of small deltas (-1 at
+            // a time was measured here), and ReShade divides each message's delta by WHEEL_DELTA
+            // as an INTEGER: forwarded as they come, every one of them rounds to nothing.
+            acc += static_cast<short>(ri.data.mouse.usButtonData);
+            int notches = 0;
+            for (; acc >= WHEEL_DELTA && notches < 16; acc -= WHEEL_DELTA, ++notches)
+                PostMessageW(w, WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), MAKELPARAM(s.x, s.y));
+            for (; acc <= -WHEEL_DELTA && notches > -16; acc += WHEEL_DELTA, --notches)
+                PostMessageW(w, WM_MOUSEWHEEL, MAKEWPARAM(0, static_cast<WORD>(-WHEEL_DELTA)), MAKELPARAM(s.x, s.y));
+            if (acc >= WHEEL_DELTA || acc <= -WHEEL_DELTA) acc = 0;   // past the cap: dropped, not owed
+            static int said = 0;
+            if (notches != 0 && said < 6)
+            {
+                ++said;
+                Log("[host] cast wheel: %d notch(es) from raw input -> WM_MOUSEWHEEL at client %d,%d",
+                    notches, static_cast<short>(LOWORD(g_wheel_at)), static_cast<short>(HIWORD(g_wheel_at)));
+            }
+        }
+        return DefWindowProcW(w, m, wp, lp);   // WM_INPUT must reach DefWindowProc to be cleaned up
+    }
     // WS_OVERLAPPEDWINDOW has always let the user drag this window's border; until now
     // nothing answered, so the swapchain kept its original size and DWM stretched it.
     if (m == WM_GETMINMAXINFO)
@@ -1318,8 +1592,10 @@ static void InitBanner()
     // when OptiScaler is the neural consumer its menu is its own, on Insert, and nothing else
     // in this window says so.
     RECT r3 = { 0, S(305), W, S(345) };
-    DrawTextW(dc, g_reshade_hooked
+    DrawTextW(dc, g_reshade_hooked && g_overlay_key != 0
                   ? L"Press  Home  in this window to tune it  \x2022  closing only hides the window"
+                : g_reshade_hooked
+                  ? L"ReShade's overlay key is unbound  \x2022  closing only hides the window"
                   : L"ReShade did not attach here, so  Home  does nothing  \x2022  closing only hides the window",
               -1, &r3, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     if (g_opti.present)
@@ -1409,7 +1685,7 @@ static void InitBanner()
     if (g_pump_alloc != nullptr)
         h.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_pump_alloc, nullptr,
                                  __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g_pump_list));
-    if (g_pump_list != nullptr) g_pump_list->Close();
+    if (g_pump_list != nullptr) { g_pump_list->SetName(L"dlss5-feed-host banner list"); g_pump_list->Close(); }
     h.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g_pump_fence));
     h.swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_swap3));
     Log("[host] banner ready");
@@ -1420,7 +1696,7 @@ static void InitBanner()
     if (g_panel_alloc != nullptr)
         h.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_panel_alloc, nullptr,
                                  __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g_panel_list));
-    if (g_panel_list != nullptr) g_panel_list->Close();
+    if (g_panel_list != nullptr) { g_panel_list->SetName(L"dlss5-feed-host panel copy list"); g_panel_list->Close(); }
     h.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g_panel_fence));
     g_panel_ready = g_panel_list != nullptr && g_panel_fence != nullptr;
     if (g_panel_ready)
@@ -1608,14 +1884,20 @@ static bool PumpPresent(bool force = false)
     // up inside the same frame reads as never pressed). Only when the window is visible.
     if (g_show_window && h.hwnd != nullptr)
     {
+        // The count itself always runs: tag 'O' re-arms against it, and it is the only clock
+        // the idle paths have. Only the posting is conditional on a key existing (issue #118).
         ++g_pump_count;
-        const UINT scan = MapVirtualKeyW(g_overlay_key, MAPVK_VK_TO_VSC);
-        if (g_pump_count == g_overlay_key_at)
-            PostMessageW(h.hwnd, WM_KEYDOWN, g_overlay_key, 1 | (scan << 16));
-        else if (g_pump_count == g_overlay_key_at + 3)
+        if (g_overlay_key != 0)
         {
-            PostMessageW(h.hwnd, WM_KEYUP, g_overlay_key, 1 | (scan << 16) | (1u << 30) | (1u << 31));
-            Log("[host] opened ReShade's overlay (key %u) so the neural consumer's panel is in view", g_overlay_key);
+            const UINT scan = MapVirtualKeyW(g_overlay_key, MAPVK_VK_TO_VSC);
+            if (g_pump_count == g_overlay_key_at)
+                PostMessageW(h.hwnd, WM_KEYDOWN, g_overlay_key, 1 | (scan << 16));
+            else if (g_pump_count == g_overlay_key_at + 3)
+            {
+                PostMessageW(h.hwnd, WM_KEYUP, g_overlay_key, 1 | (scan << 16) | (1u << 30) | (1u << 31));
+                Log("[host] opened ReShade's overlay (key %u) so the neural consumer's panel is in view",
+                    g_overlay_key);
+            }
         }
     }
 
@@ -1707,6 +1989,16 @@ static bool PumpPresent(bool force = false)
             static HRESULT            last_hr = S_OK;
             const bool                fresh   = (hr != last_hr);
             last_hr = hr;
+            // DEVICE_REMOVED / DEVICE_HUNG / DEVICE_RESET are not a window problem. The feed's
+            // queue is on the same device, so it is gone too -- and nothing else noticed: NGX
+            // keeps answering Success for an evaluate recorded on a dead device, and a removed
+            // device completes every fence, so the evaluate path never reached DeviceRemoved().
+            // #119's helper sat here for the rest of the session, logged "the feed is
+            // unaffected" 1800 presents at a time, and handed the game frames nothing had
+            // written. Name it and let the serve loop leave; the add-on then says why it stopped.
+            const bool gone = hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_HUNG ||
+                              hr == DXGI_ERROR_DEVICE_RESET;
+            if (gone && DeviceRemoved("a present")) return false;
             if (++hard == 1 || fresh || (hard % 1800) == 0)
                 Log("[host] Present failed 0x%08X (%llu so far). This window holds its last picture until "
                     "one succeeds; the feed runs on a separate queue and is unaffected.",
@@ -1868,11 +2160,18 @@ static bool InitDisguise()
     // The caption is the one line of this window a user sees on the taskbar, so it carries the
     // same advice as the banner -- including OptiScaler's Insert, which is the only door to a
     // tuning UI when OptiScaler is the consumer and ReShade lost the hook race.
+    // One state more than there used to be: ReShade is here but the user unbound its overlay
+    // key, so "press Home" would be wrong (issue #118).
+    const bool unbound = g_reshade_hooked && g_overlay_key == 0;
     const wchar_t *caption =
         !g_reshade_hooked && g_opti.present
             ? L"DLSS 5 Feed host - ReShade did not attach; press Insert HERE for OptiScaler's menu"
         : !g_reshade_hooked
             ? L"DLSS 5 Feed host - ReShade did not attach to this window; Home does nothing here"
+        : unbound && g_opti.present
+            ? L"DLSS 5 Feed host - press Insert HERE for OptiScaler's menu"
+        : unbound
+            ? L"DLSS 5 Feed host - ReShade's overlay key is unbound in this window's ReShade.ini"
         : g_opti.present
             ? L"DLSS 5 Feed host - press Home HERE to tune DLSS 5, or Insert for OptiScaler's menu"
             : L"DLSS 5 Feed host - press Home HERE to tune DLSS 5 neural rendering";
@@ -1886,6 +2185,11 @@ static bool InitDisguise()
     if (h.hwnd == nullptr) { Log("[host] window creation failed"); return false; }
     if (g_show_window) ShowWindow(h.hwnd, SW_SHOWNOACTIVATE);   // never steal the game's focus
 
+    {
+        char ini[MAX_PATH];
+        HostIniPath(ini, sizeof(ini));
+        HostEnableDred(ini);   // must precede the create; does nothing unless [DLSS5Host] Dred=1
+    }
     HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                                reinterpret_cast<void **>(&h.dev));
     if (FAILED(hr))
@@ -1906,6 +2210,8 @@ static bool InitDisguise()
     h.dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&h.pump_queue));
     h.dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&h.queue));
     if (h.pump_queue == nullptr || h.queue == nullptr) { Log("[host] queue creation failed"); return false; }
+    h.pump_queue->SetName(L"dlss5-feed-host pump queue");
+    h.queue->SetName(L"dlss5-feed-host feed queue");
 
     IDXGIFactory2 *factory = nullptr;
     hr = create_factory(__uuidof(IDXGIFactory2), reinterpret_cast<void **>(&factory));
@@ -1974,7 +2280,7 @@ static bool InitDisguise()
     if (h.alloc[0] != nullptr)
         h.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, h.alloc[0], nullptr,
                                  __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&h.list));
-    if (h.list != nullptr) h.list->Close();
+    if (h.list != nullptr) { h.list->SetName(kFrameListName); h.list->Close(); }
     h.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&h.fence));
     h.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (h.list == nullptr || h.fence == nullptr) { Log("[host] list/fence creation failed"); return false; }
@@ -2817,7 +3123,13 @@ static int Serve(DWORD game_pid)
             // Idle: the game has not sent the next frame yet, so it is not waiting on us.
             // The one moment a Present costs it nothing -- pay off anything the
             // per-evaluate call could not present (issue #15).
-            if (r == WAIT_OBJECT_0 + 1 || r == WAIT_TIMEOUT) { PumpRetireOwedPresents(); PumpPresent(); continue; }
+            if (r == WAIT_OBJECT_0 + 1 || r == WAIT_TIMEOUT)
+            {
+                PumpRetireOwedPresents();
+                PumpPresent();
+                if (g_device_removed) break;   // PumpPresent saw the device go (#119)
+                continue;
+            }
             if (r != WAIT_OBJECT_0) break;
             DWORD got = 0;
             if (!GetOverlappedResult(pipe, &ov_tag, &got, FALSE) || got != 1) { pending = false; break; }
@@ -2825,7 +3137,7 @@ static int Serve(DWORD game_pid)
             tag_read = true;
             break;
         }
-        if (!tag_read) { Log("[host] pipe closed by the game"); break; }
+        if (!tag_read) { if (!g_device_removed) Log("[host] pipe closed by the game"); break; }
 
         if (tag == 'B')
         {
@@ -3100,6 +3412,30 @@ static int Serve(DWORD game_pid)
             WriteFull(pipe, &back, sizeof(back));
             if (!ok && DeviceRemoved("a rebuild")) break;   // the ack went out; retrying here is pointless
         }
+        else if (tag == 'C')
+        {
+            // v10: where the cast panel is on screen in the game. Nothing here acts on the
+            // rectangle -- it is in the GAME's client pixels, which this process cannot draw
+            // into -- but the scale is what a consumer sizing its own UI needs, and "is it
+            // even visible" is what every one of them was missing (issue #118).
+            FeedCastMsg cm = {};
+            if (!ReadFull(pipe, &cm, sizeof(cm))) break;
+            g_cast_on    = cm.shown != 0;
+            g_cast_scale = g_cast_on ? cm.scale : 0.0f;
+            if (g_cast_on)
+                Log("[host] the cast panel is on screen in the game at %ld,%ld-%ld,%ld (scale %.2f, corner %u); "
+                    "this window is what it shows", static_cast<long>(cm.left), static_cast<long>(cm.top),
+                    static_cast<long>(cm.right), static_cast<long>(cm.bottom), cm.scale, cm.anchor);
+            else
+                Log("[host] the cast panel is no longer on screen in the game");
+            if (h.hwnd != nullptr)
+            {
+                if (g_cast_msg == 0) g_cast_msg = RegisterWindowMessageW(L"DLSS5_FEED_CAST");
+                if (g_cast_msg != 0)
+                    PostMessageW(h.hwnd, g_cast_msg, g_cast_on ? 1u : 0u,
+                                 static_cast<LPARAM>(static_cast<long>(g_cast_scale * 1000.0f + 0.5f)));
+            }
+        }
         else if (tag == 'W')
         {
             // v8: the add-on's window sliders, applied live. Handled here rather than by
@@ -3131,10 +3467,17 @@ static int Serve(DWORD game_pid)
             // v9: the add-on's "Show ReShade in Host" button. Re-arm the startup sequence
             // rather than posting here: the two edges have to land in different frames of
             // THIS process, and the pump is what counts them.
-            g_overlay_key_at = g_pump_count + 2;
-            // The key toggles, so this shows the overlay only if it is currently hidden. The
-            // add-on tracks that and labels its button show/hide; nothing here can query ReShade.
-            Log("[host] the game asked to toggle ReShade's overlay: posting key %u to this window", g_overlay_key);
+            if (g_overlay_key == 0)
+                Log("[host] the game asked to toggle ReShade's overlay, but [INPUT] KeyOverlay is unbound "
+                    "in the host's ReShade.ini: nothing posted");
+            else
+            {
+                g_overlay_key_at = g_pump_count + 2;
+                // The key toggles, so this shows the overlay only if it is currently hidden. The
+                // add-on tracks that and labels its button show/hide; nothing here can query ReShade.
+                Log("[host] the game asked to toggle ReShade's overlay: posting key %u to this window",
+                    g_overlay_key);
+            }
         }
         else if (tag == 'F')
         {
@@ -3160,7 +3503,13 @@ static int Serve(DWORD game_pid)
             // arriving at game rate the tag wait never goes idle -- so a bare `continue`
             // left the window unpumped for as long as the feature was missing, and
             // Windows ghosts it as "Not Responding" within seconds while the game runs on.
-            if (h.feature == nullptr && !transport_only) { h.fence_out->Signal(fm.n); PumpPresent(); continue; }
+            if (h.feature == nullptr && !transport_only)
+            {
+                h.fence_out->Signal(fm.n);
+                PumpPresent();
+                if (g_device_removed) break;
+                continue;
+            }
 
             // Order the evaluate behind the game's input copies on the GPU timeline and
             // move on. This used to block the CPU on the same value first, which
@@ -3311,6 +3660,7 @@ static int Serve(DWORD game_pid)
             PumpRetireOwedPresents(1);
             g_pace_presents += 1 + (owed_before - g_present_owed);
             PumpPresent(true);   // per evaluate, deliberately -- see PumpPresent
+            if (g_device_removed) break;   // the present is where a hung device shows first (#119)
         }
         else
         {
@@ -3548,6 +3898,18 @@ int main(int argc, char **argv)
     DetectOptiScaler();     // after both: it warns when either is beside it
     DetectStaleD3DCompiler();
     PrepareHostOverlay();   // edits ReShade.ini, so also BEFORE ReShade loads (InitDisguise)
+    // The startup press exists to bring the consumer's tuning panel into view. OptiScaler's
+    // panel is its own window on Insert, not a ReShade add-on page, so with OptiScaler as the
+    // only consumer there is nothing for it to open (issue #118). Only the STARTUP press is
+    // skipped: the key stays known, Home pressed by hand still works, and so does the add-on's
+    // "Toggle ReShade in host" button (tag 'O'). Here rather than in PrepareHostOverlay because
+    // this is where all the detections are in scope.
+    if (g_overlay_key != 0 && g_opti.present && !g_renodx_present && !g_chicken_present && !g_toolkit_present)
+    {
+        g_overlay_key_at = kOverlayNever;
+        Log("[host] OptiScaler is the only neural consumer here and its menu is its own window (Insert), "
+            "so ReShade's overlay is not opened at startup; Home in this window still opens it");
+    }
 
     // Both failures used to `return 1` straight out, skipping the tail below -- and a failed
     // NGX init is exactly the case where ReShade is already loaded and its teardown is the

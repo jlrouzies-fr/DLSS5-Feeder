@@ -38,6 +38,7 @@
 #include <d3dcompiler.h>
 #include <dwmapi.h>   // the cast: a DWM live thumbnail of the host window, drawn in the game window
 #include <cstdio>
+#include <share.h>
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
@@ -62,7 +63,7 @@ static void FeedOnVkDeviceGeneration();
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 #include "feed_opti.h"      // OptiScaler DLSS-NR: only the file scan and the ini reader are used here (it lives in host64 too)
 
-#define FEED_VERSION "1.16.0-beta.4"
+#define FEED_VERSION "1.16.0-beta.7"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif
@@ -320,6 +321,11 @@ struct Cfg
                            // games froze the instant the helper's shown window appeared under them
                            // (#109 Injustice, #99 Transformers, #77 Dragon Age: Origins), and the
                            // compositor cannot draw the cast over exclusive fullscreen anyway.
+                           // 3 = 0 without that: behind the game, and NEVER turned into --hide. For a
+                           // wrapper whose swapchain reports fullscreen over what is really a borderless
+                           // window -- dgVoodoo calls SetFullscreenState(TRUE) whatever its own
+                           // FullScreenMode says, so at 0 the panel was lost on every run and no dgVoodoo
+                           // setting could bring it back (#118).
     int   host_gpu_priority; // 1 = pass --gpu-priority, asking the GPU scheduler to favour the
                            // helper process. Off by default: it can starve the game it is meant to
                            // help, and it only matters where the helper is being preempted (#83,
@@ -339,6 +345,10 @@ struct Cfg
     float mv_scale_x, mv_scale_y;
     int   cast_key;        // virtual-key code that shows/hides the cast DLSS 5 panel in-game; 0 = none.
                            // Bound from the overlay page ("Set key").
+    int   cast_mods;       // modifiers that must be held with cast_key: 1 = Alt, 2 = Ctrl, 4 = Shift (issue
+                           // #118). The match is EXACT -- 0 means the bare key, and Alt+Shift+Home then does
+                           // NOT toggle the panel, so another tool can own that combination. Captured with
+                           // the key by "Set key": whatever was held when the key went down is what is saved.
     int   cast_scale;      // size of the cast panel, 25..100 percent of the largest size that fits the game
                            // window (the host's tab column at 1:1 or shrunk to the game's height)
     int   cast_mode;       // how the panel is displayed: 0 = desktop-compositor thumbnail of the host window
@@ -355,7 +365,7 @@ struct Cfg
 };
 
 //                                        host_window --v  v-- host_gpu_priority (off)
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 100, 0, 1, 0 };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 0, 100, 0, 1, 0 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -422,11 +432,11 @@ static void CfgWriteDefault()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nhost_gpu_priority=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\n",
+               "host_window=%d\nhost_gpu_priority=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_mods=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
-            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale, g_cfg.cast_mode,
-            g_cfg.cast_anchor);
+            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_mods, g_cfg.cast_scale,
+            g_cfg.cast_mode, g_cfg.cast_anchor);
     fclose(f);
 }
 
@@ -436,7 +446,7 @@ static void CfgWriteDefault()
 static const char *const kCfgSavedKeys[] = {
     "enabled", "mode", "hdr", "depth_inverted", "flags", "reset_every", "log_frames",
     "host_window", "host_gpu_priority", "work_resolution", "work_upscale", "work_sharpness", "async_home",
-    "mv_scale_x", "mv_scale_y", "cast_key", "cast_scale", "cast_mode", "cast_anchor",
+    "mv_scale_x", "mv_scale_y", "cast_key", "cast_mods", "cast_scale", "cast_mode", "cast_anchor",
 };
 
 static bool CfgKeyIsSaved(const char *key)
@@ -482,11 +492,11 @@ static void CfgSave()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nhost_gpu_priority=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\n",
+               "host_window=%d\nhost_gpu_priority=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_mods=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
-            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale, g_cfg.cast_mode,
-            g_cfg.cast_anchor);
+            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_mods, g_cfg.cast_scale,
+            g_cfg.cast_mode, g_cfg.cast_anchor);
     if (!carried.empty()) fputs(carried.c_str(), f);
     fclose(f);
 }
@@ -545,7 +555,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "flags")          == 0) next.flags          = iv;
         else if (_stricmp(key, "reset_every")    == 0) next.reset_every    = iv;
         else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
-        else if (_stricmp(key, "host_window")    == 0) next.host_window    = iv;
+        else if (_stricmp(key, "host_window")    == 0) next.host_window    = (iv >= 0 && iv <= 3) ? iv : 0;
         else if (_stricmp(key, "host_gpu_priority") == 0) next.host_gpu_priority = iv;
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
         else if (_stricmp(key, "work_upscale")   == 0) next.work_upscale   = iv;
@@ -554,6 +564,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
         else if (_stricmp(key, "cast_key")       == 0) next.cast_key       = (iv > 0 && iv < 256) ? iv : 0;
+        else if (_stricmp(key, "cast_mods")      == 0) next.cast_mods      = iv < 0 ? 0 : iv & 7;
         else if (_stricmp(key, "cast_scale")     == 0) next.cast_scale     = iv < 25 ? 25 : iv > 300 ? 300 : iv;
         else if (_stricmp(key, "cast_mode")      == 0) next.cast_mode      = iv == 1 ? 1 : 0;
         else if (_stricmp(key, "cast_anchor")    == 0) next.cast_anchor    = iv < 0 ? 0 : iv > 3 ? 3 : iv;
@@ -575,10 +586,10 @@ static bool CfgReload()   // true when a build-affecting value changed
         // what they had set (issue #15). The 64-bit side has always printed its full set.
         Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d log_frames=%d "
             "host_window=%d host_gpu_priority=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f async_home=%d "
-            "mv_scale=%.3f,%.3f cast_key=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d",
+            "mv_scale=%.3f,%.3f cast_key=%d cast_mods=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
-            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale,
+            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_mods, g_cfg.cast_scale,
             g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.host_creates);
     }
     return rebuild;
@@ -617,8 +628,10 @@ static bool ProviderCompileError(const char *file, char *out, size_t out_size)
     char path[MAX_PATH];
     GetModuleFileNameA(g_self, path, MAX_PATH);
     if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "ReShade.log");
-    FILE *f = nullptr;
-    if (fopen_s(&f, path, "rb") != 0 || f == nullptr) return false;
+    // _fsopen with _SH_DENYNO, not fopen_s: fopen_s asks that nobody else write the file, and
+    // ReShade holds its log open for writing, so that open failed every time (#119).
+    FILE *f = _fsopen(path, "rb", _SH_DENYNO);
+    if (f == nullptr) return false;
     fseek(f, 0, SEEK_END);
     const long size = ftell(f);
     const long take = size < 512 * 1024 ? size : 512 * 1024;
@@ -1199,7 +1212,31 @@ static bool       g_cast_fullscreen;      // the game's swapchain went exclusive
 static bool       g_host_hidden;          // the host was started with --hide (host_window=2, or exclusive
                                           // fullscreen at start): there is no window to cast from
 static POINT      g_cast_last = { -1, -1 };
-static POINT      g_cast_cursor = { -1, -1 };   // ReShade's mouse position this frame, game client coordinates
+static POINT      g_cast_cursor = { -1, -1 };   // the mouse position this frame, game client coordinates
+// Castlevania: Lords of Shadow 2 reads the mouse in a way ReShade x86 never sees, so the
+// position it tracks from window messages never moves and the panel cannot be clicked, while
+// the REAL cursor moves freely (issue #118, measured with GetCursorPos/GetClipCursor). When
+// ReShade's copy has been frozen for a while and the real cursor is somewhere else, believe
+// the real one instead. Reversible: the moment ReShade's position moves again it wins back,
+// so a game that merely has a still mouse for a second is not switched over permanently.
+static POINT      g_cast_rs_last   = { -2, -2 };   // ReShade's previous reading, to see it move
+static int        g_cast_rs_still  = 0;            // consecutive frames it has not moved
+static bool       g_cast_real_mouse = false;       // using GetCursorPos instead
+// The wheel in that mode (#118). A game that keeps its mouse from ReShade keeps the wheel from
+// it too, and a raw-input sink registered HERE would replace the game's own registration --
+// RegisterRawInputDevices is per process. The host has no input of its own to lose, so it
+// registers the sink, and only while this side says it is needed: DLSS5_FEED_CAST_WHEEL, posted
+// to the host window on change, wParam 1 = "the cursor is over the panel and I cannot see the
+// wheel", 0 = "stop". Never on while ReShade tracks the mouse, or each notch would scroll twice.
+static bool       g_cast_wheel_sink = false;       // what the host was last told
+static UINT       g_cast_wheel_msg  = 0;
+static const int  kCastRsStillFrames = 60;
+// How far apart the two readings must be before the real one is believed. Where ReShade
+// DOES track the mouse they agree to within rounding, and a mouse merely at rest must not
+// read as a frozen ReShade.
+static const LONG kCastRsApartPixels = 16;
+static int        g_cast_rs_said = 0;              // transition lines logged; capped at 6
+static UINT       g_cast_real_btn_prev = 0;        // GetAsyncKeyState buttons last frame, kCastButtons bits
 static bool       g_cast_capture_key;     // the overlay's "Set key" is waiting for a key
 static bool       g_cast_texture;         // the mode the current layout was made in (cfg cast_mode)
 static bool       g_game_overlay_open;    // ReShade x86's own overlay is up (it draws a cursor then)
@@ -1255,6 +1292,11 @@ static void CastRelease()   // the thumbnail only; the host window stays known
     g_cast_shown    = false;
     g_cast_last     = { -1, -1 };
     g_cast_cursor   = { -1, -1 };
+    g_cast_rs_last  = { -2, -2 };
+    g_cast_rs_still = 0;
+    // Not g_cast_real_mouse: whether this game feeds ReShade mouse messages is a property of
+    // the GAME, not of this showing of the panel, and re-deciding it costs 60 dead frames
+    // every time the panel comes up (issue #118).
 }
 
 static void CastHostLost()
@@ -1262,6 +1304,7 @@ static void CastHostLost()
     CastRelease();
     g_cast_hwnd   = nullptr;
     g_cast_placed = false;
+    g_cast_wheel_sink = false;   // a new host starts with its sink off
 }
 
 // cast_mode=1: the panel texture (IPC v7), created on the game's D3D11 device at the size
@@ -1351,7 +1394,8 @@ static void CastImportPanelGl(const FeedBuildAck &ack)
     if (g.panel_w == 0 || g.gl_panel_tex != 0) { CloseHandle(hnd); return; }
     if (!FeedGlImportImage(&g.gl, hnd, ack.panel_size, static_cast<GLsizei>(g.panel_w), static_cast<GLsizei>(g.panel_h),
                            GL_RGBA8, &g.gl_panel_tex, &g.gl_panel_memobj))
-        Log("[feed32] cast: panel import FAILED (GL error 0x%04X); texture mode unavailable", FeedGlDrainErrors(&g.gl));
+        Log("[feed32] cast: panel import FAILED at %s (GL error 0x%04X); texture mode unavailable",
+            g.gl.import_stage, g.gl.import_err);
     else
         Log("[feed32] cast: host panel texture imported (OpenGL, %ux%u)", g.panel_w, g.panel_h);
     CloseHandle(hnd);
@@ -1487,6 +1531,26 @@ static void CastKeyName(int vk, char *out, size_t n)
         sprintf_s(out, n, "key %d", vk);
 }
 
+// "Alt+Shift+Home" rather than "Home": with cast_mods in play the key alone no longer
+// describes what to press, and the overlay label and the log line both have to say so (#118).
+static void CastKeyCombo(int vk, int mods, char *out, size_t n)
+{
+    char key[64];
+    CastKeyName(vk, key, sizeof(key));
+    if (vk <= 0 || mods == 0) { strcpy_s(out, n, key); return; }
+    sprintf_s(out, n, "%s%s%s%s", (mods & 1) != 0 ? "Alt+" : "", (mods & 2) != 0 ? "Ctrl+" : "",
+              (mods & 4) != 0 ? "Shift+" : "", key);
+}
+
+// The modifiers held right now, in cast_mods' bit order. ReShade's own key state is the one
+// to ask: it is what is_key_pressed reads, so the two always agree about the same frame.
+static int CastHeldMods(reshade::api::effect_runtime *rt)
+{
+    return (rt->is_key_down(VK_MENU)    ? 1 : 0) |
+           (rt->is_key_down(VK_CONTROL) ? 2 : 0) |
+           (rt->is_key_down(VK_SHIFT)   ? 4 : 0);
+}
+
 static void CastPostKey(UINT msg, UINT vk, bool up)
 {
     // IsWindow, not just non-null: the host window can go away between the last layout pass
@@ -1510,8 +1574,18 @@ static const struct { uint32_t idx; UINT down, up; } kCastButtons[] = {
 // Release everything the host still believes is held. Called when the cursor leaves the
 // panel and whenever the panel is taken down, so no key or button can stay stuck in ReShade
 // x64's ImGui after this side stops forwarding.
+static void CastWheelSink(bool want)
+{
+    if (want == g_cast_wheel_sink || g_cast_hwnd == nullptr || !IsWindow(g_cast_hwnd)) return;
+    if (g_cast_wheel_msg == 0) g_cast_wheel_msg = RegisterWindowMessageW(L"DLSS5_FEED_CAST_WHEEL");
+    if (g_cast_wheel_msg == 0) return;
+    PostMessageW(g_cast_hwnd, g_cast_wheel_msg, want ? 1u : 0u, 0);
+    g_cast_wheel_sink = want;
+}
+
 static void CastFlushInput()
 {
+    CastWheelSink(false);   // every way off the panel comes through here
     int keys = 0, buttons = 0;
     for (UINT vk = 0; vk < 256; ++vk)
         if (g_cast_key_down[vk]) { g_cast_key_down[vk] = false; ++keys; CastPostKey(WM_KEYUP, vk, true); }
@@ -1541,7 +1615,8 @@ static bool CastLayout()
         strcpy_s(g_cast_status, g_cfg.host_window == 2
             ? "the host runs without a window (host_window=2); nothing to cast"
             : "the host runs without a window because the game was exclusive fullscreen when it started; "
-              "switch the game to borderless and restart it for the panel");
+              "switch the game to borderless and restart it for the panel (or host_window=3 if a wrapper "
+              "such as dgVoodoo only reports fullscreen)");
         return false;
     }
 
@@ -1673,7 +1748,7 @@ static bool CastLayout()
         g_cast_scale = s;
         Log("[feed32] cast: %ldx%ld of the host window shown at %dx%d (scale %.2f)", src.cx, src.cy, dw, dh, s);
     }
-    if (g_cast_fullscreen)
+    if (g_cast_fullscreen && g_cfg.host_window != 3)
         strcpy_s(g_cast_status, "shown, but the game is exclusive fullscreen: the compositor cannot draw over it -- use borderless");
     else
         sprintf_s(g_cast_status, "shown at %dx%d%s", dw, dh, g_cast_hover ? " (cursor over it)" : "");
@@ -1712,18 +1787,77 @@ static void CastInput(reshade::api::effect_runtime *rt)
     rt->get_mouse_cursor_position(&cx, &cy, &wheel);   // the wheel comes in notches
     if (wheel == 0) wheel = g_cast_wheel_pending;      // OnOverlay's earlier read, if this one came up empty
     g_cast_wheel_pending = 0;
-    const POINT p = { static_cast<LONG>(cx), static_cast<LONG>(cy) };
+    POINT p = { static_cast<LONG>(cx), static_cast<LONG>(cy) };
+
+    // The real cursor in the game's client coordinates, when there is a window to map against.
+    POINT real = {};
+    const bool have_real = g_cast_dest != nullptr && GetCursorPos(&real) != FALSE &&
+                           ScreenToClient(g_cast_dest, &real) != FALSE;
+    if (p.x == g_cast_rs_last.x && p.y == g_cast_rs_last.y)
+    {
+        if (g_cast_rs_still < kCastRsStillFrames * 4) ++g_cast_rs_still;
+    }
+    else
+    {
+        g_cast_rs_still = 0;
+        if (g_cast_real_mouse)
+        {
+            g_cast_real_mouse = false;
+            if (g_cast_rs_said < 6)
+            {
+                ++g_cast_rs_said;
+                Log("[feed32] cast: ReShade is tracking the mouse again; back to its position");
+            }
+        }
+    }
+    g_cast_rs_last = p;
+    const LONG apart = (real.x > p.x ? real.x - p.x : p.x - real.x) + (real.y > p.y ? real.y - p.y : p.y - real.y);
+    if (!g_cast_real_mouse && have_real && g_cast_rs_still >= kCastRsStillFrames && apart > kCastRsApartPixels)
+    {
+        g_cast_real_mouse = true;
+        if (g_cast_rs_said < 6)
+        {
+            ++g_cast_rs_said;
+            Log("[feed32] cast: ReShade's mouse position has not moved for %d frames while the real cursor is at "
+                "%ld,%ld -- this game does not feed ReShade mouse messages, so the panel now follows GetCursorPos "
+                "and GetAsyncKeyState (issue #118). The wheel never reaches the game window either, so while "
+                "the cursor is over the panel the host is asked to read it from raw input itself",
+                g_cast_rs_still, real.x, real.y);
+        }
+    }
+    if (g_cast_real_mouse && have_real) p = real;
     g_cast_cursor = p;
     const bool inside = PtInRect(&g_cast_rect, p) != FALSE;
-    const bool l = rt->is_mouse_button_down(0), m = rt->is_mouse_button_down(1), r = rt->is_mouse_button_down(2);
-    if (g_cast_captured && !(l || m || r)) g_cast_captured = false;
+    UINT btn_down = 0, btn_pressed = 0, btn_released = 0;   // kCastButtons bits: 0 left, 1 middle, 2 right
+    for (const auto &b : kCastButtons)
+    {
+        if (rt->is_mouse_button_down(b.idx))     btn_down     |= 1u << b.idx;
+        if (rt->is_mouse_button_pressed(b.idx))  btn_pressed  |= 1u << b.idx;
+        if (rt->is_mouse_button_released(b.idx)) btn_released |= 1u << b.idx;
+    }
+    {
+        // GetAsyncKeyState reports PHYSICAL buttons, so a left-handed setup swaps the outer two.
+        const bool swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;
+        const UINT real_btn = ((GetAsyncKeyState(swapped ? VK_RBUTTON : VK_LBUTTON) & 0x8000) != 0 ? 1u : 0u) |
+                              ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0 ? 2u : 0u) |
+                              ((GetAsyncKeyState(swapped ? VK_LBUTTON : VK_RBUTTON) & 0x8000) != 0 ? 4u : 0u);
+        if (g_cast_real_mouse)
+        {
+            btn_down     |= real_btn;
+            btn_pressed  |= real_btn & ~g_cast_real_btn_prev;
+            btn_released |= ~real_btn & g_cast_real_btn_prev;
+        }
+        g_cast_real_btn_prev = real_btn;   // tracked in both modes, so switching over raises no false edge
+    }
+    const bool l = (btn_down & 1u) != 0, m = (btn_down & 2u) != 0, r = (btn_down & 4u) != 0;
+    if (g_cast_captured && btn_down == 0) g_cast_captured = false;
 
     // The close button comes first and is never forwarded.
     const RECT close = CastCloseRect();
     g_cast_close_hover = !g_cast_captured && PtInRect(&close, p) != FALSE;
     if (g_cast_close_hover)
     {
-        if (rt->is_mouse_button_pressed(0))
+        if ((btn_pressed & 1u) != 0)
         {
             g_cast_wanted = false;
             Log("[feed32] cast: hidden (close button)");
@@ -1770,18 +1904,21 @@ static void CastInput(reshade::api::effect_runtime *rt)
         }
     }
     g_cast_hover = true;
+    CastWheelSink(g_cast_real_mouse);
 
     // Press and release land on different frames by construction -- what ImGui needs
     // to see a click.
     for (const auto &b : kCastButtons)
     {
-        if (rt->is_mouse_button_pressed(b.idx))
+        // A press only once per hold: with two sources OR-ed together the same click can
+        // surface from each on neighbouring frames.
+        if ((btn_pressed & (1u << b.idx)) != 0 && (g_cast_btn_down & (1u << b.idx)) == 0)
         {
             PostMessageW(g_cast_hwnd, b.down, mk, at);
             g_cast_captured = true;
             g_cast_btn_down |= 1u << b.idx;
         }
-        if (rt->is_mouse_button_released(b.idx))
+        if ((btn_released & (1u << b.idx)) != 0 && (g_cast_btn_down & (1u << b.idx)) != 0)
         {
             PostMessageW(g_cast_hwnd, b.up, mk, at);
             g_cast_btn_down &= ~(1u << b.idx);
@@ -1844,21 +1981,47 @@ static void CastTick(reshade::api::effect_runtime *rt)
     {
         for (UINT vk = 8; vk < 256; ++vk)
         {
-            if (vk == VK_LWIN || vk == VK_RWIN || !rt->is_key_pressed(vk)) continue;
+            // A modifier on its own is never the binding: it is what the user is HOLDING
+            // while they reach for the real key (issue #118).
+            if (vk == VK_LWIN || vk == VK_RWIN || vk == VK_MENU || vk == VK_CONTROL || vk == VK_SHIFT ||
+                vk == VK_LMENU || vk == VK_RMENU || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+                vk == VK_LSHIFT || vk == VK_RSHIFT || !rt->is_key_pressed(vk)) continue;
             g_cast_capture_key = false;
             if (vk == VK_ESCAPE) break;
-            g_cfg.cast_key = vk == VK_BACK ? 0 : static_cast<int>(vk);
+            g_cfg.cast_key  = vk == VK_BACK ? 0 : static_cast<int>(vk);
+            g_cfg.cast_mods = vk == VK_BACK ? 0 : CastHeldMods(rt);
             CfgSave();
-            char name[64];
-            CastKeyName(g_cfg.cast_key, name, sizeof(name));
-            Log("[feed32] cast: toggle key set to %s (%d)", name, g_cfg.cast_key);
+            char name[96];
+            CastKeyCombo(g_cfg.cast_key, g_cfg.cast_mods, name, sizeof(name));
+            Log("[feed32] cast: toggle key set to %s (vk %d, mods %d)", name, g_cfg.cast_key, g_cfg.cast_mods);
             break;
         }
     }
-    else if (g_cfg.cast_key > 0 && rt->is_key_pressed(static_cast<uint32_t>(g_cfg.cast_key)))
+    // The modifier match is exact both ways: cast_mods=0 means the BARE key, so a manager that
+    // owns Alt+Shift+Home no longer opens this panel as well (issue #118). Before this, the
+    // press was tested with is_key_pressed alone and every combination containing the key fired.
+    else if (g_cfg.cast_key > 0 && rt->is_key_pressed(static_cast<uint32_t>(g_cfg.cast_key)) &&
+             CastHeldMods(rt) == (g_cfg.cast_mods & 7))
     {
-        g_cast_wanted = !g_cast_wanted;
-        Log("[feed32] cast: %s (key)", g_cast_wanted ? "shown" : "hidden");
+        // With the host started --hide there is no window to cast. The key used to toggle
+        // anyway and log "cast: shown (key)" over nothing at all, which reads as a panel that
+        // should have appeared (#118). Say why, once, and leave the state alone.
+        if (g_host_hidden && HostAlive())
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                Log("[feed32] cast: key pressed, but the host runs without a window this session (%s); nothing to show",
+                    g_cfg.host_window == 2 ? "host_window=2"
+                                           : "the swapchain was exclusive fullscreen at host start -- host_window=3 overrides that");
+            }
+        }
+        else
+        {
+            g_cast_wanted = !g_cast_wanted;
+            Log("[feed32] cast: %s (key)", g_cast_wanted ? "shown" : "hidden");
+        }
     }
 
     if (!g_cast_wanted)
@@ -1886,6 +2049,10 @@ static bool OnSetFullscreenState(reshade::api::swapchain *, bool fullscreen, voi
 // Defined far below with the other ReShade callbacks; OnPresent and DrawOverlay call it to
 // re-adopt the runtime when enabled goes 0 -> 1, since no event will fire again for it.
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt);
+
+// Defined below with the other pipe writers (it needs PipeWrite): tells the host where the
+// cast panel is on screen, whenever that changes.
+static void CastPublishState();
 
 static bool OnOpenOverlay(reshade::api::effect_runtime *rt, bool open, reshade::api::input_source)
 {
@@ -1922,6 +2089,7 @@ static void OnPresent(reshade::api::effect_runtime *rt)
         FeedLeave();
     }
     CastTick(rt);
+    CastPublishState();
 }
 
 // A cursor for the panel, drawn in the game by ReShade x86's ImGui: the game has usually
@@ -2275,14 +2443,23 @@ static bool HostWorkerConnect(HANDLE ev)
     // fullscreen swapchain, and never came back: the game side of each log ends at "host
     // spawned" while the host side shows a healthy handshake. The cast could not have drawn
     // over exclusive fullscreen anyway (CastLayout says so), so the window buys nothing there.
+    //
+    // host_window=3 is the way out of that for a swapchain that only CLAIMS fullscreen: a
+    // wrapper presenting into a borderless window (dgVoodoo, #118). The add-on cannot tell
+    // the two apart from the fullscreen state alone, so the user says so.
     const bool hide = g_cfg.host_window == 2 || (g_cfg.host_window == 0 && g_cast_fullscreen);
     g_host_hidden = hide;
     if (hide)
         Log("[feed32] starting the host without a window (%s): the in-game panel is unavailable this session%s",
             g_cfg.host_window == 2 ? "host_window=2" : "the game's swapchain is exclusive fullscreen",
-            g_cfg.host_window == 2 ? "" : " -- switch the game to borderless/windowed to get it back (#109)");
+            g_cfg.host_window == 2 ? "" : " -- switch the game to borderless/windowed to get it back (#109). If it "
+                                          "already IS a borderless window behind a wrapper such as dgVoodoo, which "
+                                          "reports fullscreen regardless, set host_window=3 in dlss5-feed.cfg (#118)");
+    else if (g_cfg.host_window == 3 && g_cast_fullscreen)
+        Log("[feed32] host_window=3: the game's swapchain reports exclusive fullscreen and the host gets its window "
+            "anyway. If the game stops presenting right after this line, that fullscreen is real: go back to host_window=0");
     sprintf_s(cmd, "\"%s\" %lu%s%s", exe, GetCurrentProcessId(),
-              hide ? " --hide" : g_cfg.host_window ? "" : " --behind",
+              hide ? " --hide" : g_cfg.host_window == 1 ? "" : " --behind",
               g_cfg.host_gpu_priority ? " --gpu-priority" : "");
 
     STARTUPINFOA si = { sizeof(si) };
@@ -2909,6 +3086,59 @@ static void HostToggleOverlay()
     Log("[feed32] asked the host to toggle ReShade's overlay in its window");
 }
 
+// v10: tell the host where the cast panel is drawn, every time that changes -- and once more
+// with shown=0 when it comes down. The host is otherwise the last to know it is on screen:
+// what reaches it is posted WM_* messages that look exactly like any other input, and a
+// consumer drawing its own UI in that window (OptiScaler's menu is its own window, not a
+// ReShade page) had to tail dlss5-feed.log to find out (issue #118).
+//
+// Sent from OnPresent, after CastTick has settled the layout for this frame. Under the feed
+// lock like every other write on this side; a re-entrant frame simply skips it, and the
+// comparison below sends it again next frame because the published snapshot is unchanged.
+static bool  g_cast_pub_shown  = false;
+static RECT  g_cast_pub_rect   = {};
+static float g_cast_pub_scale  = 0.0f;
+static int   g_cast_pub_anchor = -1;
+
+static void CastPublishState()
+{
+    // No host: whatever was published died with it. Forget it, so the next host is told
+    // from scratch even if the panel comes back at the very same rectangle.
+    if (g.pipe == nullptr) { g_cast_pub_shown = false; return; }
+    const bool shown = g_cast_shown;
+    if (shown == g_cast_pub_shown &&
+        (!shown || (EqualRect(&g_cast_rect, &g_cast_pub_rect) && g_cast_scale == g_cast_pub_scale &&
+                    g_cfg.cast_anchor == g_cast_pub_anchor)))
+        return;
+    if (!FeedEnter()) return;
+    if (g.pipe == nullptr) { FeedLeave(); return; }   // lost between the check above and the lock
+
+#pragma pack(push, 1)
+    struct { BYTE tag; FeedCastMsg cm; } msg = { 'C', {} };
+#pragma pack(pop)
+    msg.cm.shown  = shown ? 1u : 0u;
+    msg.cm.left   = g_cast_rect.left;
+    msg.cm.top    = g_cast_rect.top;
+    msg.cm.right  = g_cast_rect.right;
+    msg.cm.bottom = g_cast_rect.bottom;
+    msg.cm.scale  = g_cast_scale;
+    msg.cm.anchor = static_cast<uint32_t>(g_cfg.cast_anchor < 0 ? 0 : g_cfg.cast_anchor > 3 ? 3 : g_cfg.cast_anchor);
+    const bool ok = PipeWrite(&msg, sizeof(msg));
+    if (!ok) HostLost("the cast state could not be sent");   // inside the lock: it tears down what a frame uses
+    FeedLeave();
+    if (!ok) return;
+
+    g_cast_pub_shown  = shown;
+    g_cast_pub_rect   = g_cast_rect;
+    g_cast_pub_scale  = g_cast_scale;
+    g_cast_pub_anchor = g_cfg.cast_anchor;
+    if (shown)
+        Log("[feed32] cast: told the host the panel is shown at %ld,%ld-%ld,%ld in the game (scale %.2f)",
+            g_cast_rect.left, g_cast_rect.top, g_cast_rect.right, g_cast_rect.bottom, g_cast_scale);
+    else
+        Log("[feed32] cast: told the host the panel is hidden");
+}
+
 static bool HostRequestPending() { return g_host_request != HOST_REQ_NONE; }
 
 // Called from OnPresent, on the render thread and inside the feed lock.
@@ -3525,12 +3755,49 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
         g.fence_in_handle  = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_in));
         g.fence_out_handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_out));
         g.gl_sem_in  = FeedGlImportFence(&g.gl, g.fence_in_handle);
+        const GLenum sem_in_err = g.gl.import_err;
         g.gl_sem_out = FeedGlImportFence(&g.gl, g.fence_out_handle);
         Log("[feed32] D3D12 fence -> GL semaphore import: in=%s out=%s",
             g.gl_sem_in ? "OK" : "FAILED", g.gl_sem_out ? "OK" : "FAILED");
         if (g.gl_sem_in == 0 || g.gl_sem_out == 0)
-        { FeedDisable("cross-process fence import failed -- most often the host opened a different GPU than "
-                      "the game (multi-GPU machine, #100): force both onto the same adapter (see dlss5-feed.log)"); return false; }
+        {
+            Log("[feed32] the fence import failed at %s, GL error 0x%04X (in) / 0x%04X (out)",
+                g.gl.import_stage, sem_in_err, g.gl.import_err);
+            // #121: the textures are imported after the fences, so this failure used to end the
+            // build without anyone learning whether the MEMORY half of the interop works here.
+            // Under Wine/Proton that is the fact deciding whether a CPU-synchronised fallback is
+            // possible at all. The host's handles are already in hand: try each, say, let go.
+            const char *wine = FeedGlWineVersion();
+            if (wine != nullptr)
+                Log("[feed32] running under Wine %s: it advertises GL_EXT_semaphore_win32 / GL_EXT_memory_object_win32 "
+                    "whatever the host's GL driver can do with a Win32 handle, so the extension gate cannot see this", wine);
+            static const DXGI_FORMAT kProbeFmt[FEED_SLOTS] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
+                                                               DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT };
+            for (int i = 0; i < FEED_SLOTS; ++i)
+            {
+                const DXGI_FORMAT f = i == FEED_COLOR ? g.color_fmt : i == FEED_OUTPUT ? g.output_fmt : kProbeFmt[i];
+                const GLenum glf = FeedGlFormat(f);
+                if (glf == 0 || g.tex_handle[i] == nullptr || ack.tex_size[i] == 0) continue;
+                GLuint tex = 0, mem = 0;
+                if (FeedGlImportImage(&g.gl, g.tex_handle[i], ack.tex_size[i], static_cast<GLsizei>(w),
+                                      static_cast<GLsizei>(h), glf, &tex, &mem))
+                {
+                    Log("[feed32] memory-import probe: slot %d (%s, %llu bytes) DOES import into GL -- only the "
+                        "fence half of the interop is missing", i, FeedFmtName(f), static_cast<unsigned long long>(ack.tex_size[i]));
+                    g.gl.DeleteTextures(1, &tex);
+                    g.gl.DeleteMemoryObjectsEXT(1, &mem);
+                }
+                else
+                    Log("[feed32] memory-import probe: slot %d (%s, %llu bytes) does NOT import into GL either "
+                        "(failed at %s, GL error 0x%04X)", i, FeedFmtName(f),
+                        static_cast<unsigned long long>(ack.tex_size[i]), g.gl.import_stage, g.gl.import_err);
+            }
+            FeedDisable(wine != nullptr ?
+                "the GL driver under Wine/Proton cannot import a D3D12 fence (#121; see dlss5-feed.log)" :
+                "cross-process fence import failed -- most often the host opened a different GPU than "
+                "the game (multi-GPU machine, #100): force both onto the same adapter (see dlss5-feed.log)");
+            return false;
+        }
     }
 
     static const DXGI_FORMAT kFmt[FEED_SLOTS] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
@@ -3544,8 +3811,13 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
                                static_cast<GLsizei>(w), static_cast<GLsizei>(h), glf,
                                &g.gl_tex[i], &g.gl_memobj[i]))
         {
-            Log("[feed32] texture import FAILED: slot %d %ux%u fmt=%u (%llu bytes, GL error 0x%04X)",
-                i, w, h, f, static_cast<unsigned long long>(ack.tex_size[i]), FeedGlDrainErrors(&g.gl));
+            if (glf == 0 || g.tex_handle[i] == nullptr || ack.tex_size[i] == 0)
+                Log("[feed32] texture import FAILED: slot %d %ux%u fmt=%u (%llu bytes) -- %s",
+                    i, w, h, f, static_cast<unsigned long long>(ack.tex_size[i]),
+                    glf == 0 ? "no GL internal format for it" : "the host sent no handle or size for it");
+            else
+                Log("[feed32] texture import FAILED: slot %d %ux%u fmt=%u (%llu bytes) at %s, GL error 0x%04X",
+                    i, w, h, f, static_cast<unsigned long long>(ack.tex_size[i]), g.gl.import_stage, g.gl.import_err);
             ReleaseShared();
             return false;
         }
@@ -5556,6 +5828,23 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         else if (g.backbuffer_width != 0)
             ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
                                 g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
+        // The feeder does not run the neural pass; it can only shrink the WHOLE frame it hands
+        // over, and what comes back is stretched over the backbuffer. Shrinking the model's work
+        // alone, with the frame left at full size, is something only the consumer can do.
+        if (g_work_resolution_ui < 100 || g_cfg.work_resolution < 100)
+        {
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+            // Through "%s": TextColored takes a FORMAT string, and this text's "100% the" and
+            // "100% and" are an invalid conversion and a read of a double that was never passed.
+            // The CRT's invalid-parameter handler took the game down the moment the slider left
+            // 100 and this block was drawn (#123).
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s",
+                               "Below 100% the whole image is rendered smaller and stretched back, so it looks "
+                               "blurry. For a sharp image, leave this at 100% and feed a DLSS 5 neural rendering "
+                               "mod that can lower the resolution of the neural pass alone, such as OptiScaler "
+                               "DLSS-NR (WorkingScale under [DlssNr] in OptiScaler.ini).");
+            ImGui::PopTextWrapPos();
+        }
 
         const bool fsr_available = g.blit_vs == nullptr || g.fsr_ok;   // unknown until the shaders compile
         if (!fsr_available) ImGui::BeginDisabled();
@@ -5659,8 +5948,8 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                   "left and bottom edges, and cover this overlay. Applied live; the panel stays "
                                   "anchored at the top right, and the X in its top-right corner always closes it.");
     {
-        char name[64];
-        CastKeyName(g_cfg.cast_key, name, sizeof(name));
+        char name[96];
+        CastKeyCombo(g_cfg.cast_key, g_cfg.cast_mods, name, sizeof(name));
         ImGui::Text("Toggle key: %s", name);
         ImGui::SameLine();
         if (g_cast_capture_key)
@@ -5668,7 +5957,10 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         else if (ImGui::Button("Set key"))
             g_cast_capture_key = true;
         ImGui::SameLine(); HelpMarker("A key that shows and hides the panel without opening this overlay. "
-                                      "Saved as cast_key in dlss5-feed.cfg.");
+                                      "Hold Alt, Ctrl or Shift while you press it and that combination is "
+                                      "bound instead -- and the match is exact, so binding the bare key "
+                                      "leaves Alt+<key> free for another tool. Saved as cast_key and "
+                                      "cast_mods in dlss5-feed.cfg.");
     }
     {
         static const char *const kAnchors[] = { "Top-left", "Top-right", "Bottom-left", "Bottom-right" };
@@ -5679,6 +5971,17 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     }
     bool show_host_window = g_cfg.host_window == 1;
     if (ImGui::Checkbox("Show the DLSS 5 host window", &show_host_window)) { g_cfg.host_window = show_host_window ? 1 : 0; dirty = true; }
+    if (g_cfg.host_window == 3 || (g_cfg.host_window == 0 && g_cast_fullscreen))
+    {
+        bool keep_panel = g_cfg.host_window == 3;
+        if (ImGui::Checkbox("Keep the in-game panel although the swapchain reports fullscreen", &keep_panel))
+        { g_cfg.host_window = keep_panel ? 3 : 0; dirty = true; }
+        ImGui::SameLine(); HelpMarker("For wrappers such as dgVoodoo, which put the swapchain in the fullscreen state even "
+                                      "when they present into a borderless window. Without this the helper starts with no "
+                                      "window and there is no in-game panel (#118). Leave it off for a game that is really "
+                                      "exclusive fullscreen: three of those froze when the helper's window appeared (#109). "
+                                      "Saved as host_window=3; takes effect when the host is next started.");
+    }
     ImGui::SameLine(); HelpMarker("The helper process's own separate window, the old way in. Not needed for the "
                                   "in-game panel above. Takes effect when the host is next started. host_window=2 in "
                                   "dlss5-feed.cfg starts the helper with no window at all; that also happens by itself "
