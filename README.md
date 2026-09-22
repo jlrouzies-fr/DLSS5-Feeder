@@ -254,9 +254,9 @@ a frame. Found during a Metro 2033 Redux run.
 
 ### 4. What this project actually ships, and antivirus warnings
 
-A release here contains exactly **two** files: `DLSS5-Feeder-<version>.zip` and
-`AUTOMATIC_INSTALLATION_AVAILABLE.txt`. Nothing else on the internet is a release of this
-project, whatever it is named.
+A release here contains exactly **three** files: `DLSS5-Feeder-<version>.zip`,
+`AUTOMATIC_INSTALLATION_AVAILABLE.txt` and `CAREFUL_FAKE_MALICIOUS_FEEDER.txt`. Nothing else on
+the internet is a release of this project, whatever it is named.
 
 Several third-party installers repackage this project (and ReShade, and the neural consumers)
 into their own downloads. That is fine and often convenient — but if Windows Defender flags a
