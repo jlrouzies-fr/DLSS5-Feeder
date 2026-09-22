@@ -1152,16 +1152,24 @@ $renoAddon  = Find-FileIn $consumerDir 'renodx-dlss5*.addon64'
 $toolkit    = Find-FileIn $consumerDir 'alexs-toolkit.addon64'
 $dx11Bridge = Find-FileIn $consumerDir 'dlss5-dx11-bridge.addon64'
 
-# OptiScaler, under any of the names it installs as. The DLSS-NR fork (Dagherbou/OptiScaler_DLSSNR)
-# is a supported consumer; stock OptiScaler is not -- it takes the feeder's NGX calls, upscales, and
-# never runs a neural pass. Told apart by the neural forwarder's file name, a literal only the fork has.
-$optiDll  = $null
-$optiFork = $false
+# OptiScaler, under any of the names it installs as. A DLSS-NR fork -- wilsjo2/OptiScaler-DLSSNR-
+# PreSR-Multipass or Dagherbou/OptiScaler_DLSSNR -- is a supported consumer; stock OptiScaler is not:
+# it takes the feeder's NGX calls, upscales, and never runs a neural pass. Told apart by the neural
+# model's file name as a byte string in the DLL, which no upstream build carries. The forwarder's name
+# on top of that marks Dagherbou's generation (it loads nvngx.dll_dlssnr.dll); wilsjo2 v0.8.1+ has no
+# forwarder and reaches feature 18 through the driver's NGX core (the "direct-runtime" build).
+$optiDll    = $null
+$optiFork   = $false
+$optiDirect = $false
 foreach ($n in @('winmm.dll', 'version.dll', 'dbghelp.dll', 'winhttp.dll', 'wininet.dll', 'd3d12.dll', 'OptiScaler.dll', 'OptiScaler.asi')) {
     $p = Find-FileIn $consumerDir $n
     if (-not $p) { continue }
-    if (Get-BinaryMarker -Path $p -Pattern 'nvngx\.dll_dlssnr\.dll') { $optiDll = $p; $optiFork = $true; break }
-    if (Get-BinaryMarker -Path $p -Pattern 'OptiScaler\.ini') { $optiDll = $p; break }
+    if (-not (Get-BinaryMarker -Path $p -Pattern 'OptiScaler\.ini')) { continue }
+    $optiDll = $p
+    $fwd = [bool](Get-BinaryMarker -Path $p -Pattern 'nvngx\.dll_dlssnr\.dll')
+    $optiFork = $fwd -or [bool](Get-BinaryMarker -Path $p -Pattern 'nvngx_dlssnr\.dll')
+    $optiDirect = $optiFork -and -not $fwd
+    break
 }
 
 if ($gameBits -eq 32) {
@@ -1179,7 +1187,7 @@ if ($gameBits -eq 32) {
     if ($strayOpti) {
         Report -Status 'Fail' -Text 'The OptiScaler set is next to the 32-bit game exe -- wrong place.' `
                -Detail 'OptiScaler is 64-bit. For a 32-bit game it goes into host64\ (OptiScaler.dll renamed winmm.dll beside dlss5-feed-host64.exe), where the DLSS work happens. A 64-bit winmm.dll or version.dll beside a 32-bit exe stops the game from starting at all.' `
-               -Action ('Move OptiScaler.ini, the OptiScaler DLL, nvngx.dll_dlssnr.dll and the OptiScaler\ folder into ' + $hostDir)
+               -Action ('Move OptiScaler.ini, the OptiScaler DLL, the OptiScaler\ folder (and nvngx.dll_dlssnr.dll if the build ships one) into ' + $hostDir)
     }
     # And the mirror image of it: the feeder's own 64-bit add-on inside host64\. Unlike a
     # stray consumer beside the exe this one does load -- host64\ is a 64-bit ReShade
@@ -1218,25 +1226,49 @@ if ($consumers.Count -ge 2) {
 elseif ($optiDll) {
     $optiName = [IO.Path]::GetFileName($optiDll)
     if (-not $optiFork) {
-        Report -Status 'Fail' -Text ($optiName + ' is OptiScaler, but NOT the DLSS-NR fork.') `
+        Report -Status 'Fail' -Text ($optiName + ' is OptiScaler, but NOT a DLSS-NR fork.') `
                -Detail 'Stock OptiScaler takes the feeder''s NGX calls and upscales, and no neural pass ever runs -- the picture never changes while every log reads healthy.' `
-               -Action 'Use the Dagherbou/OptiScaler_DLSSNR release, or remove OptiScaler and install Deep Fried Chicken.'
+               -Action 'Use a DLSS-NR release (wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass or Dagherbou/OptiScaler_DLSSNR), or remove OptiScaler and install Deep Fried Chicken.'
     }
     else {
-        Report -Status 'Ok' -Text ('OptiScaler DLSS-NR present as ' + $optiName + ' (supported alternative).') `
+        $flavour = if ($optiDirect) { 'direct-runtime build: wilsjo2 v0.8.1+, no forwarder DLL' } else { 'forwarder build: Dagherbou, or wilsjo2 before v0.8.1' }
+        Report -Status 'Ok' -Text ('OptiScaler DLSS-NR present as ' + $optiName + ' (supported alternative; ' + $flavour + ').') `
                -Detail ('in ' + $consumerWhere + ' -- it answers the feeder''s NGX calls itself, upscales, then runs the neural pass in place. Its menu is on Insert.')
         if ($gameBits -eq 32 -and $optiName -notmatch '(?i)^(winmm|version)\.dll$') {
             Report -Status 'Fail' -Text ('host64\' + $optiName + ' is never loaded by the helper.') `
                    -Detail 'dlss5-feed-host64.exe imports winmm.dll and version.dll at start; under any other name OptiScaler is not in the process when the first NGX call is made, and the driver answers instead.' `
                    -Action ('Rename ' + $optiName + ' to winmm.dll in ' + $hostDir)
         }
-        if (Find-FileIn $consumerDir 'nvngx.dll_dlssnr.dll') {
+        $fwdFile = Find-FileIn $consumerDir 'nvngx.dll_dlssnr.dll'
+        if ($optiDirect) {
+            if ($fwdFile) {
+                Report -Status 'Warn' -Text 'nvngx.dll_dlssnr.dll is present beside a build that never loads it.' `
+                       -Detail 'That is the forwarder of the Dagherbou-generation build, left over from an upgrade; this build reaches the neural model through the driver''s NGX core. Harmless, but the fork''s install notes say to remove it.' `
+                       -Action ('Delete ' + $fwdFile)
+            }
+            else {
+                Report -Status 'Ok' -Text 'No forwarder DLL, as this build expects (feature 18 goes through the driver''s NGX core).'
+            }
+        }
+        elseif ($fwdFile) {
             Report -Status 'Ok' -Text 'nvngx.dll_dlssnr.dll (the neural forwarder) present.'
         }
         else {
             Report -Status 'Fail' -Text 'nvngx.dll_dlssnr.dll is missing.' `
-                   -Detail 'The neural model refuses any caller whose module path does not contain nvngx.dll; this 100 KB shim from the OptiScaler_DLSSNR zip is what satisfies it. Without it OptiScaler.log says "nvngx.dll_dlssnr.dll not found" and no neural pass runs.' `
+                   -Detail 'The neural model refuses any caller whose module path does not contain nvngx.dll; this ~100 KB shim from the OptiScaler_DLSSNR zip is what satisfies it in this build. Without it OptiScaler.log says "nvngx.dll_dlssnr.dll not found" and no neural pass runs.' `
                    -Action ('Extract nvngx.dll_dlssnr.dll from the OptiScaler_DLSSNR zip into ' + $consumerDir)
+        }
+        $optiIniPf = Join-Safe $consumerDir 'OptiScaler.ini'
+        if (Test-FileHere $optiIniPf) {
+            # [ProcessFilter] TargetProcessName naming another exe puts OptiScaler into pass-through
+            # (no hooks, no menu): an ini copied from a game folder brings that game's name along.
+            $tp = Get-IniValue -Path $optiIniPf -Section 'ProcessFilter' -Key 'TargetProcessName'
+            $hostExe = if ($gameBits -eq 32) { 'dlss5-feed-host64.exe' } else { [IO.Path]::GetFileName($exePath) }
+            if ($tp -and $tp.Trim() -and $tp.Trim() -ine 'auto' -and $tp.Trim() -ine $hostExe) {
+                Report -Status 'Fail' -Text ('OptiScaler.ini: [ProcessFilter] TargetProcessName=' + $tp.Trim() + ' -- but the process here is ' + $hostExe + '.') `
+                       -Detail 'With a name that does not match, OptiScaler loads and then hooks nothing: no redirect, no menu, no neural pass. The key ships as auto.' `
+                       -Action 'Set TargetProcessName=auto under [ProcessFilter] and restart.'
+            }
         }
         if (-not (Test-DirHere (Join-Safe $consumerDir 'OptiScaler'))) {
             Report -Status 'Warn' -Text 'The OptiScaler\ runtime folder is missing.' `
@@ -1258,7 +1290,7 @@ elseif ($optiDll) {
             $upShown = if ($up) { $up.Trim() } else { 'auto' }
             Report -Status 'Na' -Text ('OptiScaler.ini: [Upscalers] Dx12Upscaler=' + $upShown + ' (dlss keeps the feed''s DLAA; auto picks DLSS on an RTX with nvngx_dlss.dll beside it).')
             $se = Get-IniValue -Path $optiIni -Section 'DlssNr' -Key 'ScanExposure'
-            if ($se -and $se.Trim() -imatch '^(true|1)$') {
+            if (-not $optiDirect -and $se -and $se.Trim() -imatch '^(true|1)$') {
                 Report -Status 'Warn' -Text 'OptiScaler.ini: [DlssNr] ScanExposure=true.' `
                        -Detail 'The scan hooks resource creation on the feeder''s device looking for an exposure buffer the feed never offers.' `
                        -Action 'Set ScanExposure=false.'
@@ -1325,7 +1357,7 @@ elseif ($renoAddon) {
 }
 else {
     Report -Status 'Fail' -Text 'No neural consumer found.' `
-           -Detail ('Expected deep-fried-chicken.addon64 (recommended), renodx-dlss5.addon64, or the OptiScaler DLSS-NR set (winmm.dll + OptiScaler.ini + nvngx.dll_dlssnr.dll) in ' + $consumerDir + '. The feeder publishes a synthetic DLSS contract; without a consumer, nothing acts on it.') `
+           -Detail ('Expected deep-fried-chicken.addon64 (recommended), renodx-dlss5.addon64, or the OptiScaler DLSS-NR set (winmm.dll + OptiScaler.ini + the OptiScaler\ folder) in ' + $consumerDir + '. The feeder publishes a synthetic DLSS contract; without a consumer, nothing acts on it.') `
            -Action ('Copy deep-fried-chicken.addon64 (+ deep-fried-chicken-nvngx.dll and deep-fried-chicken.cfg) into ' + $consumerDir)
 }
 
@@ -1720,7 +1752,7 @@ if ($optiDll) {
         if ($model -match 'NOT loaded') {
             Report -Status 'Fail' -Text 'The neural model (feature 18) was never created inside OptiScaler.' `
                    -Detail (($model -replace '^\s*[\d:.]+\s+', '').Trim()) `
-                   -Action 'OptiScaler.log says why. Check [DlssNr] Enabled=true, and nvngx_dlssnr.dll plus nvngx.dll_dlssnr.dll beside OptiScaler.'
+                   -Action ('OptiScaler.log says why. Check [DlssNr] Enabled=true and nvngx_dlssnr.dll beside OptiScaler' + $(if ($optiDirect) { '.' } else { ', plus nvngx.dll_dlssnr.dll for this build.' }))
         }
         else {
             Report -Status 'Ok' -Text 'The neural model (feature 18) was created inside OptiScaler.'
@@ -1731,8 +1763,10 @@ if ($optiDll) {
         $ol = Read-LinesSafe $optiLog
         if ($null -ne $ol) {
             $strip = '^\[[^\]]*\]\s*\[\w\]\s*'
-            $run  = @($ol | Where-Object { $_ -match 'DLSS-NR running at' }) | Select-Object -Last 1
-            $bad  = @($ol | Where-Object { $_ -match 'DLSS-NR create failed|nvngx\.dll_dlssnr\.dll not found|DLSS-NR did not run|DLSS-NR unavailable' }) | Select-Object -Last 1
+            # Dagherbou logs "DLSS-NR running at WxH"; wilsjo2 logs "DLSS-NR: feature created at WxH through ..."
+            # and then a periodic "DLSS-NR elapsed" timing line. The failure lines differ the same way.
+            $run  = @($ol | Where-Object { $_ -match 'DLSS-NR running at|DLSS-NR: feature created at' }) | Select-Object -Last 1
+            $bad  = @($ol | Where-Object { $_ -match 'DLSS-NR create failed|nvngx\.dll_dlssnr\.dll not found|DLSS-NR did not run|DLSS-NR unavailable|CreateFeature\(18\) failed|DLSS-NR driver creation for pass \d+ failed|DLSS-NR evaluate returned 0x|no supported direct runtime available' }) | Select-Object -Last 1
             $noDl = @($ol | Where-Object { $_ -match 'nvngx_dlss\.dll not found, disabling DLSS' }) | Select-Object -Last 1
             $ups  = @($ol | Where-Object { $_ -match 'Creating \S+ upscaler feature|Creating XeSS|Creating FSR' }) | Select-Object -Last 1
             if ($run)  { Report -Status 'Ok'   -Text ('OptiScaler.log: ' + ($run -replace $strip, '').Trim()) }
@@ -1744,7 +1778,7 @@ if ($optiDll) {
             if ($ups)  { Report -Status 'Na'   -Text ('OptiScaler.log: ' + ($ups -replace $strip, '').Trim()) }
             if (-not $run -and -not $bad) {
                 Report -Status 'Warn' -Text 'OptiScaler.log has no DLSS-NR line yet.' `
-                       -Detail 'The pass logs "DLSS-NR running at WxH" on its first frame. Run the game to gameplay and re-check; the log tail can also be cut short when the helper exits.'
+                       -Detail 'The pass logs "DLSS-NR running at WxH" (Dagherbou) or "DLSS-NR: feature created at WxH" (wilsjo2) on its first frames. Run the game to gameplay and re-check; the log tail can also be cut short when the helper exits.'
             }
         }
     }

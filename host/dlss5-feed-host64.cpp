@@ -712,18 +712,23 @@ static void ChickenPoll()
 // OptiScaler DLSS-NR beside this exe -- the third neural consumer (see feed_opti.h; mirrors the
 // section in src/dlss5-feed.cpp, keep the two in step). It is a proxy DLL this exe imports
 // (winmm.dll or version.dll), so by the time this runs it is loaded and its nvngx redirect is
-// armed: nothing is loaded from this side. What this does is name it, tell the DLSS-NR fork from
-// upstream OptiScaler, read the ini keys that decide whether the neural pass can run at all, and
-// refuse to be quiet about a second consumer.
+// armed: nothing is loaded from this side. What this does is name it, tell a DLSS-NR fork (either
+// generation, see feed_opti.h) from upstream OptiScaler, read the ini keys that decide whether the
+// neural pass can run at all, and refuse to be quiet about a second consumer.
 static OptiInfo    g_opti;
 static OptiBackend g_opti_backend;
 
 static void DetectOptiScaler()
 {
     g_opti = OptiInfo{};
-    g_opti.nr_enabled = g_opti.scan_exposure = g_opti.dlss_inputs = g_opti.hook_original_only = g_opti.overlay_menu = -1;
+    g_opti.nr_enabled = g_opti.scan_exposure = g_opti.run_before_sr = g_opti.finished_picture = g_opti.dlss_inputs =
+        g_opti.hook_original_only = g_opti.overlay_menu = -1;
     char dir[MAX_PATH];
     GetModuleFileNameA(nullptr, dir, MAX_PATH);
+    const char *exe_name = strrchr(dir, '\\') != nullptr ? strrchr(dir, '\\') + 1 : dir;
+    char exe_copy[MAX_PATH];
+    strcpy_s(exe_copy, exe_name);
+    exe_name = exe_copy;
     if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
 
     if (!OptiFindModule(&g_opti))
@@ -736,7 +741,7 @@ static void DetectOptiScaler()
             char path[MAX_PATH];
             sprintf_s(path, "%s%s", dir, name);
             if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
-            if (!OptiFileHasLiteral(path, OPTI_FORWARDER) && !OptiFileHasLiteral(path, OPTI_INI)) continue;
+            if (!OptiIsBuild(path)) continue;
             Log("[host] WARNING: %s is an OptiScaler build, but this helper never loads a DLL of that name, so it "
                 "cannot take the NGX calls. Rename it winmm.dll or version.dll (both are imported at start).", path);
             return;
@@ -746,20 +751,23 @@ static void DetectOptiScaler()
     }
 
     g_opti.present = true;
-    g_opti.nr_fork = OptiFileHasLiteral(g_opti.path, OPTI_FORWARDER);
+    OptiClassify(g_opti.path, &g_opti.nr_fork, &g_opti.direct);
     FeedReadFileIdent(g_opti.path, &g_opti.ident);
     OptiReadIni(&g_opti);
-    char ver[400];
+    char ver[400], nrkeys[160];
     FeedFormatFileIdent(g_opti.ident, ver, sizeof(ver));
-    Log("[host] %s loaded as %s (%s); OptiScaler.ini: [DlssNr] Enabled=%s ScanExposure=%s, [Upscalers] Dx12Upscaler=%s, "
-        "[Inputs] EnableDlssInputs=%s, [Hooks] HookOriginalNvngxOnly=%s",
+    OptiFormatNrKeys(&g_opti, nrkeys, sizeof(nrkeys));
+    Log("[host] %s loaded as %s (%s): %s; OptiScaler.ini: [DlssNr] Enabled=%s %s, [Upscalers] Dx12Upscaler=%s, "
+        "[Inputs] EnableDlssInputs=%s, [Hooks] HookOriginalNvngxOnly=%s, [ProcessFilter] TargetProcessName=%s",
         g_opti.nr_fork ? OPTI_LABEL : "OptiScaler (upstream build, no neural pass)", g_opti.module, ver,
-        OptiTri(g_opti.nr_enabled, "auto (= false)"), OptiTri(g_opti.scan_exposure, "auto (= false)"), g_opti.upscaler,
-        OptiTri(g_opti.dlss_inputs, "auto (= true)"), OptiTri(g_opti.hook_original_only, "auto (= false)"));
+        g_opti.nr_fork ? OptiFlavour(g_opti.direct) : "no DLSS-NR literal in the file",
+        OptiTri(g_opti.nr_enabled, "auto (= false)"), nrkeys, g_opti.upscaler,
+        OptiTri(g_opti.dlss_inputs, "auto (= true)"), OptiTri(g_opti.hook_original_only, "auto (= false)"),
+        g_opti.target_process);
 
     if (!g_opti.nr_fork)
-        Log("[host] WARNING: this OptiScaler is not the DLSS-NR fork: it will take the NGX calls and upscale, and no "
-            "neural pass will ever run. Use the Dagherbou/OptiScaler_DLSSNR build, or remove it and use Deep Fried "
+        Log("[host] WARNING: this OptiScaler is not a DLSS-NR fork: it will take the NGX calls and upscale, and no "
+            "neural pass will ever run. Use a DLSS-NR build (" OPTI_FORKS "), or remove it and use Deep Fried "
             "Chicken or renodx-dlss5 instead.");
     else
     {
@@ -767,6 +775,11 @@ static void DetectOptiScaler()
             "hook hands its own module to the NGX SDK), it runs its upscaler on the DLAA contract and then the neural "
             "model in place on the output. Its menu is on Insert in this window. No warm-up re-create: there is no "
             "hook to wait for.", OPTI_LABEL);
+        if (OptiProcessFilterMismatch(&g_opti, exe_name))
+            Log("[host] WARNING: OptiScaler.ini has [ProcessFilter] TargetProcessName=%s but this process is %s, so "
+                "OptiScaler is in pass-through mode: loaded, hooking nothing, no menu, no neural pass. It ships as auto; "
+                "an ini copied from a game folder brings the game's name along, and here the process is the helper. "
+                "Set it to auto and restart.", g_opti.target_process, exe_name);
         if (g_opti.nr_enabled != 1)
         {
             Log("[host] WARNING: [DlssNr] Enabled is %s in OptiScaler.ini -- the neural pass is OFF and OptiScaler "
@@ -774,10 +787,23 @@ static void DetectOptiScaler()
             OptiIniDefault(&g_opti, "DlssNr", "Enabled", "true", "the neural pass is what this helper exists for",
                            &Log, "host");
         }
-        if (g_opti.scan_exposure != 0)
+        // ScanExposure exists in the forwarder build only; the direct-runtime build deletes the
+        // key from the file whenever it saves, so writing it there would be noise.
+        if (!g_opti.direct && g_opti.scan_exposure != 0)
             OptiIniDefault(&g_opti, "DlssNr", "ScanExposure", "false",
                            "this helper passes AutoExposure and owns no exposure buffer; the scan would only hook "
                            "resource creation on its device", &Log, "host");
+        // FinishedPicture applies the edit at Present. This helper's Present is its own window,
+        // and the frame the game reads back is the shared texture written by the evaluate --
+        // so the edit would land where nobody looks.
+        if (g_opti.direct && g_opti.finished_picture == 1)
+            Log("[host] WARNING: [DlssNr] FinishedPicture=true in OptiScaler.ini: OptiScaler applies the neural edit at "
+                "Present, on the finished frame, instead of inside the evaluate. Here the presented frame is this "
+                "helper's own window, which the game never sees -- the game reads back the evaluate's output. Set "
+                "FinishedPicture=false and restart.");
+        if (OptiStrayForwarder(&g_opti))
+            Log("[host] " OPTI_FORWARDER " is beside %s, which is a direct-runtime build and never loads it -- a leftover "
+                "from the forwarder build; the fork's install notes say to delete it on upgrade", g_opti.module);
         if (g_opti.dlss_inputs == 0 || g_opti.hook_original_only == 1)
             Log("[host] WARNING: OptiScaler.ini has [Inputs] EnableDlssInputs=%s and [Hooks] HookOriginalNvngxOnly=%s -- "
                 "with these the NGX SDK in this helper is NOT redirected to OptiScaler and the driver answers instead "
@@ -2857,7 +2883,8 @@ static int RunTest()
         PumpPresent(true);
         if (Evaluate(color, output, depth, mv, W, H, i == 0 ? 1 : 0, 1.0f, 1.0f)) ++good;
         else break;
-        if (i == 1 && g_opti.routed) OptiBackendCheck(&Log, "host", g_opti.upscaler, &g_opti_backend);
+        if (i >= 1 && g_opti.routed && !g_opti_backend.checked)
+            OptiBackendCheck(&Log, "host", g_opti.upscaler, g_opti.direct, &g_opti_backend);
         if (i == 180 && !g_opti.routed)   // the warm-up re-create, same medicine as in-game; OptiScaler is the callee and needs none
         {
             Log("[host] warm-up: re-creating the feature once");
@@ -3550,8 +3577,8 @@ static int Serve(DWORD game_pid)
                     outcome_logged = true;
                     LogNeuralConsumerOutcome();
                 }
-                if (g_opti.routed && !g_opti_backend.checked && ++opti_frames == 2)
-                    OptiBackendCheck(&Log, "host", g_opti.upscaler, &g_opti_backend);
+                if (g_opti.routed && !g_opti_backend.checked && ++opti_frames >= 2)
+                    OptiBackendCheck(&Log, "host", g_opti.upscaler, g_opti.direct, &g_opti_backend);
                 // One warm-up re-create per build. RenoDX: it misses the very first create
                 // (STANDBY latch) when its hooks armed a moment too late, so re-create at a
                 // fixed frame count. Chicken: it arms its detours seconds after claiming, and

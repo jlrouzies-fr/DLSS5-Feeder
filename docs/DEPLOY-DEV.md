@@ -483,23 +483,35 @@ it, and expect a `ReShade.ini.deep-fried-chicken-backup-*` file to appear next t
 
 ## 9b. OptiScaler DLSS-NR instead of Chicken
 
-The third consumer is the OptiScaler fork with the neural pass built in
-(github.com/Dagherbou/OptiScaler_DLSSNR, release zip `OptiScaler-DLSSNR-<ver>.zip`, ~130 MB, cached
-in `deploy/optiscaler/`). It is not a Detours consumer: installed as a proxy DLL the process imports,
-its LoadLibrary hook hands its own module to the statically linked NGX SDK, so every
-`NVSDK_NGX_D3D12_*` call the feeder makes lands in OptiScaler with no code on our side. The feeder
-detects it, fingerprints the routing and the neural model, and skips the warm-up re-create
-(`src/feed_opti.h`; the same section in the add-on and the host).
+The third consumer is an OptiScaler fork with the neural pass built in. Two exist and both are
+supported (issue #126): **wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass** (release zip
+`OptiScaler-NR-v<ver>.zip`, not the `-rtx40-mfg` one; the maintained fork; from v0.8.1 it has no
+forwarder DLL and dispatches feature 18 through the driver's NGX core, aliasing its caller path for
+the one call — the feeder logs it as the *direct-runtime build*) and **Dagherbou/OptiScaler_DLSSNR**
+(release zip `OptiScaler-DLSSNR-<ver>.zip`, cached in `deploy/optiscaler/`; the original; loads the
+model through its `nvngx.dll_dlssnr.dll` shim — the *forwarder build*). Both ~130 MB. Neither is a
+Detours consumer: installed as a proxy DLL the process imports, its LoadLibrary hook hands its own
+module to the statically linked NGX SDK, so every `NVSDK_NGX_D3D12_*` call the feeder makes lands in
+OptiScaler with no code on our side. The feeder detects it, fingerprints the routing and the neural
+model, and skips the warm-up re-create (`src/feed_opti.h`; the same section in the add-on and the
+host). The DLSS-NR tell is the byte string `nvngx_dlssnr.dll` in the DLL (both forks; no upstream
+build has anything with `dlssnr`); `nvngx.dll_dlssnr.dll` on top of it marks the forwarder build.
+The version resource is useless for this: both forks ship `10.0.0-dev (<commit>) (<date>)`.
 
 **Layout.** Zip contents beside the exe that does the DLSS work (`host64\` for a 32-bit game):
 `OptiScaler.dll` renamed **`winmm.dll`** (or `version.dll`; both are imports of the host exe, and of
-most games), `OptiScaler.ini`, `nvngx.dll_dlssnr.dll` (the forwarder, at the zip root), the
-`OptiScaler\` runtime folder, plus `nvngx_dlss.dll` and `nvngx_dlssnr.dll` as always. In
-`OptiScaler.ini`: `[DlssNr] Enabled=true` (ships off), `ScanExposure=false`, `[Upscalers]
-Dx12Upscaler=dlss`, `[Log] LogToFile=true`, `LogLevel=2`; recommended `[Spoofing] Dxgi=false`,
-`StreamlineSpoofing=false`, the four non-DLSS `[Inputs] Enable*Inputs=false`, `[Hotfix]
-CheckForUpdate=false`. OptiScaler.ini has many `Enabled=` keys — edit it section-aware, never with a
-blind sed. No Chicken, no renodx, no toolkit beside it.
+most games), `OptiScaler.ini`, the `OptiScaler\` runtime folder, plus `nvngx_dlss.dll` and
+`nvngx_dlssnr.dll` as always; Dagherbou's build also needs its `nvngx.dll_dlssnr.dll` (zip root), and
+beside wilsjo2's build that file is a leftover to delete (its `docs\`, `images\`, `tests\` can stay
+out of the game folder too). In `OptiScaler.ini`: `[DlssNr] Enabled=true` (ships off), `[Upscalers]
+Dx12Upscaler=dlss`, `[Log] LogToFile=true`, `LogLevel=2`; Dagherbou only: `ScanExposure=false`
+(wilsjo2 deletes that key on save); wilsjo2: leave `FinishedPicture=false` (true moves the pass to
+Present, which on the helper path is the helper's own window) and `RunBeforeSR` as you like (same
+size either way under DLAA); both: `[ProcessFilter] TargetProcessName=auto` (another exe's name =
+pass-through, no hooks, no menu). Recommended `[Spoofing] Dxgi=false`, `StreamlineSpoofing=false`,
+the four non-DLSS `[Inputs] Enable*Inputs=false`, `[Hotfix] CheckForUpdate=false`. OptiScaler.ini has
+many `Enabled=` keys — edit it section-aware, never with a blind sed (`scratchpad ini_set.py`-style).
+No Chicken, no renodx, no toolkit beside it.
 
 ### Verifying without a game
 
@@ -516,30 +528,49 @@ The section-9 rig, with the OptiScaler set in place of Chicken's three files. Ru
 | OptiScaler + Chicken | 300/300 | — | host WARNS; Chicken still arms and reports `feeder_marker=1`, i.e. a second consumer really runs |
 | OptiScaler as `dbghelp.dll` | 300/300 | 0.24 | host WARNS it is never loaded; probe shows the driver |
 
+Re-measured 2026-09-22 (driver 616.92, RTX 5090, `Dx12Upscaler=dlss`, both zips extracted straight
+into a scratch rig, `Enabled=true` and logging on, nothing else touched):
+
+| run | `--test` | GPU ms/frame at 640x360 | proof |
+| --- | --- | --- | --- |
+| wilsjo2 v0.8.8 (direct-runtime build) | 300/300 | 3.68 | same probe answer; `after evaluate 2: no forwarder (none in a direct-runtime build), neural model (feature 18) loaded` |
+| Dagherbou v0.2.0 (forwarder build) | 300/300 | 3.90 | `after evaluate 2: neural forwarder loaded, neural model (feature 18) loaded` |
+
 What a good run looks like in `dlss5-feed-host.log`:
 
 ```
-OptiScaler DLSS-NR loaded as WINMM.dll (...); OptiScaler.ini: [DlssNr] Enabled=true ScanExposure=false, [Upscalers] Dx12Upscaler=dlss, ...
+OptiScaler DLSS-NR loaded as WINMM.dll (...): direct-runtime build (wilsjo2/...) ...; OptiScaler.ini: [DlssNr] Enabled=true RunBeforeSR=auto (= false) FinishedPicture=false, [Upscalers] Dx12Upscaler=dlss, ..., [ProcessFilter] TargetProcessName=auto
 NGX feature requirements: SuperSampling ... -> supported (min GPU architecture 0x0, min OS 10.0.10240.16384)
 NGX calls are routed through OptiScaler DLSS-NR (WINMM.dll): the requirements probe carries its fingerprint
-OptiScaler DLSS-NR after the first evaluate: neural forwarder loaded, neural model (feature 18) loaded; upscaler asked for in OptiScaler.ini: dlss
+OptiScaler DLSS-NR after evaluate 2: no forwarder (none in a direct-runtime build), neural model (feature 18) loaded; upscaler asked for in OptiScaler.ini: dlss
 --test finished: 300/300 evaluates succeeded
 --test: neural consumer OptiScaler DLSS-NR (WINMM.dll): NGX routed through it, neural model created (feature 18), upscaler asked for: dlss
 ```
 
-and in `OptiScaler.log` beside the DLL: `working as winmm.dll`, `nvngx call: ...\nvngx.dll, returning
-this dll!`, `Creating DLSS upscaler feature`, `_CreateFeature result: NVSDK_NGX_Result_Success`,
-`DLSS-NR forwarder loaded from`, `DLSS-NR running at 640x360`. Its tail can be cut short: the host exits
-through `TerminateProcess` and OptiScaler's log has no flush-on-write.
+(Dagherbou's build says `forwarder build (...)`, `ScanExposure=false` and `neural forwarder loaded` in
+the same places.) The backend line is no longer tied to the second evaluate: the check repeats until
+the model is in the process or 120 evaluates have passed, then logs once.
+
+And in `OptiScaler.log` beside the DLL: `working as winmm.dll`, `nvngx call: ...\nvngx.dll, returning
+this dll!`, `Creating DLSS upscaler feature`, `_CreateFeature result: NVSDK_NGX_Result_Success`; then
+Dagherbou: `DLSS-NR forwarder loaded from`, `DLSS-NR running at 640x360`; wilsjo2: `DLSS-NR: feature
+created at 640x360 through ...`, periodic `DLSS-NR elapsed: ... ms model`. Its tail can be cut short:
+the host exits through `TerminateProcess` and OptiScaler's log has no flush-on-write.
 
 Things learned that are not obvious:
 
 - **Module presence cannot tell the upscalers apart.** OptiScaler preloads `nvngx_dlss.dll` and
-  `libxess.dll` whatever it builds; only `nvngx_dlssnr.dll` + `nvngx.dll_dlssnr.dll` (loaded at the
-  first neural dispatch) are evidence, and they prove the pass, not the upscaler. Which upscaler ran is
-  in `OptiScaler.log`. Without `nvngx_dlss.dll` OptiScaler disables its DLSS side, builds FSR 2.1.2, still
-  reports Success — and the neural pass still ran in the rig. The feature-18 requirements probe is refused
-  in that state, which the host reports.
+  `libxess.dll` whatever it builds; only `nvngx_dlssnr.dll` (plus `nvngx.dll_dlssnr.dll` in the
+  forwarder build), loaded at the first neural dispatch, is evidence, and it proves the pass, not the
+  upscaler. Which upscaler ran is in `OptiScaler.log`. Without `nvngx_dlss.dll` OptiScaler disables its
+  DLSS side, builds FSR 2.1.2, still reports Success — and the neural pass still ran in the rig. The
+  feature-18 requirements probe is refused in that state, which the host reports.
+- **`GetFileAttributes` lies inside the process.** OptiScaler hooks `GetFileAttributesW` and answers
+  "exists" for any path containing `nvngx.dll` (outside the Windows folder) while its DXGI or
+  Streamline spoofing is on, so a game believes DLSS is installed. Dagherbou's hook exempts its own
+  `nvngx.dll_` prefix; wilsjo2's does not, so a check for a leftover `nvngx.dll_dlssnr.dll` said
+  "present" in an empty folder. `FindFirstFile` is not hooked; `feed_opti.h` uses that. Any future
+  in-process existence check on a name containing `nvngx.dll` has the same trap.
 - `[DlssNr] ScanExposure=false` does not stop the `ExposureScan::Adopt` lines (it adopts DLSS's own 1x1
   exposure buffer; our textures are filter-rejected). Harmless.
 - The fork's `dlssnr-capture.trigger` (an empty file beside the DLL) writes `before_NN.raw` /

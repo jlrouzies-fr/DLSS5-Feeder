@@ -2287,7 +2287,8 @@ static void DetectChickenHost()
 // headline keys read-only from host64\OptiScaler.ini, and points at OptiScaler's own menu
 // (Insert, in the host window -- reachable through the in-game cast).
 static bool   g_opti_host            = false;
-static bool   g_opti_host_nr         = false;   // the DLSS-NR fork, not upstream OptiScaler
+static bool   g_opti_host_nr         = false;   // a DLSS-NR fork, not upstream OptiScaler
+static bool   g_opti_host_direct     = false;   // ... the direct-runtime generation (no forwarder; see feed_opti.h)
 static char   g_opti_host_module[64] = "";
 static char   g_opti_ini_path[MAX_PATH];
 static UINT64 g_opti_ini_read_at     = 0;
@@ -2309,10 +2310,9 @@ static void DetectOptiHost()
         char path[MAX_PATH];
         sprintf_s(path, "%s%s", h64, name);
         if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
-        const bool fork = OptiFileHasLiteral(path, OPTI_FORWARDER);
-        if (!fork && !OptiFileHasLiteral(path, OPTI_INI)) continue;
-        g_opti_host        = true;
-        g_opti_host_nr     = fork;
+        if (!OptiIsBuild(path)) continue;
+        g_opti_host = true;
+        OptiClassify(path, &g_opti_host_nr, &g_opti_host_direct);
         strcpy_s(g_opti_host_module, name);
         break;
     }
@@ -2327,12 +2327,12 @@ static void DetectOptiHost()
 
     if (!g_opti_host) { Log("[feed32] OptiScaler: not present in host64\\"); return; }
     if (!g_opti_host_nr)
-        Warn("host64\\%s is OptiScaler, but not the DLSS-NR fork: the host's NGX calls go to it, it upscales, and no "
-             "neural pass ever runs. Use the Dagherbou/OptiScaler_DLSSNR build.", g_opti_host_module);
+        Warn("host64\\%s is OptiScaler, but not a DLSS-NR fork: the host's NGX calls go to it, it upscales, and no "
+             "neural pass ever runs. Use a DLSS-NR build (" OPTI_FORKS ").", g_opti_host_module);
     else
-        Log("[feed32] %s: present in host64\\ as %s -- it is the neural consumer; the host's NGX calls are answered by "
-            "it, and its menu is on Insert in the host window (through the in-game cast, or with host_window=1)",
-            OPTI_LABEL, g_opti_host_module);
+        Log("[feed32] %s: present in host64\\ as %s (%s) -- it is the neural consumer; the host's NGX calls are "
+            "answered by it, and its menu is on Insert in the host window (through the in-game cast, or with "
+            "host_window=1)", OPTI_LABEL, g_opti_host_module, OptiFlavour(g_opti_host_direct));
 
     // One consumer, and this side can at least see the files. The host says the rest.
     char reno[MAX_PATH];

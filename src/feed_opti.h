@@ -1,8 +1,15 @@
 // feed_opti.h -- OptiScaler DLSS-NR as a neural consumer, producer side.
 //
-// Dagherbou/OptiScaler_DLSSNR (branch dlss-neural-rendering) is an OptiScaler fork that runs the
-// DLSS 5 neural-rendering model (NGX feature 18, nvngx_dlssnr.dll) over its upscaler's output.
-// Unlike renodx-dlss5 and Deep Fried Chicken it is not a Detours hook over NVIDIA's _nvngx.dll:
+// Two OptiScaler forks run the DLSS 5 neural-rendering model (NGX feature 18, nvngx_dlssnr.dll)
+// over their upscaler's output: Dagherbou/OptiScaler_DLSSNR (branch dlss-neural-rendering, the
+// original) and wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass (forked from it; issue #126). They differ
+// in ONE thing this header can see -- how the model is reached. Dagherbou's build loads the model
+// through its own shim, nvngx.dll_dlssnr.dll (the "forwarder": the model refuses a caller whose
+// path lacks nvngx.dll, and the shim's name satisfies it); wilsjo2's v0.8.1+ has no shim and
+// dispatches feature 18 through the driver's NGX core, aliasing the caller path for the one call.
+// Both keep the ini section, the routing answer and the model's file name; both are "the
+// DLSS-NR fork" to this header, told apart as the forwarder build and the direct-runtime build.
+// Unlike renodx-dlss5 and Deep Fried Chicken neither is a Detours hook over NVIDIA's _nvngx.dll:
 // it IS the NGX implementation the process talks to. Installed the normal OptiScaler way --
 // renamed to a DLL the process imports (winmm.dll or version.dll; ReShade owns dxgi.dll) -- it is
 // loaded at process start, and its LoadLibrary hooks hand its own module to anything that asks
@@ -14,29 +21,42 @@
 // Measured 2026-09-07 with the host --test rig (OptiScaler-DLSSNR-v0.2.0 as winmm.dll, driver
 // 616.64, RTX 5090): 300/300 evaluates; DLSS alone 0.25 ms/frame at 640x360, with the neural pass
 // 3.4 ms (dlss), 3.1 ms (xess), 2.1 ms (fsr31) -- the pass runs whatever the upscaler is.
+// Measured 2026-09-22, same rig, driver 616.92: wilsjo2 v0.8.8 300/300, 3.68 ms (dlss), model
+// loaded by evaluate 2; Dagherbou v0.2.0 again 300/300, 3.90 ms. Same routing answer from both.
 //
 // So this header is not a protocol but a set of checks:
-//   1. is an OptiScaler build loaded in this process, under which name, and is it the DLSS-NR
+//   1. is an OptiScaler build loaded in this process, under which name, and is it a DLSS-NR
 //      fork -- upstream OptiScaler would take the calls, upscale, and never run a neural pass,
-//      which is a silent "does nothing" the log must name;
+//      which is a silent "does nothing" the log must name. The tell is the model's file name as
+//      a byte string in the DLL: both forks carry "nvngx_dlssnr.dll", upstream carries nothing
+//      with dlssnr in it (source checked at upstream master 2026-08-29, both release binaries
+//      scanned 2026-09-22). The forwarder's name on top of that says which generation it is;
 //   2. did the NGX probe really reach it: the ROUTING fingerprint. OptiScaler answers the
 //      SuperSampling requirements query with MinHWArchitecture 0 and MinOSVersion
 //      10.0.10240.16384 (inputs/NVNGX_DLSS_Dx12.cpp); the driver core answers a real
 //      architecture id (0x160 on this machine);
-//   3. after the first evaluate, whether the neural model is in the process: the BACKEND
+//   3. after the first evaluates, whether the neural model is in the process: the BACKEND
 //      fingerprint. OptiScaler returns Success from CreateFeature even when it silently fell back
 //      to FSR 2.1.2 (nvngx_dlss.dll missing), and from Evaluate on frames it skipped, so "routed"
-//      alone does not prove the neural model was created. The model (nvngx_dlssnr.dll) and its
-//      forwarder are loaded only at the first neural dispatch, so their presence after the first
-//      evaluate is the proof. Which UPSCALER ran is not observable from here -- OptiScaler
+//      alone does not prove the neural model was created. The model (nvngx_dlssnr.dll) is loaded
+//      only at the first neural dispatch, so its presence once the evaluates are flowing is the
+//      proof. The forwarder build does that inside the first evaluate; the direct-runtime build
+//      creates the model on its own schedule (it retires and rebuilds features behind GPU
+//      completion), so the check is repeated for a while before it calls the model absent.
+//      Which UPSCALER ran is not observable from here -- OptiScaler
 //      preloads every runtime it might use, nvngx_dlss.dll and libxess.dll included (measured) --
 //      so the ini says what was asked for, and the feature-18 requirements probe says whether
 //      OptiScaler's DLSS side is alive at all: it can only forward that query to the driver core
 //      when nvngx_dlss.dll is beside it and the GPU is NVIDIA, the same two conditions under
 //      which its dlss backend exists and its neural pass can get the core's capability block;
-//   4. is OptiScaler.ini set up for a bare NGX client: [DlssNr] Enabled is off by default (its
-//      release refuses to ship it on), and [DlssNr] ScanExposure hooks resource creation on our
-//      device looking for an exposure buffer we never offer.
+//   4. is OptiScaler.ini set up for a bare NGX client: [DlssNr] Enabled is off by default (both
+//      releases refuse to ship it on); in the forwarder build [DlssNr] ScanExposure hooks resource
+//      creation on our device looking for an exposure buffer we never offer (the direct-runtime
+//      build dropped the key and deletes it from the file on save); in the direct-runtime build
+//      [DlssNr] FinishedPicture moves the pass from the evaluate to Present, which on the helper
+//      path is a window the game never sees; and [ProcessFilter] TargetProcessName, when it
+//      names another exe, puts OptiScaler into pass-through (no hooks, no menu) -- upstream
+//      behaviour, and a copy of an ini configured for a game brings that name along.
 //
 // Exactly one consumer, as always -- but here it is a hard rule rather than a quality note. With
 // OptiScaler's redirect live, Deep Fried Chicken's own deep-fried-chicken-nvngx.dll (which ends in
@@ -59,11 +79,14 @@
 #include <cstdlib>
 #include <cstring>
 
-#define OPTI_LABEL     "OptiScaler DLSS-NR"
-#define OPTI_INI       "OptiScaler.ini"
-#define OPTI_FORWARDER "nvngx.dll_dlssnr.dll"   // the fork's caller-gate shim; its name is also the literal that marks the fork
-#define OPTI_MIN_OS    "10.0.10240.16384"        // what OptiScaler answers as MinOSVersion for SuperSampling
-#define OPTI_MAX_SCAN  (96u * 1024u * 1024u)     // OptiScaler.dll is ~25 MB
+#define OPTI_LABEL      "OptiScaler DLSS-NR"
+#define OPTI_INI        "OptiScaler.ini"
+#define OPTI_NR_LITERAL "nvngx_dlssnr.dll"       // the model's file name: in every DLSS-NR build, in no upstream OptiScaler
+#define OPTI_FORWARDER  "nvngx.dll_dlssnr.dll"   // the forwarder build's caller-gate shim; a build that names it loads it
+#define OPTI_MIN_OS     "10.0.10240.16384"       // what OptiScaler answers as MinOSVersion for SuperSampling
+#define OPTI_MAX_SCAN   (96u * 1024u * 1024u)    // OptiScaler.dll is ~26 MB
+#define OPTI_MODEL_WAIT 120u                     // evaluates to keep looking for the model before calling it never created
+#define OPTI_FORKS      "wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass or Dagherbou/OptiScaler_DLSSNR"
 
 // Names OptiScaler can be installed under (its setup_windows.bat), plus its own. dxgi.dll is in
 // the list for a game folder; a caller that knows dxgi.dll is ReShade skips it.
@@ -75,7 +98,8 @@ static const char *const kOptiProxyNames[] = {
 struct OptiInfo
 {
     bool present;            // an OptiScaler build is loaded in this process
-    bool nr_fork;            // its file carries the DLSS-NR forwarder literal
+    bool nr_fork;            // its file names the neural model (or the forwarder): a DLSS-NR build
+    bool direct;             // ... without the forwarder: feature 18 goes through the driver's NGX core (wilsjo2 v0.8.1+)
     bool routed;             // the NGX requirements probe answered with OptiScaler's fingerprint
     char module[64];         // the name it is loaded as ("winmm.dll")
     char path[MAX_PATH];     // its full path
@@ -85,23 +109,37 @@ struct OptiInfo
 #endif
     // OptiScaler.ini as read: -1 = key absent or "auto" (the compiled default applies), else 0/1.
     int  nr_enabled;         // [DlssNr] Enabled              default false -- the neural pass itself
-    int  scan_exposure;      // [DlssNr] ScanExposure         default false
+    int  scan_exposure;      // [DlssNr] ScanExposure         default false (forwarder build only)
+    int  run_before_sr;      // [DlssNr] RunBeforeSR          default false (direct build only; same size either way under DLAA)
+    int  finished_picture;   // [DlssNr] FinishedPicture      default false (direct build only; true moves the pass to Present)
     int  dlss_inputs;        // [Inputs] EnableDlssInputs     default true  -- the nvngx redirect itself
     int  hook_original_only; // [Hooks] HookOriginalNvngxOnly default false -- true exempts loads from the exe folder
     int  overlay_menu;       // [Menu] OverlayMenu            default true  -- must stay true
     char upscaler[32];       // [Upscalers] Dx12Upscaler      "auto" = DLSS on a capable GPU with nvngx_dlss.dll beside it
+    char target_process[64]; // [ProcessFilter] TargetProcessName  "auto" = every process; another exe's name = pass-through here
 };
 
 struct OptiBackend
 {
-    bool checked;
-    bool forwarder;   // nvngx.dll_dlssnr.dll: the neural pass reached its caller gate
-    bool nr_created;  // nvngx_dlssnr.dll: feature 18 exists
+    bool     checked;     // the verdict below is final
+    bool     forwarder;   // nvngx.dll_dlssnr.dll: the forwarder build's neural pass reached its caller gate
+    bool     nr_created;  // nvngx_dlssnr.dll: feature 18 exists
+    unsigned looks;       // how many evaluates the check has looked after
 };
 
 static inline const char *OptiTri(int v, const char *when_auto)
 {
     return v == 1 ? "true" : v == 0 ? "false" : when_auto;
+}
+
+// Which generation of the fork, for the log. Both are OPTI_LABEL; the difference is the model's
+// route, and it decides which ini keys exist and which module the backend check may expect.
+static inline const char *OptiFlavour(bool direct)
+{
+    return direct ? "direct-runtime build (wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass v0.8.1+): feature 18 through the "
+                    "driver's NGX core, no forwarder"
+                  : "forwarder build (Dagherbou/OptiScaler_DLSSNR, or wilsjo2 before v0.8.1): feature 18 through its "
+                    "nvngx.dll_dlssnr.dll shim";
 }
 
 // The loaded module, if any. OptiScaler exports the NGX entry points AND the DXGI factory
@@ -137,7 +175,8 @@ static inline bool OptiFindModule(OptiInfo *o)
 }
 
 // Does the FILE contain this byte string? A plain substring: the names this is used for
-// (the forwarder's file name, OptiScaler.ini) exist nowhere but in an OptiScaler build.
+// (OptiScaler.ini, the model's and the forwarder's file names) exist nowhere but in an
+// OptiScaler build, and the last two nowhere but in a DLSS-NR build of it.
 static inline bool OptiFileHasLiteral(const char *path, const char *needle)
 {
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -158,6 +197,21 @@ static inline bool OptiFileHasLiteral(const char *path, const char *needle)
     return found;
 }
 
+// Is this file an OptiScaler build at all (any fork, upstream included)?
+static inline bool OptiIsBuild(const char *path)
+{
+    return OptiFileHasLiteral(path, OPTI_INI);
+}
+
+// Which kind: a DLSS-NR build names the model; the forwarder build also names its shim. Reads
+// the file twice at most (~26 MB each); called once per candidate, at load.
+static inline void OptiClassify(const char *path, bool *nr_fork, bool *direct)
+{
+    const bool forwarder = OptiFileHasLiteral(path, OPTI_FORWARDER);
+    *nr_fork = forwarder || OptiFileHasLiteral(path, OPTI_NR_LITERAL);
+    *direct  = *nr_fork && !forwarder;
+}
+
 // One boolean key: -1 when absent or "auto".
 static inline int OptiIniBool(const char *ini, const char *section, const char *key)
 {
@@ -176,11 +230,53 @@ static inline void OptiReadIni(OptiInfo *o)
     _snprintf_s(ini, sizeof(ini), _TRUNCATE, "%s" OPTI_INI, o->dir);
     o->nr_enabled         = OptiIniBool(ini, "DlssNr", "Enabled");
     o->scan_exposure      = OptiIniBool(ini, "DlssNr", "ScanExposure");
+    o->run_before_sr      = OptiIniBool(ini, "DlssNr", "RunBeforeSR");
+    o->finished_picture   = OptiIniBool(ini, "DlssNr", "FinishedPicture");
     o->dlss_inputs        = OptiIniBool(ini, "Inputs", "EnableDlssInputs");
     o->hook_original_only = OptiIniBool(ini, "Hooks", "HookOriginalNvngxOnly");
     o->overlay_menu       = OptiIniBool(ini, "Menu", "OverlayMenu");
     GetPrivateProfileStringA("Upscalers", "Dx12Upscaler", "auto", o->upscaler, sizeof(o->upscaler), ini);
     if (o->upscaler[0] == '\0') strcpy_s(o->upscaler, "auto");
+    GetPrivateProfileStringA("ProcessFilter", "TargetProcessName", "auto", o->target_process, sizeof(o->target_process), ini);
+    if (o->target_process[0] == '\0') strcpy_s(o->target_process, "auto");
+}
+
+// The [DlssNr] keys that exist in this build, for the one log line that shows the ini.
+static inline void OptiFormatNrKeys(const OptiInfo *o, char *out, size_t n)
+{
+    if (o->direct)
+        _snprintf_s(out, n, _TRUNCATE, "RunBeforeSR=%s FinishedPicture=%s",
+                    OptiTri(o->run_before_sr, "auto (= false)"), OptiTri(o->finished_picture, "auto (= false)"));
+    else
+        _snprintf_s(out, n, _TRUNCATE, "ScanExposure=%s", OptiTri(o->scan_exposure, "auto (= false)"));
+}
+
+// [ProcessFilter] TargetProcessName set to some other exe: OptiScaler's DllMain compares it with
+// the process name (lower-cased on both sides) and goes pass-through on a mismatch -- loaded,
+// exporting everything, hooking nothing. Upstream behaviour; an ini copied from a game brings
+// the game's name along, and on the helper path the process is the helper.
+static inline bool OptiProcessFilterMismatch(const OptiInfo *o, const char *exe_name)
+{
+    if (_stricmp(o->target_process, "auto") == 0) return false;
+    return _stricmp(o->target_process, exe_name) != 0;
+}
+
+// The obsolete forwarder beside a direct-runtime build: nothing loads it, and the fork's install
+// notes say to remove it on upgrade. Reported, not removed -- it is the user's file.
+// FindFirstFile, not GetFileAttributes: OptiScaler hooks GetFileAttributesW and answers "exists"
+// for any path containing nvngx.dll while its spoofing is on (so a game believes DLSS is
+// installed), and this name contains it. Measured on the rig: the direct build reported a
+// forwarder that was not there. Its FindFirstFile is not hooked.
+static inline bool OptiStrayForwarder(const OptiInfo *o)
+{
+    if (!o->direct) return false;
+    char path[MAX_PATH];
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%s" OPTI_FORWARDER, o->dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE f = FindFirstFileA(path, &fd);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    FindClose(f);
+    return true;
 }
 
 // Write a key into OptiScaler.ini only when it is absent or "auto" -- a value the user (or
@@ -223,20 +319,27 @@ static inline bool OptiRouted(const FeedNgxVerdict &v)
 }
 #endif
 
-// The backend fingerprint (point 3). Call once, after the first evaluate has RETURNED: the
-// neural pass loads its forwarder and creates feature 18 on the CPU inside that first evaluate,
-// so both modules are in the process by then if they ever will be.
-static inline void OptiBackendCheck(void (*log)(const char *, ...), const char *tag, const char *upscaler,
+// The backend fingerprint (point 3). Call after each evaluate that RETURNED Success, from the
+// second one on, until it says it is done (`checked`): the forwarder build has the model loaded
+// inside the first evaluate; the direct-runtime build may take a few more, so a miss is retried
+// for OPTI_MODEL_WAIT evaluates before it counts. Logs once, at the verdict. The wording of the
+// "neural model (feature 18) loaded / NOT loaded" clause is read by Verify-DLSS5Feeder.ps1.
+static inline void OptiBackendCheck(void (*log)(const char *, ...), const char *tag, const char *upscaler, bool direct,
                                     OptiBackend *b)
 {
-    b->checked    = true;
     b->forwarder  = GetModuleHandleA(OPTI_FORWARDER) != nullptr;
     b->nr_created = GetModuleHandleW(L"nvngx_dlssnr.dll") != nullptr;
-    log("[%s] %s after the first evaluate: neural forwarder %s, neural model (feature 18) %s; upscaler asked for in "
-        "OptiScaler.ini: %s (which one actually ran is in OptiScaler.log, not observable from here)",
-        tag, OPTI_LABEL, b->forwarder ? "loaded" : "NOT loaded", b->nr_created ? "loaded" : "NOT loaded", upscaler);
+    ++b->looks;
+    if (!b->nr_created && b->looks < OPTI_MODEL_WAIT) return;
+    b->checked = true;
+    log("[%s] %s after evaluate %u: %s, neural model (feature 18) %s; upscaler asked for in OptiScaler.ini: %s "
+        "(which one actually ran is in OptiScaler.log, not observable from here)",
+        tag, OPTI_LABEL, b->looks + 1,
+        direct ? "no forwarder (none in a direct-runtime build)"
+               : b->forwarder ? "neural forwarder loaded" : "neural forwarder NOT loaded",
+        b->nr_created ? "loaded" : "NOT loaded", upscaler);
     if (!b->nr_created)
-        log("[%s] WARNING: the neural model was never created -- OptiScaler is upscaling and nothing more. Needs "
-            "[DlssNr] Enabled=true in OptiScaler.ini, and nvngx_dlssnr.dll plus %s beside it; OptiScaler.log says why",
-            tag, OPTI_FORWARDER);
+        log("[%s] WARNING: the neural model was never created in %u evaluates -- OptiScaler is upscaling and nothing "
+            "more. Needs [DlssNr] Enabled=true in OptiScaler.ini and nvngx_dlssnr.dll beside it%s; OptiScaler.log says why",
+            tag, b->looks + 1, direct ? "" : " (plus " OPTI_FORWARDER ")");
 }

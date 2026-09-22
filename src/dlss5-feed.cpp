@@ -2537,16 +2537,21 @@ static bool ContainsNoCase(const char *hay, const char *needle)
 // carries the same section, keep the two in step). It is a proxy DLL the GAME imports (winmm.dll,
 // version.dll, ... -- OptiScaler's own setup picks the name), so by the time ReShade loads this
 // add-on it is in the process and its nvngx redirect is armed: nothing is loaded from this side.
-// What this does is name it, tell the DLSS-NR fork from upstream OptiScaler, read the ini keys
-// that decide whether the neural pass can run at all, and refuse to be quiet about a second
-// consumer -- or about a game that has DLSS of its own, which OptiScaler captures whole.
+// What this does is name it, tell a DLSS-NR fork (either generation, see feed_opti.h) from
+// upstream OptiScaler, read the ini keys that decide whether the neural pass can run at all, and
+// refuse to be quiet about a second consumer -- or about a game that has DLSS of its own, which
+// OptiScaler captures whole.
 static void DetectOptiScaler()
 {
     g_opti = OptiInfo{};
-    g_opti.nr_enabled = g_opti.scan_exposure = g_opti.dlss_inputs = g_opti.hook_original_only = g_opti.overlay_menu = -1;
+    g_opti.nr_enabled = g_opti.scan_exposure = g_opti.run_before_sr = g_opti.finished_picture = g_opti.dlss_inputs =
+        g_opti.hook_original_only = g_opti.overlay_menu = -1;
     char dir[MAX_PATH];
     GetModuleFileNameA(g_self, dir, MAX_PATH);
     if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
+    char exe[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    const char *exe_name = strrchr(exe, '\\') != nullptr ? strrchr(exe, '\\') + 1 : exe;
 
     if (!OptiFindModule(&g_opti))
     {
@@ -2558,7 +2563,7 @@ static void DetectOptiScaler()
             char path[MAX_PATH];
             sprintf_s(path, "%s%s", dir, name);
             if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
-            if (!OptiFileHasLiteral(path, OPTI_FORWARDER) && !OptiFileHasLiteral(path, OPTI_INI)) continue;
+            if (!OptiIsBuild(path)) continue;
             Warn("%s is an OptiScaler build, but this game never loaded a DLL of that name, so it cannot take the "
                  "NGX calls and no neural pass will run. Rename it to a DLL the game imports (OptiScaler's own "
                  "setup_windows.bat offers the choices; winmm.dll or version.dll suit most games).", name);
@@ -2569,20 +2574,23 @@ static void DetectOptiScaler()
     }
 
     g_opti.present = true;
-    g_opti.nr_fork = OptiFileHasLiteral(g_opti.path, OPTI_FORWARDER);
+    OptiClassify(g_opti.path, &g_opti.nr_fork, &g_opti.direct);
     FeedReadFileIdent(g_opti.path, &g_opti.ident);
     OptiReadIni(&g_opti);
-    char ver[400];
+    char ver[400], nrkeys[160];
     FeedFormatFileIdent(g_opti.ident, ver, sizeof(ver));
-    Log("[feed] %s loaded as %s (%s); OptiScaler.ini: [DlssNr] Enabled=%s ScanExposure=%s, [Upscalers] Dx12Upscaler=%s, "
-        "[Inputs] EnableDlssInputs=%s, [Hooks] HookOriginalNvngxOnly=%s",
+    OptiFormatNrKeys(&g_opti, nrkeys, sizeof(nrkeys));
+    Log("[feed] %s loaded as %s (%s): %s; OptiScaler.ini: [DlssNr] Enabled=%s %s, [Upscalers] Dx12Upscaler=%s, "
+        "[Inputs] EnableDlssInputs=%s, [Hooks] HookOriginalNvngxOnly=%s, [ProcessFilter] TargetProcessName=%s",
         g_opti.nr_fork ? OPTI_LABEL : "OptiScaler (upstream build, no neural pass)", g_opti.module, ver,
-        OptiTri(g_opti.nr_enabled, "auto (= false)"), OptiTri(g_opti.scan_exposure, "auto (= false)"), g_opti.upscaler,
-        OptiTri(g_opti.dlss_inputs, "auto (= true)"), OptiTri(g_opti.hook_original_only, "auto (= false)"));
+        g_opti.nr_fork ? OptiFlavour(g_opti.direct) : "no DLSS-NR literal in the file",
+        OptiTri(g_opti.nr_enabled, "auto (= false)"), nrkeys, g_opti.upscaler,
+        OptiTri(g_opti.dlss_inputs, "auto (= true)"), OptiTri(g_opti.hook_original_only, "auto (= false)"),
+        g_opti.target_process);
 
     if (!g_opti.nr_fork)
-        Warn("this OptiScaler (%s) is not the DLSS-NR fork: it will take the NGX calls and upscale, and no neural pass "
-             "will ever run. Use the Dagherbou/OptiScaler_DLSSNR build, or remove it and use Deep Fried Chicken or "
+        Warn("this OptiScaler (%s) is not a DLSS-NR fork: it will take the NGX calls and upscale, and no neural pass "
+             "will ever run. Use a DLSS-NR build (" OPTI_FORKS "), or remove it and use Deep Fried Chicken or "
              "renodx-dlss5 instead.", g_opti.module);
     else
     {
@@ -2590,6 +2598,11 @@ static void DetectOptiScaler()
             "hands its own module to the NGX SDK), it runs its upscaler on the DLAA contract and then the neural model "
             "in place on the output. Its menu is on Insert. No warm-up re-create: there is no hook to wait for.",
             OPTI_LABEL);
+        if (OptiProcessFilterMismatch(&g_opti, exe_name))
+            Warn("OptiScaler.ini has [ProcessFilter] TargetProcessName=%s but this process is %s, so OptiScaler is in "
+                 "pass-through mode: loaded, hooking nothing, no menu, no neural pass. It ships as auto; an ini copied "
+                 "from another game brings that game's name along. Set it to auto (or to %s) and restart.",
+                 g_opti.target_process, exe_name, exe_name);
         if (g_opti.nr_enabled != 1)
         {
             Warn("[DlssNr] Enabled is %s in OptiScaler.ini -- the neural pass is OFF and OptiScaler only upscales. Turn "
@@ -2598,10 +2611,19 @@ static void DetectOptiScaler()
             OptiIniDefault(&g_opti, "DlssNr", "Enabled", "true", "the neural pass is what this add-on exists for",
                            &Log, "feed");
         }
-        if (g_opti.scan_exposure != 0)
+        // ScanExposure exists in the forwarder build only; the direct-runtime build deletes the
+        // key from the file whenever it saves, so writing it there would be noise.
+        if (!g_opti.direct && g_opti.scan_exposure != 0)
             OptiIniDefault(&g_opti, "DlssNr", "ScanExposure", "false",
                            "this add-on passes AutoExposure and owns no exposure buffer; the scan would only hook "
                            "resource creation on its device", &Log, "feed");
+        if (g_opti.direct && g_opti.finished_picture == 1)
+            Warn("[DlssNr] FinishedPicture=true in OptiScaler.ini: OptiScaler applies the neural edit at the game's "
+                 "Present, on the finished frame, instead of inside the DLAA evaluate this add-on makes. That is not "
+                 "the path this add-on was measured on; if nothing looks neural, set FinishedPicture=false and restart.");
+        if (OptiStrayForwarder(&g_opti))
+            Log("[feed] " OPTI_FORWARDER " is beside %s, which is a direct-runtime build and never loads it -- a leftover "
+                "from the forwarder build; the fork's install notes say to delete it on upgrade", g_opti.module);
         if (g_opti.dlss_inputs == 0 || g_opti.hook_original_only == 1)
             Warn("OptiScaler.ini has [Inputs] EnableDlssInputs=%s and [Hooks] HookOriginalNvngxOnly=%s -- with these the "
                  "NGX SDK in this add-on is NOT redirected to OptiScaler and the driver answers instead (plain DLAA, no "
@@ -2728,10 +2750,11 @@ static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, D
     const NVSDK_NGX_Result r = EvaluateDLSSGuarded(ep, code);
     QueryPerformanceCounter(&b);
     g_last_eval_ticks = b.QuadPart - a.QuadPart;
-    // The neural pass loads its forwarder and creates feature 18 on the CPU inside the first
-    // evaluate; by the second one the modules are there if they ever will be.
-    if (*code == 0 && NVSDK_NGX_SUCCEED(r) && g_opti.routed && !g_opti_backend.checked && ++g_opti_evals == 2)
-        OptiBackendCheck(&Log, "feed", g_opti.upscaler, &g_opti_backend);
+    // The forwarder build loads the model inside the first evaluate, so the second one sees it;
+    // the direct-runtime build creates it on its own schedule, so the check keeps looking for a
+    // while (feed_opti.h) and says `checked` when its verdict is final.
+    if (*code == 0 && NVSDK_NGX_SUCCEED(r) && g_opti.routed && !g_opti_backend.checked && ++g_opti_evals >= 2)
+        OptiBackendCheck(&Log, "feed", g_opti.upscaler, g_opti.direct, &g_opti_backend);
     return r;
 }
 
