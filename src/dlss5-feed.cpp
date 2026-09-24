@@ -65,6 +65,7 @@
 #include "feed_opti.h" // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 #include "feed_pq12.h" // the D3D12 PQ<->linear pass, for the transports with no shaders of their own
+#include "feed_hold12.h" // the output stabiliser: one compute pass after the evaluate, all four transports
 
 #define FEED_VERSION "1.17.0-beta.2"
 #ifndef FEED_BUILD_ID
@@ -1032,10 +1033,18 @@ struct Cfg
                            // through the MV scale, which OptiScaler honours for its DLSS and
                            // its own NR vectors; a consumer that ignores the scale would
                            // double-advance instead.
+    float hold_strength;   // the output stabiliser (feed_hold12.h), one compute pass after the evaluate on
+                           // every transport. 0 = off. Where the game's frame did not change since the
+                           // pixel last moved, the shown pixel keeps this much of last frame's value and
+                           // takes (1 - this) of the model's new answer; where it changed, the model's
+                           // answer shows as is. Same key and meaning as the 32-bit add-on's.
+    float hold_tolerance;  // relative input change (0.04 = 4 percent of local brightness) below which a
+                           // pixel counts as still; the gate opens fully at twice this.
 };
 
 static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 0, 0.3f, 2000, 1, 0, 0, 0, 0, 1.0f, 1.0f, 50, 1, 0, 1, 0,
-                     /* hdr_bridge */ -1, /* hdr_paper_white */ 203.0f, /* native_dlss_ok */ 0, /* settle_evals */ 0 };
+                     /* hdr_bridge */ -1, /* hdr_paper_white */ 203.0f, /* native_dlss_ok */ 0, /* settle_evals */ 0,
+                     /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -1078,13 +1087,15 @@ static void CfgWriteDefault()
             "stall_log_ms=%d\n"
             "hdr_bridge=%d\n"
             "hdr_paper_white=%.0f\n"
-            "settle_evals=%d\n",
+            "settle_evals=%d\n"
+            "hold_strength=%.3f\n"
+            "hold_tolerance=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
             g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms,
-            g_cfg.hdr_bridge, g_cfg.hdr_paper_white, g_cfg.settle_evals);
+            g_cfg.hdr_bridge, g_cfg.hdr_paper_white, g_cfg.settle_evals, g_cfg.hold_strength, g_cfg.hold_tolerance);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -1136,10 +1147,14 @@ static bool CfgReload()
         else if (_stricmp(key, "jitter_phases")  == 0) next.jitter_phases  = iv;
         else if (_stricmp(key, "native_dlss_ok") == 0) next.native_dlss_ok = iv == 1 ? 1 : 0;
         else if (_stricmp(key, "settle_evals")   == 0) next.settle_evals   = iv;
+        else if (_stricmp(key, "hold_strength")  == 0) next.hold_strength  = val;
+        else if (_stricmp(key, "hold_tolerance") == 0) next.hold_tolerance = val;
     }
     fclose(f);
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
     if (next.settle_evals < 0 || next.settle_evals > 8) next.settle_evals = g_cfg.settle_evals;
+    if (next.hold_strength < 0.0f || next.hold_strength > 1.0f) next.hold_strength = g_cfg.hold_strength;
+    if (next.hold_tolerance < 0.005f || next.hold_tolerance > 0.5f) next.hold_tolerance = g_cfg.hold_tolerance;
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
     if (next.work_upscale < 0 || next.work_upscale > 2) next.work_upscale = g_cfg.work_upscale;
     if (next.work_sharpness < 0.0f || next.work_sharpness > 1.0f) next.work_sharpness = g_cfg.work_sharpness;
@@ -1173,6 +1188,7 @@ static bool CfgReload()
         g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
         g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
         g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms, g_cfg.settle_evals);
+    Log("[feed] config: hold_strength=%.2f hold_tolerance=%.3f", g_cfg.hold_strength, g_cfg.hold_tolerance);
     return rebuild;
 }
 
@@ -1184,6 +1200,7 @@ static const char *const kCfgSavedKeys[] = {
     "rebuild", "log_frames", "create_delay", "preset", "work_resolution", "work_upscale",
     "work_sharpness", "gpu_timeout_ms", "buffer_home", "async_home", "sync_home",
     "mv_scale_x", "mv_scale_y", "stall_log_ms", "hdr_bridge", "hdr_paper_white", "settle_evals",
+    "hold_strength", "hold_tolerance",
 };
 
 static bool CfgKeyIsSaved(const char *key)
@@ -1237,13 +1254,13 @@ static void CfgSave()
     fprintf(f,
         "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
             "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\ngpu_timeout_ms=%d\n"
-            "buffer_home=%d\nasync_home=%d\nsync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\nstall_log_ms=%d\nhdr_bridge=%d\nhdr_paper_white=%.0f\nsettle_evals=%d\n",
+            "buffer_home=%d\nasync_home=%d\nsync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\nstall_log_ms=%d\nhdr_bridge=%d\nhdr_paper_white=%.0f\nsettle_evals=%d\nhold_strength=%.3f\nhold_tolerance=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
             g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms,
-            g_cfg.hdr_bridge, g_cfg.hdr_paper_white, g_cfg.settle_evals);
+            g_cfg.hdr_bridge, g_cfg.hdr_paper_white, g_cfg.settle_evals, g_cfg.hold_strength, g_cfg.hold_tolerance);
     if (!carried.empty()) fputs(carried.c_str(), f);
     fclose(f);
 }
@@ -2756,6 +2773,21 @@ static bool WarmupRebuildDue(UINT64 n)
     return g_cfg.warmup_rebuild > 0 && n >= static_cast<UINT64>(g_cfg.warmup_rebuild);
 }
 
+// The output stabiliser (feed_hold12.h), built on first use on whichever D3D12 device the
+// evaluate runs on: the game's on the same-device transport, ours on the other three. Its
+// compiler is the same d3dcompiler_47 the HDR bridge uses, resolved by name.
+static FeedHold12 g_hold = {};
+
+static bool HoldPassReady()
+{
+    if (g_hold.ok) return true;
+    if (g_hold.failed || g.dev12 == nullptr) return false;
+    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+    auto compile = m != nullptr ? reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
+    if (compile == nullptr) { Log("[hold] d3dcompiler_47.dll has no D3DCompile; stabiliser unavailable"); g_hold.failed = true; return false; }
+    return FeedHold12Init(g_hold, g.dev12, compile, &Log);
+}
+
 static NVSDK_NGX_Result EvaluateDLSSGuarded(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, DWORD *code)
 {
     __try { return NGX_D3D12_EVALUATE_DLSS_EXT(g.list, g.feature, g.params, ep); }
@@ -2784,6 +2816,16 @@ static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, D
         again.InMVScaleX = 0.0f;
         again.InMVScaleY = 0.0f;
         r = EvaluateDLSSGuarded(&again, code);
+    }
+    // The stabiliser reads the model's answer and the input in the evaluate's own states
+    // (Color a non-pixel-shader resource, Output an unordered access) and leaves them there,
+    // so whatever each transport records after the evaluate sees what it expects.
+    if (g_cfg.hold_strength > 0.0f && *code == 0 && NVSDK_NGX_SUCCEED(r) && HoldPassReady())
+    {
+        static bool said = false;
+        if (!said) { said = true; Log("[feed] hold: output stabiliser active (strength %.2f, tolerance %.3f)", g_cfg.hold_strength, g_cfg.hold_tolerance); }
+        FeedHold12Run(g_hold, g.list, ep->Feature.pInColor, ep->Feature.pInOutput,
+                      g_cfg.hold_strength, g_cfg.hold_tolerance, ep->InReset != 0, &Log);
     }
     QueryPerformanceCounter(&b);
     g_last_eval_ticks = b.QuadPart - a.QuadPart;
@@ -3295,7 +3337,7 @@ static void ReleaseFrameResources()
     g.pq_bridge = false;
     SafeRelease(g.lin_color);
     SafeRelease(g.lin_output);
-    FeedPq12Release(g.pq12);
+    FeedPq12Release(g.pq12); FeedHold12Release(g_hold);   // both live on this device
 
     // The private fence retires D3D12 only. Vulkan may still have copy-home
     // commands referencing these imports (including on the immediate list).
@@ -3791,7 +3833,7 @@ static bool SetupPq12Bridge(UINT w, UINT h, DXGI_FORMAT shared_fmt, const char *
     {
         Log("[feed] HDR10 bridge (%s): the linear textures failed 0x%08X / 0x%08X", where, h1, h2);
         SafeRelease(g.lin_color); SafeRelease(g.lin_output);
-        FeedPq12Release(g.pq12);
+        FeedPq12Release(g.pq12); FeedHold12Release(g_hold);   // both live on this device
         return false;
     }
 
@@ -8875,6 +8917,19 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                   "advances it one step without the scene moving -- so the image settles sooner "
                                   "after the camera stops. Costs (N+1)x the whole neural stack every frame. "
                                   "Meant for OptiScaler DLSS-NR; other consumers may ignore the zero motion.");
+    ImGui::Separator();
+    ImGui::TextUnformatted("Output stabiliser");
+    if (ImGui::SliderFloat("Hold strength", &g_cfg.hold_strength, 0.0f, 1.0f)) dirty = true;
+    ImGui::SameLine(); HelpMarker("Experimental. Where the game's frame did not change since the pixel last moved, the "
+                                  "shown pixel keeps this much of what was shown last frame and takes the rest from "
+                                  "the model; where the frame changed, the model's answer shows as is. 0 = off. "
+                                  "1 = a still region never moves until something in it really changes. 0.9 = the "
+                                  "model's new opinion fades in over ~10 frames. One compute pass after the evaluate.");
+    if (ImGui::SliderFloat("Change tolerance", &g_cfg.hold_tolerance, 0.005f, 0.3f, "%.3f")) dirty = true;
+    ImGui::SameLine(); HelpMarker("How much a pixel's input (3x3 box, relative to its brightness) may differ from "
+                                  "its anchor and still count as still. Below it: held. At twice it: the model "
+                                  "shows through fully. Raise it if a held region unlocks by itself (exposure "
+                                  "drift, shimmer); lower it if slow animation lags behind.");
 
     ImGui::Separator();
     ImGui::TextUnformatted("DLSS render preset");
