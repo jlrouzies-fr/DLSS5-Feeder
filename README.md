@@ -604,6 +604,16 @@ underneath. The installer does all of the below with `-Consumer OptiScaler` and 
 - OptiScaler's menu opens with **Insert**; its neural-rendering section holds the pass controls.
   For a 32-bit game the menu is in the helper: press **Show the DLSS 5 panel in-game** and then
   Insert, or run with `host_window=1`.
+- **Model resolution below 100% flickers on wilsjo2's builds up to v0.8.91** and keeps "settling"
+  for a few frames after the camera stops, at every scale below 100%. The cause is in the fork's
+  reduced path: the model was given a colour at the working size and depth / motion vectors at the
+  frame's size. A fixed build is on
+  [this project's fork, release v0.8.92](https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.8.92)
+  (v0.8.91 plus that one change, offered upstream as a pull request): same zip layout, same
+  install. `[DlssNr] MatchGuides=false` in its `OptiScaler.ini` brings the old behaviour back for
+  a comparison. The feeder's own **Work resolution** (`work_resolution`) is the other way to run
+  the model below native, and was never affected: it shrinks the whole frame and makes the guides
+  at that size.
 
 `dlss5-feed.log` (or `host64\dlss5-feed-host.log`) then says `NGX calls are routed through
 OptiScaler DLSS-NR (winmm.dll)` and, after the first frames, `neural model (feature 18) loaded`
@@ -1121,6 +1131,7 @@ if you prefer editing the file directly:
 | `depth_inverted` | -1 | -1 follow `RESHADE_DEPTH_INPUT_IS_REVERSED`, 0/1 force. |
 | `flags` | -1 | raw `DLSS.Feature.Create.Flags` override. |
 | `reset_every` | 0 | 1 = NGX Reset every frame (no temporal history; diagnostic). |
+| `settle_evals` | 0 | **Diagnostic, both add-ons and the helper, since 1.17.0-beta.2.** N extra evaluates (0..8) of the *same* frame after the real one, with zero motion and no reset, before the result goes home; a slider on the overlay page. It was built to test whether the neural consumer's "settling" after a camera stop was its temporal history catching up: it is not (nine evaluates a frame changed nothing, see `hold_strength`), so this only costs frame time. Kept because it answers that question in any game in a minute. |
 | `warmup_rebuild` | 180 | **RenoDX path only.** Re-create the feature once after N delivered frames, working around older RenoDX builds latching STANDBY on their first create. Skipped automatically on "v45+" builds. **Not used as a frame count while Deep Fried Chicken is present** — there the one re-create is triggered by Chicken's own `ARMED` state instead (it arms its NGX detours seconds after claiming, and never adopts a create it did not see). |
 | `rebuild` | 0 | change the number to re-create the feature once, by hand. |
 | `log_frames` | 3 | first N frames logged in detail. |
@@ -1142,6 +1153,9 @@ if you prefer editing the file directly:
 | `cast_mode` | 0 | **32-bit games only.** How the cast panel is drawn: 0 = a desktop-compositor thumbnail of the helper's window (windowed / borderless games, any API); 1 = a shared copy of the helper's frame drawn by the game's ReShade or blitted onto its backbuffer (works in exclusive fullscreen; D3D11, OpenGL and Vulkan). The two overlay buttons set it. |
 | `cast_anchor` | 1 | **32-bit games only.** Which corner of the game window the cast panel sits in: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right. Before 0.14.0-beta.4 it was always the top-right and there was no way to move it. Also on the overlay as "Panel corner". |
 | `native_dlss_ok` | 0 | **D3D12 games (64-bit), parse-only.** Since 1.17.0-beta.2 the same-device D3D12 session refuses to open when the game has loaded a DLSS runtime of its own (`nvngx_dlss.dll` / `nvngx_dlssd.dll` from anywhere other than this add-on's folder or the driver, or Streamline's `sl.dlss.dll`). A second DLSS contract on the game's device is what crashed the neural consumer in #130; in such a game, turn DLSS on in its own settings and let the DLSS 5 add-on use that instead. `1` opens the session anyway. |
+| `hold_strength` | 0 | **32-bit games (the helper), since 1.17.0-beta.2. Experimental output stabiliser.** The neural consumer re-decides what a still region should look like from small frame-to-frame differences in its input: a slope under a tree is bright while the camera pans and darkens over the frames after the stop, although the game drew it the same way on every one of them (and a reset on every frame still darkens, so it is not history). The helper runs one compute pass after the evaluate: per output pixel it compares a 3x3 box of the game's frame with an anchor (that box as it was when the pixel last moved), relative to local brightness. Where the input moved, the model's answer shows as is and the anchor follows; where it did not, the shown pixel keeps this much of last frame's value and takes the rest from the model. 0 = off, 1 = a still region never moves until its input changes, 0.9 = the model's new opinion fades in over about ten frames. No reprojection, so nothing ghosts: a pixel whose input changed shows the current output that frame. A slider on the overlay page ("Output stabiliser"), applied live. Not on the 64-bit add-on yet. |
+| `hold_tolerance` | 0.04 | How much a pixel's input (3x3 box, relative to its brightness) may differ from its anchor and still count as still: 0.04 = 4%. Below it the pixel is held; at twice it the model shows through fully. Raise it if a held region unlocks by itself (exposure drift, shimmer), lower it if slow animation lags behind. |
+| `hold_input` | 0 | **32-bit games, diagnostic, never written back.** 1 freezes the colour and depth the helper hands the model, with zero motion, until it is set back to 0 (a checkbox on the overlay page). The game keeps rendering; only the model's input is frozen. Tells "the model drifts on a constant input" from "the game's frame keeps changing after the camera stops". |
 | `wine_fence_import` | 0 | **32-bit Vulkan games under Wine/Proton, parse-only.** Wine 11 cannot import a D3D12 fence created in another process, and the 32-bit add-on's fences always come from the 64-bit helper: the attempt faults inside Wine and closes the game (#121). Since 1.17.0-beta.2 the add-on imports the shared textures first, then stops cleanly instead of importing the fences. `1` tries anyway, for a Wine build that has closed that gap. |
 
 **For neural consumers that draw their own UI in the helper window.** The cast draws the helper's
