@@ -362,10 +362,16 @@ struct Cfg
                            // its device refuses one (a feature-level 10.x game, issue #33/#43). 1 = always
                            // let the host create it, which is the only way to exercise that path on a device
                            // that does not need it. Parse-only, not written back, not on the overlay.
+    int   wine_fence_import; // Vulkan client under Wine/Proton: 0 = do not import the helper's D3D12 fences.
+                           // Wine 11 cannot import a D3D12 fence created in ANOTHER process (win32u prints
+                           // "fixme: d3d12 fence from other process") and then faults inside the Unix call,
+                           // which takes the game with it (#121, FF8 Remastered through Zink). The 32-bit
+                           // add-on's fences always come from host64, so under Wine it stops cleanly instead.
+                           // 1 = try anyway, for a Wine build that has closed that gap. Parse-only.
 };
 
 //                                        host_window --v  v-- host_gpu_priority (off)
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 0, 100, 0, 1, 0 };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 0, 100, 0, 1, 0, 0 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -569,6 +575,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "cast_mode")      == 0) next.cast_mode      = iv == 1 ? 1 : 0;
         else if (_stricmp(key, "cast_anchor")    == 0) next.cast_anchor    = iv < 0 ? 0 : iv > 3 ? 3 : iv;
         else if (_stricmp(key, "host_creates")   == 0) next.host_creates   = iv == 1 ? 1 : 0;
+        else if (_stricmp(key, "wine_fence_import") == 0) next.wine_fence_import = iv == 1 ? 1 : 0;
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
@@ -586,11 +593,11 @@ static bool CfgReload()   // true when a build-affecting value changed
         // what they had set (issue #15). The 64-bit side has always printed its full set.
         Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d log_frames=%d "
             "host_window=%d host_gpu_priority=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f async_home=%d "
-            "mv_scale=%.3f,%.3f cast_key=%d cast_mods=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d",
+            "mv_scale=%.3f,%.3f cast_key=%d cast_mods=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d wine_fence_import=%d",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_mods, g_cfg.cast_scale,
-            g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.host_creates);
+            g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.host_creates, g_cfg.wine_fence_import);
     }
     return rebuild;
 }
@@ -3988,24 +3995,6 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         Log("[feed32] the host created the Output as %s, not the requested %s",
             FeedFmtName(g.output_fmt), FeedFmtName(requested));
 
-    // The fences are per session, not per build: import them once.
-    if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
-    {
-        g.fence_in_handle  = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_in));
-        g.fence_out_handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_out));
-        g.vk_sem_in  = FeedVkImportFence(&g.vk, g.fence_in_handle);
-        g.vk_sem_out = FeedVkImportFence(&g.vk, g.fence_out_handle);
-        Log("[feed32] D3D12 fence -> Vulkan timeline semaphore import: in=%s out=%s",
-            g.vk_sem_in  != VK_NULL_HANDLE ? "OK" : "FAILED",
-            g.vk_sem_out != VK_NULL_HANDLE ? "OK" : "FAILED");
-        if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
-        { FeedDisable("cross-process fence import failed -- most often the host opened a different GPU than "
-                      "the game (multi-GPU machine, #100): force both onto the same adapter (see dlss5-feed.log)"); return false; }
-        // Hand them back to ReShade as api::fence handles, which is what they already are.
-        g.rs_fence_in  = { FeedVkValue(g.vk_sem_in) };
-        g.rs_fence_out = { FeedVkValue(g.vk_sem_out) };
-    }
-
     static const DXGI_FORMAT kFmt[FEED_SLOTS] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
                                                   DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT };
     for (int i = 0; i < FEED_SLOTS; ++i)
@@ -4028,6 +4017,47 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
             ReleaseShared();
             return false;
         }
+    }
+
+    // The fences are per session, not per build: import them once. AFTER the textures (#121): under
+    // Wine the fence import is the call that takes the game down, so the textures go first and the
+    // log records whether the memory half of the interop crosses processes before anything else.
+    if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
+    {
+        g.fence_in_handle  = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_in));
+        g.fence_out_handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_out));
+        if (const char *wine = FeedGlWineVersion())
+        {
+            Log("[feed32] running under Wine %s: all %d shared textures from host64 imported as VkImage; the two "
+                "D3D12 fences come from host64 too, and Wine 11's win32u cannot import a fence made in another "
+                "process -- it prints \"fixme: d3d12 fence from other process\" and faults inside the Unix call, "
+                "which ends the game (#121)", wine, FEED_SLOTS);
+            if (!g_cfg.wine_fence_import)
+            {
+                Log("[feed32] not importing them (wine_fence_import=0). wine_fence_import=1 in dlss5-feed.cfg tries "
+                    "anyway, for a Wine build that has closed that gap -- expect the game to close if it has not");
+                ReleaseShared();
+                FeedDisable("Wine/Proton cannot import a D3D12 fence from the host64 helper into this 32-bit Vulkan "
+                            "game (#121; see dlss5-feed.log). The game renders normally.");
+                return false;
+            }
+            Log("[feed32] wine_fence_import=1: importing them anyway");
+        }
+        g.vk_sem_in  = FeedVkImportFence(&g.vk, g.fence_in_handle);
+        g.vk_sem_out = FeedVkImportFence(&g.vk, g.fence_out_handle);
+        Log("[feed32] D3D12 fence -> Vulkan timeline semaphore import: in=%s out=%s",
+            g.vk_sem_in  != VK_NULL_HANDLE ? "OK" : "FAILED",
+            g.vk_sem_out != VK_NULL_HANDLE ? "OK" : "FAILED");
+        if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
+        {
+            ReleaseShared();
+            FeedDisable("cross-process fence import failed -- most often the host opened a different GPU than "
+                        "the game (multi-GPU machine, #100): force both onto the same adapter (see dlss5-feed.log)");
+            return false;
+        }
+        // Hand them back to ReShade as api::fence handles, which is what they already are.
+        g.rs_fence_in  = { FeedVkValue(g.vk_sem_in) };
+        g.rs_fence_out = { FeedVkValue(g.vk_sem_out) };
     }
 
     CastImportPanelVk(ack);   // v7: the host-created panel texture, if the host has one

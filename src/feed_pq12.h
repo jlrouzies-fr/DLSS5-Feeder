@@ -167,6 +167,10 @@ static bool FeedPq12Init(FeedPq12 &p, ID3D12Device *dev, pD3DCompile compile,
         return false;
     }
 
+    // Named like every other D3D12 object of this add-on, for DRED (#97).
+    p.heap->SetName(L"dlss5-feed PQ bridge descriptors");
+    p.root->SetName(L"dlss5-feed PQ bridge root signature");
+    p.pso->SetName(L"dlss5-feed PQ bridge pipeline");
     p.stride = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     p.ok = true;
     return true;

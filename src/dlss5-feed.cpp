@@ -36,6 +36,7 @@
 #include <d3d11_4.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <psapi.h>
 #include <d3dcompiler.h>
 #include <cstdio>
 #include <share.h>
@@ -1017,10 +1018,12 @@ struct Cfg
                            // linear HDR it expects, in a format it accepts.
     float hdr_paper_white; // nits that the bridge maps to linear 1.0 (BT.2408 reference white
                            // is 203). Highlights run above 1.0, up to 10000/this.
+    int   native_dlss_ok;  // 1 = open the same-device D3D12 session even when the game has loaded a DLSS
+                           // runtime of its own (see FeedFindNativeDlss). Parse-only, not written back.
 };
 
 static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 0, 0.3f, 2000, 1, 0, 0, 0, 0, 1.0f, 1.0f, 50, 1, 0, 1, 0,
-                     /* hdr_bridge */ -1, /* hdr_paper_white */ 203.0f };
+                     /* hdr_bridge */ -1, /* hdr_paper_white */ 203.0f, /* native_dlss_ok */ 0 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -1118,6 +1121,7 @@ static bool CfgReload()
         else if (_stricmp(key, "stall_log_ms")   == 0) next.stall_log_ms   = iv;
         else if (_stricmp(key, "jitter_sign")    == 0) next.jitter_sign    = iv;
         else if (_stricmp(key, "jitter_phases")  == 0) next.jitter_phases  = iv;
+        else if (_stricmp(key, "native_dlss_ok") == 0) next.native_dlss_ok = iv == 1 ? 1 : 0;
     }
     fclose(f);
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
@@ -1894,6 +1898,10 @@ static void TimingEnsure()
         g.ts_failed = true;
         return;
     }
+    // Every D3D12 object this add-on creates carries a name, so a DRED "RECENTLY FREED" or
+    // page-fault line that says '(unnamed)' is not one of ours (#97).
+    g.ts_heap->SetName(L"dlss5-feed timestamp queries");
+    g.ts_read->SetName(L"dlss5-feed timestamp readback");
     Log("[feed] GPU timing on (queue timestamp frequency %llu Hz)", (unsigned long long)g.ts_freq);
 }
 
@@ -2962,6 +2970,7 @@ static void GuideProbeRecord(ID3D12Resource *mv, D3D12_RESOURCE_STATES mv_state,
         if (FAILED(g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                     __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g_mv_probe_buf))))
             return;
+        g_mv_probe_buf->SetName(L"dlss5-feed MV probe readback");
     }
 
     if (g_depth_probe_buf == nullptr)
@@ -2974,6 +2983,7 @@ static void GuideProbeRecord(ID3D12Resource *mv, D3D12_RESOURCE_STATES mv_state,
         if (FAILED(g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                     __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g_depth_probe_buf))))
             return;
+        g_depth_probe_buf->SetName(L"dlss5-feed depth probe readback");
     }
 
     D3D12_TEXTURE_COPY_LOCATION src = {};
@@ -3128,6 +3138,7 @@ static void StaleProbeRecord(ID3D12Resource *color, D3D12_RESOURCE_STATES color_
         if (FAILED(g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                     __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g_stale_buf))))
             return;
+        g_stale_buf->SetName(L"dlss5-feed staleness probe readback");
     }
 
     const UINT x0 = (g.width - kStaleProbeSize) / 2, y0 = (g.height - kStaleProbeSize) / 2;
@@ -3745,6 +3756,8 @@ static bool SetupPq12Bridge(UINT w, UINT h, DXGI_FORMAT shared_fmt, const char *
     HRESULT h2 = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
                                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                                   __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g.lin_output));
+    if (g.lin_color  != nullptr) g.lin_color->SetName(L"dlss5-feed HDR bridge linear Color");
+    if (g.lin_output != nullptr) g.lin_output->SetName(L"dlss5-feed HDR bridge linear Output");
     if (FAILED(h1) || FAILED(h2))
     {
         Log("[feed] HDR10 bridge (%s): the linear textures failed 0x%08X / 0x%08X", where, h1, h2);
@@ -5046,11 +5059,76 @@ static void ShutdownSession()
 // shader-readable, and DLSS needs Output != Color anyway).
 // ---------------------------------------------------------------------------
 
+// A D3D12 game with DLSS of its own. Its DLSS runtime is already in the process by the time
+// the first frame reaches us: a Unity HDRP plugin copy (issue #130, Nishuihan: ray tracing forces
+// Ray Reconstruction, and nshm_Data\Plugins\x86_64\nvngx_dlssd.dll was loaded before ReShade
+// loaded its add-ons), Streamline, or an nvngx_dlss*.dll beside the exe. Our copies (beside this
+// add-on) and the driver's (DriverStore) do not count. On the same device, the neural consumer
+// then sees two DLSS contracts -- the game's and ours -- and in #130 renodx-dlss5 faulted inside
+// our CreateFeature (a read of 0xC in D3D12Core). This project is for games WITHOUT DLSS: in
+// one that has it, the consumer hooks the game's own DLSS directly and the feed has no job.
+// Fills *found with the first such module's path; false when there is none.
+static bool FeedFindNativeDlss(wchar_t *found, size_t found_len)
+{
+    wchar_t self_dir[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, self_dir, MAX_PATH);
+    if (wchar_t *sl = wcsrchr(self_dir, L'\\')) *(sl + 1) = L'\0';
+    const size_t self_len = wcslen(self_dir);
+
+    HMODULE mods[1024];
+    DWORD bytes = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &bytes)) return false;
+    const DWORD n = bytes / sizeof(HMODULE) < 1024 ? bytes / sizeof(HMODULE) : 1024;
+    for (DWORD i = 0; i < n; ++i)
+    {
+        wchar_t path[MAX_PATH] = {};
+        if (GetModuleFileNameW(mods[i], path, MAX_PATH) == 0) continue;
+        const wchar_t *name = wcsrchr(path, L'\\');
+        name = name != nullptr ? name + 1 : path;
+        // Streamline's DLSS plugins, not sl.interposer.dll alone: a game can ship Streamline for
+        // Reflex or frame generation only. Same reasoning for NGX: nvngx_dlss.dll (Super
+        // Resolution) and nvngx_dlssd.dll (Ray Reconstruction) are the features a game runs on its
+        // frame; nvngx_dlssg.dll is frame generation, and nvngx_dlssnr.dll is the neural runtime
+        // this project ships.
+        const bool streamline = _wcsicmp(name, L"sl.dlss.dll") == 0 || _wcsicmp(name, L"sl.dlss_d.dll") == 0;
+        const bool dlss = _wcsicmp(name, L"nvngx_dlss.dll") == 0 || _wcsicmp(name, L"nvngx_dlssd.dll") == 0;
+        if (!streamline && !dlss) continue;
+        if (dlss && _wcsnicmp(path, self_dir, self_len) == 0 && wcschr(path + self_len, L'\\') == nullptr)
+            continue;   // beside this add-on: ours
+        wchar_t lower[MAX_PATH];
+        wcscpy_s(lower, path);
+        _wcslwr_s(lower);
+        if (dlss && wcsstr(lower, L"\\driverstore\\") != nullptr) continue;   // the driver's own
+        // NGX's over-the-air store (ProgramData\NVIDIA\NGX): a session of OURS earlier in this process
+        // (#130 opened a D3D11 cross-API one first) can have pulled a feature DLL in from there.
+        if (dlss && wcsstr(lower, L"\\nvidia\\ngx\\") != nullptr) continue;
+        wcsncpy_s(found, found_len, path, _TRUNCATE);
+        return true;
+    }
+    return false;
+}
+
 static bool InitSession12(reshade::api::effect_runtime *rt)
 {
     Breadcrumb("opening the same-device D3D12 session");
     Log("################ feed: opening same-device D3D12 session ################");
     g_ngx_dying = false;
+
+    wchar_t native[MAX_PATH] = {};
+    if (FeedFindNativeDlss(native, MAX_PATH))
+    {
+        Log("[feed] this game has DLSS of its own: %ls is loaded, and it is not this add-on's copy (#130)", native);
+        if (!g_cfg.native_dlss_ok)
+        {
+            Log("[feed] not opening a second DLSS contract on the game's device: the neural consumer hooks the game's "
+                "own DLSS directly -- turn DLSS (or DLAA / Ray Reconstruction) on in the game's settings and remove "
+                "dlss5-feed.addon64. native_dlss_ok=1 in dlss5-feed.cfg opens the session anyway");
+            FeedDisable("this D3D12 game loads its own DLSS (see dlss5-feed.log): enable DLSS in the game's settings "
+                        "and let the DLSS 5 add-on use it; the feed is for games without DLSS. The game renders normally.");
+            return false;
+        }
+        Log("[feed] native_dlss_ok=1: opening the session anyway");
+    }
 
     reshade::api::device *dev_api = rt->get_device();
     auto *dev = reinterpret_cast<ID3D12Device *>(dev_api->get_native());
@@ -5157,6 +5235,7 @@ static bool MakeTex12(int i, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, D3D12_RE
     const HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, initial, nullptr,
                                                         __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g.tex12[i]));
     if (FAILED(hr)) { Log("[feed] %s: CreateCommittedResource failed 0x%08X", kSlotName[i], hr); return false; }
+    FeedNameD3D12Objects();   // DRED names (#63, #97)
     Log("[feed] %-6s %ux%u %s on the game's device%s", kSlotName[i], w, h, FormatName(fmt), uav ? " (UAV)" : "");
     return true;
 }
@@ -5410,6 +5489,8 @@ static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
                                                   nullptr, __uuidof(ID3D12Resource),
                                                   reinterpret_cast<void **>(&g.tex12[slot]));
     if (SUCCEEDED(hr))
+        FeedNameD3D12Objects();   // DRED names (#63, #97)
+    if (SUCCEEDED(hr))
         hr = g.dev12->CreateSharedHandle(g.tex12[slot], nullptr, GENERIC_ALL, nullptr, &g.tex_shared_ext[slot]);
     if (FAILED(hr))
     {
@@ -5527,6 +5608,8 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
                                                       nullptr, __uuidof(ID3D12Resource),
                                                       reinterpret_cast<void **>(&g.home_buf12));
         if (SUCCEEDED(hr))
+            g.home_buf12->SetName(L"dlss5-feed Output home buffer");
+        if (SUCCEEDED(hr))
             hr = g.dev12->CreateSharedHandle(g.home_buf12, nullptr, GENERIC_ALL, nullptr, &g.home_buf_handle);
         if (SUCCEEDED(hr) && !FeedVkImportBuffer(&g.vk, g.home_buf_handle, home_size, &g.vk_home_buf, &g.vk_home_mem))
             hr = E_FAIL;
@@ -5570,6 +5653,8 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
             HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
                                                           nullptr, __uuidof(ID3D12Resource),
                                                           reinterpret_cast<void **>(&g.in_buf12[d.slot]));
+            if (SUCCEEDED(hr))
+                g.in_buf12[d.slot]->SetName(L"dlss5-feed input home buffer");
             if (SUCCEEDED(hr))
                 hr = g.dev12->CreateSharedHandle(g.in_buf12[d.slot], nullptr, GENERIC_ALL, nullptr, &g.in_buf_handle[d.slot]);
             if (SUCCEEDED(hr) && !FeedVkImportBuffer(&g.vk, g.in_buf_handle[d.slot], size,
@@ -5639,6 +5724,7 @@ static void ProbeGlMemoryImport()
     HANDLE shared = nullptr;
     HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
                                                   nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&res));
+    if (SUCCEEDED(hr)) res->SetName(L"dlss5-feed GL import probe");
     if (SUCCEEDED(hr)) hr = g.dev12->CreateSharedHandle(res, nullptr, GENERIC_ALL, nullptr, &shared);
     if (FAILED(hr))
         Log("[feed] memory-import probe: could not make the throwaway shared D3D12 texture (0x%08X), so it says nothing", hr);
@@ -5852,6 +5938,8 @@ static bool MakeSharedTexGl(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
     HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
                                                   nullptr, __uuidof(ID3D12Resource),
                                                   reinterpret_cast<void **>(&g.tex12[slot]));
+    if (SUCCEEDED(hr))
+        FeedNameD3D12Objects();   // DRED names (#63, #97)
     if (SUCCEEDED(hr))
         hr = g.dev12->CreateSharedHandle(g.tex12[slot], nullptr, GENERIC_ALL, nullptr, &g.tex_shared_ext[slot]);
     if (FAILED(hr))
@@ -6223,6 +6311,66 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
 // Per frame
 // ---------------------------------------------------------------------------
 
+// VRAM as the OS sees it for this process: what it uses on the adapter, the budget the OS grants
+// it, and the adapter's dedicated total. The budget is the figure that moves: another process
+// holding VRAM (issue #121: a local ComfyUI with 7.6 GB of models resident) shrinks it, and once
+// usage passes it the driver pages across PCIe -- the neural pass then runs at a fraction of its
+// speed, the GPU reads "100%" at a fraction of its power, and every STALL line blames something
+// outside this add-on, which is true and useless. False when the device or DXGI cannot say.
+static bool FeedVramInfo(ID3D12Device *dev, UINT64 *usage_mb, UINT64 *budget_mb, UINT64 *total_mb)
+{
+    if (dev == nullptr) return false;
+    typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1_)(REFIID, void **);
+    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    auto make_factory = dxgi != nullptr
+        ? reinterpret_cast<PFN_CreateDXGIFactory1_>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+    IDXGIFactory4 *f4 = nullptr;
+    IDXGIAdapter3 *ad = nullptr;
+    if (make_factory == nullptr ||
+        FAILED(make_factory(__uuidof(IDXGIFactory4), reinterpret_cast<void **>(&f4))) || f4 == nullptr)
+        return false;
+    f4->EnumAdapterByLuid(dev->GetAdapterLuid(), __uuidof(IDXGIAdapter3), reinterpret_cast<void **>(&ad));
+    f4->Release();
+    if (ad == nullptr) return false;
+    DXGI_QUERY_VIDEO_MEMORY_INFO mi = {};
+    DXGI_ADAPTER_DESC desc = {};
+    const bool ok = SUCCEEDED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi)) &&
+                    SUCCEEDED(ad->GetDesc(&desc));
+    ad->Release();
+    if (!ok) return false;
+    *usage_mb  = mi.CurrentUsage >> 20;
+    *budget_mb = mi.Budget >> 20;
+    *total_mb  = static_cast<UINT64>(desc.DedicatedVideoMemory) >> 20;
+    return true;
+}
+
+// Stalls get the VRAM picture next to them (#121): with a logged STALL line (at most every 30 s),
+// and with every 600-frame summary that had one. The explanation is printed once; the numbers
+// every time, so a reader can watch the budget move.
+static void FeedLogVram(const char *when)
+{
+    UINT64 vram_used = 0, vram_budget = 0, vram_total = 0;
+    if (FeedVramInfo(g.dev12, &vram_used, &vram_budget, &vram_total))
+    {
+        const bool squeezed = vram_budget > 0 && (vram_used * 100 >= vram_budget * 95 ||
+                                                  (vram_total > 0 && vram_budget * 100 < vram_total * 60));
+        Log("[feed] VRAM %s: this process uses %llu MB of a %llu MB budget (adapter %llu MB)%s",
+            when, static_cast<unsigned long long>(vram_used), static_cast<unsigned long long>(vram_budget),
+            static_cast<unsigned long long>(vram_total),
+            squeezed ? " -- TIGHT: see the note below" : "");
+        static bool explained = false;
+        if (squeezed && !explained)
+        {
+            explained = true;
+            Log("[feed] note: the OS budget is what is left of the GPU's memory after every OTHER process's share. "
+                "At or over it, the driver pages textures across PCIe and the neural pass runs many times slower "
+                "while the GPU still reads busy (issue #121: 2 fps at 80 W, 31 fps at 190 W once a local AI tool "
+                "idling with 7.6 GB of models was closed). Close other GPU-heavy programs -- local AI tools, "
+                "browsers with video, a second game -- or lower the resolution, then compare.");
+        }
+    }
+}
+
 static void TimingTick(LONGLONG entry, LONGLONG exit)
 {
     if (g.qpf == 0)
@@ -6269,6 +6417,10 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
             Log("[feed] STALL frame %llu: interval %.1f ms | feed %.2f ms (of which NGX evaluate %.2f ms) | "
                 "outside the feed %.1f ms -- %s",
                 static_cast<unsigned long long>(g.frames_done), iv_ms, tt_ms, ev_ms, out_ms, verdict);
+            // At most every 30 s: at 2 fps a 600-frame summary is five minutes away (#121).
+            static ULONGLONG vram_logged_at = 0;
+            if (vram_logged_at == 0 || GetTickCount64() - vram_logged_at >= 30000)
+            { vram_logged_at = GetTickCount64(); FeedLogVram("at this stall"); }
         }
     }
 
@@ -6293,6 +6445,7 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
     if (g.win_stalls > g.win_stalls_logged)
         Log("[feed] (%llu further stall lines suppressed in that window)",
             static_cast<unsigned long long>(g.win_stalls - g.win_stalls_logged));
+    if (g.win_stalls > 0) FeedLogVram("in that window");
     g.cpu_ticks = 0;
     g.timed_frames = 0;
     g.ts_sum_ms = 0.0;

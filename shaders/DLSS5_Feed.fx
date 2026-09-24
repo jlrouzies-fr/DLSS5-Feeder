@@ -65,9 +65,35 @@
 // [loop]s over dynamically indexed arrays, which is the "error X3531: can't unroll loops
 // marked with loop attribute" of issue #56). Say which of those two facts the user is looking
 // at, because the compiler error alone sends people hunting through their shader list.
+//
+// It used to be an #error, and issue #129 still reported the X3531 it was meant to replace --
+// from an older copy of this file, or a ReShade build that shows the compiler's error rather
+// than the preprocessor's; the report does not say which. Either way, on D3D9 the effect now
+// compiles to a stub (a pass-through technique, the explanation as its overlay text) that
+// cannot fail, so the reason is the one thing on screen.
 #if __RENDERER__ < 0xA000
-    #error "DLSS5_Feed needs D3D10 or newer, and ReShade has loaded its DirectX 9 backend. For a D3D9 game the dgVoodoo2 wrapper must be in effect first (check DisableAndPassThru=false in dgVoodoo.conf); see the README's 'Install for a DirectX 9 game' section. A 64-bit D3D9 game does not need this add-on at all -- renodx-dlss handles those on its own."
-#endif
+
+#warning "DLSS5_Feed needs D3D10 or newer, and ReShade has loaded its DirectX 9 backend. For a D3D9 game the dgVoodoo2 wrapper must be in effect first (check DisableAndPassThru=false in dgVoodoo.conf); see the README's 'Install for a DirectX 9 game' section. A 64-bit D3D9 game does not need this add-on at all -- renodx-dlss handles those on its own."
+
+uniform int DLSS5_D3D9_Notice <
+    ui_type = "radio"; ui_label = " ";
+    ui_text = "DLSS5_Feed does nothing here: ReShade is running on DirectX 9, and the add-on only attaches to\n"
+              "D3D10/11/12, OpenGL and Vulkan. For a 32-bit D3D9 game, put the dgVoodoo2 wrapper in front first\n"
+              "(DisableAndPassThru=false in dgVoodoo.conf) -- see the README's 'Install for a DirectX 9 game'.\n"
+              "A 64-bit D3D9 game does not need this add-on at all: renodx-dlss handles those on its own.";
+> = 0;
+
+float4 PS_DLSS5_D3D9(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+    return tex2D(ReShade::BackBuffer, uv);
+}
+
+technique DLSS5_Feed < ui_tooltip = "Not available on DirectX 9 -- see the text in this effect's settings."; >
+{
+    pass { VertexShader = PostProcessVS; PixelShader = PS_DLSS5_D3D9; }
+}
+
+#else   // D3D10 and newer: the real effect, to the end of the file
 
 // Expose ReShade's completed frame to the add-on as an SRV. The 64-bit D3D11 path
 // uses this only when its work-resolution control is below 100%; no extra pass or
@@ -891,3 +917,5 @@ technique DLSS5_Feed_Debug
 {
     pass { VertexShader = PostProcessVS; PixelShader = PS_Debug; }
 }
+
+#endif   // __RENDERER__ >= 0xA000
