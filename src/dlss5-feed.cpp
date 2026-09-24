@@ -66,7 +66,7 @@
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 #include "feed_pq12.h" // the D3D12 PQ<->linear pass, for the transports with no shaders of their own
 
-#define FEED_VERSION "1.17.0-beta.1"
+#define FEED_VERSION "1.17.0-beta.2"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif
