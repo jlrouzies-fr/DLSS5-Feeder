@@ -1020,10 +1020,22 @@ struct Cfg
                            // is 203). Highlights run above 1.0, up to 10000/this.
     int   native_dlss_ok;  // 1 = open the same-device D3D12 session even when the game has loaded a DLSS
                            // runtime of its own (see FeedFindNativeDlss). Parse-only, not written back.
+    int   settle_evals;    // experimentHold: extra evaluates of the SAME frame, 0..8. Every neural
+                           // pass the consumer runs inside our evaluate keeps a temporal history
+                           // that takes several evaluates to settle on a new framing (wilsjo2
+                           // measured ~3-5 with a frozen input), and a multipass stack settles
+                           // once per layer, one after the other. So after the real evaluate the
+                           // same colour/depth go in N more times with ZERO motion and no reset:
+                           // to the model that is N frames in which nothing moved, and its
+                           // history advances that many steps before the output goes home.
+                           // Costs (N+1)x the whole stack every frame. Zero motion is done
+                           // through the MV scale, which OptiScaler honours for its DLSS and
+                           // its own NR vectors; a consumer that ignores the scale would
+                           // double-advance instead.
 };
 
 static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 0, 0.3f, 2000, 1, 0, 0, 0, 0, 1.0f, 1.0f, 50, 1, 0, 1, 0,
-                     /* hdr_bridge */ -1, /* hdr_paper_white */ 203.0f, /* native_dlss_ok */ 0 };
+                     /* hdr_bridge */ -1, /* hdr_paper_white */ 203.0f, /* native_dlss_ok */ 0, /* settle_evals */ 0 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -1065,13 +1077,14 @@ static void CfgWriteDefault()
             "mv_scale_y=%.3f\n"
             "stall_log_ms=%d\n"
             "hdr_bridge=%d\n"
-            "hdr_paper_white=%.0f\n",
+            "hdr_paper_white=%.0f\n"
+            "settle_evals=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
             g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms,
-            g_cfg.hdr_bridge, g_cfg.hdr_paper_white);
+            g_cfg.hdr_bridge, g_cfg.hdr_paper_white, g_cfg.settle_evals);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -1122,9 +1135,11 @@ static bool CfgReload()
         else if (_stricmp(key, "jitter_sign")    == 0) next.jitter_sign    = iv;
         else if (_stricmp(key, "jitter_phases")  == 0) next.jitter_phases  = iv;
         else if (_stricmp(key, "native_dlss_ok") == 0) next.native_dlss_ok = iv == 1 ? 1 : 0;
+        else if (_stricmp(key, "settle_evals")   == 0) next.settle_evals   = iv;
     }
     fclose(f);
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
+    if (next.settle_evals < 0 || next.settle_evals > 8) next.settle_evals = g_cfg.settle_evals;
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
     if (next.work_upscale < 0 || next.work_upscale > 2) next.work_upscale = g_cfg.work_upscale;
     if (next.work_sharpness < 0.0f || next.work_sharpness > 1.0f) next.work_sharpness = g_cfg.work_sharpness;
@@ -1152,12 +1167,12 @@ static bool CfgReload()
     g_cfg = next;
     Log("[feed] config: hdr_bridge=%d hdr_paper_white=%.0f", g_cfg.hdr_bridge, g_cfg.hdr_paper_white);
     Log("[feed] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d warmup_rebuild=%d "
-        "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f gpu_timeout_ms=%d buffer_home=%d async_home=%d sync_home=%d mv_scale=%.3f,%.3f stall_log_ms=%d",
+        "rebuild=%d log_frames=%d create_delay=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f gpu_timeout_ms=%d buffer_home=%d async_home=%d sync_home=%d mv_scale=%.3f,%.3f stall_log_ms=%d settle_evals=%d",
         g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
         g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay,
         g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
         g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
-        g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms);
+        g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms, g_cfg.settle_evals);
     return rebuild;
 }
 
@@ -1168,7 +1183,7 @@ static const char *const kCfgSavedKeys[] = {
     "enabled", "mode", "hdr", "depth_inverted", "flags", "reset_every", "warmup_rebuild",
     "rebuild", "log_frames", "create_delay", "preset", "work_resolution", "work_upscale",
     "work_sharpness", "gpu_timeout_ms", "buffer_home", "async_home", "sync_home",
-    "mv_scale_x", "mv_scale_y", "stall_log_ms", "hdr_bridge", "hdr_paper_white",
+    "mv_scale_x", "mv_scale_y", "stall_log_ms", "hdr_bridge", "hdr_paper_white", "settle_evals",
 };
 
 static bool CfgKeyIsSaved(const char *key)
@@ -1222,13 +1237,13 @@ static void CfgSave()
     fprintf(f,
         "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
             "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\ngpu_timeout_ms=%d\n"
-            "buffer_home=%d\nasync_home=%d\nsync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\nstall_log_ms=%d\nhdr_bridge=%d\nhdr_paper_white=%.0f\n",
+            "buffer_home=%d\nasync_home=%d\nsync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\nstall_log_ms=%d\nhdr_bridge=%d\nhdr_paper_white=%.0f\nsettle_evals=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
             g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms,
-            g_cfg.hdr_bridge, g_cfg.hdr_paper_white);
+            g_cfg.hdr_bridge, g_cfg.hdr_paper_white, g_cfg.settle_evals);
     if (!carried.empty()) fputs(carried.c_str(), f);
     fclose(f);
 }
@@ -2755,7 +2770,21 @@ static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, D
     PublishDfcInterop();
     LARGE_INTEGER a, b;
     QueryPerformanceCounter(&a);
-    const NVSDK_NGX_Result r = EvaluateDLSSGuarded(ep, code);
+    NVSDK_NGX_Result r = EvaluateDLSSGuarded(ep, code);
+    // settle_evals: the same frame again, N times, with nothing moving (see Cfg). Same list,
+    // same states, every path; only the output needs a UAV barrier between two writes.
+    for (int i = 0; i < g_cfg.settle_evals && *code == 0 && NVSDK_NGX_SUCCEED(r); ++i)
+    {
+        D3D12_RESOURCE_BARRIER uav = {};
+        uav.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uav.UAV.pResource = ep->Feature.pInOutput;
+        g.list->ResourceBarrier(1, &uav);
+        NVSDK_NGX_D3D12_DLSS_Eval_Params again = *ep;
+        again.InReset    = 0;
+        again.InMVScaleX = 0.0f;
+        again.InMVScaleY = 0.0f;
+        r = EvaluateDLSSGuarded(&again, code);
+    }
     QueryPerformanceCounter(&b);
     g_last_eval_ticks = b.QuadPart - a.QuadPart;
     // The forwarder build loads the model inside the first evaluate, so the second one sees it;
@@ -8839,6 +8868,13 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     if (ImGui::Combo("Depth inverted", &di_idx, kTri, 3)) { g_cfg.depth_inverted = di_idx - 1; dirty = true; rebuild = true; }
     bool reset_every = g_cfg.reset_every != 0;
     if (ImGui::Checkbox("Reset every frame (diagnostic)", &reset_every)) { g_cfg.reset_every = reset_every ? 1 : 0; dirty = true; }
+    if (ImGui::SliderInt("Settle evaluates (extra, per frame)", &g_cfg.settle_evals, 0, 8)) dirty = true;
+    ImGui::SameLine(); HelpMarker("Experimental. After the real evaluate, runs the same frame N more times with zero "
+                                  "motion and no reset before the result goes home. Every neural pass keeps a history "
+                                  "that takes a few frames to settle on a new framing, and each extra evaluate "
+                                  "advances it one step without the scene moving -- so the image settles sooner "
+                                  "after the camera stops. Costs (N+1)x the whole neural stack every frame. "
+                                  "Meant for OptiScaler DLSS-NR; other consumers may ignore the zero motion.");
 
     ImGui::Separator();
     ImGui::TextUnformatted("DLSS render preset");

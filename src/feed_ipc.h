@@ -70,7 +70,13 @@
 #include <cstdint>
 
 #define FEED_IPC_MAGIC   0x35534C44u  // 'DLS5'
-#define FEED_IPC_VERSION 10u
+#define FEED_IPC_VERSION 11u
+
+// Version 11 added FeedFrameMsg::settle_evals (experimentHold): how many extra evaluates of the
+// SAME frame the host runs after the real one, with zero motion and no reset, so the neural
+// consumer's history settles before the output goes home. Per frame because it is a slider on
+// the 32-bit add-on's page, and a feature rebuild for every notch would reset the very history
+// it is about. The struct grew, so a v10 pair would desync the pipe: hence the bump.
 
 // Version 10 added the tag 'C' with a FeedCastMsg payload: "the cast panel is now shown at
 // this rectangle in the game, at this scale" (and again with shown=0 when it goes away).
@@ -219,6 +225,17 @@ struct FeedFrameMsg     // game -> host, per frame
     uint32_t reset;              // 1 = reset temporal history
     float    jitter_x, jitter_y; // v6+: the sub-pixel shift applied to this frame's downsample grid, in
                                  // work pixels; 0 under DLAA. Handed to DLSS as the jitter offset.
+    uint32_t settle_evals;       // v11+: extra zero-motion evaluates of this same frame, 0..8 (see above)
+    uint32_t flags;              // v11+: FEED_FRAME_*
+    float    hold_strength;      // v11+: output stabiliser (feed_hold12.h): 0 = off, 1 = a still pixel never
+                                 // moves; in between, the model's new answer creeps in at (1 - this) per frame
+    float    hold_tolerance;     // v11+: relative input change that counts as "moved" (0.04 = 4 percent)
 };
+
+// FeedFrameMsg::flags (v11+)
+#define FEED_FRAME_HOLD_INPUT 1u   // diagnostic: the host keeps handing the model the colour and depth it
+                                   // captured on the first flagged frame, with zero motion, until the flag
+                                   // drops. Separates "the model drifts on a constant input" from "the
+                                   // game's frame keeps changing after the camera stops".
 
 #pragma pack(pop)

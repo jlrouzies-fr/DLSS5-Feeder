@@ -23,6 +23,7 @@
 #include <mmsystem.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <d3dcompiler.h>   // pD3DCompile only; the function itself comes from d3dcompiler_47 by name
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
@@ -42,6 +43,7 @@
 #include "../src/feed_fmt.h"
 #include "../src/feed_dfc.h"   // Deep Fried Chicken interop ABI 1 (producer side, HostMode=1 here)
 #include "../src/feed_opti.h"  // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
+#include "../src/feed_hold12.h" // the output stabiliser (experimentHold): one compute pass after the evaluate
 
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
@@ -1082,6 +1084,38 @@ static void HostEnableDred(const char *ini)
     g_dred_armed = true;
     Log("[host] DRED: auto-breadcrumbs and page-fault reporting enabled ([DLSS5Host] Dred=1). If "
         "D3D12CreateDevice fails below, set Dred=0 again");
+}
+
+// Extra evaluates of the SAME frame (experimentHold). In a game the 32-bit add-on's slider sends
+// the count on every frame message (FeedFrameMsg::settle_evals, IPC v11); [DLSS5Host]
+// SettleEvals=N (0..8) in this folder's ReShade.ini sets it for --test only, which has no
+// add-on to ask. Every neural pass the consumer runs inside our evaluate keeps
+// a temporal history that takes several evaluates to settle on a new framing (wilsjo2 measured
+// ~3-5 with a frozen input), and a multipass stack settles once per layer, one after the other.
+// So after the real evaluate, run N more on the same colour/depth with ZERO motion and no
+// reset: to the model that is N more frames in which nothing moved, and its history advances
+// that many steps before the output goes home. Costs (N+1)x the whole stack every frame, which
+// is the trade this experiment is about. Zero motion is done through the MV scale, which is
+// enough for OptiScaler (it hands our parameter object to the real DLSS and multiplies its
+// own NR vectors by it); a consumer that ignores the scale would double-advance instead.
+static int   g_settle_evals = 0;
+static float g_test_hold    = 0.0f;   // [DLSS5Host] HoldStrength, --test only: proves the stabiliser pass runs
+
+static void HostReadSettleEvals(const char *ini)
+{
+    int n = GetPrivateProfileIntA("DLSS5Host", "SettleEvals", 0, ini);
+    if (n < 0) n = 0;
+    if (n > 8) n = 8;
+    g_settle_evals = n;
+    char hs[32] = "";
+    GetPrivateProfileStringA("DLSS5Host", "HoldStrength", "0", hs, sizeof(hs), ini);
+    g_test_hold = static_cast<float>(atof(hs));
+    if (g_test_hold < 0.0f) g_test_hold = 0.0f;
+    if (g_test_hold > 1.0f) g_test_hold = 1.0f;
+    if (g_test_hold > 0.0f) Log("[host] hold: --test will run the output stabiliser at strength %.2f", g_test_hold);
+    if (n > 0)
+        Log("[host] settle: %d extra zero-motion evaluate(s) per frame for --test ([DLSS5Host] SettleEvals=%d); "
+            "in a game the add-on's slider decides", n, n);
 }
 
 // The name DRED reports for the list every frame is recorded into. That list is handed to
@@ -2215,6 +2249,7 @@ static bool InitDisguise()
         char ini[MAX_PATH];
         HostIniPath(ini, sizeof(ini));
         HostEnableDred(ini);   // must precede the create; does nothing unless [DLSS5Host] Dred=1
+        HostReadSettleEvals(ini);
     }
     HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                                reinterpret_cast<void **>(&h.dev));
@@ -2689,11 +2724,30 @@ static void OptiBarriers(ID3D12Resource *const *inputs, int n_inputs, ID3D12Reso
     if (n > 0) h.list->ResourceBarrier(n, b);
 }
 
+// The output stabiliser (feed_hold12.h), built on first use. Its compiler is the same
+// d3dcompiler_47 DetectStaleD3DCompiler already loaded, resolved by name.
+static FeedHold12 g_hold = {};
+
+static bool HoldPassReady()
+{
+    if (g_hold.ok) return true;
+    if (g_hold.failed) return false;
+    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+    auto compile = m != nullptr ? reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
+    if (compile == nullptr) { Log("[hold] d3dcompiler_47.dll has no D3DCompile; stabiliser unavailable"); g_hold.failed = true; return false; }
+    return FeedHold12Init(g_hold, h.dev, compile, &Log);
+}
+
 static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resource *depth, ID3D12Resource *mv,
-                     UINT w, UINT h_, int reset, float mvsx, float mvsy, float jitter_x = 0.0f, float jitter_y = 0.0f)
+                     UINT w, UINT h_, int reset, float mvsx, float mvsy, float jitter_x = 0.0f, float jitter_y = 0.0f,
+                     int settle = -1,   // -1 = the ini value (--test); a game sends its own every frame
+                     float hold_strength = 0.0f, float hold_tolerance = 0.04f)
 {
     if (NgxRefuse("evaluate")) return false;
     if (!BeginCommands()) return false;
+    if (settle < 0) settle = g_settle_evals;
+    if (settle > 8) settle = 8;
+    const bool hold = hold_strength > 0.0f && HoldPassReady();
 
     NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
     ep.Feature.pInColor  = color;
@@ -2722,6 +2776,28 @@ static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resour
     DWORD ecode = 0;
     NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
     if (ecode != 0) { AbortCommands(); LogNgxFault("evaluate"); return false; }
+    // SettleEvals: the same frame again, N times, with nothing moving -- see g_settle_evals.
+    // Same list, same states; only the output needs a UAV barrier between two writes.
+    for (int i = 0; i < settle && NVSDK_NGX_SUCCEED(re); ++i)
+    {
+        D3D12_RESOURCE_BARRIER uav = {};
+        uav.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uav.UAV.pResource = output;
+        h.list->ResourceBarrier(1, &uav);
+        ep.InReset    = 0;
+        ep.InMVScaleX = 0.0f;
+        ep.InMVScaleY = 0.0f;
+        re = SafeEvaluateDLSS(&ep, &ecode);
+        if (ecode != 0) { AbortCommands(); LogNgxFault("evaluate"); return false; }
+    }
+    // The stabiliser reads the model's answer and the input in the evaluate's own states and
+    // leaves them there, so the barriers below see what they expect.
+    if (hold && NVSDK_NGX_SUCCEED(re))
+    {
+        static bool said = false;
+        if (!said) { said = true; Log("[host] hold: output stabiliser active (strength %.2f, tolerance %.3f)", hold_strength, hold_tolerance); }
+        FeedHold12Run(g_hold, h.list, color, output, hold_strength, hold_tolerance, reset != 0, &Log);
+    }
     if (g_opti.routed)
     {
         OptiBarriers(opti_in, 3, nullptr, false);
@@ -2756,6 +2832,39 @@ static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resour
     }
     EndCommands();
     if (NVSDK_NGX_FAILED(re)) { Log("[host] evaluate failed 0x%08X (%s)", re, NgxResultName(re)); return false; }
+    return true;
+}
+
+static ID3D12Resource *MakeTex(UINT w, UINT h_, DXGI_FORMAT fmt, bool uav);
+
+// FEED_FRAME_HOLD_INPUT (experimentHold diagnostic): private copies of Color and Depth taken on
+// the first flagged frame and handed to the model instead of the live slots until the flag
+// drops. The copy is its own submission so the copies have decayed to COMMON by the time the
+// evaluate's barriers (OptiBarriers assumes COMMON) run.
+static ID3D12Resource *g_hold_color = nullptr, *g_hold_depth = nullptr;
+
+static void HoldRelease(bool drain)
+{
+    if (g_hold_color == nullptr && g_hold_depth == nullptr) return;
+    if (drain && h.fence != nullptr) WaitFenceValue(h.fence, h.fence_value, 2000);   // the last evaluate read them
+    if (g_hold_color != nullptr) { g_hold_color->Release(); g_hold_color = nullptr; }
+    if (g_hold_depth != nullptr) { g_hold_depth->Release(); g_hold_depth = nullptr; }
+    Log("[host] hold: input released; the model sees the live frame again");
+}
+
+static bool HoldCapture(ID3D12Resource *color, ID3D12Resource *depth)
+{
+    if (g_hold_color != nullptr) return true;   // already held
+    if (color == nullptr || depth == nullptr) return false;
+    const D3D12_RESOURCE_DESC cd = color->GetDesc(), dd = depth->GetDesc();
+    g_hold_color = MakeTex(static_cast<UINT>(cd.Width), cd.Height, cd.Format, false);
+    g_hold_depth = MakeTex(static_cast<UINT>(dd.Width), dd.Height, dd.Format, false);
+    if (g_hold_color == nullptr || g_hold_depth == nullptr || !BeginCommands()) { HoldRelease(false); return false; }
+    h.list->CopyResource(g_hold_color, color);
+    h.list->CopyResource(g_hold_depth, depth);
+    if (EndCommands() == 0) { HoldRelease(true); return false; }
+    Log("[host] hold: input frozen (%llux%u colour + depth captured; zero motion until released)",
+        cd.Width, cd.Height);
     return true;
 }
 
@@ -2881,7 +2990,7 @@ static int RunTest()
     for (int i = 0; i < 300; ++i)
     {
         PumpPresent(true);
-        if (Evaluate(color, output, depth, mv, W, H, i == 0 ? 1 : 0, 1.0f, 1.0f)) ++good;
+        if (Evaluate(color, output, depth, mv, W, H, i == 0 ? 1 : 0, 1.0f, 1.0f, 0.0f, 0.0f, -1, g_test_hold)) ++good;
         else break;
         if (i >= 1 && g_opti.routed && !g_opti_backend.checked)
             OptiBackendCheck(&Log, "host", g_opti.upscaler, g_opti.direct, &g_opti_backend);
@@ -3192,6 +3301,8 @@ static int Serve(DWORD game_pid)
             for (int i = 0; i < FEED_SLOTS; ++i)
                 if (h.tex[i] != nullptr) { h.tex[i]->Release(); h.tex[i] = nullptr; }
             if (h.out_scratch != nullptr) { h.out_scratch->Release(); h.out_scratch = nullptr; }
+            HoldRelease(false);   // sized for the old slots
+            FeedHold12DropHistory(g_hold);
 
             bool ok = true;
             uint64_t game_tex[FEED_SLOTS] = {}, tex_size[FEED_SLOTS] = {}, game_panel = 0;
@@ -3565,9 +3676,26 @@ static int Serve(DWORD game_pid)
                 }
             }
             else
-                done = Evaluate(h.tex[FEED_COLOR], h.out_scratch != nullptr ? h.out_scratch : h.tex[FEED_OUTPUT],
-                                h.tex[FEED_DEPTH], h.tex[FEED_MV],
-                                h.width, h.height, fm.reset ? 1 : 0, mvsx, mvsy, fm.jitter_x, fm.jitter_y);
+            {
+                static uint32_t settle_seen = ~0u;
+                if (fm.settle_evals != settle_seen)
+                {
+                    settle_seen = fm.settle_evals;
+                    Log("[host] settle: %u extra zero-motion evaluate(s) per frame (from the add-on's slider)", fm.settle_evals);
+                }
+                ID3D12Resource *color = h.tex[FEED_COLOR], *depth = h.tex[FEED_DEPTH];
+                float fmvx = mvsx, fmvy = mvsy;
+                if (fm.flags & FEED_FRAME_HOLD_INPUT)
+                {
+                    if (HoldCapture(color, depth)) { color = g_hold_color; depth = g_hold_depth; fmvx = fmvy = 0.0f; }
+                }
+                else
+                    HoldRelease(true);
+                done = Evaluate(color, h.out_scratch != nullptr ? h.out_scratch : h.tex[FEED_OUTPUT],
+                                depth, h.tex[FEED_MV],
+                                h.width, h.height, fm.reset ? 1 : 0, fmvx, fmvy, fm.jitter_x, fm.jitter_y,
+                                static_cast<int>(fm.settle_evals), fm.hold_strength, fm.hold_tolerance);
+            }
 
             if (done)
             {
