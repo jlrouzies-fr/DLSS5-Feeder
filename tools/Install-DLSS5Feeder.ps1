@@ -189,9 +189,17 @@ $Sources = @{
     Lumenite        = 'https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/mainline'
     DgVoodoo        = 'https://api.github.com/repos/dege-diosg/dgVoodoo2/releases/latest'
     # No public download; see Get-ChickenManually.
-    DlssNr          = 'https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.8.0/nvngx_dlssnr_310.8.0.zip'
+    # The neural model and the RenoDX add-on track RHI's newest release of each (Get-RhiLatest);
+    # these two pins are only the fallback when GitHub's API cannot be reached and nothing is cached.
+    # Lecram is a modified 310.8 build, RTX 50 only like NVIDIA's signed 310.8.0 (#131): older
+    # GPUs need a build from the RenoDX Discord, which Verify-DLSS5Feeder.ps1 says at the end.
+    # RenoDX before v6 fails on driver 616.64+.
+    RhiReleases     = 'https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100'
+    DlssNrTag       = '^dlssnr-'
+    RenoDxDlss5Tag  = '^renodx-dlss5-\d'
+    DlssNr          = 'https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.8.Lecram/nvngx_dlssnr_310.8.Lecram.zip'
     Dlss            = 'https://github.com/RankFTW/rhi-repo/releases/download/dlss-310.9.1/nvngx_dlss_310.9.1.zip'
-    RenoDxDlss5     = 'https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-4.70/renodx-dlss5_4.70.zip'
+    RenoDxDlss5     = 'https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-7.0.0-rc8/renodx-dlss5_7.0.0-rc8.zip'
     # Two DLSS-NR forks, both supported; see -OptiScalerFork. Each names its release zip
     # differently, and wilsjo2 also publishes an RTX 40 MFG variant that the pattern skips.
     OptiScalerReleases = @{ wilsjo2 = 'https://api.github.com/repos/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases'
@@ -1076,9 +1084,12 @@ function Get-ChickenManually
 function Resolve-PieceZipped
 {
     param([string] $Label, [string] $Explicit, [string] $LocalPattern, [string] $DefaultUrl,
-          [string] $CacheName, [string] $InnerName)
+          [string] $CacheName, [string] $InnerName, [string] $InnerCacheName)
 
-    $inner = Join-Safe $script:Cache $InnerName
+    # The extracted file is cached under InnerCacheName when given (one per release, so a newer
+    # release is actually downloaded), else under its own name.
+    if (-not $InnerCacheName) { $InnerCacheName = $InnerName }
+    $inner = Join-Safe $script:Cache $InnerCacheName
     if (-not $Explicit -and (Test-FileHere $inner)) {
         Report -Status 'Ok' -Text ($Label + ': using the copy already in the cache')
         return $inner
@@ -1108,6 +1119,60 @@ function Resolve-PieceZipped
     return $inner
 }
 
+
+# Newest release on RankFTW/rhi-repo whose tag matches $TagPattern and that carries a zip.
+# The repo mixes many projects in one release list, and its order is not by date, so sort.
+# Returns @{ Tag; Url; Name } or $null (GitHub unreachable, rate-limited, nothing matched).
+$script:RhiReleases = $null
+function Get-RhiLatest
+{
+    param([string] $TagPattern, [string] $Label)
+    if ($null -eq $script:RhiReleases) {
+        $script:RhiReleases = @()
+        $json = Get-WebString $Sources.RhiReleases
+        # Windows PowerShell 5.1 hands a JSON array down the pipeline as ONE object; assigning
+        # it first and piping the variable enumerates the releases.
+        if ($json) { try { $parsed = $json | ConvertFrom-Json; $script:RhiReleases = @($parsed | ForEach-Object { $_ }) } catch { } }
+    }
+    $pick = $script:RhiReleases |
+            Where-Object { -not $_.draft -and $_.tag_name -match $TagPattern -and @($_.assets | Where-Object { $_.name -match '(?i)\.zip$' }).Count -gt 0 } |
+            Sort-Object { [DateTime] $_.published_at } -Descending | Select-Object -First 1
+    if (-not $pick) { return $null }
+    $asset = @($pick.assets | Where-Object { $_.name -match '(?i)\.zip$' })[0]
+    Report -Status 'Info' -Text ($Label + ': latest on RHI is ' + $pick.tag_name + ' (' + $asset.name + ')')
+    return @{ Tag = $pick.tag_name; Url = $asset.browser_download_url; Name = $asset.name }
+}
+
+# An RHI piece that follows the newest release: resolves the release, then hands
+# Resolve-PieceZipped per-release cache names. Offline, the newest copy already cached
+# (from any release) wins over the pinned fallback URL.
+function Resolve-RhiPiece
+{
+    param([string] $Label, [string] $Explicit, [string] $LocalPattern, [string] $TagPattern,
+          [string] $FallbackUrl, [string] $InnerName, [string] $ZipPrefix)
+
+    $ext = [IO.Path]::GetExtension($InnerName)
+    $stem = [IO.Path]::GetFileNameWithoutExtension($InnerName)
+    if ($Explicit) {
+        return Resolve-PieceZipped -Label $Label -Explicit $Explicit -CacheName ($stem + '-explicit.zip') -InnerName $InnerName `
+                                   -InnerCacheName ($stem + '-explicit' + $ext)
+    }
+    $rel = Get-RhiLatest -TagPattern $TagPattern -Label $Label
+    if (-not $rel) {
+        $hit = Get-ChildItem -LiteralPath $script:Cache -File -Filter ('rhi_' + $ZipPrefix + '*' + $ext) -ErrorAction SilentlyContinue |
+               Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($hit -and -not $LocalFiles) {
+            Report -Status 'Warn' -Text ($Label + ': could not get the newest release from RHI; using the cached ' + $hit.Name)
+            return $hit.FullName
+        }
+        $url = $FallbackUrl
+    }
+    else { $url = $rel.Url }
+    $zipName = [IO.Path]::GetFileName(([Uri] $url).AbsolutePath)
+    $innerCache = 'rhi_' + [IO.Path]::GetFileNameWithoutExtension($zipName) + $ext
+    return Resolve-PieceZipped -Label $Label -LocalPattern $LocalPattern -DefaultUrl $url -CacheName $zipName `
+                               -InnerName $InnerName -InnerCacheName $innerCache
+}
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -1883,9 +1948,9 @@ if ($Consumer -eq 'DFC') {
     }
 }
 elseif ($Consumer -eq 'RenoDX') {
-    $renoPath = Resolve-PieceZipped -Label 'RenoDX DLSS 5 add-on' -Explicit $RenoDxAddon `
-                                    -LocalPattern 'renodx-dlss5*' -DefaultUrl $Sources.RenoDxDlss5 `
-                                    -CacheName 'renodx-dlss5.zip' -InnerName 'renodx-dlss5.addon64'
+    $renoPath = Resolve-RhiPiece -Label 'RenoDX DLSS 5 add-on' -Explicit $RenoDxAddon `
+                                 -LocalPattern 'renodx-dlss5*' -TagPattern $Sources.RenoDxDlss5Tag -FallbackUrl $Sources.RenoDxDlss5 `
+                                 -InnerName 'renodx-dlss5.addon64' -ZipPrefix 'renodx-dlss5_'
     if (-not $renoPath) {
         Report -Status 'Fail' -Text 'renodx-dlss5.addon64 is not available.' `
                -Detail ('Get it from the RenoDX Discord (' + $Sources.RenoDxDiscord + ') or the RHI installer, and pass it with -RenoDxAddon or via -LocalFiles.')
@@ -1937,7 +2002,7 @@ else {
 }
 
 # 3f. NVIDIA runtimes
-$dlssNrPath = Resolve-PieceZipped -Label 'nvngx_dlssnr.dll' -Explicit $DlssNrDll -LocalPattern 'nvngx_dlssnr*' -DefaultUrl $Sources.DlssNr -CacheName 'nvngx_dlssnr.zip' -InnerName 'nvngx_dlssnr.dll'
+$dlssNrPath = Resolve-RhiPiece    -Label 'nvngx_dlssnr.dll' -Explicit $DlssNrDll -LocalPattern 'nvngx_dlssnr*' -TagPattern $Sources.DlssNrTag -FallbackUrl $Sources.DlssNr -InnerName 'nvngx_dlssnr.dll' -ZipPrefix 'nvngx_dlssnr_'
 $dlssPath   = Resolve-PieceZipped -Label 'nvngx_dlss.dll'   -Explicit $DlssDll   -LocalPattern 'nvngx_dlss.dll'   -DefaultUrl $Sources.Dlss   -CacheName 'nvngx_dlss.zip'   -InnerName 'nvngx_dlss.dll'
 if (-not $dlssNrPath) { Report -Status 'Fail' -Text 'nvngx_dlssnr.dll is not available.' -Detail ('It is on the RenoDX Discord (' + $Sources.RenoDxDiscord + '). Pass it with -DlssNrDll.') }
 if (-not $dlssPath)   { Report -Status 'Fail' -Text 'nvngx_dlss.dll is not available.'   -Detail 'Any DLSS-enabled game ships one, or use DLSS Swapper. Pass it with -DlssDll.' }

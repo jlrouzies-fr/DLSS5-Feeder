@@ -1498,6 +1498,7 @@ else {
 Write-Section 'GPU'
 
 $gpus = $null
+$rtx = @()
 try { $gpus = Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop }
 catch {
     try { $gpus = Get-WmiObject -Class Win32_VideoController -ErrorAction Stop } catch { $gpus = $null }
@@ -1970,6 +1971,22 @@ elseif ($script:CountWarn -gt 0) {
 }
 else {
     Write-Chunk '  Verdict: everything checks out.' 'Green'
+}
+
+# NVIDIA's signed nvngx_dlssnr.dll 310.8.0 creates feature 18 on RTX 50 only: elsewhere it
+# answers 0xBAD00001 and the neural pass never runs, while DLSS itself still works (#131).
+# The builds that run on older cards are community-modified and live on the RenoDX Discord.
+# Said last, after the verdict, because every check above can pass on such a machine.
+# Whatever the installer fetched: RHI's newest NR build (310.8.Lecram today) is RTX 50 only too.
+if ($rtx.Count -gt 0 -and -not ($rtx | Where-Object { $_.Name -match '(?i)RTX\s*50\d\d|Blackwell' })) {
+    Write-Host ''
+    Write-Chunk ('  [WARN] ' + (($rtx | ForEach-Object { $_.Name }) -join '; ') + ' is not an RTX 50-series GPU.') 'Yellow'
+    Write-Chunk '         The nvngx_dlssnr.dll the installer fetches only runs neural rendering on RTX 50. On this' 'Yellow'
+    Write-Chunk '         GPU it refuses (feature 18 create failed with 0xbad00001): DLSS still works, but' 'Yellow'
+    Write-Chunk '         you only get its anti-aliasing and no neural rendering.' 'Yellow'
+    Write-Chunk '         Get the modified nvngx_dlssnr.dll made for your GPU from the RenoDX Discord' 'Yellow'
+    Write-Chunk '         (https://discord.com/invite/renodx) and replace the one next to the neural consumer' 'Yellow'
+    Write-Chunk '         (or re-run the installer with -DlssNrDll <path>).' 'Yellow'
 }
 
 Write-Host ''

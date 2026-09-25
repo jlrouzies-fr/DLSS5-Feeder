@@ -30,19 +30,31 @@
 > `host64\dlss5-feed-host64.exe --test` (`300/300 evaluates succeeded` means you are fine). The
 > scenarios we know about:
 >
-> | neural consumer | driver **616.56** | driver **616.64** |
-> |---|---|---|
-> | *(none — DLAA only, no neural pass)* | — | ✅ 300/300 |
-> | **Deep Fried Chicken** 1.4.8-alpha | — | ✅ 300/300 |
-> | `renodx-dlss5` **v4.55** (classic engine) | — | ✅ 300/300 |
-> | `renodx-dlss5` **"latest"** (classic engine) | — | ✅ 300/300 |
-> | `renodx-dlss5` **v4.6** (lazy-adoption engine) | — | ❌ 1/300 |
-> | `renodx-dlss5` **v4.7** (lazy-adoption engine) | ✅ 300/300 | ❌ 0/300 |
+> | neural consumer | driver **616.56** | driver **616.64** | driver **617.14** |
+> |---|---|---|---|
+> | *(none — DLAA only, no neural pass)* | — | ✅ 300/300 | — |
+> | **Deep Fried Chicken** 1.4.8-alpha | — | ✅ 300/300 | — |
+> | `renodx-dlss5` **v4.55** (classic engine) | — | ✅ 300/300 | — |
+> | `renodx-dlss5` **"latest"** (classic engine) | — | ✅ 300/300 | — |
+> | `renodx-dlss5` **v4.6** (lazy-adoption engine) | — | ❌ 1/300 | — |
+> | `renodx-dlss5` **v4.7** (lazy-adoption engine) | ✅ 300/300 | ❌ 0/300 | ❌ 0/300 |
+> | `renodx-dlss5` **v6.1.0** | — | — | ✅ 300/300 |
+> | `renodx-dlss5` **v7.0.0-rc8** | — | — | ✅ 300/300 |
+> | `renodx-dlss5` **v8.0.1** (beta 8) | — | — | ✅ 300/300 |
 >
 > Blank cells are combinations nobody has run. Measured with `--test` on one RTX 5090 through the
-> 64-bit helper. On 616.64+ the evaluate faults inside NVIDIA's own `nvngx_dlssnr.dll`
-> ([#54](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/54)) — **any one of these works:** Deep
-> Fried Chicken, a classic-engine `renodx-dlss5`, or driver 616.56.
+> 64-bit helper; every ✅ on 617.14 also created and evaluated the neural feature. On 616.64+ the
+> v4.6/v4.7 evaluate faults inside NVIDIA's own `nvngx_dlssnr.dll`
+> ([#54](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/54)) — **any one of these works:** a
+> `renodx-dlss5` **v6.1 or newer** (what the installer now downloads), Deep Fried Chicken, a
+> classic-engine `renodx-dlss5`, or driver 616.56.
+>
+> **The neural model runs on RTX 50 only.** NVIDIA's signed `nvngx_dlssnr.dll` 310.8.0, and the
+> modified 310.8.Lecram build the installer downloads, create the neural feature on RTX 50-series
+> GPUs only. On an RTX 20/30/40 DLSS still runs but the neural pass does not (`feature 18 create
+> failed with 0xbad00001` in `ReShade.log`, [#131](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/131)):
+> get the modified `nvngx_dlssnr.dll` made for your GPU from the
+> [RenoDX Discord](https://discord.com/invite/renodx). `Verify-DLSS5Feeder.ps1` says so at the end.
 >
 > Use **0.14.0-beta.2 or newer**, and run `Verify-DLSS5Feeder.ps1` in the game folder before reporting anything.
 
@@ -146,7 +158,8 @@ file and its own overlay tab.
 
 | Build | Marker | What the feeder does about it |
 | --- | --- | --- |
-| v4.7 | `NRGlobalTone` | Newest, checked 2026-09-01. Replaces the paper-white codec with a reversible colour bridge (SDR sRGB / linear HDR BT.709 / PQ BT.2020) picked from the contract the feeder already publishes, plus a fenced D3D12 workset pool. Nothing new is required from the feeder; the 32-bit overlay mirrors its renamed sliders and its two new keys. |
+| v6+ (v6.1.0, v7.0.0-rc8, v8.0.1) | `NRGlobalTone` + version banner v6 or newer | Checked 2026-09-25. Same markers as v4.7, told apart by the add-on's version banner (or its build date). Survives driver 616.64+, so the helper no longer warns about it. v8 migrates an ini without `ConfigVersion` on first launch and puts the helper's unbound hotkeys back to F6/F5; in `host64` that is harmless, as it ignores them unless the helper's window is in front. |
+| v4.7 | `NRGlobalTone` | Checked 2026-09-01. Replaces the paper-white codec with a reversible colour bridge (SDR sRGB / linear HDR BT.709 / PQ BT.2020) picked from the contract the feeder already publishes, plus a fenced D3D12 workset pool. Nothing new is required from the feeder; the 32-bit overlay mirrors its renamed sliders and its two new keys. |
 | v4.6 | `NRToggleKey` | Global hotkeys, WIP upscaling with a rejection latch, richer decline diagnostics. See the `NRStyle=2` note under Smooth Motion below. |
 | v45+ | `EnableHooks` | Rescans every present and adopts missed features lazily, so the feeder skips its warm-up re-create. |
 | older | — | Classic single hook pass; the warm-up re-create stays on. |
@@ -1376,9 +1389,11 @@ Common cases:
 
   616.64 also changed what NGX says about the feature that path creates: the requirements query for
   feature 18 answered `NotImplemented` (`0xBAD00012`) on 616.56 and answers `supported` on 616.64.
-  So the driver moved and the v4.6+ engine is what does not survive the move. **Three fixes, any
-  one of them:** use Deep Fried Chicken as the neural consumer, use a classic-engine
-  `renodx-dlss5` build, or roll the driver back to 616.56. Run
+  So the driver moved and the v4.6/v4.7 engine is what does not survive the move. **Four fixes, any
+  one of them:** update `renodx-dlss5` to **v6.1 or newer** (v6.1.0, v7.0.0-rc8 and v8.0.1 all pass
+  300/300 on driver 617.14, where v4.7 still gives 0/300; the installer downloads the newest), use
+  Deep Fried Chicken as the neural consumer, use a classic-engine `renodx-dlss5` build, or roll the
+  driver back to 616.56. Run
   `host64\dlss5-feed-host64.exe --test` to check your own combination in about fifteen seconds.
 * **32-bit game: `dlss5-feed.addon64` in `host64\`** — it does not belong there and 0.14.0-beta.1
   refuses to run when it finds itself in the helper. `host64\` takes `dlss5-feed-host64.exe`, a

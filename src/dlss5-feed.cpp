@@ -283,7 +283,7 @@ static bool RenodxHasLiteral(const char *buf, DWORD size, const char *needle)
     return false;
 }
 
-// Find the add-on's generation banner: a NUL-terminated "v<d>.<d>[<d>]" literal, which
+// Find the add-on's generation banner: a NUL-terminated "v<d>.<d>[<d>][.<d>][-<tag>]" literal, which
 // only v4.6+ builds carry (older classic-engine builds have none; fall back to the resource).
 static void RenodxFindBanner(const char *buf, DWORD size, char *out, size_t out_size)
 {
@@ -297,6 +297,9 @@ static void RenodxFindBanner(const char *buf, DWORD size, char *out, size_t out_
         // rhi-repo's "renodx-dlss5-4.55" tag carries a three-part banner, "v4.1.5" (#90).
         if (end + 1 < size && buf[end] == '.' && digit(buf[end + 1]))
             for (++end; end < size && digit(buf[end]); ++end) {}
+        // Pre-releases add a suffix: "v7.0.0-rc8", "v8.0.1-beta8".
+        if (end + 1 < size && buf[end] == '-' && isalnum(static_cast<unsigned char>(buf[end + 1])))
+            for (++end; end < size && isalnum(static_cast<unsigned char>(buf[end])); ++end) {}
         if (end < size && buf[end] == '\0' && end - i < out_size)
         {
             memcpy(out, buf + i, end - i);

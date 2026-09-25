@@ -318,6 +318,7 @@ static char g_renodx_file[MAX_PATH] = "";
 static bool g_renodx_lazy = false;   // DLSS 5 add-on is v45+ (per-present rescan, lazy adoption)
 static bool g_renodx_v46  = false;   // DLSS 5 add-on is v4.6+ (global hotkeys, upscaling latch)
 static bool g_renodx_v47  = false;   // DLSS 5 add-on is v4.7+ (reversible colour bridge, workset pool)
+static bool g_renodx_v6   = false;   // v6+: still carries the v4.7 markers, but survives driver 616.64+
 // NVIDIA's branded driver version times 100 (616.64 -> 61664), 0 when it could not be read.
 // A driver number is not usually worth comparing against, but see LogHostAdapter: one
 // specific pairing of driver and neural consumer faults inside the driver every frame.
@@ -374,6 +375,9 @@ static void RenodxFindBanner(const char *buf, DWORD size, char *out, size_t out_
         // rhi-repo's "renodx-dlss5-4.55" tag carries a three-part banner, "v4.1.5" (#90).
         if (end + 1 < size && buf[end] == '.' && digit(buf[end + 1]))
             for (++end; end < size && digit(buf[end]); ++end) {}
+        // Pre-releases add a suffix: "v7.0.0-rc8", "v8.0.1-beta8".
+        if (end + 1 < size && buf[end] == '-' && isalnum(static_cast<unsigned char>(buf[end + 1])))
+            for (++end; end < size && isalnum(static_cast<unsigned char>(buf[end])); ++end) {}
         if (end < size && buf[end] == '\0' && end - i < out_size)
         {
             memcpy(out, buf + i, end - i);
@@ -439,6 +443,7 @@ static void DetectRenodxAddon()
     if (g_renodx_v46) g_renodx_lazy = true;   // v4.6+ is a per-present-rescan engine too
 
     char ver[48] = "?";
+    unsigned built = 0;   // yyyymmdd: the add-on's file version is 0.<year>.<month><day>.<time>
     DWORD dummy = 0;
     const DWORD vsize = GetFileVersionInfoSizeA(path, &dummy);
     if (vsize > 0)
@@ -448,13 +453,22 @@ static void DetectRenodxAddon()
         UINT flen = 0;
         if (vdata != nullptr && GetFileVersionInfoA(path, 0, vsize, vdata) &&
             VerQueryValueA(vdata, "\\", reinterpret_cast<void **>(&ffi), &flen) && ffi != nullptr)
+        {
             sprintf_s(ver, "%u.%u.%u.%u", HIWORD(ffi->dwFileVersionMS), LOWORD(ffi->dwFileVersionMS),
                       HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS));
+            built = LOWORD(ffi->dwFileVersionMS) * 10000u + HIWORD(ffi->dwFileVersionLS);
+        }
         free(vdata);
     }
+    // Every generation since v4.7 keeps the v4.7 markers, so the markers alone cannot tell
+    // v4.7 from v8. The banner's major number can; a build with no banner falls back to
+    // its build date (v6.1.0 is 0.2026.917.1432, v4.7 is 0.2026.828.517).
+    const int major = gen[0] == 'v' ? atoi(gen + 1) : 0;
+    g_renodx_v6 = g_renodx_v47 && (major >= 6 || (major == 0 && built >= 20260917u));
     Log("[host] DLSS 5 add-on: %s%s (file version %s) -- %s engine",
         gen[0] != '\0' ? "" : "v", gen[0] != '\0' ? gen : ver, ver,
-        g_renodx_v47  ? "v4.7+ (lazy adoption, colour bridge, workset pool)"
+        g_renodx_v6   ? "v6+ (v4.7 lineage; neural pass measured working on driver 617.14)"
+      : g_renodx_v47  ? "v4.7+ (lazy adoption, colour bridge, workset pool)"
       : g_renodx_v46  ? "v4.6 (lazy adoption, global hotkeys, upscaling latch)"
       : g_renodx_lazy ? "v45+ (lazy adoption; warm-up skipped)" : "classic (warm-up stays on)");
 
@@ -2421,18 +2435,23 @@ static void LogHostAdapter()
     // answers `supported` on 616.64. So the driver moved, and the v4.6+ engine is what does
     // not survive the move.
     //
+    // Later add-on generations do survive it. Measured on driver 617.14 (RTX 5090), same rig:
+    // v4.7 0/300 still, v6.1.0, v7.0.0-rc8 and v8.0.1 300/300 with feature 18 created and
+    // evaluated. So the warning is for the v4.6/v4.7 generation only (g_renodx_v6 = false).
+    //
     // Said up front, because the alternative is a helper that runs, logs nothing alarming
     // and delivers no neural frame -- which is exactly how this arrived as "the new driver
     // broke the 32-bit path" (issue #54).
     // The bound is >= 616.64 rather than == because there is no evidence a later driver
     // fixes it, and a warning that stops the moment NVIDIA ships 616.70 would be worse than
     // one that says plainly which driver it was measured on.
-    if (g_renodx_v46 && g_driver_x100 >= 61664)
+    if (g_renodx_v46 && !g_renodx_v6 && g_driver_x100 >= 61664)
         Log("[host] WARNING: renodx-dlss5 %s with NVIDIA driver %s is a combination measured to fail (on "
             "616.64 exactly; anything newer is untested here and assumed the same). The neural evaluate "
             "faults inside the driver's own NGX runtime -- an access violation in D3D12Core.dll, reached "
             "through nvngx_dlssnr.dll -- so DLSS 5 delivers nothing while everything else keeps working, "
-            "and there is nothing to fix on this side. Three things do work: Deep Fried Chicken as the "
+            "and there is nothing to fix on this side. Four things do work: a newer renodx-dlss5 (v6.1.0, "
+            "v7.0.0-rc8 and v8.0.1 were measured working on driver 617.14), Deep Fried Chicken as the "
             "neural consumer, a renodx-dlss5 build this helper does NOT report as v4.6+ (the classic build "
             "measured here is 391168 bytes, sha256 87aef9ddd937c724...; the rhi-repo 'renodx-dlss5-4.55' "
             "download is a different build, banner v4.1.5, with the v4.6 engine markers), or driver 616.56. "
