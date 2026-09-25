@@ -67,7 +67,7 @@
 #include "feed_pq12.h" // the D3D12 PQ<->linear pass, for the transports with no shaders of their own
 #include "feed_hold12.h" // the output stabiliser: one compute pass after the evaluate, all four transports
 
-#define FEED_VERSION "1.17.0-beta.2"
+#define FEED_VERSION "1.17.0-beta.3"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif
