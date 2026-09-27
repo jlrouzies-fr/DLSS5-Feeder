@@ -409,7 +409,8 @@ static void FeedLogNgxFeatureRequirements(void (*log)(const char *, ...), const 
             else if (is_nr && static_cast<unsigned>(r) == 0xBAD0000Cu)
                 log("[%s]   *** The installed NVIDIA driver reports feature 18 as OutOfDate. Plain DLSS/DLAA "
                     "may still initialise, but DLSS 5 neural rendering is unavailable until the driver is "
-                    "updated to 616.56 or newer. ***", tag);
+                    "updated to 616.56 or newer (Windows numbering; on Linux/Proton the matching branch is "
+                    "615.x, e.g. 615.71.09 pairs with 616.92 -- untested, #121). ***", tag);
             continue;
         }
         char why[192];
