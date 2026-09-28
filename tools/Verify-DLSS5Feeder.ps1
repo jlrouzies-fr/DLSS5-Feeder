@@ -1025,14 +1025,21 @@ else { Report -Status 'Warn' -Text 'No ReShade.ini in the game folder -- ReShade
 
 Write-Section 'DLSS5-Feeder'
 
+# 64-bit helper mode: a 64-bit game whose own process cannot run NGX gets the 32-bit path's
+# in-game half built x64 (dlss5-feed-helper.addon64), and NGX runs in host64\ exactly as for a
+# 32-bit game. $useHost is "this install goes through host64\", whichever the reason.
+$helperMode = ($gameBits -eq 64) -and [bool](Find-FileIn $gameDir 'dlss5-feed-helper.addon64')
+$useHost    = ($gameBits -eq 32) -or $helperMode
+
 if ($gameBits -eq 32) { $addonName = 'dlss5-feed.addon32'; $wrongAddon = 'dlss5-feed.addon64' }
+elseif ($helperMode)  { $addonName = 'dlss5-feed-helper.addon64'; $wrongAddon = 'dlss5-feed.addon32' }
 else                  { $addonName = 'dlss5-feed.addon64'; $wrongAddon = 'dlss5-feed.addon32' }
 
 $addonPath = Find-FileIn $gameDir $addonName
 $feedVersion = $null
 
 if ($addonPath) {
-    $feedVersion = Get-BinaryMarker -Path $addonPath -Pattern 'DLSS 5 Feed (?:\(32-bit\) )?(\d[\w.\-+]*)'
+    $feedVersion = Get-BinaryMarker -Path $addonPath -Pattern 'DLSS 5 Feed (?:\((?:32-bit|64-bit helper)\) )?(\d[\w.\-+]*)'
     $peAddon = Get-PeInfo $addonPath
     $d = ''
     if ($peAddon -and $peAddon.Bits -gt 0) { $d = $peAddon.Arch + ' image' }
@@ -1059,12 +1066,20 @@ if ($strayAddon) {
     Report -Status 'Warn' -Text ($wrongAddon + ' is also present, and is for the other architecture.') `
            -Detail 'Harmless (ReShade will not load it) but it makes the install confusing -- remove it.'
 }
+if ($helperMode) {
+    $inProcess = Find-FileIn $gameDir 'dlss5-feed.addon64'
+    if ($inProcess) {
+        Report -Status 'Fail' -Text 'dlss5-feed.addon64 is next to dlss5-feed-helper.addon64 -- use one or the other.' `
+               -Detail 'Both are 64-bit, so the game''s ReShade loads both: the in-process add-on tries NGX in the game while the helper add-on hands the same frames to host64\.' `
+               -Action ('For the 64-bit helper mode, remove ' + $inProcess + ' (rename it to .off to keep it).')
+    }
+}
 
-# The 32-bit split-process path needs the 64-bit host helper.
+# The 32-bit split-process path, and the 64-bit helper mode, need the 64-bit host helper.
 $hostDir = Join-Safe $gameDir 'host64'
 $hostExe = $null
 
-if ($gameBits -eq 32) {
+if ($useHost) {
     $hostExe = Find-FileIn $hostDir 'dlss5-feed-host64.exe'
     if ($hostExe) {
         $peHost = Get-PeInfo $hostExe
@@ -1081,7 +1096,7 @@ if ($gameBits -eq 32) {
                 $gap = [math]::Abs(($peAddon2.Built - $peHost.Built).TotalHours)
                 if ($gap -gt 24) {
                     Report -Status 'Warn' -Text 'The add-on and the host64 helper look like different builds.' `
-                           -Detail ('dlss5-feed.addon32 linked ' + $peAddon2.Built.ToString('yyyy-MM-dd HH:mm') +
+                           -Detail ($addonName + ' linked ' + $peAddon2.Built.ToString('yyyy-MM-dd HH:mm') +
                                     ' UTC, host64 linked ' + $peHost.Built.ToString('yyyy-MM-dd HH:mm') + ' UTC (' +
                                     [math]::Round($gap / 24, 1) + ' days apart).' +
                                     "`nA version mismatch across the IPC pipe is a real failure mode -- the host refuses the connection and neural rendering never starts. Redeploy both halves from the same release.")
@@ -1093,8 +1108,10 @@ if ($gameBits -eq 32) {
         }
     }
     else {
+        if ($helperMode) { $why = 'The 64-bit helper mode runs NGX in the helper process, not in the game -- dlss5-feed-helper.addon64 only hands it the frames.' }
+        else             { $why = 'A 32-bit game needs the 64-bit helper process -- the x86 add-on cannot talk to NGX itself.' }
         Report -Status 'Fail' -Text 'host64\dlss5-feed-host64.exe is missing.' `
-               -Detail 'A 32-bit game needs the 64-bit helper process -- the x86 add-on cannot talk to NGX itself.' `
+               -Detail $why `
                -Action 'Create host64\ next to the game exe and copy dlss5-feed-host64.exe into it.'
     }
 }
@@ -1138,7 +1155,7 @@ else {
 
 Write-Section 'Neural consumer'
 
-if ($gameBits -eq 32) {
+if ($useHost) {
     $consumerDir = $hostDir
     $consumerWhere = 'host64\'
 }
@@ -1172,21 +1189,31 @@ foreach ($n in @('winmm.dll', 'version.dll', 'dbghelp.dll', 'winhttp.dll', 'wini
     break
 }
 
-if ($gameBits -eq 32) {
+if ($useHost) {
+    if ($helperMode) {
+        $strayWhere   = 'next to the game exe -- wrong place for the 64-bit helper mode.'
+        $strayWhy     = 'In the 64-bit helper mode the neural consumer lives in host64\, where the helper process runs NGX. Beside the game it loads into the game''s own ReShade instead, the process that cannot run NGX.'
+        $strayOptiWhy = 'In the 64-bit helper mode OptiScaler goes into host64\ (OptiScaler.dll renamed winmm.dll beside dlss5-feed-host64.exe), where the DLSS work happens.'
+    }
+    else {
+        $strayWhere   = 'next to the 32-bit game exe -- wrong place.'
+        $strayWhy     = 'This game is 32-bit, so the neural consumer must live in host64\ where the 64-bit helper process loads it. A 64-bit add-on beside an x86 exe is never loaded by anything.'
+        $strayOptiWhy = 'OptiScaler is 64-bit. For a 32-bit game it goes into host64\ (OptiScaler.dll renamed winmm.dll beside dlss5-feed-host64.exe), where the DLSS work happens. A 64-bit winmm.dll or version.dll beside a 32-bit exe stops the game from starting at all.'
+    }
     # A 64-bit add-on beside a 32-bit exe is the single most common 32-bit deploy mistake.
     foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5*.addon64', 'alexs-toolkit.addon64')) {
         $stray = Find-FileIn $gameDir $n
         if ($stray) {
             $n = [IO.Path]::GetFileName($stray)   # the versioned name, not the pattern
-            Report -Status 'Fail' -Text ($n + ' is next to the 32-bit game exe -- wrong place.') `
-                   -Detail 'This game is 32-bit, so the neural consumer must live in host64\ where the 64-bit helper process loads it. A 64-bit add-on beside an x86 exe is never loaded by anything.' `
+            Report -Status 'Fail' -Text ($n + ' is ' + $strayWhere) `
+                   -Detail $strayWhy `
                    -Action ('Move ' + $n + ' into ' + $hostDir)
         }
     }
     $strayOpti = Find-FileIn $gameDir 'OptiScaler.ini'
     if ($strayOpti) {
-        Report -Status 'Fail' -Text 'The OptiScaler set is next to the 32-bit game exe -- wrong place.' `
-               -Detail 'OptiScaler is 64-bit. For a 32-bit game it goes into host64\ (OptiScaler.dll renamed winmm.dll beside dlss5-feed-host64.exe), where the DLSS work happens. A 64-bit winmm.dll or version.dll beside a 32-bit exe stops the game from starting at all.' `
+        Report -Status 'Fail' -Text ('The OptiScaler set is ' + $strayWhere) `
+               -Detail $strayOptiWhy `
                -Action ('Move OptiScaler.ini, the OptiScaler DLL, the OptiScaler\ folder (and nvngx.dll_dlssnr.dll if the build ships one) into ' + $hostDir)
     }
     # And the mirror image of it: the feeder's own 64-bit add-on inside host64\. Unlike a
@@ -1234,7 +1261,7 @@ elseif ($optiDll) {
         $flavour = if ($optiDirect) { 'direct-runtime build: wilsjo2 v0.8.1+, no forwarder DLL' } else { 'forwarder build: Dagherbou, or wilsjo2 before v0.8.1' }
         Report -Status 'Ok' -Text ('OptiScaler DLSS-NR present as ' + $optiName + ' (supported alternative; ' + $flavour + ').') `
                -Detail ('in ' + $consumerWhere + ' -- it answers the feeder''s NGX calls itself, upscales, then runs the neural pass in place. Its menu is on Insert.')
-        if ($gameBits -eq 32 -and $optiName -notmatch '(?i)^(winmm|version)\.dll$') {
+        if ($useHost -and $optiName -notmatch '(?i)^(winmm|version)\.dll$') {
             Report -Status 'Fail' -Text ('host64\' + $optiName + ' is never loaded by the helper.') `
                    -Detail 'dlss5-feed-host64.exe imports winmm.dll and version.dll at start; under any other name OptiScaler is not in the process when the first NGX call is made, and the driver answers instead.' `
                    -Action ('Rename ' + $optiName + ' to winmm.dll in ' + $hostDir)
@@ -1263,7 +1290,7 @@ elseif ($optiDll) {
             # [ProcessFilter] TargetProcessName naming another exe puts OptiScaler into pass-through
             # (no hooks, no menu): an ini copied from a game folder brings that game's name along.
             $tp = Get-IniValue -Path $optiIniPf -Section 'ProcessFilter' -Key 'TargetProcessName'
-            $hostExe = if ($gameBits -eq 32) { 'dlss5-feed-host64.exe' } else { [IO.Path]::GetFileName($exePath) }
+            $hostExe = if ($useHost) { 'dlss5-feed-host64.exe' } else { [IO.Path]::GetFileName($exePath) }
             if ($tp -and $tp.Trim() -and $tp.Trim() -ine 'auto' -and $tp.Trim() -ine $hostExe) {
                 Report -Status 'Fail' -Text ('OptiScaler.ini: [ProcessFilter] TargetProcessName=' + $tp.Trim() + ' -- but the process here is ' + $hostExe + '.') `
                        -Detail 'With a name that does not match, OptiScaler loads and then hooks nothing: no redirect, no menu, no neural pass. The key ships as auto.' `
@@ -1437,7 +1464,7 @@ foreach ($n in @('nvngx_dlssnr.dll', 'nvngx_dlss.dll')) {
 Write-Section 'd3dcompiler_47.dll'
 
 $dcDirs = @(@{ Dir = $gameDir; Label = 'game folder' })
-if ($gameBits -eq 32 -and (Test-DirHere $hostDir)) { $dcDirs += @{ Dir = $hostDir; Label = 'host64\' } }
+if ($useHost -and (Test-DirHere $hostDir)) { $dcDirs += @{ Dir = $hostDir; Label = 'host64\' } }
 
 $foundAny = $false
 foreach ($e in $dcDirs) {
@@ -1657,12 +1684,12 @@ function Report-FeedLog
 
 $anyLog = $false
 
-if ($gameBits -eq 32) { $gameHalf = 'game' } else { $gameHalf = '' }
+if ($useHost) { $gameHalf = 'game' } else { $gameHalf = '' }
 
 $feedLog = Find-FileIn $gameDir 'dlss5-feed.log'
 if ($feedLog) { $anyLog = $true; Report-FeedLog -Path $feedLog -Label 'dlss5-feed.log' -Half $gameHalf }
 
-if ($gameBits -eq 32 -and (Test-DirHere $hostDir)) {
+if ($useHost -and (Test-DirHere $hostDir)) {
     $hostLog = Find-FileIn $hostDir 'dlss5-feed-host.log'
     if ($hostLog) { $anyLog = $true; Report-FeedLog -Path $hostLog -Label 'host64\dlss5-feed-host.log' -Half 'host' }
 }
@@ -1721,7 +1748,7 @@ if ($optiDll) {
     # loaded"). OptiScaler.log beside the DLL then names the upscaler and the pass.
     $ownLogs = @()
     if ($feedLog) { $ownLogs += $feedLog }
-    if ($gameBits -eq 32) {
+    if ($useHost) {
         $hl = Find-FileIn $hostDir 'dlss5-feed-host.log'
         if ($hl) { $ownLogs += $hl }
     }
