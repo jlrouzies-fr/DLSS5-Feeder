@@ -2229,6 +2229,7 @@ static void NgxAskWhy(ID3D12Device *dev, const wchar_t *data_path)
     _snwprintf_s(hostdir, _TRUNCATE, L"%shost64\\", data_path);
     const wchar_t *const search[2] = { data_path, hostdir };
     NVSDK_NGX_FeatureCommonInfo info = {};
+    FeedNgxRouteLog(&info, &Log, "feed");
     info.PathListInfo.Path   = search;
     info.PathListInfo.Length = 2;
 
@@ -2258,6 +2259,7 @@ static int LogNgxCaps(NVSDK_NGX_Parameter *caps, ID3D12Device *dev, const wchar_
     caps->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);
     caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &maj);
     caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &min_v);
+    FeedLogNgxSsInitResult(&Log, "feed", caps);
     Log("[feed] NGX capabilities: SuperSampling.Available=%d SuperSamplingDenoising.Available=%d "
         "NeedsUpdatedDriver=%d MinDriver=%d.%d", avail, denoise, needs_driver, maj, min_v);
     return avail;
@@ -2466,6 +2468,7 @@ static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *de
     _snwprintf_s(hostdir, _TRUNCATE, L"%shost64\\", data_path);
     const wchar_t *const search[2] = { data_path, hostdir };
     NVSDK_NGX_FeatureCommonInfo info = {};
+    FeedNgxRouteLog(&info, &Log, "feed");
     info.PathListInfo.Path   = search;
     info.PathListInfo.Length = 2;
 

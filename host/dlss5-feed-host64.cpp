@@ -2517,6 +2517,7 @@ static bool InitNgx()
     // entirely on comparing them -- so it should not be a difference at all.
     const wchar_t *const search[1] = { data_path };
     NVSDK_NGX_FeatureCommonInfo info = {};
+    FeedNgxRouteLog(&info, &Log, "host");
     info.PathListInfo.Path   = search;
     info.PathListInfo.Length = 1;
 
@@ -2614,6 +2615,7 @@ static bool InitNgx()
         caps->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);
         caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &maj);
         caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &min_v);
+        FeedLogNgxSsInitResult(&Log, "host", caps);
         // SuperSamplingDenoising is DLSS Ray Reconstruction (nvngx_dlssd.dll), NOT the
         // DLSS 5 neural rendering this project feeds -- that is NGX feature 18, backed by
         // nvngx_dlssnr.dll, and no capability parameter reports on it. Kept as the cheapest
