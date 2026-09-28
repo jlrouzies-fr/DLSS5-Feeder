@@ -33,7 +33,7 @@
 
 static void Log(const char *fmt, ...);   // dlss5-feed.cpp
 
-#ifdef _WIN64
+#if defined(_WIN64) && !defined(FEED_HELPER64)
 static bool FeedVkPresentEnter(VkQueue queue, const VkPresentInfoKHR *info);
 static void FeedVkPresentLeave();
 static bool FeedVkFramePresentInstallDevice(VkDevice device);
@@ -139,7 +139,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookQueuePresent(VkQueue queue, cons
     FeedVkHookGate gate;
     const PFN_vkQueuePresentKHR orig = g_vk_present_orig;
     if (orig == nullptr) return VK_SUCCESS;   // torn down under us; nothing safe to call
-#ifdef _WIN64
+#if defined(_WIN64) && !defined(FEED_HELPER64)
     const bool present_context_entered = FeedVkPresentEnter(queue, pPresentInfo);
 #endif
     const LONG64 presents = InterlockedIncrement64(&g_vk_presents);
@@ -164,7 +164,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookQueuePresent(VkQueue queue, cons
             fed > 0 ? static_cast<double>(since) / static_cast<double>(fed) : 0.0);
     }
     const VkResult result = orig(queue, pPresentInfo);
-#ifdef _WIN64
+#if defined(_WIN64) && !defined(FEED_HELPER64)
     if (present_context_entered) FeedVkPresentLeave();
 #endif
     return result;
@@ -340,7 +340,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice ph
         Log("[feed] vkCreateDevice failed (%d) with the added extensions; retrying with the app's original create info", r);
         r = orig_create(physicalDevice, pCreateInfo, pAllocator, pDevice);
     }
-#ifdef _WIN64
+#if defined(_WIN64) && !defined(FEED_HELPER64)
     if (r == VK_SUCCESS && pDevice != nullptr)
     {
         if (!FeedVkFramePresentInstallDevice(*pDevice))

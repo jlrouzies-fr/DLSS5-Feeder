@@ -68,9 +68,23 @@ static void FeedOnVkDeviceGeneration();
 #define FEED_BUILD_ID "unknown"
 #endif
 
-extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
+// FEED_HELPER64 (tools\build-helper64.bat): this same file built x64 for the 64-bit helper
+// mode -- a 64-bit game whose own process cannot run NGX. Only the names the user sees differ.
+#ifdef FEED_HELPER64
+#define FEED_HALF_NAME  "64-bit helper"
+#define FEED_GAME_BITS  "64-bit"
+#else
+#define FEED_HALF_NAME  "32-bit"
+#define FEED_GAME_BITS  "32-bit"
+#endif
+
+extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (" FEED_HALF_NAME ") " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
+#ifdef FEED_HELPER64
+    "Feeds DLSS 5 neural rendering in 64-bit games whose own process cannot run NGX (64-bit helper mode): ships the frame, depth and "
+#else
     "Feeds DLSS 5 neural rendering in 32-bit D3D10, D3D11, OpenGL and Vulkan (DXVK) games without DLSS: ships the frame, depth and "
+#endif
     "motion vectors to a 64-bit helper process (host64\\dlss5-feed-host64.exe) over cross-process "
     "shared GPU textures, and blits the neural result back. Needs DLSS5_Feed.fx and a motion-vector "
     "provider (DRME, qUINT, Launchpad, VORT or LumeniteFX; pick it with the DLSS5_MV_PROVIDER definition). "
@@ -2302,8 +2316,13 @@ static void DetectChickenHost()
     char stray[MAX_PATH];
     sprintf_s(stray, "%s" DFC_ADDON_FILENAME, dir);
     if (GetFileAttributesA(stray) != INVALID_FILE_ATTRIBUTES)
+#ifdef FEED_HELPER64
+        Warn("deep-fried-chicken.addon64 is next to the game exe, where it loads into the game's own ReShade -- the "
+             "process that cannot run NGX. It belongs in host64\\ (it is already there too). Remove the copy next to the game.");
+#else
         Warn("deep-fried-chicken.addon64 is next to the 32-bit game exe, where a 32-bit process cannot load it. "
              "It belongs in host64\\ (it is already there too). Remove the copy next to the game.");
+#endif
 }
 
 // OptiScaler DLSS-NR in host64\ -- the third neural consumer on the split path (see feed_opti.h).
@@ -2347,9 +2366,14 @@ static void DetectOptiHost()
     char stray[MAX_PATH];
     sprintf_s(stray, "%s" OPTI_INI, dir);
     if (GetFileAttributesA(stray) != INVALID_FILE_ATTRIBUTES)
+#ifdef FEED_HELPER64
+        Warn("OptiScaler.ini is next to the game exe. In the 64-bit helper mode OptiScaler belongs in host64\\ (beside "
+             "dlss5-feed-host64.exe, renamed winmm.dll), where the DLSS work happens.");
+#else
         Warn("OptiScaler.ini is next to the 32-bit game exe. OptiScaler is 64-bit and belongs in host64\\ (beside "
              "dlss5-feed-host64.exe, renamed winmm.dll), where the DLSS work happens. A 32-bit game cannot load it, "
              "and a 64-bit winmm.dll or version.dll beside a 32-bit exe stops the game from starting at all.");
+#endif
 
     if (!g_opti_host) { Log("[feed32] OptiScaler: not present in host64\\"); return; }
     if (!g_opti_host_nr)
@@ -3919,7 +3943,11 @@ static bool EnsureVulkanLoaded(reshade::api::effect_runtime *rt)
         Log("[feed32] The add-on's vkCreateDevice hook was installed but never called: this game creates its device some way it does not intercept.");
     else
         Log("[feed32] The hook did run (%d vkCreateDevice call(s)); check its per-extension lines above for what the driver refused.", g_vk_hook_devices);
+#ifdef FEED_HELPER64
+    Log("[feed32] FALLBACK: launch the game through layer\\run-with-feed-layer.bat (the 64-bit VK_LAYER_feed_vk appends them from outside).");
+#else
     Log("[feed32] FALLBACK: launch the game through layer\\x86\\run-with-feed-layer32.bat (the 32-bit VK_LAYER_feed_vk appends them from outside).");
+#endif
     FeedDisable("the Vulkan interop extensions are missing on this device -- see dlss5-feed.log");
     return false;
 }
@@ -4056,7 +4084,7 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
                 Log("[feed32] not importing them (wine_fence_import=0). wine_fence_import=1 in dlss5-feed.cfg tries "
                     "anyway, for a Wine build that has closed that gap -- expect the game to close if it has not");
                 ReleaseShared();
-                FeedDisable("Wine/Proton cannot import a D3D12 fence from the host64 helper into this 32-bit Vulkan "
+                FeedDisable("Wine/Proton cannot import a D3D12 fence from the host64 helper into this " FEED_GAME_BITS " Vulkan "
                             "game (#121; see dlss5-feed.log). The game renders normally.");
                 return false;
             }
@@ -5172,7 +5200,7 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
     if (dev_api->get_api() == reshade::api::device_api::d3d10)
     { g.is_d3d10 = true; FeedFrame10(rt, rtv); return; }
     if (dev_api->get_api() != reshade::api::device_api::d3d11)
-    { FeedDisable("only Direct3D 10, Direct3D 11, OpenGL and Vulkan games are supported by the 32-bit add-on"); return; }
+    { FeedDisable("only Direct3D 10, Direct3D 11, OpenGL and Vulkan games are supported by the " FEED_HALF_NAME " add-on"); return; }
 
     auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cl->get_native());
     if (ctx == nullptr || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
