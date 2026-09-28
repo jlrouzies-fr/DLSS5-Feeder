@@ -117,6 +117,10 @@ jobs:
         shell: cmd
         run: call host\build-host.bat
 
+      - name: dlss5-feed-helper.addon64 (the in-game half built x64 -- 64-bit helper mode)
+        shell: cmd
+        run: call tools\build-helper64.bat
+
       - name: VkLayer_feed_vk.dll (Vulkan interop layer, x64 + x86)
         shell: cmd
         run: call layer\build-layer.bat
@@ -137,6 +141,7 @@ jobs:
           cp build/dlss5-feed.addon64   artifacts/
           cp build/dlss5-feed.addon32   artifacts/
           cp host/dlss5-feed-host64.exe artifacts/
+          cp build/helper64/dlss5-feed-helper.addon64 artifacts/
           cp layer/VkLayer_feed_vk.dll  artifacts/
           cp layer/VkLayer_feed_vk.json artifacts/
           # The 32-bit layer keeps its own subdirectory: the Vulkan loader tries every

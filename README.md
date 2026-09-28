@@ -312,6 +312,7 @@ your antivirus.
 - [Install for a DirectX 9 game](#install-for-a-directx-9-game-beta)
 - [Install for a Vulkan game](#install-for-a-vulkan-game)
   - [32-bit Vulkan (DXVK)](#32-bit-vulkan-dxvk)
+  - [64-bit helper mode](#64-bit-helper-mode-games-whose-own-process-cannot-run-ngx)
 - [Install for an OpenGL game](#install-for-an-opengl-game)
 - [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider)
 - [How it works](#how-it-works)
@@ -817,6 +818,39 @@ If `dlss5-feed.log` says the interop entry points are missing, use the 32-bit fa
 layer\x86\run-with-feed-layer32.bat "E:\path\to\game.exe"
 ```
 
+### 64-bit helper mode (games whose own process cannot run NGX)
+
+Some 64-bit games cannot run NGX inside their own process. `dlss5-feed.log` then shows
+`NVSDK_NGX_D3D12_Init -> 0x00000001 (Success)` followed by `SuperSampling.Available=0` and
+"DLSS is not available on this GPU/driver", while `host64\dlss5-feed-host64.exe --test` on the
+same PC succeeds. Confirmed so far: **Bloodborne on shadPS4**, where NGX's own log says
+`NvAPI_D3D12_CreateCuModule failed` and `SuperSampling.FeatureInitResult` is `0xBAD00002`
+(`PlatformError`).
+
+For these games, `dlss5-feed-helper.addon64` runs the 32-bit path's in-game half as 64-bit code.
+The game hands its frames to the helper process and NGX runs there, exactly as for a 32-bit game.
+
+**Next to the game `.exe`**
+- ReShade with add-on support, as in [Install for a Vulkan game](#install-for-a-vulkan-game).
+- `dlss5-feed-helper.addon64` **instead of** `dlss5-feed.addon64`. Never both.
+- `DLSS5_Feed.fx` and a motion-vector provider, as for any game.
+- No neural consumer here: it goes in `host64\`.
+
+**In `host64\`**: the same files as in [Install for a 32-bit game](#install-for-a-32-bit-game-beta):
+`dlss5-feed-host64.exe`, a 64-bit ReShade `dxgi.dll`, the neural consumer, `nvngx_dlssnr.dll` and
+`nvngx_dlss.dll`.
+
+From there it behaves like the 32-bit path: the first fed frame starts the helper, and the panel
+and settings are the ones described there. The limits of [32-bit Vulkan](#32-bit-vulkan-dxvk)
+apply too: DLAA at native size, **Work resolution** fixed at 100%.
+
+- Tested on Vulkan only (shadPS4). The D3D11 and OpenGL paths of the same code are compiled in,
+  but nobody has run them at 64-bit yet.
+- ReShade's add-on list shows it as **DLSS 5 Feed (64-bit helper)**. The log still calls it
+  `dlss5-feed32` / `[feed32]`: it is the same code, built x64.
+- `Verify-DLSS5Feeder.ps1` recognises the layout by `dlss5-feed-helper.addon64` next to a 64-bit
+  exe and then checks `host64\` and the neural consumer there, as for a 32-bit game.
+
 ## Install for an OpenGL game
 
 The simplest of the four — nothing extra to configure.
@@ -1113,7 +1147,7 @@ memory objects are import-only and a GL process cannot export one. Both directio
 | A neural consumer + `nvngx_dlssnr.dll` | **Deep Fried Chicken** (recommended — `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll`, `deep-fried-chicken.cfg`, from its Discord), or **Krish's `renodx-dlss5.addon64`** `#DLSS5` build as the alternative. Exactly one of them. Not ShortFuse's `renodx-dlss`, which is a different add-on that replaces this project rather than working with it (see [Before you install](#1-you-might-not-need-this-project-at-all)). Neither is included here, and neither bundles `nvngx_dlssnr.dll`. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
 | A motion vector provider | one of five, selected with the `DLSS5_MV_PROVIDER` definition — **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) Kernel is recommended** (`=3`); also iMMERSE Launchpad, VORT, LumeniteFX QuantMotion, or anything writing `texMotionVectors` (qUINT, `dh_uber_motion`). **Not DRME — it does not compile on ReShade 6.8.** See [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider). Install it yourself — nothing third-party is bundled, and our shader includes no third-party files. |
-| `dlss5-feed.addon64` (or `.addon32` + `host64\`) + `DLSS5_Feed.fx` | this project. |
+| `dlss5-feed.addon64` (or `.addon32` + `host64\`, or `dlss5-feed-helper.addon64` + `host64\` in the [64-bit helper mode](#64-bit-helper-mode-games-whose-own-process-cannot-run-ngx)) + `DLSS5_Feed.fx` | this project. |
 
 ## Configuration
 
@@ -1520,6 +1554,7 @@ under `external/reshade/include` (BSD-3-Clause, Patrick Mours), as is **MinHook*
 | --- | --- | --- |
 | `tools\build.bat` | `build\dlss5-feed.addon64` | NGX SDK |
 | `tools\build-addon32.bat` | `build\dlss5-feed.addon32` | Vulkan headers |
+| `tools\build-helper64.bat` | `build\helper64\dlss5-feed-helper.addon64` (the same in-game half, built x64 for the [64-bit helper mode](#64-bit-helper-mode-games-whose-own-process-cannot-run-ngx)) | Vulkan headers |
 | `host\build-host.bat` | `host\dlss5-feed-host64.exe` | NGX SDK |
 | `layer\build-layer.bat` | `layer\VkLayer_feed_vk.dll` and `layer\x86\VkLayer_feed_vk32.dll` (fallback for Vulkan games where the add-on's own `vkCreateDevice` hook cannot add the interop extensions; the 32-bit pair keeps its own subdirectory because the Vulkan loader tries every manifest on `VK_LAYER_PATH`) | Vulkan headers |
 | `spike\build-spike.bat` | the standalone proofs used during development: the 32↔64-bit shared-resource pair, plus `spike-gl64.exe` / `spike-gl32.exe` and `spike-vkhost64.exe` / `spike-vkclient32.exe`, which round-trip a texture and a fence between D3D12 and OpenGL / Vulkan, in-process and cross-process, and `spike-proxy-swapchain.exe`, the `IDXGISwapChain` wrapper contract behind `docs/PLAN-PROXY-SWAPCHAIN.md` (a 960×540 "game" presented at window size through FSR 1). They need an NVIDIA GPU to *run*, none to compile. | — |
