@@ -440,6 +440,11 @@ Things to know:
   installed, and if another is already in the folder it offers to disable it. For OptiScaler it
   also asks which fork: wilsjo2's (the default) or Dagherbou's. `-Consumer RenoDX|OptiScaler|DFC`
   and `-OptiScalerFork wilsjo2|Dagherbou` answer both in advance for an unattended run.
+- **For a 64-bit game it asks whether to use the
+  [64-bit helper mode](#64-bit-helper-mode-games-whose-own-process-cannot-run-ngx)**, which runs NGX
+  in `host64\` as for a 32-bit game. Answer No (the default, and what Enter does) unless the game
+  already failed with "NGX would not set DLSS up inside this game's process". `-HelperMode Yes|No`
+  answers in advance; `-Yes` alone means No.
 - Pieces you already have go in a folder passed with `-LocalFiles`, or one at a time with
   `-DfcZip`, `-RenoDxAddon`, `-OptiScalerZip`, `-DlssNrDll`, `-DlssDll`, `-FeederZip`, `-ReShadeSetup`,
   `-LumeniteZip`, `-DgVoodooZip`.

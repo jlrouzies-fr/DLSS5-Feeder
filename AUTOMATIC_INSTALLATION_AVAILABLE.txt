@@ -65,6 +65,11 @@ WORTH KNOWING
   - -Consumer RenoDX, -Consumer OptiScaler or -Consumer DFC answers the
     consumer question in advance, for an unattended run. -OptiScalerFork
     wilsjo2 or -OptiScalerFork Dagherbou answers the fork question.
+  - For a 64-bit game the script asks whether to run NGX in the host64
+    helper process (the 64-bit helper mode) instead of inside the game.
+    Answer No, the default, unless the game already failed with "NGX would
+    not set DLSS up inside this game's process". -HelperMode Yes or
+    -HelperMode No answers in advance.
   - Already have some of the pieces? Point -LocalFiles at a folder, or pass
     them one at a time: -DfcZip, -RenoDxAddon, -OptiScalerZip, -DlssNrDll, -DlssDll,
     -FeederZip, -ReShadeSetup, -LumeniteZip, -DgVoodooZip.

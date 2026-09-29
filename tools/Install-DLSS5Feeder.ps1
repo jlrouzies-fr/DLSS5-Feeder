@@ -11,8 +11,9 @@
       2. ReShade 6.8+ with add-on support: a local dxgi.dll / opengl32.dll for Direct3D and
          OpenGL, the machine-wide implicit layer plus ReShadeApps.ini entry for Vulkan.
       3. The feeder itself from the latest GitHub release: the add-on matching the game's
-         bitness, the 64-bit host helper for 32-bit games, the shader, the Vulkan fallback
-         layer, and the verification script.
+         bitness, the 64-bit host helper for 32-bit games (and for a 64-bit game in the
+         64-bit helper mode, when asked for), the shader, the Vulkan fallback layer, and the
+         verification script.
       4. The ReShade framework headers and LumeniteFX (the recommended motion-vector provider).
       5. The neural consumer -- the RenoDX DLSS 5 add-on by default -- and the two NVIDIA
          NGX runtimes, in the folder where the 64-bit code runs (the game folder, or host64\).
@@ -63,6 +64,14 @@
     actively maintained, no forwarder DLL, pre-SR and multipass options) or Dagherbou
     (OptiScaler_DLSSNR, the original; ships nvngx.dll_dlssnr.dll, its forwarder). Both are
     supported by the feeder. Omitted, the script asks; with -Yes it takes wilsjo2.
+
+.PARAMETER HelperMode
+    64-bit games only: run NGX in the host64\ helper process instead of inside the game (the
+    64-bit helper mode, dlss5-feed-helper.addon64), the way every 32-bit game works. Only for
+    games whose own process cannot run NGX -- dlss5-feed.log then says "NGX would not set DLSS
+    up inside this game's process" while host64's --test passes (shadPS4). It supports
+    Direct3D 10/11, OpenGL and Vulkan, not Direct3D 12, and runs DLAA at native size only.
+    Ask (default) asks, with No as the answer on Enter; with -Yes and Ask it is No.
 
 .PARAMETER MvProvider
     DLSS5_MV_PROVIDER value: 3 (LumeniteFX Kernel, default) or 4 (LumeniteFX QuantMotion).
@@ -134,6 +143,9 @@ param(
 
     [ValidateSet('Ask', 'wilsjo2', 'Dagherbou')]
     [string] $OptiScalerFork = 'Ask',
+
+    [ValidateSet('Ask', 'No', 'Yes')]
+    [string] $HelperMode = 'Ask',
 
     [ValidateSet(3, 4)]
     [int] $MvProvider = 3,
@@ -1818,9 +1830,37 @@ $isDgV     = ($useApi -eq 'D3D9' -or $useApi -eq 'D3D8')
 $is32      = ($gameBits -eq 32)
 if ($is32 -and $isVulkan) { Report -Status 'Info' -Text '32-bit Vulkan: ReShade goes in as the 32-bit layer, and the feeder as addon32 + host64\.' }
 
+# The 64-bit helper mode (#139): a 64-bit game can hand its frames to host64\ and have NGX run
+# there, as every 32-bit game does. It exists for games whose own process cannot run NGX
+# (shadPS4); everywhere else running NGX in the game is faster and has the full feature set,
+# so the answer is No unless the user says otherwise. (PowerShell names are case-insensitive:
+# $viaHelper, never $helperMode, or it would overwrite the -HelperMode parameter.)
+$viaHelper = $false
+if (-not $is32) {
+    if ($HelperMode -eq 'Yes') { $viaHelper = $true }
+    elseif ($HelperMode -eq 'Ask' -and -not $Yes) {
+        Write-Host ''
+        Write-Chunk '  Run NGX in the host64 helper process instead of inside the game?' 'White'
+        Write-Chunk '  Answer No unless this game already failed with DLSS5-Feeder: its dlss5-feed.log said' 'DarkGray'
+        Write-Chunk '  "NGX would not set DLSS up inside this game''s process", while' 'DarkGray'
+        Write-Chunk '  host64\dlss5-feed-host64.exe --test passed (shadPS4 is the known case). The helper mode' 'DarkGray'
+        Write-Chunk '  supports Direct3D 10/11, OpenGL and Vulkan (not Direct3D 12) and runs DLAA at native size only.' 'DarkGray'
+        Write-Chunk '  Use the 64-bit helper mode? [y/N, Enter for No (recommended)] ' 'Cyan' -NoNewline
+        try { $a = Read-Host } catch { $a = '' }
+        $viaHelper = ($a -match '^(?i)y(es)?$')
+    }
+    if ($viaHelper) {
+        Report -Status 'Info' -Text '64-bit helper mode: dlss5-feed-helper.addon64 beside the game, NGX and the neural consumer in host64\.' `
+               -Detail 'The same layout as a 32-bit game. Re-run with -HelperMode No to go back to running NGX in the game.'
+    }
+}
+# Everything below that means "this install goes through host64\" tests $useHost; $is32 is
+# left for what really depends on the game's bitness (ReShade's own DLL, the Vulkan layer).
+$useHost = $is32 -or $viaHelper
+
 # Where the 64-bit side (consumer + NGX) lives.
 $hostDir = Join-Safe $gameDir 'host64'
-if ($is32) { $consumerDir = $hostDir; $consumerWhere = 'host64\' } else { $consumerDir = $gameDir; $consumerWhere = 'the game folder' }
+if ($useHost) { $consumerDir = $hostDir; $consumerWhere = 'host64\' } else { $consumerDir = $gameDir; $consumerWhere = 'the game folder' }
 $shaderDir  = Join-Safe $gameDir 'reshade-shaders\Shaders'
 $textureDir = Join-Safe $gameDir 'reshade-shaders\Textures'
 
@@ -2272,8 +2312,8 @@ else {
     $null = Install-ReShadeDll -Bits $gameBits -To $reshadeLocalDll -Label ('Game folder (' + $gameBits + '-bit)')
 }
 
-# 32-bit: the host helper needs its own 64-bit ReShade as dxgi.dll.
-if ($is32) {
+# 32-bit and the 64-bit helper mode: the host helper needs its own 64-bit ReShade as dxgi.dll.
+if ($useHost) {
     New-DirSafe $hostDir
     $null = Install-ReShadeDll -Bits 64 -To (Join-Safe $hostDir 'dxgi.dll') -Label 'host64\'
 }
@@ -2344,8 +2384,12 @@ if ($isDgV) {
 
 Write-Section 'DLSS5-Feeder'
 
-$addonName = if ($is32) { 'dlss5-feed.addon32' } else { 'dlss5-feed.addon64' }
-$wrongAddon = if ($is32) { 'dlss5-feed.addon64' } else { 'dlss5-feed.addon32' }
+# Exactly one game-side add-on. A helper add-on left from an earlier helper-mode install would
+# make dlss5-feed.addon64 stand down, so switching back and forth has to clear the other one.
+if ($is32)          { $addonName = 'dlss5-feed.addon32' }
+elseif ($viaHelper) { $addonName = 'dlss5-feed-helper.addon64' }
+else                { $addonName = 'dlss5-feed.addon64' }
+$wrongAddons = @('dlss5-feed.addon32', 'dlss5-feed.addon64', 'dlss5-feed-helper.addon64') | Where-Object { $_ -ne $addonName }
 $verifyScript = $null
 $feederVersion = $null
 
@@ -2353,6 +2397,7 @@ try {
     $z = Open-Zip $feederPath
     try {
         $e = Find-ZipEntry $z ('(?i)(^|/)' + [regex]::Escape($addonName) + '$')
+        if (-not $e -and $viaHelper) { throw ($addonName + ' not found in ' + $feederPath + ' -- the 64-bit helper mode ships from 1.18.0-beta.1 on') }
         if (-not $e) { throw ($addonName + ' not found in ' + $feederPath) }
         Expand-ZipEntry -Entry $e -To (Join-Safe $gameDir $addonName)
 
@@ -2364,7 +2409,7 @@ try {
         if ($m.Success) { $feederVersion = $m.Groups[1].Value }
         Report -Status 'Done' -Text ($addonName + ' and reshade-shaders\Shaders\DLSS5_Feed.fx installed' + $(if ($feederVersion) { ' (' + $feederVersion + ')' } else { '' }) + '.')
 
-        if ($is32) {
+        if ($useHost) {
             $h = Find-ZipEntry $z '(?i)(^|/)dlss5-feed-host64\.exe$'
             if (-not $h) { throw 'host64/dlss5-feed-host64.exe not found in the release' }
             Expand-ZipEntry -Entry $h -To (Join-Safe $hostDir 'dlss5-feed-host64.exe')
@@ -2391,10 +2436,11 @@ try {
 }
 catch { Report -Status 'Fail' -Text 'Feeder files could not be installed.' -Detail $_.Exception.Message }
 
-$stray = Find-FileIn $gameDir $wrongAddon
-if ($stray) {
-    try { Rename-Item -LiteralPath $stray -NewName ($wrongAddon + '.disabled-by-installer') -Force; Report -Status 'Done' -Text ($wrongAddon + ' (wrong architecture) renamed to .disabled-by-installer.') }
-    catch { Report -Status 'Warn' -Text ($wrongAddon + ' is also present and is for the other architecture; remove it.') }
+foreach ($wrongAddon in $wrongAddons) {
+    $stray = Find-FileIn $gameDir $wrongAddon
+    if (-not $stray) { continue }
+    try { Rename-Item -LiteralPath $stray -NewName ($wrongAddon + '.disabled-by-installer') -Force; Report -Status 'Done' -Text ($wrongAddon + ' (not the add-on this install uses) renamed to .disabled-by-installer.') }
+    catch { Report -Status 'Warn' -Text ($wrongAddon + ' is also present and is not the add-on this install uses; remove it.') }
 }
 
 # Framework headers
@@ -2478,11 +2524,19 @@ function Find-OptiScalerDll
 }
 
 Disable-Conflict -Path (Find-FileIn $consumerDir 'dlss5-dx11-bridge.addon64') -Why 'the DX11 bridge must never be combined with DLSS5-Feeder'
-if ($is32) {
-    Disable-Conflict -Path (Find-OptiScalerDll $gameDir) -Why 'a 64-bit OptiScaler beside a 32-bit exe stops the game from starting; for a 32-bit game it belongs in host64\'
+if ($useHost) {
+    if ($is32) {
+        $whyOpti     = 'a 64-bit OptiScaler beside a 32-bit exe stops the game from starting; for a 32-bit game it belongs in host64\'
+        $whyConsumer = 'a 64-bit add-on beside a 32-bit exe is never loaded; the consumer belongs in host64\'
+    }
+    else {
+        $whyOpti     = 'in the 64-bit helper mode OptiScaler belongs in host64\, where NGX runs; beside the game it hooks the process that cannot run NGX'
+        $whyConsumer = 'in the 64-bit helper mode the neural consumer belongs in host64\; beside the game it loads into the game''s own ReShade'
+    }
+    Disable-Conflict -Path (Find-OptiScalerDll $gameDir) -Why $whyOpti
     foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5*.addon64', 'alexs-toolkit.addon64')) {
         foreach ($f in (Find-FilesIn $gameDir $n)) {
-            Disable-Conflict -Path $f.FullName -Why 'a 64-bit add-on beside a 32-bit exe is never loaded; the consumer belongs in host64\'
+            Disable-Conflict -Path $f.FullName -Why $whyConsumer
         }
     }
     # The reverse mistake, and the damaging one: this project's own 64-bit add-on inside
@@ -2637,7 +2691,7 @@ else {
         # The name OptiScaler is renamed to has to be one the process imports at start, and free.
         # The 64-bit helper imports winmm.dll and version.dll; a game imports what it imports.
         $optiName = $null
-        if ($is32) { $imports = @('winmm.dll', 'version.dll') }
+        if ($useHost) { $imports = @('winmm.dll', 'version.dll') }
         else {
             $imports = Get-PeImportNames $exePath
             if ($null -eq $imports) { $imports = @() } else { $imports = @($imports) }
@@ -2656,7 +2710,7 @@ else {
                    -Action ('Pick a name by hand: rename OptiScaler.dll in ' + $consumerDir + ' to a DLL the game loads (OptiScaler''s own setup_windows.bat lists the choices; never dxgi.dll, which is ReShade).')
         }
         else {
-            if ($imports.Count -eq 0 -and -not $is32) { Report -Status 'Info' -Text ('Could not read the game''s imports; OptiScaler goes in as ' + $optiName + '. If OptiScaler.log never appears, rename it to a DLL the game does load.') }
+            if ($imports.Count -eq 0 -and -not $useHost) { Report -Status 'Info' -Text ('Could not read the game''s imports; OptiScaler goes in as ' + $optiName + '. If OptiScaler.log never appears, rename it to a DLL the game does load.') }
             try {
                 $z = Open-Zip $optiPath
                 $zipForwarder = $false   # Dagherbou's generation ships nvngx.dll_dlssnr.dll; wilsjo2 v0.8.1+ has no such file
@@ -2756,7 +2810,7 @@ foreach ($pair in @(@{ N = 'nvngx_dlssnr.dll'; P = $dlssNrPath }, @{ N = 'nvngx_
 
 Write-Section 'd3dcompiler_47.dll'
 $dcDirs = @($gameDir)
-if ($is32) { $dcDirs += $hostDir }
+if ($useHost) { $dcDirs += $hostDir }
 $dcFound = $false
 foreach ($d in $dcDirs) {
     $p = Find-FileIn $d 'd3dcompiler_47.dll'
@@ -2894,7 +2948,7 @@ if ($riNow -and $riNow -match '(?i)DLSS5_MV_PROVIDER') {
 }
 
 # host64\ReShade.ini: minimal, and deliberately without AddonPath (the host loads its own folder's add-ons).
-if ($is32) {
+if ($useHost) {
     $hostIni = Join-Safe $hostDir 'ReShade.ini'
     if (-not (Test-FileHere $hostIni)) {
         Write-TextTracked -Path $hostIni -Text ("[GENERAL]`r`nEffectSearchPaths=.\`r`nTextureSearchPaths=.\`r`n")
@@ -2957,7 +3011,7 @@ $steps = @()
 $steps += 'Launch it. Press Home for the ReShade overlay and check there are no compile errors.'
 $steps += ('Both techniques should already be ticked, in this order: ' + $providerTechnique.Split('@')[0] + ' above DLSS 5 Feed.')
 if ($Consumer -eq 'DFC') {
-    if ($is32) { $steps += 'Open the ReShade overlay > Add-ons > DLSS 5 Feed and press "Show the DLSS 5 panel in-game" to reach the Deep Fried Chicken tab (it lives in the host64 helper).' }
+    if ($useHost) { $steps += 'Open the ReShade overlay > Add-ons > DLSS 5 Feed and press "Show the DLSS 5 panel in-game" to reach the Deep Fried Chicken tab (it lives in the host64 helper).' }
     else { $steps += 'Turn on neural rendering in the Deep Fried Chicken tab of the overlay.' }
     $steps += 'On its first armed run Chicken registers itself for early load in ReShade.ini and asks for one more full restart. Do that restart.'
 }
@@ -2965,11 +3019,12 @@ elseif ($Consumer -eq 'RenoDX') {
     $steps += 'Turn on neural rendering in the DLSS 5 Neural Rendering add-on panel.'
 }
 else {
-    if ($is32) { $steps += 'OptiScaler''s menu lives in the host64 helper: open the ReShade overlay > Add-ons > DLSS 5 Feed, press "Show the DLSS 5 panel in-game", then press Insert. Its neural-rendering section holds the pass controls; the pass is already switched on.' }
+    if ($useHost) { $steps += 'OptiScaler''s menu lives in the host64 helper: open the ReShade overlay > Add-ons > DLSS 5 Feed, press "Show the DLSS 5 panel in-game", then press Insert. Its neural-rendering section holds the pass controls; the pass is already switched on.' }
     else { $steps += 'Press Insert for OptiScaler''s menu; its neural-rendering section holds the pass controls, and the pass is already switched on.' }
-    $steps += 'dlss5-feed.log (host64\dlss5-feed-host.log for a 32-bit game) should say "NGX calls are routed through OptiScaler DLSS-NR" and, after the first frames, "neural model (feature 18) loaded".'
+    $steps += 'dlss5-feed.log (host64\dlss5-feed-host.log for a 32-bit game or the helper mode) should say "NGX calls are routed through OptiScaler DLSS-NR" and, after the first frames, "neural model (feature 18) loaded".'
 }
 $steps += 'Turn the game''s MSAA/SSAA off.'
+if ($viaHelper) { $steps += 'ReShade''s add-on list should show "DLSS 5 Feed (64-bit helper)". If the game renders but DLSS never starts, check host64\dlss5-feed-host.log.' }
 if ($isDgV -and -not $DgVoodooWatermark) { $steps += 'dgVoodoo''s watermark is off. If nothing seems to happen, re-run with -DgVoodooWatermark to confirm dgVoodoo is active at all.' }
 if ($isVulkan) { $steps += 'If dlss5-feed.log says the Vulkan interop entry points are missing, launch through layer\run-with-feed-layer' + $(if ($is32) { '32' } else { '' }) + '.bat "<path to exe>" instead.' }
 $steps += 'Then check dlss5-feed.log next to the exe for "feature ready", "frame N delivered", and re-run Verify-DLSS5Feeder.ps1 for a runtime verdict.'
