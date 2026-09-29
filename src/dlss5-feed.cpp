@@ -2229,7 +2229,6 @@ static void NgxAskWhy(ID3D12Device *dev, const wchar_t *data_path)
     _snwprintf_s(hostdir, _TRUNCATE, L"%shost64\\", data_path);
     const wchar_t *const search[2] = { data_path, hostdir };
     NVSDK_NGX_FeatureCommonInfo info = {};
-    FeedNgxRouteLog(&info, &Log, "feed");
     info.PathListInfo.Path   = search;
     info.PathListInfo.Length = 2;
 
@@ -2250,7 +2249,37 @@ static void NgxAskWhy(ID3D12Device *dev, const wchar_t *data_path)
     if (ad != nullptr) ad->Release();
 }
 
-// Returns SuperSampling.Available; the caller decides what to do about it.
+static void NgxDiagnosticPass(ID3D12Device *dev, const wchar_t *data_path, bool shut_down_first);   // below
+
+// SuperSampling.FeatureInitResult from the last capability query, when NGX reported one.
+static bool             g_ngx_ss_fir_known;
+static NVSDK_NGX_Result g_ngx_ss_fir;
+
+// The sentence for a session that stops on SuperSampling.Available=0. The GPU and the driver
+// are only to blame when NGX has nothing more specific to say: under shadPS4 it reports
+// PlatformError for this one process while host64 --test passes on the same PC (#137/#138),
+// which is exactly what the 64-bit helper mode is for.
+static const char *NgxUnavailableReason()
+{
+    static char why[400];
+    if (!g_ngx_ss_fir_known || NVSDK_NGX_SUCCEED(g_ngx_ss_fir))
+        return "DLSS is not available on this GPU/driver";
+    if (static_cast<unsigned>(g_ngx_ss_fir) == 0xBAD00002u)
+        _snprintf_s(why, sizeof(why), _TRUNCATE,
+                    "NGX would not set DLSS up inside this game's process (SuperSampling.FeatureInitResult 0x%08X %s). "
+                    "If host64\\dlss5-feed-host64.exe --test passes on this PC, it is not your GPU or driver: try the "
+                    "64-bit helper mode (dlss5-feed-helper.addon64, see the README), which runs NGX in host64",
+                    static_cast<unsigned>(g_ngx_ss_fir), NgxResultName(g_ngx_ss_fir));
+    else
+        _snprintf_s(why, sizeof(why), _TRUNCATE,
+                    "DLSS is not available here: NGX reports SuperSampling.FeatureInitResult 0x%08X (%s)",
+                    static_cast<unsigned>(g_ngx_ss_fir), NgxResultName(g_ngx_ss_fir));
+    return why;
+}
+
+// Returns SuperSampling.Available; the caller decides what to do about it. On 0 the session
+// is being abandoned, so this also collects NGX's own log of the failure and leaves NGX shut
+// down: the caller's g.ngx_inited is cleared here to match.
 static int LogNgxCaps(NVSDK_NGX_Parameter *caps, ID3D12Device *dev, const wchar_t *data_path)
 {
     int avail = 0, denoise = 0, needs_driver = 0, maj = 0, min_v = 0;
@@ -2259,9 +2288,14 @@ static int LogNgxCaps(NVSDK_NGX_Parameter *caps, ID3D12Device *dev, const wchar_
     caps->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);
     caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &maj);
     caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &min_v);
-    FeedLogNgxSsInitResult(&Log, "feed", caps);
+    g_ngx_ss_fir_known = FeedLogNgxSsInitResult(&Log, "feed", caps, &g_ngx_ss_fir);
     Log("[feed] NGX capabilities: SuperSampling.Available=%d SuperSamplingDenoising.Available=%d "
         "NeedsUpdatedDriver=%d MinDriver=%d.%d", avail, denoise, needs_driver, maj, min_v);
+    if (!avail && dev == g.dev12 && g.ngx_inited)
+    {
+        NgxDiagnosticPass(dev, data_path, true);
+        g.ngx_inited = false;
+    }
     return avail;
 }
 
@@ -2435,6 +2469,10 @@ static void FeedSetNgxProvenance(const char *transport, const char *adapter_why)
                 "transport %s, device created with %s", transport, adapter_why);
 }
 
+// The NGX application data path the last successful init used (one of SafeNgxInit12's
+// candidates), so the diagnostic pass reproduces that init rather than a different one.
+static wchar_t g_ngx_app_path[MAX_PATH];
+
 static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *dev, DWORD *code)
 {
     Log("[feed] NGX init: %s, DRED %s, D3D12 debug layer %s (#47: these are the variables that "
@@ -2467,8 +2505,7 @@ static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *de
     wchar_t hostdir[MAX_PATH];
     _snwprintf_s(hostdir, _TRUNCATE, L"%shost64\\", data_path);
     const wchar_t *const search[2] = { data_path, hostdir };
-    NVSDK_NGX_FeatureCommonInfo info = {};
-    FeedNgxRouteLog(&info, &Log, "feed");
+    NVSDK_NGX_FeatureCommonInfo info = {};   // no logging callback: see NgxDiagnosticPass
     info.PathListInfo.Path   = search;
     info.PathListInfo.Length = 2;
 
@@ -2527,13 +2564,63 @@ static NVSDK_NGX_Result SafeNgxInit12(const wchar_t *data_path, ID3D12Device *de
         if (NVSDK_NGX_SUCCEED(r))
         {
             if (i != 0) Log("[feed] NGX initialised on attempt %d -- the add-on's own folder was the problem", i + 1);
+            wcscpy_s(g_ngx_app_path, cand[i]);
             return r;
         }
         Log("[feed] NGX init attempt %d -> 0x%08X (%s)", i + 1, r, NgxResultName(r));
     }
     LogNgxEnvironment();
+    wcscpy_s(g_ngx_app_path, cand[0]);
+    NgxDiagnosticPass(dev, data_path, false);
 
     return r;
+}
+
+// NGX's own account of a failure, in this log (#136/#137). NGX keeps the logging callback it
+// is handed until NVSDK_NGX_D3D12_Shutdown1. This add-on skips that call on purpose on several
+// teardown paths (g_ngx_dying), and ReShade can unload the DLL mid-process, which would leave
+// NGX calling into an unmapped module. So the session's own init never passes a callback. Only
+// once it has failed, and the session is being abandoned anyway, is init run once more with
+// the callback, then shut down again before returning. Once per process: the #47 matrix calls
+// SafeNgxInit12 eight times.
+static void NgxDiagnosticPass(ID3D12Device *dev, const wchar_t *data_path, bool shut_down_first)
+{
+    static bool done = false;
+    if (done || dev == nullptr) return;
+    done = true;
+    if (shut_down_first) NVSDK_NGX_D3D12_Shutdown1(dev);
+
+    wchar_t hostdir[MAX_PATH];
+    _snwprintf_s(hostdir, _TRUNCATE, L"%shost64\\", data_path);
+    const wchar_t *const search[2] = { data_path, hostdir };
+    NVSDK_NGX_FeatureCommonInfo info = {};
+    FeedNgxRouteLog(&info, &Log, "feed");
+    info.PathListInfo.Path   = search;
+    info.PathListInfo.Length = 2;
+
+    Log("[feed] ===== NGX's own log of the failure above: one more init, with NGX logging into this file =====");
+    DWORD code = 0;
+    const NVSDK_NGX_Result r = SafeNgxInitOnce(g_ngx_app_path[0] != 0 ? g_ngx_app_path : data_path, dev, &info, &code);
+    if (code != 0)
+    {
+        // Nothing can be assumed about NGX after a fault, so it is not called again.
+        FeedNgxUnrouteLog();
+        Log("[feed] ===== the diagnostic init raised 0x%08X; end of NGX's own log =====", code);
+        return;
+    }
+    if (NVSDK_NGX_SUCCEED(r))
+    {
+        NVSDK_NGX_Parameter *caps = nullptr;
+        if (NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D12_GetCapabilityParameters(&caps)) && caps != nullptr)
+        {
+            FeedLogNgxSsInitResult(&Log, "feed", caps);
+            NVSDK_NGX_D3D12_DestroyParameters(caps);
+        }
+    }
+    // Whatever init returned: a failed init can still have taken the callback.
+    NVSDK_NGX_D3D12_Shutdown1(dev);
+    FeedNgxUnrouteLog();
+    Log("[feed] ===== end of NGX's own log (the diagnostic init returned 0x%08X %s) =====", r, NgxResultName(r));
 }
 
 // CPU ticks spent inside the last NGX call. The neural consumer's detour runs INSIDE these
@@ -4966,7 +5053,7 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         if (NVSDK_NGX_SUCCEED(r) && caps != nullptr)
         {
             const int avail = LogNgxCaps(caps, g.dev12, data_path);
-            if (!avail) { Log("[feed] DLSS super sampling is not available on this GPU/driver"); goto fail; }
+            if (!avail) { Log("[feed] %s", NgxUnavailableReason()); FeedDisable(NgxUnavailableReason()); goto fail; }
         }
         else
             Log("[feed] capability query failed 0x%08X (%s); continuing", r, NgxResultName(r));
@@ -5253,7 +5340,7 @@ static bool InitSession12(reshade::api::effect_runtime *rt)
         if (!avail)
         {
             ShutdownSession();
-            FeedDisable("DLSS is not available on this GPU/driver");
+            FeedDisable(NgxUnavailableReason());
             return false;
         }
     }
@@ -5453,7 +5540,7 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
         if (!avail)
         {
             ShutdownSession();
-            FeedDisable("DLSS is not available on this GPU/driver");
+            FeedDisable(NgxUnavailableReason());
             return false;
         }
     }
@@ -5911,7 +5998,7 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
         if (!avail)
         {
             ShutdownSession();
-            FeedDisable("DLSS is not available on this GPU/driver");
+            FeedDisable(NgxUnavailableReason());
             return false;
         }
     }
@@ -9020,9 +9107,19 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         InitializeCriticalSection(&g_log_cs);
         InitializeCriticalSection(&g_feed_cs);
         GetModuleFileNameA(module, g_log_path, MAX_PATH);
+        // The 64-bit helper mode (#139) does this add-on's job through host64\. Both files are
+        // 64-bit, so ReShade loads both, and two feeders would each open a session on the same
+        // frames. The helper beside this file means the user chose that mode, so this one stands
+        // down (below). It also writes dlss5-feed.log, and ReShade loads it first, so the log is
+        // not truncated here in that case.
+        char helper[MAX_PATH];
+        strcpy_s(helper, g_log_path);
+        if (char *s = strrchr(helper, '\\'))
+            strcpy_s(s + 1, MAX_PATH - (s + 1 - helper), "dlss5-feed-helper.addon64");
+        const bool helper_beside = GetFileAttributesA(helper) != INVALID_FILE_ATTRIBUTES;
         if (char *s = strrchr(g_log_path, '\\'))
             strcpy_s(s + 1, MAX_PATH - (s + 1 - g_log_path), "dlss5-feed.log");
-        { FILE *f = nullptr; if (fopen_s(&f, g_log_path, "w") == 0 && f) fclose(f); }
+        if (!helper_beside) { FILE *f = nullptr; if (fopen_s(&f, g_log_path, "w") == 0 && f) fclose(f); }
 
         if (!reshade::register_addon(module)) return FALSE;
 
@@ -9069,6 +9166,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
                      "add-on has registered but will do nothing in this process.");
                 return TRUE;
             }
+        }
+        if (helper_beside)
+        {
+            g_inert = true;
+            Warn("dlss5-feed-helper.addon64 is next to this add-on, so the 64-bit helper mode is installed and "
+                 "feeds this game through host64\\. dlss5-feed.addon64 stands down and does nothing in this "
+                 "process. Remove one of the two: dlss5-feed.addon64 for the helper mode, or "
+                 "dlss5-feed-helper.addon64 to go back to running NGX in the game.");
+            return TRUE;
         }
         CfgWriteDefault();
         CfgReload();

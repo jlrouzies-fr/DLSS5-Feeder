@@ -60,6 +60,7 @@ static void FeedOnVkDeviceGeneration();
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 #undef FEED_VK_DEVICE_GENERATION_CALLBACK
 #include "feed_d3d10.h"     // D3D10.1 <-> D3D11 keyed-mutex bridge + the private relay device
+#include "feed_ldr.h"       // loader notifications: vulkan-1.dll or ReShade unloading under us (#135)
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 #include "feed_opti.h"      // OptiScaler DLSS-NR: only the file scan and the ini reader are used here (it lives in host64 too)
 
@@ -98,6 +99,10 @@ static HMODULE          g_self;
 static char             g_log_path[MAX_PATH];
 static CRITICAL_SECTION g_log_cs;
 static volatile LONG    g_reshade_generation_closed;
+// Set when the ReShade module this add-on registered with has been unloaded while the DLL
+// stayed mapped (#135). The ReShade header caches that module's entry points, so from here on
+// nothing may call through them: no log::message, no unregister_* at detach.
+static volatile LONG    g_reshade_gone;
 
 static void Log(const char *fmt, ...)
 {
@@ -126,6 +131,7 @@ static void Warn(const char *fmt, ...)
     _vsnprintf_s(line, sizeof(line), _TRUNCATE, fmt, ap);
     va_end(ap);
     Log("%s", line);
+    if (g_reshade_gone) return;   // its ReShadeLogMessage is unmapped (#135)
     char tagged[1100];
     _snprintf_s(tagged, sizeof(tagged), _TRUNCATE, "[DLSS 5 Feed 32] %s", line);
     reshade::log::message(reshade::log::level::warning, tagged);
@@ -6376,6 +6382,55 @@ static void FeedOnVkDeviceGeneration()
     Log("[feed32] renewed ReShade add-on registration for a new Vulkan device generation while the DLL remained mapped");
 }
 
+// #135 (Fallout: New Vegas under DXVK): the game releases its first D3D9 object and loads
+// d3d9.dll again. That takes vulkan-1.dll and ReShade's Vulkan layer down with it and brings
+// both back, but ReShade never unloads its add-ons on the way out, so this DLL stays mapped
+// with its only reference owned by a ReShade that no longer exists. The next ReShade's
+// LoadLibrary then finds it already loaded, DllMain does not run, and ReShade logs "No add-on
+// was registered" and carries on without us. The vkCreateDevice hook sat on the vulkan-1.dll
+// that went away, so the renewal in FeedOnVkDeviceGeneration never fired either.
+//
+// So watch the loader. When vulkan-1.dll unloads, take the hooks off it while it is still
+// mapped. When the ReShade we registered with unloads and we are still here, drop the
+// reference it left behind from a thread of our own: the DLL then really unloads, and the
+// next ReShade maps a fresh copy that registers the normal way, with the ReShade header's
+// cached entry points pointing at the ReShade that is actually loaded.
+static PVOID         g_ldr_cookie;
+static volatile LONG g_orphan_unload_queued;
+
+static DWORD WINAPI OrphanUnloadThread(LPVOID)
+{
+    // Runs once the loader lock is free, i.e. after ReShade's unload has finished. The one
+    // reference left is the one ReShade loaded us with; FreeLibraryAndExitThread drops it and
+    // never returns into this module.
+    Log("[feed32] releasing the add-on ReShade left loaded; the next ReShade instance will load it fresh");
+    FreeLibraryAndExitThread(g_self, 0);
+}
+
+static VOID CALLBACK OnLdrNotify(ULONG reason, const FeedLdrDllNotificationData *d, PVOID)
+{
+    if (reason != FEED_LDR_UNLOADED || d == nullptr || FeedLdrShuttingDown()) return;
+    FeedVkHookRetire(d->DllBase, d->SizeOfImage);
+    if (d->DllBase == nullptr || d->DllBase != reshade::internal::get_reshade_module_handle()) return;
+
+    InterlockedExchange(&g_reshade_gone, 1);
+    if (InterlockedExchange(&g_orphan_unload_queued, 1) != 0) return;
+    // A host worker still running holds its own reference and drops it as its last act. If
+    // ReShade had in fact released us already, that would be the only reference left, and
+    // dropping another one would unmap this module under the worker. Leave it, and say so.
+    if (g_link.thread != nullptr && WaitForSingleObject(g_link.thread, 0) != WAIT_OBJECT_0)
+    {
+        Log("[feed32] the ReShade instance this add-on registered with was unloaded, but the host worker is "
+            "still running, so the add-on stays loaded and unregistered. If the DLSS 5 panel is missing, restart the game.");
+        return;
+    }
+    Log("[feed32] the ReShade instance this add-on registered with (%p) was unloaded without unloading this "
+        "add-on; releasing it so the next ReShade instance can load it again (#135)", d->DllBase);
+    HANDLE t = CreateThread(nullptr, 0, OrphanUnloadThread, nullptr, 0, nullptr);
+    if (t != nullptr) CloseHandle(t);
+    else Log("[feed32] could not start the release thread (%lu); the add-on stays loaded and unregistered", GetLastError());
+}
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
@@ -6414,8 +6469,29 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         DetectChickenHost();
         DetectOptiHost();       // after DetectChickenHost: it warns when both are in host64
         DetectStrayHostAddon();
+#ifdef FEED_HELPER64
+        {
+            // dlss5-feed.addon64 stands down on its own when it sees this file (#139); say so here
+            // too, since this is the log a helper-mode user reads.
+            char inproc[MAX_PATH];
+            strcpy_s(inproc, g_log_path);
+            if (char *s = strrchr(inproc, '\\'))
+                strcpy_s(s + 1, MAX_PATH - (s + 1 - inproc), "dlss5-feed.addon64");
+            if (GetFileAttributesA(inproc) != INVALID_FILE_ATTRIBUTES)
+                Log("[feed32] dlss5-feed.addon64 is next to this helper add-on too. It stands down while this file is "
+                    "here, so the helper mode runs; remove it to keep the folder unambiguous.");
+        }
+#endif
 
         RegisterReShadeCallbacks();
+        g_ldr_cookie = FeedLdrWatch(OnLdrNotify);
+        {
+            wchar_t rs[MAX_PATH] = {};
+            const HMODULE rsm = reshade::internal::get_reshade_module_handle();
+            if (rsm != nullptr) GetModuleFileNameW(rsm, rs, MAX_PATH);
+            Log("[feed32] registered with ReShade at %p (%ls)%s", (void *)rsm, rs,
+                g_ldr_cookie != nullptr ? "" : "; loader notifications unavailable, a ReShade reload will not be followed");
+        }
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
@@ -6424,13 +6500,16 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // leaving it installed means a later crash jumps into freed memory and the game's own
         // handler never sees the real fault.
         SetUnhandledExceptionFilter(g_prev_filter);
+        FeedLdrUnwatch(g_ldr_cookie);   // the callback is code in this module
         // We are under the loader lock: HostLinkStop must not try to join the worker here.
         g_detaching = true;
         CastRelease();
-        UnregisterReShadeCallbacks();
+        // After #135's release the ReShade these were registered with is gone, and the
+        // header's cached entry points with it: calling them would jump into freed memory.
+        if (!g_reshade_gone) UnregisterReShadeCallbacks();
         FeedVkHookRemove();   // before this code is unmapped -- ReShade reloads add-ons per Vulkan instance
         HostClose();
-        reshade::unregister_addon(module);
+        if (!g_reshade_gone) reshade::unregister_addon(module);
         Log("shut down cleanly.");
         // Last, after the final Log: these are re-initialised on every attach, and ReShade
         // attaches this add-on again per Vulkan instance, so not deleting them leaks one pair

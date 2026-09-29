@@ -701,8 +701,10 @@ ReShade goes in as `dxgi.dll`, which is what its own installer picks for "Direct
 Three things are worth knowing before you start.
 
 **Direct3D 10 support lives in the 32-bit add-on** -- `dlss5-feed.addon32` plus the `host64\`
-folder -- because that is where the Direct3D 10 games are. A 64-bit D3D10 game is a rare enough
-animal that the 64-bit add-on has no D3D10 backend.
+folder -- because that is where the Direct3D 10 games are. The 64-bit add-on has no D3D10
+backend. For a 64-bit D3D10 game (Crysis's `Bin64\Crysis.exe`, #134), use the
+[64-bit helper mode](#64-bit-helper-mode-games-whose-own-process-cannot-run-ngx): it is the 32-bit
+add-on's code built x64, D3D10 backend included. Nobody has run a D3D10 game through it yet.
 
 **Choose a motion-vector provider that does not need compute.** ReShade compiles effects at shader
 model 4 on Direct3D 10, so a provider written around compute shaders will not build. LumeniteFX is
@@ -818,21 +820,37 @@ If `dlss5-feed.log` says the interop entry points are missing, use the 32-bit fa
 layer\x86\run-with-feed-layer32.bat "E:\path\to\game.exe"
 ```
 
+Some games create a first Direct3D 9 object, drop it and load `d3d9.dll` again (Fallout: New
+Vegas under Mod Organizer 2 and NVSE, #135). Under DXVK that unloads `vulkan-1.dll` and ReShade's
+Vulkan layer and loads them again, and ReShade never unloads its add-ons on the way out. Up to
+1.17.0 the add-on stayed behind: `ReShade.log` said "No add-on was registered" and no DLSS 5 panel
+appeared. Now the add-on takes its Vulkan hooks off the old `vulkan-1.dll` and releases itself,
+and the new ReShade loads it again. `dlss5-feed.log` shows "releasing the add-on ReShade left
+loaded" followed by a second "attached".
+
 ### 64-bit helper mode (games whose own process cannot run NGX)
 
 Some 64-bit games cannot run NGX inside their own process. `dlss5-feed.log` then shows
-`NVSDK_NGX_D3D12_Init -> 0x00000001 (Success)` followed by `SuperSampling.Available=0` and
-"DLSS is not available on this GPU/driver", while `host64\dlss5-feed-host64.exe --test` on the
-same PC succeeds. Confirmed so far: **Bloodborne on shadPS4**, where NGX's own log says
-`NvAPI_D3D12_CreateCuModule failed` and `SuperSampling.FeatureInitResult` is `0xBAD00002`
-(`PlatformError`).
+`NVSDK_NGX_D3D12_Init -> 0x00000001 (Success)` followed by `SuperSampling.Available=0`, and the
+add-on stops with "NGX would not set DLSS up inside this game's process
+(SuperSampling.FeatureInitResult 0xBAD00002 PlatformError)", while
+`host64\dlss5-feed-host64.exe --test` on the same PC succeeds. Confirmed so far: **Bloodborne on
+shadPS4**, where NGX's own log says `NvAPI_D3D12_CreateCuModule failed`.
+
+When the in-process session fails like this, the add-on runs NGX's init once more with NGX's own
+log routed into `dlss5-feed.log`, between two `===== NGX's own log` lines, then shuts it down
+again. The helper always writes NGX's log into `host64\dlss5-feed-host.log`. Both leave out NGX's
+config dumps and its per-preset lines; set the environment variable `DLSS5_FEED_NGX_VERBOSE=1` to
+keep everything.
 
 For these games, `dlss5-feed-helper.addon64` runs the 32-bit path's in-game half as 64-bit code.
 The game hands its frames to the helper process and NGX runs there, exactly as for a 32-bit game.
 
 **Next to the game `.exe`**
 - ReShade with add-on support, as in [Install for a Vulkan game](#install-for-a-vulkan-game).
-- `dlss5-feed-helper.addon64` **instead of** `dlss5-feed.addon64`. Never both.
+- `dlss5-feed-helper.addon64` **instead of** `dlss5-feed.addon64`. If both are there,
+  `dlss5-feed.addon64` sees the helper, says so in the log and stands down, so the helper mode
+  runs; remove one anyway.
 - `DLSS5_Feed.fx` and a motion-vector provider, as for any game.
 - No neural consumer here: it goes in `host64\`.
 
@@ -844,8 +862,10 @@ From there it behaves like the 32-bit path: the first fed frame starts the helpe
 and settings are the ones described there. The limits of [32-bit Vulkan](#32-bit-vulkan-dxvk)
 apply too: DLAA at native size, **Work resolution** fixed at 100%.
 
-- Tested on Vulkan only (shadPS4). The D3D11 and OpenGL paths of the same code are compiled in,
-  but nobody has run them at 64-bit yet.
+- Tested on Vulkan only (shadPS4). The D3D10, D3D11 and OpenGL paths of the same code are
+  compiled in, but nobody has run them at 64-bit yet. D3D10 makes it the only route for a 64-bit
+  Direct3D 10 game. D3D11 may also help a game where NGX fails in the game's process but works in
+  host64 (#47); that is untested too.
 - ReShade's add-on list shows it as **DLSS 5 Feed (64-bit helper)**. The log still calls it
   `dlss5-feed32` / `[feed32]`: it is the same code, built x64.
 - `Verify-DLSS5Feeder.ps1` recognises the layout by `dlss5-feed-helper.addon64` next to a 64-bit

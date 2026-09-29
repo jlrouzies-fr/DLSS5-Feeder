@@ -485,3 +485,20 @@ static void FeedVkHookRemove()
     g_vk_create_device_orig   = nullptr;
     Log("[feed] vkCreateDevice hook removed");
 }
+
+// The module these hooks patch is being unloaded: called from an LDR unload notification
+// (feed_ldr.h), loader lock held, the image still mapped. vulkan-1.dll can go away and come
+// back at another address while this DLL stays loaded (#135: a DXVK game that releases its
+// D3D9 object and loads d3d9.dll again). Take the hooks out NOW, while the bytes they patched
+// still belong to vulkan-1.dll. Later the range may hold another module, and the removal at
+// DLL unload would write the saved prologue over it. Returns true when it retired them.
+static bool FeedVkHookRetire(const void *base, size_t size)
+{
+    const char *lo = static_cast<const char *>(base);
+    const char *t  = static_cast<const char *>(g_vk_create_device_target);
+    if (t == nullptr || lo == nullptr || t < lo || t >= lo + size) return false;
+    Log("[feed] vulkan-1.dll (%p) is being unloaded with the vkCreateDevice hook on it; removing the "
+        "hooks while its code is still mapped", base);
+    FeedVkHookRemove();
+    return true;
+}

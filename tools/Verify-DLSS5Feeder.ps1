@@ -1069,8 +1069,8 @@ if ($strayAddon) {
 if ($helperMode) {
     $inProcess = Find-FileIn $gameDir 'dlss5-feed.addon64'
     if ($inProcess) {
-        Report -Status 'Fail' -Text 'dlss5-feed.addon64 is next to dlss5-feed-helper.addon64 -- use one or the other.' `
-               -Detail 'Both are 64-bit, so the game''s ReShade loads both: the in-process add-on tries NGX in the game while the helper add-on hands the same frames to host64\.' `
+        Report -Status 'Warn' -Text 'dlss5-feed.addon64 is next to dlss5-feed-helper.addon64 -- use one or the other.' `
+               -Detail 'Both are 64-bit, so the game''s ReShade loads both. dlss5-feed.addon64 sees the helper and stands down (its log says so), so the helper mode runs, but the folder is ambiguous.' `
                -Action ('For the 64-bit helper mode, remove ' + $inProcess + ' (rename it to .off to keep it).')
     }
 }

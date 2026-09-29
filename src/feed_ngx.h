@@ -450,14 +450,31 @@ static void FeedLogNgxFeatureRequirements(void (*log)(const char *, ...), const 
 // NvAPI_D3D12_CreateCuModule failed - nvapi status -1" while the host64 helper, on the same
 // files and GPU, creates the feature. Hand NGX a callback so those lines land in
 // dlss5-feed.log / dlss5-feed-host.log. Level ON by default (errors and the load trail);
-// DLSS5_FEED_NGX_VERBOSE=1 raises it to VERBOSE.
+// DLSS5_FEED_NGX_VERBOSE=1 raises it to VERBOSE and keeps the lines filtered out below.
+//
+// NGX keeps the callback until NVSDK_NGX_D3D12_Shutdown1. The host64 helper is an exe and
+// always routes. The in-process add-on skips that shutdown on purpose on several teardown
+// paths, and ReShade can unload it mid-process, so it only routes for a diagnostic init that
+// it shuts down again straight away (NgxDiagnosticPass in dlss5-feed.cpp).
 // ---------------------------------------------------------------------------------------
 static void      (*g_ngx_log_fn)(const char *, ...) = nullptr;
 static const char *g_ngx_log_tag = "ngx";
+static bool        g_ngx_log_verbose;
+
+// At level ON, a healthy host64 --test gave 169 NGX lines, and about 120 of them were these:
+// NGX's whole app-override config and deny list on every init, the preset it picked for each
+// quality mode on every feature creation, and "failed to load ... from cache" for each cached
+// model it did not pick. That last one reads like an error in every healthy log.
+static bool FeedNgxLogIsNoise(const char *m)
+{
+    return strstr(m, "[NGXLoadConfig:") != nullptr || strstr(m, "[NGXContextDenyListData") != nullptr ||
+           strstr(m, "FillCreationParams") != nullptr || strstr(m, ") from cache (location:") != nullptr;
+}
 
 static void NVSDK_CONV FeedNgxLogCallback(const char *message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature component)
 {
     if (g_ngx_log_fn == nullptr || message == nullptr) return;
+    if (!g_ngx_log_verbose && FeedNgxLogIsNoise(message)) return;
     char line[1024];
     strncpy_s(line, sizeof(line), message, _TRUNCATE);
     size_t n = strlen(line);
@@ -470,18 +487,28 @@ static void FeedNgxRouteLog(NVSDK_NGX_FeatureCommonInfo *info, void (*log)(const
     g_ngx_log_fn  = log;
     g_ngx_log_tag = tag;
     char v[8] = {};
-    const bool verbose = GetEnvironmentVariableA("DLSS5_FEED_NGX_VERBOSE", v, sizeof(v)) != 0 && v[0] == '1';
+    g_ngx_log_verbose = GetEnvironmentVariableA("DLSS5_FEED_NGX_VERBOSE", v, sizeof(v)) != 0 && v[0] == '1';
     info->LoggingInfo.LoggingCallback          = FeedNgxLogCallback;
-    info->LoggingInfo.MinimumLoggingLevel      = verbose ? NVSDK_NGX_LOGGING_LEVEL_VERBOSE : NVSDK_NGX_LOGGING_LEVEL_ON;
+    info->LoggingInfo.MinimumLoggingLevel      = g_ngx_log_verbose ? NVSDK_NGX_LOGGING_LEVEL_VERBOSE : NVSDK_NGX_LOGGING_LEVEL_ON;
     info->LoggingInfo.DisableOtherLoggingSinks = false;
+}
+
+// After the shutdown that released the callback: anything NGX still sends is dropped.
+static void FeedNgxUnrouteLog()
+{
+    g_ngx_log_fn = nullptr;
 }
 
 // SuperSampling.FeatureInitResult: NGX's own reason for SuperSampling.Available=0, which
 // the capability line alone never gave (0xBAD00002 under shadPS4, 0x1 in host64).
-static void FeedLogNgxSsInitResult(void (*log)(const char *, ...), const char *tag, NVSDK_NGX_Parameter *caps)
+// Returns false when NGX did not report it; *out gets the value otherwise.
+static bool FeedLogNgxSsInitResult(void (*log)(const char *, ...), const char *tag, NVSDK_NGX_Parameter *caps,
+                                   NVSDK_NGX_Result *out = nullptr)
 {
     int fir = 0;
-    if (caps->Get(NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &fir) != NVSDK_NGX_Result_Success) return;
+    if (caps->Get(NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &fir) != NVSDK_NGX_Result_Success) return false;
     const NVSDK_NGX_Result r = static_cast<NVSDK_NGX_Result>(fir);
     log("[%s] NGX SuperSampling.FeatureInitResult: 0x%08X (%s)", tag, static_cast<unsigned>(fir), NgxResultName(r));
+    if (out != nullptr) *out = r;
+    return true;
 }
