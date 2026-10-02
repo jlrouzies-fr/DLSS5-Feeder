@@ -49,7 +49,7 @@
 #include "feed_vk_present64.h"
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 
-#define FEED_VERSION "ck3-upstream-test.1"
+#define FEED_VERSION "ck3-upstream-test.2"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -687,6 +687,17 @@ static const char *NgxResultName(NVSDK_NGX_Result r)
     }
 }
 
+// Adapted from upstream 012bb13: availability alone does not explain why NGX
+// refused DLSS. Query the result without installing a callback that could outlive
+// this add-on when ReShade reloads it.
+static void LogNgxSsInitResult(NVSDK_NGX_Parameter *caps)
+{
+    int result = 0;
+    if (caps->Get(NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &result) == NVSDK_NGX_Result_Success)
+        Log("[feed] NGX SuperSampling.FeatureInitResult: 0x%08X (%s)",
+            static_cast<unsigned>(result), NgxResultName(static_cast<NVSDK_NGX_Result>(result)));
+}
+
 static void FeedDisable(const char *why)
 {
     if (g.disabled) return;
@@ -1302,6 +1313,7 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
             caps->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);
             caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &maj);
             caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &min);
+            LogNgxSsInitResult(caps);
             Log("[feed] NGX capabilities: SuperSampling.Available=%d NeedsUpdatedDriver=%d MinDriver=%d.%d", avail,
                 needs_driver, maj, min);
             if (!avail) { Log("[feed] DLSS super sampling is not available on this GPU/driver"); goto fail; }
@@ -1448,6 +1460,7 @@ static bool InitSession12(reshade::api::effect_runtime *rt)
         int avail = 0;
         caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
         Log("[feed] NGX capabilities: SuperSampling.Available=%d", avail);
+        LogNgxSsInitResult(caps);
         if (!avail)
         {
             ShutdownSession();
@@ -1636,6 +1649,7 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
         int avail = 0;
         caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
         Log("[feed] NGX capabilities: SuperSampling.Available=%d", avail);
+        LogNgxSsInitResult(caps);
         if (!avail)
         {
             ShutdownSession();
