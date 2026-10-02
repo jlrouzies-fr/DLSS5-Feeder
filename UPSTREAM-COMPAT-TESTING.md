@@ -2,9 +2,11 @@
 
 Branch: `testing/ck3-upstream-compat`, based on CK3 `5ede14d`.
 This is a selective source port, with no upstream merge or change to the fork relationship.
-The current feeder identifies itself as `ck3-upstream-test.2` in ReShade and its log.
+The current feeder identifies itself as `ck3-upstream-test.3` in ReShade and its log.
 The October 2 selective refresh and remaining candidates are documented in
 [UPSTREAM-REVIEW-2026-10-02.md](UPSTREAM-REVIEW-2026-10-02.md).
+The `.3` follow-up adds loader/layer present context and early device hooks;
+real ReShade/Vulkan and Native Streamline presentation regressions pass.
 The September 8 results below describe the original `ck3-upstream-test.1` port.
 
 ## Changes and provenance

@@ -49,7 +49,7 @@
 #include "feed_vk_present64.h"
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 
-#define FEED_VERSION "ck3-upstream-test.2"
+#define FEED_VERSION "ck3-upstream-test.3"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -2876,6 +2876,10 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
 
 static void OnDestroyDevice(reshade::api::device *dev)
 {
+    // This also covers transport-off sessions. CK3's layer/Streamline startup can
+    // bypass the loader create hook, so init_device owns an early fallback hook.
+    if (dev->get_api() == reshade::api::device_api::vulkan)
+        FeedVkPresentForgetDevice(FeedVkDispatch<VkDevice>(dev->get_native()));
     if (g.dev11 != nullptr && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev11)
     {
         Log("[feed] D3D11 device destroyed; shutting the session down");
@@ -2892,7 +2896,6 @@ static void OnDestroyDevice(reshade::api::device *dev)
     else if (g.session_ready && dev->get_api() == reshade::api::device_api::vulkan && dev == g.rs_dev)
     {
         Log("[feed] the game's Vulkan device is being destroyed; shutting the session down");
-        FeedVkFramePresentRemove();
         g.rs_queue = nullptr; // ReShade queue wrappers have already been destroyed.
         g_ngx_dying = true;
         ShutdownSession();
@@ -3021,6 +3024,13 @@ static bool OnCreateDevice(reshade::api::device_api api, uint32_t & /*api_versio
     return false;   // never change the requested API version
 }
 
+static void OnInitDevice(reshade::api::device *dev)
+{
+    if (dev->get_api() == reshade::api::device_api::vulkan &&
+        !FeedVkFramePresentInstallDevice(FeedVkDispatch<VkDevice>(dev->get_native())))
+        Log("[feed] Vulkan present dependency hook unavailable at device initialization; runtime initialization will retry");
+}
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
@@ -3047,6 +3057,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         DetectRenodxAddon();
 
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
+        reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
@@ -3058,6 +3069,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     {
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
+        reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);

@@ -4,7 +4,9 @@ Selective updating is worthwhile. The strongest immediately usable improvements
 are in the feeder shader: avoid an unused camera-fit calculation, stop feeding
 partial motion vectors, and give the static-surface decision temporal memory.
 These are now on `testing/ck3-upstream-compat`, together with NGX initialization
-result logging and a rebuilt feeder. CK3 gameplay gains remain unmeasured.
+result logging and a rebuilt feeder. The subsequent `.3` refresh also carries
+the Vulkan present-hook follow-up described below. CK3 gameplay gains remain
+unmeasured.
 
 ## Reviewed state
 
@@ -43,7 +45,8 @@ The shader was taken from the pinned upstream tree with the D3D9-only stub remov
 and the generic work-resolution comment adapted; the real effect body is otherwise
 retained. The shader improvements were inside
 the requested month but had not been included in our September 8 selective port.
-The new feeder reports `ck3-upstream-test.2`. Its matching compiled payload is
+The shader/diagnostic refresh reported `ck3-upstream-test.2`; the current feeder
+with the subsequent Vulkan follow-up reports `ck3-upstream-test.3`. Its compiled payload is
 staged at `ck3-package/binaries/dlss-payload/dlss5-feed.addon64`.
 The package builder copies the refreshed shader from `shaders/DLSS5_Feed.fx`.
 
@@ -51,7 +54,7 @@ The package builder copies the refreshed shader from `shaders/DLSS5_Feed.fx`.
 
 | Priority | Upstream work | Assessment |
 |---|---|---|
-| High | [`9febd0d`](https://github.com/jlrouzies-fr/DLSS5-Feeder/commit/9febd0d), September 16: preserve present context across loader/device hooks and install the device hook directly after creation. | A real follow-up to the semaphore-ordering fix we already ported. Our branch still installs its dispatch hook at runtime initialization and lacks the upstream loader-present context provider. Port this with explicit CK3 layer and Native Streamline coverage; the existing two-queue ordering test does not establish hook coverage. |
+| Carried into `.3` | [`9febd0d`](https://github.com/jlrouzies-fr/DLSS5-Feeder/commit/9febd0d), September 16: preserve present context across loader/device hooks and install the device hook directly after creation. | Adapted with an early ReShade `init_device` hook for CK3 paths that bypass the loader create hook. Both CK3 local-layer and Native Streamline paths pass 32 actual presents each with the dependency gate active. Details below; gameplay remains a separate gate. |
 | High | [`03b3f7b`](https://github.com/jlrouzies-fr/DLSS5-Feeder/commit/03b3f7b), September 27: distinguish newer RenoDX generations and update consumer acquisition. | Upstream reports helper tests of v6.1.0/v7.0.0-rc8/v8.0.1 on driver 617.14 passing 300/300 feature-18 evaluations, where v4.7 failed. That is useful evidence for a separate CK3 runtime matrix, not proof for our custom bridge, Extended pair or GPU. Do not silently replace our verified v4.55 archive/DLL pins with a moving latest download. |
 | Medium | Same September 27 change: optional `feed_hold12.h` output stabilizer. | Potentially useful for changing neural output in otherwise still areas. It blends output based on input change and defaults off. The commit explicitly says the 64-bit integration had built but had not yet run in a 64-bit game. Test still views, animated portraits, HUD text and camera pans for lag/smearing before adopting. |
 | Medium | [`0a9ed23`](https://github.com/jlrouzies-fr/DLSS5-Feeder/commit/0a9ed23), September 22: device-loss/DRED diagnostics and NGX fault attribution. | Better crash evidence would help support CK3. This spans substantial crash, transport and lifetime infrastructure; adapt separately with fault/recovery tests. |
@@ -69,7 +72,7 @@ after ReShade unloads an add-on. This port only reads a capability parameter.
 Extra `settle_evals` are also not a performance improvement: upstream kept them
 as a diagnostic after their flicker investigation, and each adds neural evaluations.
 
-## Verification on October 2
+## Verification of the shader/diagnostic refresh on October 2
 
 - Feeder build succeeds with the existing VS 2022 Build Tools and NGX SDK.
 - Actual D3D12 WARP submission, failed `Close()` recovery, format-layout and config
@@ -109,6 +112,75 @@ effect, emits per-entry-point SPIR-V files under `build/compat-tests`, and fails
 on preprocessing, parsing or assembly errors. It does not load provider effects
 or the game.
 
+## Vulkan follow-up: `ck3-upstream-test.3`
+
+The present-context provider now covers both the system loader's present export
+and ReShade's layer/device dispatch. Nested wrappers for the same queue and
+present info share one dependency gate; different nested presents restore the
+caller's context through stack scopes. There is no fixed TLS nesting limit.
+The missing-context path still skips full DLSS processing with synchronization
+enabled; no automatic unsynchronized bypass was added.
+
+The device hook installs after intercepted `vkCreateDevice`, and also at ReShade's
+`init_device` event. The latter covers direct layer and Native Streamline startup.
+A real test exposed that the system loader has not published the new device's
+dispatch table at that event. The early hook therefore resolves through the
+registered ReShade module's Vulkan layer entry point, with system-device dispatch
+as fallback. Runtime initialization remains an idempotent retry.
+
+ReShade shares its present entry point across devices. The feeder tracks live
+Vulkan devices so destroying a temporary device does not unhook a surviving
+device. Device destruction also removes hooks for sessions where feeding was
+disabled, rather than depending on an NGX session having opened. Loader context
+hooks are removed before the add-on unloads. Hook-install failures only remove
+hooks created by this feeder, preserving another owner's hook.
+
+Verification of `.3` on October 2:
+
+- Feeder, local Vulkan layer and CK3 DXGI bridge compile successfully.
+- The test observer includes the actual feeder translation unit and adds
+  instrumentation only in the test DLL. ReShade 6.8.0 loads it through the real
+  CK3 local layer chain; the test launches hidden fixture windows and actual
+  swapchains on the RTX 3060.
+- Both system and Native Streamline paths complete **32 presents / 32 covered /
+  32 ordered**, with **2 devices hooked at initialization** each. The system
+  fixture alternates loader-export and direct-device dispatch; the native fixture
+  uses the CK3 shim's exported and device proc-address routes.
+- Each path keeps the main device alive through eight temporary instance probes
+  and through creation/destruction of a second device. Both survive without losing
+  present coverage. The gate is called twice per frame to check idempotence; the
+  final driver waits retire, and no context remains after returning to the caller.
+- WARP submission/recovery and config regressions pass, including nested-context
+  sharing/restoration assertions. The two-queue ordering test remains **8 fresh /
+  8 stale / 8 fresh** for deferred / ungated / gated submission.
+- The built/staged `.3` feeder SHA-256 matches:
+  `a38737660b778dff163346c46dac04d9a7f559763253f4a02c7f0f61f56ff26e`.
+
+Reproduce with VS 2022 Build Tools, existing SDK inputs, and the pinned ReShade
+and Native Streamline payloads already acquired for a CK3 package:
+
+```powershell
+.\build-local-current-tree.cmd
+.\tests\test-feeder-compat.cmd
+powershell -NoProfile -ExecutionPolicy Bypass -File tests/Test-CK3-PresentHooks.ps1
+```
+
+`Test-CK3-PresentHooks.ps1` accepts `-GraphicsSource` for a directory containing
+`ReShade64.dll`/`ReShade64.json` and `-NativeRuntimeDirectory` for the existing
+Streamline DLL directory. Defaults point at the previously built all-profiles
+package under `release`. It rebuilds the local layer/bridge and instrumented
+test add-on, restores its process's Vulkan environment, and keeps fixture logs
+under `build/compat-tests/present-hooks-system` and `present-hooks-native`.
+Each fixture process has a 60-second timeout; no game files or global layer
+registration are changed.
+
+The fixtures intentionally disable feeder evaluation and load no feeder effect.
+They establish real hook coverage and binary-semaphore ordering, not CK3 gameplay
+or DLSS/NR evaluation. The existing Streamline payload's optional `NvLowLatencyVk`
+module was rejected by its signature check; Streamline initialization and the
+tested presentation routes still passed. No newer RenoDX/runtime pair or output
+stabilizer was added in this follow-up.
+
 ## Gameplay gate before promoting to main
 
 Build a fresh CK3 package with this feeder and the local CK3 layer/bridge. Installing
@@ -121,8 +193,9 @@ Record frame times with geometry fitting off, inspect shimmer and black levels,
 and check reloads, profile switches, resize/window transitions and exit. Retain
 ReShade/feeder/bridge logs and confirm feature evaluation, rather than relying on
 an overlay being visible. Keep `vk_present_sync=1`; a missing-present-context log
-still identifies a coverage gap requiring the separate Vulkan hook work above.
+still identifies a coverage gap; retain that launch's logs even though the fixture
+paths now pass.
 
-Promote this selective shader/diagnostic refresh only after that CK3 comparison.
-Investigate the Vulkan hook follow-up next; evaluate newer RenoDX/runtime pairs
-in their own experiment with immutable versions and hashes.
+Promote this selective shader/Vulkan refresh only after that CK3 comparison.
+Evaluate newer RenoDX/runtime pairs in their own experiment with immutable
+versions and hashes; assess the output stabilizer separately with it defaulted off.

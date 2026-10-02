@@ -61,7 +61,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice ph
     if (HMODULE lib = GetModuleHandleW(L"vulkan-1.dll"))
     {
         if (const auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
-                GetProcAddress(lib, "vkEnumerateDeviceExtensionProperties")))
+                FeedVkLoaderProc(lib, "vkEnumerateDeviceExtensionProperties")))
         {
             uint32_t n = 0;
             if (enumerate(physicalDevice, nullptr, &n, nullptr) == VK_SUCCESS && n > 0)
@@ -150,6 +150,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice ph
         Log("[feed] vkCreateDevice failed (%d) with the added extensions; retrying with the app's original create info", r);
         r = g_vk_create_device_orig(physicalDevice, pCreateInfo, pAllocator, pDevice);
     }
+    if (r == VK_SUCCESS && pDevice && !FeedVkFramePresentInstallDevice(*pDevice))
+        Log("[feed] Vulkan present dependency hook could not be installed on the new device");
     Log("[feed] vkCreateDevice -> %d", r);
     return r;
 }
@@ -158,6 +160,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice ph
 // vkCreateInstance hook: vulkan-1.dll is loaded, no device exists yet. Idempotent.
 static bool FeedVkHookInstall()
 {
+    FeedVkLoaderPresentInstall();
     if (g_vk_create_device_target != nullptr) return true;
 
     HMODULE lib = GetModuleHandleW(L"vulkan-1.dll");
@@ -166,7 +169,7 @@ static bool FeedVkHookInstall()
         Log("[feed] vkCreateDevice hook: vulkan-1.dll is not loaded in this process (?)");
         return false;
     }
-    void *target = GetProcAddress(lib, "vkCreateDevice");
+    void *target = reinterpret_cast<void *>(FeedVkLoaderProc(lib, "vkCreateDevice"));
     if (target == nullptr)
     {
         Log("[feed] vkCreateDevice hook: vulkan-1.dll exports no vkCreateDevice (?)");
@@ -199,6 +202,7 @@ static bool FeedVkHookInstall()
 // From DllMain(DLL_PROCESS_DETACH). See the header comment for why this is mandatory.
 static void FeedVkHookRemove()
 {
+    FeedVkLoaderPresentRemove();
     if (g_vk_create_device_target == nullptr) return;
     MH_DisableHook(g_vk_create_device_target);
     MH_RemoveHook(g_vk_create_device_target);

@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cwchar>
 #include <vector>
+#include <cstring>
+#include "vk-hook-test-api.h"
 
 static LRESULT CALLBACK SmokeWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
 {
@@ -21,10 +23,15 @@ static bool ExecutableSibling(wchar_t (&path)[MAX_PATH], const wchar_t *name)
     return true;
 }
 
-int wmain()
+int wmain(int argc, wchar_t **argv)
 {
+    bool native = true, present_hooks = false;
+    for (int i = 1; i < argc; ++i) {
+        if (wcscmp(argv[i], L"--system") == 0) native = false;
+        if (wcscmp(argv[i], L"--present-hooks") == 0) present_hooks = true;
+    }
     wchar_t bridge_path[MAX_PATH] = {};
-    if (!ExecutableSibling(bridge_path, L"dxgi.dll") || LoadLibraryW(bridge_path) == nullptr)
+    if (native && (!ExecutableSibling(bridge_path, L"dxgi.dll") || LoadLibraryW(bridge_path) == nullptr))
     {
         std::printf("Loading fixture dxgi.dll failed: %lu\n", GetLastError());
         return 2;
@@ -64,7 +71,7 @@ int wmain()
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(get_instance_proc_addr), &proc_owner);
     if (proc_owner != nullptr) GetModuleFileNameW(proc_owner, proc_owner_path, MAX_PATH);
-    if (wcsstr(proc_owner_path, L"dxgi.dll") == nullptr)
+    if (native && wcsstr(proc_owner_path, L"dxgi.dll") == nullptr)
     {
         std::wprintf(L"vkGetInstanceProcAddr did not come from the compatibility shim: %ls\n", proc_owner_path);
         return 6;
@@ -232,7 +239,7 @@ int wmain()
                        reinterpret_cast<LPCWSTR>(create_surface), &surface_proc_owner);
     if (surface_proc_owner != nullptr)
         GetModuleFileNameW(surface_proc_owner, surface_proc_owner_path, MAX_PATH);
-    if (wcsstr(surface_proc_owner_path, L"dxgi.dll") == nullptr)
+    if (native && wcsstr(surface_proc_owner_path, L"dxgi.dll") == nullptr)
     {
         destroy_device(device, nullptr);
         destroy_instance(instance, nullptr);
@@ -253,7 +260,7 @@ int wmain()
         return 10;
     }
     const HWND window = CreateWindowExW(0, window_class.lpszClassName, L"Streamline smoke",
-                                        WS_OVERLAPPEDWINDOW, 0, 0, 64, 64,
+                                        WS_OVERLAPPEDWINDOW, 0, 0, present_hooks ? 256 : 64, present_hooks ? 256 : 64,
                                         nullptr, nullptr, app_instance, nullptr);
     if (window == nullptr)
     {
@@ -290,7 +297,8 @@ int wmain()
     }
 
     VkQueue queue = VK_NULL_HANDLE;
-    get_device_queue(device, queue_family, 0, &queue);    VkSurfaceCapabilitiesKHR capabilities = {};
+    get_device_queue(device, queue_family, 0, &queue);
+    VkSurfaceCapabilitiesKHR capabilities = {};
     uint32_t format_count = 0;
     if (queue == VK_NULL_HANDLE ||
         get_surface_capabilities(physical_device, surface, &capabilities) != VK_SUCCESS ||
@@ -327,7 +335,7 @@ int wmain()
     swapchain_info.imageColorSpace = formats[0].colorSpace;
     swapchain_info.imageExtent = extent;
     swapchain_info.imageArrayLayers = 1;
-    swapchain_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    swapchain_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (present_hooks ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0);
     swapchain_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     swapchain_info.preTransform = capabilities.currentTransform;
     swapchain_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -358,6 +366,87 @@ int wmain()
         return 21;
     }
 
+    if (present_hooks)
+    {
+        // ReShade uses a shared present entry point. Destroy a temporary device
+        // while the real swapchain/device survive; their hook must stay armed.
+        VkDevice temporary = VK_NULL_HANDLE;
+        const VkResult temporary_result = create_device(physical_device, &device_info, nullptr, &temporary);
+        if (temporary_result != VK_SUCCESS) return 29;
+        const auto destroy_temporary = reinterpret_cast<PFN_vkDestroyDevice>(get_device_proc_addr(temporary, "vkDestroyDevice"));
+        if (!destroy_temporary) return 29;
+        destroy_temporary(temporary, nullptr);
+#define PROC(name) const auto name = reinterpret_cast<PFN_vk##name>(get_device_proc_addr(device, "vk" #name)); if (!name) return 30
+#define CHECK(call) do { const VkResult r = (call); if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { std::printf("Present test failure: %s -> %d\n", #call, r); return 31; } } while (0)
+        PROC(AcquireNextImageKHR); PROC(QueuePresentKHR); PROC(QueueSubmit);
+        PROC(CreateSemaphore); PROC(DestroySemaphore); PROC(CreateCommandPool); PROC(DestroyCommandPool);
+        PROC(AllocateCommandBuffers); PROC(BeginCommandBuffer); PROC(EndCommandBuffer); PROC(ResetCommandPool);
+        PROC(CmdPipelineBarrier); PROC(CmdClearColorImage);
+        const auto loader_present = reinterpret_cast<PFN_vkQueuePresentKHR>(GetProcAddress(vulkan, "vkQueuePresentKHR"));
+        HMODULE observer = GetModuleHandleW(L"vk-hook-observer.addon64");
+        const auto read_stats = observer ? reinterpret_cast<VkHookTestReadStats>(GetProcAddress(observer, "ReadVkHookTestStats")) : nullptr;
+        if (!read_stats || !loader_present) { std::puts("The instrumented feeder was not loaded by ReShade."); return 32; }
+        std::vector<VkImage> images(swapchain_image_count);
+        CHECK(get_swapchain_images(device, swapchain, &swapchain_image_count, images.data()));
+        std::vector<bool> initialized(swapchain_image_count, false);
+        VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        VkSemaphore acquired, rendered;
+        CHECK(CreateSemaphore(device, &sci, nullptr, &acquired));
+        CHECK(CreateSemaphore(device, &sci, nullptr, &rendered));
+        VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        pci.queueFamilyIndex = queue_family;
+        VkCommandPool pool;
+        CHECK(CreateCommandPool(device, &pci, nullptr, &pool));
+        VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        cai.commandPool = pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+        VkCommandBuffer commands;
+        CHECK(AllocateCommandBuffers(device, &cai, &commands));
+        for (unsigned frame = 0; frame < 32; ++frame)
+        {
+            uint32_t index;
+            CHECK(AcquireNextImageKHR(device, swapchain, UINT64_MAX, acquired, VK_NULL_HANDLE, &index));
+            CHECK(ResetCommandPool(device, pool, 0));
+            VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+            CHECK(BeginCommandBuffer(commands, &bi));
+            VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+            barrier.oldLayout = initialized[index] ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = images[index]; barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            CmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+            VkClearColorValue color = { { 0.1f, 0.2f, frame / 32.0f, 1.0f } };
+            CmdClearColorImage(commands, images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &barrier.subresourceRange);
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; barrier.dstAccessMask = 0;
+            CmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+            CHECK(EndCommandBuffer(commands));
+            VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+            submit.waitSemaphoreCount = 1; submit.pWaitSemaphores = &acquired; submit.pWaitDstStageMask = &stage;
+            submit.commandBufferCount = 1; submit.pCommandBuffers = &commands;
+            submit.signalSemaphoreCount = 1; submit.pSignalSemaphores = &rendered;
+            CHECK(QueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+            VkPresentInfoKHR present = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+            present.waitSemaphoreCount = 1; present.pWaitSemaphores = &rendered;
+            present.swapchainCount = 1; present.pSwapchains = &swapchain; present.pImageIndices = &index;
+            CHECK((frame % 2 ? loader_present : QueuePresentKHR)(queue, &present));
+            CHECK(device_wait_idle(device));
+            initialized[index] = true;
+            VkHookTestStats current = {};
+            read_stats(&current);
+            if (current.active_context) { std::puts("Present context leaked after returning to the caller."); return 33; }
+        }
+        VkHookTestStats stats = {};
+        read_stats(&stats);
+        std::printf("Present hooks (%s): presents=%u covered=%u ordered=%u early devices=%u\n", native ? "Streamline shim" : "system loader", stats.presents, stats.covered, stats.ordered, stats.early_devices);
+        if (stats.presents != 32 || stats.covered != 32 || stats.ordered != 32 || stats.early_devices != 2) return 34;
+        DestroyCommandPool(device, pool, nullptr);
+        DestroySemaphore(device, rendered, nullptr); DestroySemaphore(device, acquired, nullptr);
+#undef CHECK
+#undef PROC
+    }
+
     device_wait_idle(device);
     destroy_swapchain(device, swapchain, nullptr);
     destroy_device(device, nullptr);
@@ -368,6 +457,6 @@ int wmain()
     std::wprintf(L"Vulkan loader handle: %ls\n", loader_path);
     std::wprintf(L"Shim proc owner: %ls\n", proc_owner_path);
     std::wprintf(L"Surface proc owner: %ls\n", surface_proc_owner_path);
-    std::puts("Native Streamline Vulkan 1.3 CK3-order device/probe/surface/swapchain smoke test passed.");
+    std::puts("Vulkan 1.3 CK3-order device/probe/surface/swapchain smoke test passed.");
     return 0;
 }

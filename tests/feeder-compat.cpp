@@ -13,6 +13,26 @@ int main()
     InitializeCriticalSection(&g_log_cs);
     strcpy_s(g_log_path, "build\\compat-tests\\submission.log");
     g_self = GetModuleHandleW(nullptr);
+    // Loader/device hooks share one semaphore gate for the same present; nested
+    // different presents restore their caller's context when they return.
+    VkPresentInfoKHR first = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR }, second = first;
+    const auto queue = FeedVkDispatch<VkQueue>(1);
+    Require(!g_vk_present_context, "no present context outside a hook");
+    {
+        FeedVkPresentScope outer(queue, &first);
+        auto *context = g_vk_present_context;
+        context->ordered = true;
+        {
+            FeedVkPresentScope same(queue, &first);
+            Require(g_vk_present_context == context && g_vk_present_context->ordered, "nested hooks share an already ordered present");
+        }
+        {
+            FeedVkPresentScope other(queue, &second);
+            Require(g_vk_present_context != context && !g_vk_present_context->ordered, "different nested presents have independent dependencies");
+        }
+        Require(g_vk_present_context == context && context->ordered, "nested present restores outer dependencies");
+    }
+    Require(!g_vk_present_context, "present context is cleared after hook return");
     Require(SameTexelLayout(DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB), "BGRA sRGB is a raw-copy layout");
     Require(!SameTexelLayout(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB), "channel swizzles must not be raw-copied");
     Require(!SameTexelLayout(DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN), "unknown formats must not be raw-copied");
