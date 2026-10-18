@@ -7,6 +7,37 @@ in this app at all.
 This file is the status of *this target*. The reusable knowledge is in `deploy/SOURCES.md`
 (`reshade-winui3/` section); `DEPLOY-DEV.md` has no WinUI 3 section yet (see Open items).
 
+## Redeploy after an Elgato update (2026-10-18)
+
+Every Elgato update installs a new `Elgato.Studio_<ver>_x64__g54w8ztgkx496` folder and deletes the
+old one **with everything we added**. The 2.0.0.2730 -> 2.0.0.3184 update (2026-10-06) took the
+deploy, the user's preset, the Psycho shaders and an unsaved newer ReShade build with it. So:
+
+```
+powershell -ExecutionPolicy Bypass -File tools\elgato\Deploy-ElgatoStudio.ps1        # deploy
+powershell -ExecutionPolicy Bypass -File tools\elgato\Deploy-ElgatoStudio.ps1 -Pull  # after tuning
+```
+
+- Finds the newest package folder, re-launches itself elevated once to `takeown`/`icacls` it.
+- **Shaders and preset live outside the package**, in `Documents\DLSS5-Feeder\ElgatoStudio\`
+  (`reshade-shaders\`, `ReShadePreset.ini`, `screenshots\`); `ReShade.ini` points there with absolute
+  paths. Put custom shaders there, not in the package folder.
+- `ReShade.ini` and `OptiScaler.ini` have to sit next to the DLLs: `-Pull` copies them to
+  `<store>\saved\` (older versions kept in `saved\history\`); a deploy pulls first, restores them,
+  and re-forces the WinUI-critical OptiScaler keys from `tools\elgato\OptiScaler.overrides.ini`.
+- Binaries: `deploy\reshade-winui3\dxgi_x64.dll` (rebuild from `tools\elgato\reshade-6.8.0-winui3.patch`
+  if lost -- `deploy\` is gitignored), `build\dlss5-feed.addon64`, `deploy\shared\nvngx_*.dll`, and the
+  OptiScaler fork from `deploy\optiscaler-fork\` (`winmm.dll` + `OptiScaler\` + stock ini; source is
+  `jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass` branch `fix/finished-picture-reshade`, cff47ae4).
+- A copy of the package folder elsewhere does **not** run: `Elgato.Studio.exe` exits `0x80073D54`
+  (APPMODEL_ERROR_NO_PACKAGE) without its package identity.
+
+Since 2026-10-03 the OptiScaler consumer is the wilsjo2-based fork as **`winmm.dll`** (as `version.dll`
+it corrupts the heap at start), and it needs the fork-only keys `[FrameGen] WrapCompositionSwapChain=false`
+and `[Menu] InputHooks=false` (passive input: no cursor/key detours, so ReShade's mouse and toggle
+key keep working; OptiScaler's menu polls keys, wheel via a low-level mouse hook). The sections below
+describe the original 2026-09-08 deploy (Dagherbou forwarder as `version.dll`).
+
 ## Target
 
 | | |

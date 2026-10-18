@@ -1,0 +1,499 @@
+diff --git a/res/exports.def b/res/exports.def
+index bfd80ae..6a60795 100644
+--- a/res/exports.def
++++ b/res/exports.def
+@@ -53,6 +53,8 @@ EXPORTS
+ 	D3D11CreateDevice PRIVATE
+ 	D3D11CreateDeviceAndSwapChain PRIVATE
+ 	D3D11On12CreateDevice PRIVATE
++	CreateDirect3D11DeviceFromDXGIDevice PRIVATE
++	CreateDirect3D11SurfaceFromDXGISurface PRIVATE
+ 
+ 	; d3d12.dll (Uses ordinals in d3d12.lib for 'D3D12CreateDevice' and 'D3D12GetDebugInterface')
+ 	D3D12CreateDevice @101 PRIVATE
+diff --git a/source/d2d1/d2d1.cpp b/source/d2d1/d2d1.cpp
+index 1a163aa..c2e849b 100644
+--- a/source/d2d1/d2d1.cpp
++++ b/source/d2d1/d2d1.cpp
+@@ -8,18 +8,26 @@
+ #include "com_ptr.hpp"
+ #include "dll_log.hpp" // Include late to get 'hr_to_string' helper function
+ #include "hook_manager.hpp"
++#include <intrin.h>
++
++// DLSS5-Feeder diagnostic (2026-09-08): who creates D2D factories/devices, and whether the DXGI device they pass is ReShade's proxy
++extern const wchar_t *caller_module_name(void *return_address, wchar_t (&module_path)[MAX_PATH]);
+ 
+ #define ID2D1Factory_CreateDevice_Impl(vtable_index, factory_interface_version, device_interface_version) \
+ 	HRESULT STDMETHODCALLTYPE ID2D1Factory##factory_interface_version##_CreateDevice(ID2D1Factory##factory_interface_version *factory, IDXGIDevice *dxgiDevice, ID2D1Device##device_interface_version **d2dDevice) \
+ 	{ \
++		wchar_t caller_path[MAX_PATH]; \
+ 		reshade::log::message( \
+ 			reshade::log::level::info, \
+-			"Redirecting ID2D1Factory" #factory_interface_version "::CreateDevice(this = %p, dxgiDevice = %p, d2dDevice = %p) ...", \
+-			factory, dxgiDevice , d2dDevice); \
++			"Redirecting ID2D1Factory" #factory_interface_version "::CreateDevice(this = %p, dxgiDevice = %p, d2dDevice = %p) from %ls ...", \
++			factory, dxgiDevice , d2dDevice, caller_module_name(_ReturnAddress(), caller_path)); \
+ 		\
+ 		if (com_ptr<DXGIDevice> device_proxy; \
+ 			SUCCEEDED(dxgiDevice->QueryInterface(&device_proxy))) \
++		{ \
++			reshade::log::message(reshade::log::level::info, "> dxgiDevice is a ReShade proxy, unwrapping to %p", device_proxy->_orig); \
+ 			dxgiDevice = device_proxy->_orig; \
++		} \
+ 		\
+ 		const HRESULT hr = reshade::hooks::call(ID2D1Factory##factory_interface_version##_CreateDevice, reshade::hooks::vtable_from_instance(factory) + vtable_index)(factory, dxgiDevice, d2dDevice); \
+ 		if (FAILED(hr)) \
+@@ -63,9 +71,10 @@ extern "C" HRESULT WINAPI D2D1CreateDevice(IDXGIDevice *dxgiDevice, CONST D2D1_C
+ 
+ extern "C" HRESULT WINAPI D2D1CreateFactory(D2D1_FACTORY_TYPE factoryType, REFIID riid, CONST D2D1_FACTORY_OPTIONS *pFactoryOptions, void **ppIFactory)
+ {
++	wchar_t caller_path[MAX_PATH];
+ 	reshade::log::message(reshade::log::level::info,
+-		"Redirecting D2D1CreateFactory(factoryType = %d, riid = %s, pFactoryOptions = %p, ppIFactory = %p) ...",
+-		factoryType, reshade::log::iid_to_string(riid).c_str(), pFactoryOptions, ppIFactory);
++		"Redirecting D2D1CreateFactory(factoryType = %d, riid = %s, pFactoryOptions = %p, ppIFactory = %p) from %ls ...",
++		factoryType, reshade::log::iid_to_string(riid).c_str(), pFactoryOptions, ppIFactory, caller_module_name(_ReturnAddress(), caller_path));
+ 
+ 	// Choose the correct overload (instead of the template D2D1CreateFactory functions also defined in the header)
+ 	using D2D1CreateFactory_t = HRESULT(WINAPI *)(D2D1_FACTORY_TYPE, REFIID, CONST D2D1_FACTORY_OPTIONS *, void **);
+diff --git a/source/d3d11/d3d11.cpp b/source/d3d11/d3d11.cpp
+index 22d6183..9c5d781 100644
+--- a/source/d3d11/d3d11.cpp
++++ b/source/d3d11/d3d11.cpp
+@@ -13,11 +13,68 @@
+ 
+ extern thread_local bool g_in_dxgi_runtime;
+ 
++#include <intrin.h>
++
++// DLSS5-Feeder local patch (2026-09-08): WinUI 3's lifted composition engine (dwmcorei.dll, with
++// dcompi.dll) hands the D3D11 device it creates to Direct2D through a path the D2D1 hooks do not
++// cover, and D2D refuses a proxied device: the process fail-fasts inside dwmcorei.dll with
++// D2DERR_UNSUPPORTED_OPERATION (0x88990003) right after its D2D1CreateFactory call. Devices those
++// modules create are therefore passed through unproxied; the application's own devices still are.
++const wchar_t *caller_module_name(void *return_address, wchar_t (&module_path)[MAX_PATH])
++{
++	HMODULE module = nullptr;
++	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(return_address), &module) ||
++		GetModuleFileNameW(module, module_path, MAX_PATH) == 0)
++		return L"<unknown>";
++	const wchar_t *name = wcsrchr(module_path, L'\\');
++	return name != nullptr ? name + 1 : module_path;
++}
++extern HMODULE g_module_handle;
++// The immediate return address is not enough: an interposer such as OptiScaler (loaded as winmm.dll or
++// version.dll) hooks D3D11CreateDevice too and sits between the real requester and this module. Walk
++// the stack and take the first frame that belongs to neither ReShade, the D3D/DXGI runtime, nor a proxy.
++static const wchar_t *requesting_module_name(wchar_t (&module_path)[MAX_PATH])
++{
++	void *frames[24];
++	const USHORT count = RtlCaptureStackBackTrace(1, ARRAYSIZE(frames), frames, nullptr);
++	for (USHORT i = 0; i < count; ++i)
++	{
++		HMODULE module = nullptr;
++		if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(frames[i]), &module) ||
++			module == g_module_handle || GetModuleFileNameW(module, module_path, MAX_PATH) == 0)
++			continue;
++		const wchar_t *name = wcsrchr(module_path, L'\\');
++		name = name != nullptr ? name + 1 : module_path;
++		if (_wcsicmp(name, L"dxgi.dll") == 0 || _wcsicmp(name, L"d3d11.dll") == 0 || _wcsicmp(name, L"d3d10warp.dll") == 0 ||
++			_wcsicmp(name, L"winmm.dll") == 0 || _wcsicmp(name, L"version.dll") == 0)
++			continue;
++		return name;
++	}
++	return L"<unknown>";
++}
++static bool is_composition_engine_caller(void *, wchar_t (&module_path)[MAX_PATH])
++{
++	const wchar_t *const name = requesting_module_name(module_path);
++	reshade::log::message(reshade::log::level::info, "> D3D11 device creation requested by %ls", name);
++	return _wcsicmp(name, L"dwmcorei.dll") == 0 || _wcsicmp(name, L"dcompi.dll") == 0;
++}
++
+ extern "C" HRESULT WINAPI D3D11CreateDevice(IDXGIAdapter *pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags, const D3D_FEATURE_LEVEL *pFeatureLevels, UINT FeatureLevels, UINT SDKVersion, ID3D11Device **ppDevice, D3D_FEATURE_LEVEL *pFeatureLevel, ID3D11DeviceContext **ppImmediateContext)
+ {
+ 	if (g_in_dxgi_runtime)
+ 		return reshade::hooks::call(D3D11CreateDevice)(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion, ppDevice, pFeatureLevel, ppImmediateContext);
+ 
++	if (wchar_t caller[MAX_PATH]; is_composition_engine_caller(_ReturnAddress(), caller))
++	{
++		reshade::log::message(reshade::log::level::info, "Passing on D3D11CreateDevice unproxied: caller %ls is a composition engine module.", caller);
++
++		if (com_ptr<DXGIAdapter> adapter_proxy;
++			pAdapter && SUCCEEDED(pAdapter->QueryInterface(&adapter_proxy)))
++			pAdapter = adapter_proxy->_orig;
++
++		return reshade::hooks::call(D3D11CreateDevice)(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion, ppDevice, pFeatureLevel, ppImmediateContext);
++	}
++
+ 	reshade::log::message(
+ 		reshade::log::level::info,
+ 		"Redirecting D3D11CreateDevice(pAdapter = %p, DriverType = %d, Software = %p, Flags = %#x, pFeatureLevels = %p, FeatureLevels = %u, SDKVersion = %u, ppDevice = %p, pFeatureLevel = %p, ppImmediateContext = %p) ...",
+@@ -36,6 +93,17 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(IDXGIAdapter *pAdapter,
+ 	if (g_in_dxgi_runtime)
+ 		return trampoline(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
+ 
++	if (wchar_t caller[MAX_PATH]; is_composition_engine_caller(_ReturnAddress(), caller))
++	{
++		reshade::log::message(reshade::log::level::info, "Passing on D3D11CreateDeviceAndSwapChain unproxied: caller %ls is a composition engine module.", caller);
++
++		if (com_ptr<DXGIAdapter> adapter_proxy;
++			pAdapter && SUCCEEDED(pAdapter->QueryInterface(&adapter_proxy)))
++			pAdapter = adapter_proxy->_orig;
++
++		return trampoline(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
++	}
++
+ 	reshade::log::message(
+ 		reshade::log::level::info,
+ 		"Redirecting D3D11CreateDeviceAndSwapChain(pAdapter = %p, DriverType = %d, Software = %p, Flags = %#x, pFeatureLevels = %p, FeatureLevels = %u, SDKVersion = %u, pSwapChainDesc = %p, ppSwapChain = %p, ppDevice = %p, pFeatureLevel = %p, ppImmediateContext = %p) ...",
+@@ -215,3 +283,58 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(IDXGIAdapter *pAdapter,
+ 
+ 	return hr;
+ }
++
++// DLSS5-Feeder local patch (2026-09-08): the two WinRT Direct3D 11 interop exports of d3d11.dll
++// (windows.graphics.directx.direct3d11.interop.h). WinUI 3, Win2D and Media Foundation import them,
++// so a ReShade installed as d3d11.dll for such an app fails with "Entry Point Not Found" without
++// them (seen in Elgato Studio: Elgato.MFComponents.dll, Microsoft.Graphics.Canvas.dll, Windows.Media.dll).
++// Both are pass-throughs to the real d3d11.dll. The device variant hands over the original DXGI
++// device rather than ReShade's proxy, for the same reason the D2D1 hooks do.
++#include <inspectable.h>
++#include "dxgi/dxgi_device.hpp"
++
++static FARPROC d3d11_winrt_interop_from_system(const char *name)
++{
++	WCHAR path[MAX_PATH];
++	if (GetSystemDirectoryW(path, MAX_PATH) == 0 || wcscat_s(path, L"\\d3d11.dll") != 0)
++		return nullptr;
++	const HMODULE module = LoadLibraryW(path);
++	return module != nullptr ? GetProcAddress(module, name) : nullptr;
++}
++
++extern "C" HRESULT WINAPI CreateDirect3D11DeviceFromDXGIDevice(IDXGIDevice *dxgiDevice, IInspectable **graphicsDevice)
++{
++	reshade::log::message(
++		reshade::log::level::info,
++		"Redirecting CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice = %p, graphicsDevice = %p) ...",
++		dxgiDevice, graphicsDevice);
++
++	if (com_ptr<DXGIDevice> device_proxy;
++		dxgiDevice != nullptr && SUCCEEDED(dxgiDevice->QueryInterface(&device_proxy)))
++		dxgiDevice = device_proxy->_orig;
++
++	auto trampoline = reshade::hooks::call(CreateDirect3D11DeviceFromDXGIDevice);
++	if (trampoline == nullptr)
++		trampoline = reinterpret_cast<decltype(trampoline)>(d3d11_winrt_interop_from_system("CreateDirect3D11DeviceFromDXGIDevice"));
++	if (trampoline == nullptr)
++		return E_NOTIMPL;
++
++	const HRESULT hr = trampoline(dxgiDevice, graphicsDevice);
++	if (FAILED(hr))
++		reshade::log::message(reshade::log::level::warning, "CreateDirect3D11DeviceFromDXGIDevice failed with error code %s.", reshade::log::hr_to_string(hr).c_str());
++	return hr;
++}
++
++extern "C" HRESULT WINAPI CreateDirect3D11SurfaceFromDXGISurface(IDXGISurface *dxgiSurface, IInspectable **graphicsSurface)
++{
++	auto trampoline = reshade::hooks::call(CreateDirect3D11SurfaceFromDXGISurface);
++	if (trampoline == nullptr)
++		trampoline = reinterpret_cast<decltype(trampoline)>(d3d11_winrt_interop_from_system("CreateDirect3D11SurfaceFromDXGISurface"));
++	if (trampoline == nullptr)
++		return E_NOTIMPL;
++
++	const HRESULT hr = trampoline(dxgiSurface, graphicsSurface);
++	if (FAILED(hr))
++		reshade::log::message(reshade::log::level::warning, "CreateDirect3D11SurfaceFromDXGISurface failed with error code %s.", reshade::log::hr_to_string(hr).c_str());
++	return hr;
++}
+diff --git a/source/input.hpp b/source/input.hpp
+index 7f09ac2..4b50241 100644
+--- a/source/input.hpp
++++ b/source/input.hpp
+@@ -154,6 +154,19 @@ namespace reshade
+ 		unsigned int mouse_position_y() const { return _mouse_position[1]; }
+ 		void max_mouse_position(unsigned int position[2]) const;
+ 
++		// DLSS5-Feeder local patch (2026-09-08): when the runtime had to bind input to a fallback window (composition
++		// swap chain), pointer moves never arrive as messages on that window (WinUI 3 handles them on its own input
++		// thread), so the cursor position is polled every frame instead.
++		bool poll_cursor_position = false;
++		// The surface a composition swap chain is shown on is usually scaled, so the polled client position is mapped from
++		// 'poll_cursor_surface_rect' (client-area left, top, width, height; width or height 0 = whole client area) onto
++		// 'poll_cursor_target_size' (the back buffer size; 0 = no mapping).
++		unsigned int poll_cursor_target_size[2] = {};
++		unsigned int poll_cursor_surface_rect[4] = {};
++		// While the overlay takes the mouse, the pointer is driven by deltas and the real cursor is warped back to the
++		// window centre every frame (the way games do), so the whole surface is reachable whatever its on-screen scale.
++		bool poll_cursor_relative_active = false;
++
+ 		/// <summary>
+ 		/// Gets the character input as captured by 'WM_CHAR' for the current frame.
+ 		/// </summary>
+diff --git a/source/input_windows.cpp b/source/input_windows.cpp
+index d022aeb..05f6ff5 100644
+--- a/source/input_windows.cpp
++++ b/source/input_windows.cpp
+@@ -16,6 +16,8 @@
+ extern bool is_uwp_app();
+ 
+ extern HANDLE g_exit_event;
++#include <set>
++#include <mutex>
+ static std::shared_mutex s_windows_mutex;
+ static std::unordered_map<HWND, unsigned int> s_raw_input_windows;
+ static std::unordered_map<HWND, std::weak_ptr<reshade::input>> s_windows;
+@@ -26,6 +28,9 @@ static std::atomic<bool> s_block_keyboard = false;
+ static std::atomic<bool> s_block_cursor_warping = false;
+ 
+ extern "C" BOOL WINAPI HookClipCursor(const RECT *lpRect);
++extern "C" BOOL WINAPI HookGetCursorPosition(LPPOINT lpPoint);
++extern "C" auto WINAPI HookGetAsyncKeyState(int vKey) -> SHORT;
++extern "C" BOOL WINAPI HookSetCursorPosition(int X, int Y);
+ extern "C" auto WINAPI HookGetKeyState(int vKey) -> SHORT;
+ extern "C" auto WINAPI HookGetAsyncKeyState(int vKey) -> SHORT;
+ 
+@@ -107,10 +112,36 @@ bool reshade::input::handle_window_message(const void *message_data)
+ 	bool is_mouse_message = details.message >= WM_MOUSEFIRST && details.message <= WM_MOUSELAST;
+ 	bool is_keyboard_message = details.message >= WM_KEYFIRST && details.message <= WM_KEYLAST;
+ 
++	// DLSS5-Feeder local patch (2026-09-08): WinUI 3 delivers mouse input as WM_POINTER* messages, which sit
++	// outside WM_MOUSEFIRST..WM_MOUSELAST. Accept them too (values spelled out: the project targets _WIN32_WINNT_WIN7).
++	const bool is_pointer_message = details.message >= 0x0245 /* WM_POINTERUPDATE */ && details.message <= 0x024F /* WM_POINTERHWHEEL */;
++
++	// DLSS5-Feeder diagnostic (2026-09-08): which mouse-ish messages reach this hook at all (one line per message type and window)
++	if (is_mouse_message || (details.message >= 0x0238 && details.message <= 0x024F) || details.message == WM_INPUT)
++	{
++		static std::set<std::pair<UINT, HWND>> seen; static std::mutex seen_mutex;
++		const std::lock_guard<std::mutex> seen_lock(seen_mutex);
++		if (seen.emplace(details.message, details.hwnd).second)
++		{
++			char cls[64] = {}; GetClassNameA(details.hwnd, cls, sizeof(cls));
++			reshade::log::message(reshade::log::level::info, "mouse-range message 0x%X first seen on window %p (%s), thread %lu", details.message, details.hwnd, cls, GetCurrentThreadId());
++		}
++	}
++
+ 	// Ignore messages that are not related to mouse or keyboard input
+-	if (details.message != WM_INPUT && !is_mouse_message && !is_keyboard_message)
++	if (details.message != WM_INPUT && !is_mouse_message && !is_keyboard_message && !is_pointer_message)
+ 		return false;
+ 
++	// DLSS5-Feeder diagnostic (2026-09-08): where do key presses arrive, and do we know that window?
++	if (details.message == WM_KEYDOWN || details.message == WM_SYSKEYDOWN)
++	{
++		char cls[64] = {}; GetClassNameA(details.hwnd, cls, sizeof(cls));
++		char root_cls[64] = {}; const HWND root = GetAncestor(details.hwnd, GA_ROOT); GetClassNameA(root, root_cls, sizeof(root_cls));
++		const std::shared_lock<std::shared_mutex> diag_lock(s_windows_mutex);
++		reshade::log::message(reshade::log::level::info, "WM_KEYDOWN vk=%u on window %p (%s), root %p (%s); %zu registered input window(s), first %p",
++			static_cast<unsigned>(details.wParam), details.hwnd, cls, root, root_cls, s_windows.size(), s_windows.empty() ? nullptr : s_windows.begin()->first);
++	}
++
+ 	// Guard access to windows list against race conditions
+ 	std::unique_lock<std::shared_mutex> lock(s_windows_mutex);
+ 
+@@ -137,11 +168,15 @@ bool reshade::input::handle_window_message(const void *message_data)
+ 	if (input_window == s_windows.end())
+ 	{
+ 		// Some applications handle input in a child window to the main render window
+-		if (const HWND parent = GetParent(details.hwnd); parent != NULL)
++		// DLSS5-Feeder local patch (2026-09-08): walk the whole parent chain, not one level. WinUI 3 focuses a
++		// grandchild ("InputSiteWindowClass" under "Microsoft.UI.Content.DesktopChildSiteBridge") of the top-level window.
++		for (HWND parent = GetParent(details.hwnd); parent != NULL && input_window == s_windows.end(); parent = GetParent(parent))
+ 			input_window = s_windows.find(parent);
+ 	}
+ 
+-	if (input_window == s_windows.end() && raw_input_window != s_raw_input_windows.end())
++	// DLSS5-Feeder local patch (2026-09-08): WinUI 3 posts WM_POINTER* to a message-only window on its own input
++	// thread, which is nobody's child, so treat them like raw input and hand them to the window with the most rendering.
++	if (input_window == s_windows.end() && (raw_input_window != s_raw_input_windows.end() || is_pointer_message) && !s_windows.empty())
+ 	{
+ 		// Reroute this raw input message to the window with the most rendering
+ 		input_window = std::max_element(s_windows.begin(), s_windows.end(),
+@@ -149,7 +184,11 @@ bool reshade::input::handle_window_message(const void *message_data)
+ 	}
+ 
+ 	if (input_window == s_windows.end())
++	{
++		if (is_pointer_message && details.message != 0x0245)
++			reshade::log::message(reshade::log::level::info, "pointer message 0x%X on %p dropped: no input window matched (%zu registered)", details.message, details.hwnd, s_windows.size());
+ 		return false;
++	}
+ 
+ 	const std::shared_ptr<input> input = input_window->second.lock();
+ 	// It may happen that the input was destroyed between the removal of expired entries above and here, so need to abort in this case
+@@ -165,8 +204,11 @@ bool reshade::input::handle_window_message(const void *message_data)
+ 	// Prevent input threads from modifying input while it is accessed elsewhere
+ 	const std::unique_lock<std::recursive_mutex> input_lock(input->_mutex);
+ 
+-	input->_mouse_position[0] = details.pt.x;
+-	input->_mouse_position[1] = details.pt.y;
++	if (!input->poll_cursor_position) // polled position is authoritative in that mode (messages would reset it to the warped cursor)
++	{
++		input->_mouse_position[0] = details.pt.x;
++		input->_mouse_position[1] = details.pt.y;
++	}
+ 
+ 	switch (details.message)
+ 	{
+@@ -238,6 +280,38 @@ bool reshade::input::handle_window_message(const void *message_data)
+ 	case WM_CHAR:
+ 		input->_text_input += static_cast<wchar_t>(details.wParam);
+ 		break;
++	// DLSS5-Feeder local patch (2026-09-08): WM_POINTER* (WinUI 3). Position already came from 'details.pt' above.
++	case 0x0245: // WM_POINTERUPDATE
++	case 0x0246: // WM_POINTERDOWN
++	case 0x0247: // WM_POINTERUP
++	{
++		is_mouse_message = true;
++		const auto update_button = [&](bool down, unsigned int key) {
++			if (down && (input->_keys[key] & 0x80) == 0)
++				input->_keys[key] = 0x88;
++			else if (!down && (input->_keys[key] & 0x80) != 0)
++				input->_keys[key] = 0x08;
++		};
++		// The copies WinUI 3 posts to its input-thread window carry only POINTER_MESSAGE_FLAG_NEW in wParam (seen: flags 0x1 on
++		// every down and up), so the button bits are useless here; read the physical button state instead. Through the trampoline,
++		// because the hooked GetAsyncKeyState reports nothing while the overlay blocks input.
++		static const auto GetAsyncKeyState_trampoline = reshade::hooks::is_hooked(GetAsyncKeyState) ? reshade::hooks::call(HookGetAsyncKeyState, GetAsyncKeyState) : GetAsyncKeyState;
++		const WORD flags = LOWORD(details.wParam);
++		if (details.message != 0x0245)
++		{
++			update_button((GetAsyncKeyState_trampoline(VK_LBUTTON) & 0x8000) != 0, VK_LBUTTON);
++			update_button((GetAsyncKeyState_trampoline(VK_RBUTTON) & 0x8000) != 0, VK_RBUTTON);
++			update_button((GetAsyncKeyState_trampoline(VK_MBUTTON) & 0x8000) != 0, VK_MBUTTON);
++		}
++		if (details.message != 0x0245)
++			reshade::log::message(reshade::log::level::info, "pointer message 0x%X flags 0x%X on %p -> input window %p, LBUTTON state 0x%02X, blocking mouse %d, pos %d,%d",
++				details.message, flags, details.hwnd, input->_window, input->_keys[VK_LBUTTON], input->is_blocking_mouse_input() ? 1 : 0, details.pt.x, details.pt.y);
++		break;
++	}
++	case 0x024E: // WM_POINTERWHEEL
++		is_mouse_message = true;
++		input->_mouse_wheel_delta += GET_WHEEL_DELTA_WPARAM(details.wParam) / WHEEL_DELTA;
++		break;
+ 	case WM_KEYDOWN:
+ 	case WM_SYSKEYDOWN:
+ 		assert(details.wParam > 0 && details.wParam < std::size(input->_keys));
+@@ -307,6 +381,64 @@ void reshade::input::next_frame()
+ 
+ 	_frame_count++;
+ 
++	// DLSS5-Feeder local patch (2026-09-08): see 'poll_cursor_position' in input.hpp
++	if (poll_cursor_position)
++	{
++		// Through the trampoline: the hooked GetCursorPos hands back the application's last known position while the overlay blocks mouse input
++		static const auto GetCursorPos_trampoline = reshade::hooks::is_hooked(GetCursorPos) ? reshade::hooks::call(HookGetCursorPosition, GetCursorPos) : GetCursorPos;
++		static const auto SetCursorPos_trampoline = reshade::hooks::is_hooked(SetCursorPos) ? reshade::hooks::call(HookSetCursorPosition, SetCursorPos) : SetCursorPos;
++		const HWND hwnd = static_cast<HWND>(_window);
++		if (POINT pt; GetCursorPos_trampoline(&pt) && ScreenToClient(hwnd, &pt))
++		{
++			RECT client = {};
++			GetClientRect(hwnd, &client);
++			const bool have_target = poll_cursor_target_size[0] != 0 && poll_cursor_target_size[1] != 0 && client.right > 0 && client.bottom > 0;
++
++			const std::unique_lock<std::recursive_mutex> input_lock(_mutex);
++
++			if (have_target && is_blocking_mouse_input())
++			{
++				// Overlay has the mouse: relative mode (see 'poll_cursor_relative_active' in input.hpp)
++				const POINT center = { client.right / 2, client.bottom / 2 };
++				if (poll_cursor_relative_active)
++				{
++					// One client pixel moves the pointer as far as it would under the whole-client-area mapping
++					const float scale = static_cast<float>(poll_cursor_target_size[1]) / static_cast<float>(client.bottom);
++					const LONG x = static_cast<LONG>(_mouse_position[0]) + static_cast<LONG>((pt.x - center.x) * scale);
++					const LONG y = static_cast<LONG>(_mouse_position[1]) + static_cast<LONG>((pt.y - center.y) * scale);
++					_mouse_position[0] = std::clamp<LONG>(x, 0, poll_cursor_target_size[0] - 1);
++					_mouse_position[1] = std::clamp<LONG>(y, 0, poll_cursor_target_size[1] - 1);
++				}
++				else
++				{
++					poll_cursor_relative_active = true; // first frame: only recenter, no jump
++				}
++				POINT screen_center = center;
++				ClientToScreen(hwnd, &screen_center);
++				SetCursorPos_trampoline(screen_center.x, screen_center.y);
++			}
++			else
++			{
++				poll_cursor_relative_active = false;
++
++				// Map the client-area position onto the (scaled) surface the swap chain is shown on
++				if (have_target)
++				{
++					const LONG left = poll_cursor_surface_rect[0], top = poll_cursor_surface_rect[1];
++					const LONG width = poll_cursor_surface_rect[2] != 0 ? poll_cursor_surface_rect[2] : client.right;
++					const LONG height = poll_cursor_surface_rect[3] != 0 ? poll_cursor_surface_rect[3] : client.bottom;
++					if (width > 0 && height > 0)
++					{
++						pt.x = std::clamp<LONG>((pt.x - left) * static_cast<LONG>(poll_cursor_target_size[0]) / width, 0, poll_cursor_target_size[0] - 1);
++						pt.y = std::clamp<LONG>((pt.y - top) * static_cast<LONG>(poll_cursor_target_size[1]) / height, 0, poll_cursor_target_size[1] - 1);
++					}
++				}
++				_mouse_position[0] = pt.x;
++				_mouse_position[1] = pt.y;
++			}
++		}
++	}
++
+ 	// Backup key states from the last processed frame so that state transitions can be identified
+ 	std::copy_n(_keys, 256, _last_keys);
+ 
+diff --git a/source/runtime.cpp b/source/runtime.cpp
+index 9ad4b62..bd011a1 100644
+--- a/source/runtime.cpp
++++ b/source/runtime.cpp
+@@ -35,6 +35,25 @@
+ #include <stb_image_write_hdr_png.h>
+ #include <stb_image_resize2.h>
+ 
++// DLSS5-Feeder local patch (2026-09-08): a composition swap chain (WinUI 3 SwapChainPanel, CoreWindow
++// interop) has no output window, which left the runtime without input and therefore without any way
++// to open the overlay. Fall back to the process's main top-level window in that case.
++#include <Windows.h>
++static HWND find_process_main_window()
++{
++	struct search { DWORD pid; HWND found; } s = { GetCurrentProcessId(), nullptr };
++	EnumWindows([](HWND hwnd, LPARAM lparam) -> BOOL {
++		search *const s = reinterpret_cast<search *>(lparam);
++		DWORD pid = 0;
++		GetWindowThreadProcessId(hwnd, &pid);
++		if (pid != s->pid || !IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER) != nullptr)
++			return TRUE;
++		s->found = hwnd;
++		return FALSE;
++	}, reinterpret_cast<LPARAM>(&s));
++	return s.found;
++}
++
+ std::string expand_macro_string(const std::string &input, std::vector<std::pair<std::string_view, std::string>> macros = {})
+ {
+ 	std::string result;
+@@ -554,9 +573,25 @@ bool reshade::runtime::on_init()
+ #endif
+ 
+ 	{
+-		const input::window_handle window = get_hwnd();
++		input::window_handle window = get_hwnd();
++		if (window == nullptr && !_is_vr)
++		{
++			window = find_process_main_window();
++			log::message(log::level::info, "Swap chain has no output window (composition or core window); binding input to the process main window %p instead.", window);
++		}
+ 		if (window != nullptr && !_is_vr)
++		{
+ 			_input = input::register_window(window);
++			if (get_hwnd() == nullptr) // fallback window in use: pointer moves will not arrive as messages, poll the cursor instead
++			{
++				_input->poll_cursor_position = true;
++				_input->poll_cursor_target_size[0] = _width;
++				_input->poll_cursor_target_size[1] = _height;
++				ini_file::load_cache(_config_path).get("INPUT", "CompositionSurfaceRect", _input->poll_cursor_surface_rect);
++				log::message(log::level::info, "Mapping the polled cursor from the client area (surface rect %u,%u %ux%u; 0 = whole client area) onto the %ux%u back buffer.",
++					_input->poll_cursor_surface_rect[0], _input->poll_cursor_surface_rect[1], _input->poll_cursor_surface_rect[2], _input->poll_cursor_surface_rect[3], _width, _height);
++			}
++		}
+ 		else
+ 			_input.reset();
+ 
