@@ -8,7 +8,7 @@
     script makes that a one-command redeploy and keeps the user's state OUT of the package folder:
 
       * reshade-shaders\ and ReShadePreset.ini live in the store folder (default
-        Documents\DLSS5-Feeder\ElgatoStudio); ReShade.ini points at them with absolute paths, so
+        %USERPROFILE%\DLSS5-Feeder\ElgatoStudio -- not Documents, often OneDrive); ReShade.ini points at them with absolute paths, so
         shaders and presets you add survive updates on their own.
       * ReShade.ini and OptiScaler.ini must sit next to the DLLs. -Pull copies them back to
         <store>\saved\ (run it after tuning); a deploy always pulls first and then restores
@@ -32,7 +32,7 @@
 [CmdletBinding()]
 param(
     [string] $Target,
-    [string] $Store = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'DLSS5-Feeder\ElgatoStudio'),
+    [string] $Store = (Join-Path $env:USERPROFILE 'DLSS5-Feeder\ElgatoStudio'),
     [string] $OptiScalerDir,
     [switch] $Pull,
     [switch] $NoElevate,
@@ -53,6 +53,8 @@ if (-not $Target) {
 if (-not (Test-Path (Join-Path $Target 'Elgato.Studio.exe'))) { throw "Not an Elgato Studio folder: $Target" }
 Write-Host "Elgato Studio: $Target"
 Write-Host "Store:         $Store"
+New-Item -ItemType Directory -Force $Store | Out-Null
+if ($NoElevate) { Start-Transcript -Path (Join-Path $Store 'deploy.log') -Force | Out-Null }   # the elevated window closes
 
 $Saved = Join-Path $Store 'saved'
 

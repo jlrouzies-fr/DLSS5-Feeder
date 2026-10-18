@@ -19,7 +19,7 @@ powershell -ExecutionPolicy Bypass -File tools\elgato\Deploy-ElgatoStudio.ps1 -P
 ```
 
 - Finds the newest package folder, re-launches itself elevated once to `takeown`/`icacls` it.
-- **Shaders and preset live outside the package**, in `Documents\DLSS5-Feeder\ElgatoStudio\`
+- **Shaders and preset live outside the package**, in `%USERPROFILE%\DLSS5-Feeder\ElgatoStudio\` (not Documents: OneDrive)
   (`reshade-shaders\`, `ReShadePreset.ini`, `screenshots\`); `ReShade.ini` points there with absolute
   paths. Put custom shaders there, not in the package folder.
 - `ReShade.ini` and `OptiScaler.ini` have to sit next to the DLLs: `-Pull` copies them to
