@@ -46,6 +46,10 @@ $Utf8 = New-Object System.Text.UTF8Encoding($false)
 function Say([string] $t) { Write-Host "  $t" }
 
 if (-not $Target) {
+    # a dev-registered loose copy (Add-AppxPackage -Register) is the only writable layout since 3184
+    $Target = (Get-AppxPackage Elgato.Studio -ErrorAction SilentlyContinue | Select-Object -First 1).InstallLocation
+}
+if (-not $Target) {
     $Target = Get-ChildItem 'C:\Program Files\WindowsApps' -Directory -Filter 'Elgato.Studio_*_x64__g54w8ztgkx496' -ErrorAction SilentlyContinue |
         Sort-Object { [version]($_.Name -split '_')[1] } | Select-Object -Last 1 -ExpandProperty FullName
     if (-not $Target) { throw 'No Elgato Studio package folder found under C:\Program Files\WindowsApps.' }

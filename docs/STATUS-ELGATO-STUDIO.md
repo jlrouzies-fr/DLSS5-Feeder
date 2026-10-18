@@ -29,8 +29,16 @@ powershell -ExecutionPolicy Bypass -File tools\elgato\Deploy-ElgatoStudio.ps1 -P
   if lost -- `deploy\` is gitignored), `build\dlss5-feed.addon64`, `deploy\shared\nvngx_*.dll`, and the
   OptiScaler fork from `deploy\optiscaler-fork\` (`winmm.dll` + `OptiScaler\` + stock ini; source is
   `jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass` branch `fix/finished-picture-reshade`, cff47ae4).
-- A copy of the package folder elsewhere does **not** run: `Elgato.Studio.exe` exits `0x80073D54`
-  (APPMODEL_ERROR_NO_PACKAGE) without its package identity.
+- **Since 3184 the WindowsApps folder cannot be written at all**, even elevated after takeown/icacls:
+  it carries a process-trust-label ACE (`S-1-19-512-4096`) that caps every non-protected process at
+  read/execute + permission changes. A plain copy elsewhere does not run either (`0x80073D54`,
+  APPMODEL_ERROR_NO_PACKAGE). What works (2026-10-18, verified NR 3840x2160): Developer Mode on, copy
+  the package folder to `D:\Games\Elgato.Studio_<ver>`, move `AppxSignature.p7x` + `AppxBlockMap.xml`
+  aside, back up `%LOCALAPPDATA%\Packages\Elgato.Studio_g54w8ztgkx496`, `Remove-AppxPackage` the
+  installed one, `Add-AppxPackage -Register <copy>\AppxManifest.xml`, restore the app data, run the
+  script (it targets the registered InstallLocation). A version-bumped dev registration cannot
+  replace the signed install (`0x80073CFB`); uninstalling first is required. Elgato's own updater
+  will reinstall a signed package over this; then repeat.
 
 Since 2026-10-03 the OptiScaler consumer is the wilsjo2-based fork as **`winmm.dll`** (as `version.dll`
 it corrupts the heap at start), and it needs the fork-only keys `[FrameGen] WrapCompositionSwapChain=false`
