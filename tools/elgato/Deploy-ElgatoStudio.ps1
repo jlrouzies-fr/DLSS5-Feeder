@@ -35,6 +35,8 @@ param(
     [string] $Store = (Join-Path $env:USERPROFILE 'DLSS5-Feeder\ElgatoStudio'),
     [string] $OptiScalerDir,
     [switch] $Pull,
+    # also install crosire's full shader package list (tools\Install-ReShadeShaders.ps1) into the store
+    [switch] $AllShaders,
     [switch] $NoElevate,
     [string] $Owner = "$env:USERDOMAIN\$env:USERNAME"
 )
@@ -93,6 +95,7 @@ if (-not (Test-Writable $Target)) {
         Write-Host 'Package folder is read-only: re-launching elevated (UAC prompt) ...'
         $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Target', "`"$Target`"",
                '-Store', "`"$Store`"", '-OptiScalerDir', "`"$OptiScalerDir`"", '-Owner', "`"$Owner`"", '-NoElevate')
+        if ($AllShaders) { $a += '-AllShaders' }
         $p = Start-Process powershell.exe -Verb RunAs -ArgumentList $a -Wait -PassThru
         exit $p.ExitCode
     }
@@ -135,8 +138,11 @@ Copy-IfMissing (Join-Path $Repo 'deploy\reshade-framework') $Shaders
 Copy-IfMissing (Join-Path $Repo 'deploy\motion-vectors\lumenitefx\Shaders') $Shaders
 Copy-IfMissing (Join-Path $Repo 'deploy\motion-vectors\lumenitefx\Textures') $Textures
 Copy-Item (Join-Path $Repo 'shaders\DLSS5_Feed.fx') $Shaders -Force   # must match the add-on
+# our own Elgato shaders (Elgato_Deband, PsychoV HDR/SDR) are tracked in the repo: always refresh
+Copy-Item (Join-Path $PSScriptRoot 'shaders\*.fx') $Shaders -Force
+if ($AllShaders) { & (Join-Path $Repo 'tools\Install-ReShadeShaders.ps1') -Destination (Split-Path $Shaders) }
 $Preset = Join-Path $Store 'ReShadePreset.ini'
-if (-not (Test-Path $Preset)) { Copy-Item (Join-Path $Repo 'deploy\templates\ReShadePreset.ini') $Preset }
+if (-not (Test-Path $Preset)) { Copy-Item (Join-Path $PSScriptRoot 'ReShadePreset.ini') $Preset }
 
 # --- binaries ---
 Write-Host 'Copying binaries ...'

@@ -22,6 +22,11 @@ powershell -ExecutionPolicy Bypass -File tools\elgato\Deploy-ElgatoStudio.ps1 -P
 - **Shaders and preset live outside the package**, in `%USERPROFILE%\DLSS5-Feeder\ElgatoStudio\` (not Documents: OneDrive)
   (`reshade-shaders\`, `ReShadePreset.ini`, `screenshots\`); `ReShade.ini` points there with absolute
   paths. Put custom shaders there, not in the package folder.
+- Our own shaders are tracked in `tools\elgato\shaders\` and refreshed on every deploy: `Elgato_Deband.fx`
+  (capture-feed deband, before DLSS5_Feed; rewritten 2026-10-18, the original was lost with 2730),
+  `PsychoV_HDR_Post.fx` (PQ only) and `PsychoV_SDR_Post.fx` (3184 presents 8-bit sRGB). Seed preset:
+  `tools\elgato\ReShadePreset.ini`. `-AllShaders` adds crosire's full package list via
+  `tools\Install-ReShadeShaders.ps1` (44 packages, ~510 effects; mdapt, RadiantGI, dh_uber_rt fail on D3D11).
 - `ReShade.ini` and `OptiScaler.ini` have to sit next to the DLLs: `-Pull` copies them to
   `<store>\saved\` (older versions kept in `saved\history\`); a deploy pulls first, restores them,
   and re-forces the WinUI-critical OptiScaler keys from `tools\elgato\OptiScaler.overrides.ini`.
