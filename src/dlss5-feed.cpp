@@ -69,7 +69,7 @@
 #include "feed_hold12.h" // the output stabiliser: one compute pass after the evaluate, all four transports
 #include "feed_depthsrc.h" // which buffer Generic Depth binds, against the back buffer and any MSAA depth (#145)
 
-#define FEED_VERSION "1.19.0"
+#define FEED_VERSION "1.19.1-beta.1"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif

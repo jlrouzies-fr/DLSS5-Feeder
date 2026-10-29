@@ -65,7 +65,7 @@ static void FeedOnVkDeviceGeneration();
 #include "feed_opti.h"      // OptiScaler DLSS-NR: only the file scan and the ini reader are used here (it lives in host64 too)
 #include "feed_depthsrc.h"  // which buffer Generic Depth binds, against the back buffer and any MSAA depth (#145)
 
-#define FEED_VERSION "1.19.0"
+#define FEED_VERSION "1.19.1-beta.1"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif
@@ -402,11 +402,16 @@ struct Cfg
                            // model's new answer; where it changed, the model's answer shows as is.
     float hold_tolerance;  // relative input change (0.04 = 4 percent of local brightness) below which a
                            // pixel counts as still; the gate opens fully at twice this.
+    int   d3d10_pipeline;  // Direct3D 10 games: 1 = two sets of bridges, and every wait is on work
+                           // queued a frame earlier, so neither device is drained mid-frame (issue #146,
+                           // Far Cry 2 at 32 fps with the GPU 60% busy). The game shows the result from
+                           // two frames back. 0 = the original drain of the current frame.
+                           // Parse-only, not written back, not on the overlay.
 };
 
 //                                        host_window --v  v-- host_gpu_priority (off)          settle_evals --v  v-- hold_input
 static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 0, 100, 0, 1, 0, 0, 0, 0,
-                     /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f };
+                     /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f, /* d3d10_pipeline */ 1 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -615,6 +620,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "settle_evals")   == 0) next.settle_evals   = iv < 0 ? 0 : iv > 8 ? 8 : iv;
         else if (_stricmp(key, "hold_strength")  == 0) next.hold_strength  = val < 0.0f ? 0.0f : val > 1.0f ? 1.0f : val;
         else if (_stricmp(key, "hold_tolerance") == 0) next.hold_tolerance = val < 0.005f ? 0.005f : val > 0.5f ? 0.5f : val;
+        else if (_stricmp(key, "d3d10_pipeline") == 0) next.d3d10_pipeline = iv != 0 ? 1 : 0;
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
@@ -632,12 +638,12 @@ static bool CfgReload()   // true when a build-affecting value changed
         // what they had set (issue #15). The 64-bit side has always printed its full set.
         Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d log_frames=%d "
             "host_window=%d host_gpu_priority=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f async_home=%d "
-            "mv_scale=%.3f,%.3f cast_key=%d cast_mods=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d wine_fence_import=%d settle_evals=%d hold=%.2f/%.3f",
+            "mv_scale=%.3f,%.3f cast_key=%d cast_mods=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d wine_fence_import=%d settle_evals=%d hold=%.2f/%.3f d3d10_pipeline=%d",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_mods, g_cfg.cast_scale,
             g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.host_creates, g_cfg.wine_fence_import, g_cfg.settle_evals,
-            g_cfg.hold_strength, g_cfg.hold_tolerance);
+            g_cfg.hold_strength, g_cfg.hold_tolerance, g_cfg.d3d10_pipeline);
     }
     return rebuild;
 }
@@ -804,6 +810,14 @@ struct Feed32
     bool            is_d3d10;
     FeedD3D10       d10;
     FeedD3D10Bridge d10_bridge[FEED_SLOTS];   // native-sized; FEED_OUTPUT is the one with an RTV
+    // d3d10_pipeline: the second set of bridges, Output included. Ring slot 0 is d10_bridge,
+    // slot 1 is this. See PIPELINED HANDOFF in feed_d3d10.h.
+    FeedD3D10Bridge d10_in1[FEED_SLOTS];
+    bool            d10_pipelined;            // what the current build made: one slot or two
+    int             d10_pipeline_asked;       // g_cfg.d3d10_pipeline at that build; a change rebuilds
+    UINT64          d10_ring_n;               // deposits since the build; this frame's slot = n & 1
+    bool            d10_in_full[2];           // In[slot] holds a frame the game copied
+    bool            d10_out_full[2];          // Out[slot] has a result queued into it
     ID3D10Device1  *d10_dev;                  // not owned, and only for the log line
 
     bool        built;
@@ -3264,6 +3278,7 @@ static void ReleaseShared()
     {
         if (g.d10.relay_ctx != nullptr) { g.d10.relay_ctx->ClearState(); g.d10.relay_ctx->Flush(); }
         for (int i = 0; i < FEED_SLOTS; ++i) FeedD3D10ReleaseBridge(&g.d10_bridge[i]);
+        for (int i = 0; i < FEED_SLOTS; ++i) FeedD3D10ReleaseBridge(&g.d10_in1[i]);
     }
     SafeRelease(g.output_srv);
     g.sr_active = false;              // the next build decides again
@@ -4933,6 +4948,15 @@ static ID3D10Texture2D *AsTexture2D10(ID3D10Resource *res, D3D10_TEXTURE2D_DESC 
 static bool BuildD3D10Bridges(UINT native_w, UINT native_h)
 {
     for (int i = 0; i < FEED_SLOTS; ++i) FeedD3D10ReleaseBridge(&g.d10_bridge[i]);
+    for (int i = 0; i < FEED_SLOTS; ++i) FeedD3D10ReleaseBridge(&g.d10_in1[i]);
+    // Whatever the ring held belongs to the old bridges.
+    g.d10_pipelined        = false;
+    g.d10_pipeline_asked   = g_cfg.d3d10_pipeline;
+    g.d10_ring_n           = 0;
+    g.d10_in_full[0]       = g.d10_in_full[1]  = false;
+    g.d10_out_full[0]      = g.d10_out_full[1] = false;
+    g.d10.ring_marked[0]   = g.d10.ring_marked[1]  = false;
+    g.d10.relay_marked[0]  = g.d10.relay_marked[1] = false;
 
     const struct { int slot; DXGI_FORMAT fmt; bool rtv; } want[FEED_SLOTS] = {
         { FEED_COLOR,  g.color_fmt,              false },
@@ -4950,7 +4974,23 @@ static bool BuildD3D10Bridges(UINT native_w, UINT native_h)
         }
     }
 
-    Log("[feed32] D3D10 bridges built: %ux%u, colour %s", native_w, native_h, FeedFmtName(g.color_fmt));
+    // The second set. A failure here is not fatal: the single-slot drain still works.
+    bool pipelined = g_cfg.d3d10_pipeline != 0;
+    for (int i = 0; pipelined && i < FEED_SLOTS; ++i)
+    {
+        if (!FeedD3D10MakeBridge(&g.d10, &g.d10_in1[want[i].slot], native_w, native_h, want[i].fmt, want[i].rtv))
+        {
+            Log("[feed32] D3D10 second %s bridge failed at %s: 0x%08X -- staying with the per-frame drain",
+                FeedSlotName(want[i].slot), g.d10.where != nullptr ? g.d10.where : "?", g.d10.hr);
+            for (int j = 0; j < FEED_SLOTS; ++j) FeedD3D10ReleaseBridge(&g.d10_in1[j]);
+            pipelined = false;
+        }
+    }
+    g.d10_pipelined = pipelined;
+
+    Log("[feed32] D3D10 bridges built: %ux%u, colour %s, %s", native_w, native_h, FeedFmtName(g.color_fmt),
+        pipelined ? "pipelined (d3d10_pipeline=1: two slots each way, no device is drained; the game shows the result from two frames back)"
+                  : "per-frame drain (d3d10_pipeline=0)");
     return true;
 }
 
@@ -4971,6 +5011,99 @@ static bool BlitHome10(ID3D10Resource *dst)
 // The Direct3D 10 sibling of FeedFrameDispatch's D3D11 branch. Everything from
 // CopyOrResampleInputs onwards is that same client running on the private relay device;
 // what is new is only the two API crossings at either end. See src/feed_d3d10.h.
+// d3d10_pipeline=1: the two-slot handoff described in feed_d3d10.h (PIPELINED HANDOFF).
+// Every wait below is on work submitted a whole frame earlier, so neither the game's GPU
+// nor the CPU sits idle while the other finishes; the game shows the result from two
+// frames back. async_home does not apply: the Output ring already keeps the host's round
+// trip out of the frame.
+static void FeedHandoff10Pipelined(ID3D10Resource *color_res, ID3D10Resource *mv_res,
+                                   ID3D10Resource *depth_res, UINT native_w, UINT native_h)
+{
+    ID3D11DeviceContext *ctx = g.d10.relay_ctx;
+    const int cur  = static_cast<int>(g.d10_ring_n & 1);
+    const int prev = cur ^ 1;
+    FeedD3D10Bridge *b_cur  = cur  == 0 ? g.d10_bridge : g.d10_in1;
+    FeedD3D10Bridge *b_prev = prev == 0 ? g.d10_bridge : g.d10_in1;
+
+    // 1. The relay's work from last frame: it read In[cur] and drew Out[prev].
+    Breadcrumb("waiting for the relay's previous frame");
+    if (!FeedD3D10WaitRelayMark(&g.d10, prev)) { FeedFail("D3D10 relay sync"); return; }
+
+    // 2. This frame into In[cur], and on its way to the GPU.
+    Breadcrumb("handing the frame to the relay device");
+    FeedD3D10Deposit(&g.d10, &b_cur[FEED_COLOR], color_res);
+    FeedD3D10Deposit(&g.d10, &b_cur[FEED_MV],    mv_res);
+    FeedD3D10Deposit(&g.d10, &b_cur[FEED_DEPTH], depth_res);
+    g.d10.game->Flush();
+    ++g.d10_ring_n;
+    g.d10_in_full[cur] = true;
+
+    // The first frame after a build has no previous one to hand on.
+    if (g.d10_in_full[prev])
+    {
+        // 3. The game's work from last frame: its copies into In[prev], its read of Out[cur].
+        Breadcrumb("waiting for the previous frame's copies");
+        if (!FeedD3D10WaitMark(&g.d10, prev)) { FeedFail("D3D10 input sync"); FeedD3D10Mark(&g.d10, cur); return; }
+
+        if (g.sr_active)
+        {
+            if (g.need_reset || g_cfg.reset_every) g.jitter_index = 0;
+            HaltonJitter(g.jitter_index, g.jitter_phases, &g.jitter_x, &g.jitter_y);
+        }
+
+        Breadcrumb("preparing work-resolution inputs");
+        if (!CopyOrResampleInputs(ctx,
+                                  b_prev[FEED_COLOR].tex11,
+                                  b_prev[FEED_MV].tex11,
+                                  b_prev[FEED_DEPTH].tex11,
+                                  b_prev[FEED_MV].srv11,
+                                  b_prev[FEED_DEPTH].srv11,
+                                  native_w, native_h))
+        { FeedFail("work-resolution resample"); FeedD3D10Mark(&g.d10, cur); return; }
+
+        const UINT64 n = ++g.frame_n;
+        const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+        g.need_reset = false;
+
+        g.ctx4->Signal(g.fence_in, n);
+        ctx->Flush();
+
+        const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset),
+                                  g.sr_active ? g.jitter_x : 0.0f, g.sr_active ? g.jitter_y : 0.0f,
+                                  static_cast<uint32_t>(g_cfg.settle_evals),
+                                  g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u,
+                                  g_cfg.hold_strength, g_cfg.hold_tolerance };
+        const bool sent = PipeWriteFrame(fm);
+        if (sent && g.sr_active) ++g.jitter_index;
+        if (!sent) { HostLost("frame message failed"); FeedD3D10Mark(&g.d10, cur); return; }
+
+        // 4. The host's answer, drawn into Out[cur] -- queued on the relay behind the
+        // host's fence, and nobody waits for it this frame.
+        Breadcrumb("queueing the host's result");
+        g.ctx4->Wait(g.fence_out, n);
+        g.fence_wait_queued = true;
+        g.wait_n            = n;
+        g.sent_n            = n;
+        BlitOutputToBackbuffer(ctx, b_cur[FEED_OUTPUT].rtv11);
+        FeedD3D10MarkRelay(&g.d10, cur);
+        g.d10_out_full[cur] = true;
+
+        // 5. Last frame's answer home. Step 1 proved the relay has drawn it.
+        if (g.d10_out_full[prev])
+        {
+            g.d10.game->CopyResource(color_res, b_prev[FEED_OUTPUT].tex10);
+            g.out_valid = true;
+            const UINT64 done = ++g.frames_done;
+            g.consecutive_fails = 0;
+            if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                Log("[feed32] frame %llu delivered (%ux%u, reset=%d, D3D10, pipelined)", done, g.width, g.height, reset);
+        }
+    }
+
+    // Last of the game's work for this frame, after its read of Out[prev].
+    FeedD3D10Mark(&g.d10, cur);
+}
+
 static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource_view rtv)
 {
     LARGE_INTEGER t0, t1;
@@ -5058,7 +5191,8 @@ static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource
                               cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height;
     if (size_changed) g.sr_unavailable = false;
     const bool want_sr = sr_wanted && !g.sr_unavailable && (work_w != cd.Width || work_h != cd.Height);
-    if (ok && (!g.built || size_changed || cd.Format != g.bb_fmt || want_sr != g.sr_requested))
+    if (ok && (!g.built || size_changed || cd.Format != g.bb_fmt || want_sr != g.sr_requested ||
+               g.d10_pipeline_asked != g_cfg.d3d10_pipeline))
     {
         if (GetTickCount64() < g_retry_at)
             ok = false;
@@ -5076,6 +5210,8 @@ static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource
     if (ok && g.built && g.d10_bridge[FEED_COLOR].tex11 != nullptr && g.d10_bridge[FEED_OUTPUT].rtv11 != nullptr)
     {
         if (!HostAlive()) { HostLost("process died"); }
+        else if (g.d10_pipelined)
+            FeedHandoff10Pipelined(color_res, mv_res, depth_res, cd.Width, cd.Height);
         else
         {
             const bool async_home = g_cfg.async_home != 0;
@@ -6435,6 +6571,47 @@ static VOID CALLBACK OnLdrNotify(ULONG reason, const FeedLdrDllNotificationData 
     else Log("[feed32] could not start the release thread (%lu); the add-on stays loaded and unregistered", GetLastError());
 }
 
+// dpi_aware=1 in dlss5-feed.cfg: make the game process DPI aware before it creates its window.
+// A DPI-unaware 32-bit game on a scaled desktop (4K at 200%) is told the screen is 1920x1080:
+// Max Payne 3 then sizes its window, and with it the swap chain, to 1940x1100 and rolls a 4K
+// setting back to 1080p (or shows a grey picture), and RenoDX's fake fullscreen sizes against
+// the same wrong screen. The AppCompat "~ HIGHDPIAWARE" layer did not reach it when started by
+// Steam through PlayMaxPayne3.exe. Read straight from the file at attach -- CfgReload's Cfg has no
+// slot for it, and CfgSave carries unknown keys over -- because it only means anything here,
+// before the first window. Off by default: some games lay their UI out for a 96-DPI screen.
+static void ApplyDpiAwareFromCfg()
+{
+    char path[MAX_PATH];
+    CfgPath(path);
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "r") != 0 || f == nullptr) return;
+    int want = 0;
+    char line[160];
+    while (fgets(line, sizeof(line), f) != nullptr)
+    {
+        int v = 0;
+        if (sscanf_s(line, " dpi_aware = %d", &v) == 1) want = v;
+    }
+    fclose(f);
+    if (want != 1) return;
+
+    const HMODULE user32 = GetModuleHandleA("user32.dll");
+    using SetCtxFn = BOOL(WINAPI *)(HANDLE);
+    using SetAwareFn = BOOL(WINAPI *)();
+    const auto set_ctx = user32 ? reinterpret_cast<SetCtxFn>(GetProcAddress(user32, "SetProcessDpiAwarenessContext")) : nullptr;
+    const auto set_aware = user32 ? reinterpret_cast<SetAwareFn>(GetProcAddress(user32, "SetProcessDPIAware")) : nullptr;
+    // -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, -3 = PER_MONITOR_AWARE (older Windows 10)
+    if (set_ctx != nullptr && (set_ctx(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-4))) ||
+                               set_ctx(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-3)))))
+        Log("[feed32] dpi_aware=1: the game process is now per-monitor DPI aware (it sees the real screen size).");
+    else if (set_ctx != nullptr && GetLastError() == ERROR_ACCESS_DENIED)
+        Log("[feed32] dpi_aware=1: the process already had its DPI awareness set (manifest or compatibility setting); left as it is.");
+    else if (set_aware != nullptr && set_aware())
+        Log("[feed32] dpi_aware=1: the game process is now system DPI aware.");
+    else
+        Log("[feed32] dpi_aware=1: Windows refused to change the DPI awareness (error %lu).", GetLastError());
+}
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
@@ -6464,6 +6641,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         }
         CfgWriteDefault();
         CfgReload();
+        ApplyDpiAwareFromCfg();
         // Said once, plainly, because "enabled=0 but it still crashed" is only evidence if
         // the reader knows what enabled=0 actually leaves behind (issue #44).
         if (!g_cfg.enabled)

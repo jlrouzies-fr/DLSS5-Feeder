@@ -726,12 +726,15 @@ Two smaller notes. The in-game panel's **Show as texture** button is unavailable
 would have to cross into the game's ReShade as a Direct3D 11 texture -- so use the compositor
 button next to it, or `host_window=1`.
 
-And the frame costs two GPU drains, because Direct3D 10 has no fence. The copies themselves are
-cheap (`spike\spike-d3d10client32.exe` measures hundredths of a millisecond at 1080p on an idle
-GPU), but that is a floor rather than a forecast: a drain waits for everything the device has
-outstanding, which in a real game includes the frame the game has just queued. The honest cost is
-lost CPU/GPU pipelining, and the only place to measure it is in the game, with the add-on's own
-GPU-cost figures on the overlay.
+Direct3D 10 has no fence, and up to 1.19.0 the frame paid for that with two GPU drains: a drain
+waits for everything the device has outstanding, which in a real game includes the frame the game
+has just queued, so the CPU and the GPU took turns. Far Cry 2 at 4K sat at 32 fps with the GPU 60%
+used (issue #146). From 1.19.1 the handoff is pipelined by default (`d3d10_pipeline=1`): two
+copies of every bridge, and each wait is on work queued a whole frame earlier, so nothing drains.
+The price is latency -- the game shows the DLSS result from **two** frames back. On a test rig the
+same synthetic load went from 52 to 87 fps; a real game will land somewhere else, and the add-on's
+GPU-cost figures on the overlay are where to look. `d3d10_pipeline=0` brings back the old
+same-frame drain.
 
 ## Install for a DirectX 9 game (beta)
 
@@ -1042,14 +1045,16 @@ the game's own device is asked for nothing but copies.
 
 Two details are worth recording, because neither is what the design notes predicted.
 
-**Keyed mutexes do not work.** `LEGACY-API-ADAPTER.md` says D3D10.1 can synchronise the two
-devices with an `IDXGIKeyedMutex`. On real hardware it cannot: every `CreateTexture2D` carrying
-`D3D10_RESOURCE_MISC_SHARED_KEYEDMUTEX` comes back `E_INVALIDARG` -- every bind flag, every
-format, with or without `MISC_SHARED` alongside -- while the same call on a D3D11 device succeeds
-and plain legacy `MISC_SHARED` on the same D3D10 device succeeds. Modern drivers simply do not
-implement that legacy path. Both D3D10 versions therefore take the event-query route that document
-reserves for D3D10.0, and `spike\spike-d3d10client32.exe` keeps the check so that a driver which
-ever grows the capability shows up as a passing line rather than as folklore.
+**Keyed mutexes do not work -- for the games that matter.** `LEGACY-API-ADAPTER.md` says D3D10.1
+can synchronise the two devices with an `IDXGIKeyedMutex`. In `spike\spike-d3d10client32.exe`
+every `CreateTexture2D` carrying `D3D10_RESOURCE_MISC_SHARED_KEYEDMUTEX` comes back `E_INVALIDARG`
+-- every bind flag, every format, with or without `MISC_SHARED` alongside -- while plain legacy
+`MISC_SHARED` on the same device succeeds. This was first read as drivers dropping the legacy
+path; the real cause is narrower. A D3D10.1 device made on an adapter from a DXGI 1.0 factory --
+which is what passing no adapter gives, and what Far Cry 2 does -- can neither create nor open a
+keyed-mutex texture, and a D3D11 device made on that device's adapter cannot create one either. On
+an `IDXGIFactory1` adapter both work. The game chooses its own factory, so both D3D10 versions take
+the event-query route that document reserves for D3D10.0.
 
 **The frame comes home by `CopyResource`, not by a draw.** The relay runs the whole blit chain --
 scaling, FSR1 EASU/RCAS -- into a backbuffer-sized shared texture, and the game's device only
@@ -1058,9 +1063,12 @@ render target. That matters more here than anywhere else in this project, becaus
 `ID3D10DeviceContext`: state lives directly on the device, so anything the add-on set, the game
 would silently inherit.
 
-The price is two pipeline bubbles a frame, one per device, since an event query drains everything
-that device has outstanding. All three input copies share a single drain rather than paying for
-one each, and `spike\spike-d3d10client32.exe` measures the result.
+With `d3d10_pipeline=0` the price is two pipeline bubbles a frame, one per device, since an event
+query drains everything that device has outstanding; all three input copies share a single drain
+rather than paying for one each. The default pipelined handoff avoids the bubbles by giving each
+crossing two slots and an event query per slot, and only ever waiting on the query from the frame
+before -- by then the GPU has long since finished it. `src\feed_d3d10.h` (PIPELINED HANDOFF) has
+the five steps.
 
 ### The DirectX 9 path
 
@@ -1217,6 +1225,7 @@ if you prefer editing the file directly:
 | `buffer_home` | 0 | **Diagnostic, Vulkan (64-bit).** Route the copy home through a staging buffer instead of an image-to-image copy, for layouts a raw copy cannot express. |
 | `sync_home` | 0 | **Diagnostic, Vulkan and D3D11 (64-bit).** 1 = CPU-wait for the D3D12 result before copying it home. On D3D11 this replaces the cross-API GPU fence wait; on Vulkan it also flushes the copy home before returning. For isolating ordering problems only; it serialises the frame and costs frame time by design. |
 | `async_home` | 1 | **32-bit games only.** 1 = pipelined handoff: each frame carries the DLSS output of the frame *before* it, so the game never waits for the helper process inside a frame — this is what lifts the ~35 fps ceiling of the original same-frame contract (issue #15). Costs one frame of latency on the DLSS output, which the temporal history hides. 0 = the original same-frame behaviour. Also on the overlay as "Pipelined handoff". |
+| `d3d10_pipeline` | 1 | **Direct3D 10 games only.** 1 = two-slot handoff with no GPU drain in the frame; the game shows the DLSS result from two frames back (issue #146). 0 = the drain of 1.19.0 and earlier, same-frame result, with `async_home` applying as before. `async_home` is ignored while this is 1. Edit the file; there is no overlay control. |
 | `host_window` | 0 | **32-bit games only.** 0 keeps the helper's window behind the game, off the taskbar, and lets the overlay's "Show the DLSS 5 panel in-game" button cast its tuning panel into the game window; 1 gives the helper its own visible window instead (press Home there); 2 starts it with no window at all (`--hide`: no in-game panel, no host window, the feed itself unaffected). Read when the helper is started. **At 0 the window is still created, shown and presented on every evaluate** — only its z-order and window style differ — so 0 vs 1 is not an A/B for "does the helper's presenting cost anything"; 2 is. **Exclusive fullscreen:** at 0, if the game's swapchain is exclusive fullscreen when the helper starts, the add-on passes `--hide` by itself and says so in the log. Three 32-bit games froze the instant the helper's window appeared under their fullscreen swapchain (#109, #99, #77), and the desktop compositor cannot draw the cast panel over exclusive fullscreen anyway. Run the game borderless to get the panel. **3** is 0 without that rule: the window stays behind the game and is never turned into `--hide`. It is for wrappers whose swapchain reports fullscreen over what is really a borderless window -- dgVoodoo does this whatever its own `FullScreenMode` says (#118) -- and the overlay offers it as a checkbox when it applies. Do not use 3 on a game that is genuinely exclusive fullscreen. |
 | `host_gpu_priority` | 0 | **32-bit games only.** `1` asks the GPU scheduler to favour the helper process (`D3DKMTSetProcessSchedulingPriorityClass`, realtime class), passed to it as `--gpu-priority` when it starts. Worth trying only for periodic multi-second stalls that persist with everything else at defaults — reported on GTA IV under DXVK, where the reporter had already proved it with Process Lasso. **Off by default on purpose:** realtime GPU priority can starve the very game it is meant to help, and the call needs privilege that may not be granted. The helper logs which of the two happened on every start. |
 | `cast_key` | 0 | **32-bit games only.** Virtual-key code that shows/hides the cast DLSS 5 panel in-game; 0 = none. Set it from the overlay page with "Set key" rather than by hand. |
