@@ -4951,6 +4951,32 @@ static void ShutdownSession();   // defined below; every InitSession* unwinds th
 
 static ID3D12Device *g_dfc_device_proxy = nullptr;
 
+// GITC Uplift (#153) runs NR on a private D3D12 device of its own for D3D11 games. Where the
+// OS/driver cannot give it an independent device (its log: "device factory could not make an
+// independent device (0x80004002)"), D3D12CreateDevice hands out the adapter's one device per
+// process -- so the "private" device InitSession creates below is Uplift's. Uplift starts NGX
+// on the NATIVE device; starting it again on ReShade's proxy of that same device mixes the two
+// identities inside NGX: our list then fails Close() with E_INVALIDARG and the evaluate faults
+// in dxgi.dll through Uplift's _nvngx hooks. It only bit when Uplift came up first (its NR left
+// on from the previous session). With Uplift loaded we take the native device, the same
+// identity Uplift uses, exactly as for Deep Fried Chicken.
+static bool g_uplift_device_shared = false;   // this session's dev12 is the native device Uplift may share
+
+static bool FeedUpliftLoaded()
+{
+    if (GetModuleHandleW(L"gitc-uplift.addon64") != nullptr) return true;
+    wchar_t pat[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, pat, MAX_PATH);
+    wchar_t *s = wcsrchr(pat, L'\\');
+    if (s == nullptr) return false;
+    wcscpy_s(s + 1, MAX_PATH - (s + 1 - pat), L"gitc-uplift*.addon64");
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    FindClose(h);
+    return true;
+}
+
 static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
 {
     Breadcrumb("opening the D3D12 session");
@@ -5017,7 +5043,9 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         // native, otherwise NGX allocates ReShade-wrapped descriptor heaps and
         // passes them to native SetDescriptorHeaps (D3D12Core null dereference).
         // Keep the proxy alive until session teardown for observers holding it.
-        if (g_chicken_present)
+        const bool uplift = FeedUpliftLoaded();
+        g_uplift_device_shared = false;
+        if (g_chicken_present || uplift)
         {
             // ReShade v6.8.0 source/com_utils.hpp: IID_UnwrappedObject (QueryInterface owns a reference).
             static constexpr GUID unwrapped = { 0x7f2c9a11, 0x3b4e, 0x4d6a,
@@ -5027,12 +5055,25 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
             {
                 g_dfc_device_proxy = g.dev12;
                 g.dev12 = native;
-                Log("[feed] DFC native D3D12 transport: proxy=%p native=%p; device, lists and descriptor heaps share native identity",
-                    g_dfc_device_proxy, g.dev12);
+                g_uplift_device_shared = uplift;
+                Log("[feed] %s native D3D12 transport: proxy=%p native=%p; device, lists and descriptor heaps share native identity",
+                    g_chicken_present ? "DFC" : "GITC Uplift", g_dfc_device_proxy, g.dev12);
+                if (uplift)
+                    Log("[feed] GITC Uplift is loaded: it runs NGX on the native device, which D3D12 may hand this "
+                        "add-on too (one device per adapter when Uplift cannot get an independent one, #153). NGX "
+                        "is started on that same native identity, and is not shut down on it at teardown, because "
+                        "that would also end Uplift's NGX instance");
+            }
+            else if (uplift)
+            {
+                Log("[feed] GITC Uplift is loaded but ReShade gave no native device behind the proxy; continuing on "
+                    "the proxy (if this session then fails at 'command list would not close', use the 64-bit "
+                    "helper mode, #153)");
             }
         }
-    // Debug names make the DRED breadcrumb and page-fault output identify OUR objects.
-    g.dev12->SetName(L"dlss5-feed private device");
+    // Debug names make the DRED breadcrumb and page-fault output identify OUR objects. Not on a
+    // device Uplift may own: it would rename Uplift's device in its own DRED output.
+    if (!g_uplift_device_shared) g.dev12->SetName(L"dlss5-feed private device");
     FeedAttachInfoQueue();
 
         wchar_t data_path[MAX_PATH] = {};
@@ -5149,7 +5190,14 @@ static void ShutdownSession()
 {
     ReleaseFrameResources();
     if (g.params != nullptr) { if (!g_ngx_dying) NVSDK_NGX_D3D12_DestroyParameters(g.params); g.params = nullptr; }
-    if (g.ngx_inited && g.dev12 != nullptr) { if (!g_ngx_dying) NVSDK_NGX_D3D12_Shutdown1(g.dev12); g.ngx_inited = false; }
+    // On a device shared with GITC Uplift, Shutdown1 would end Uplift's NGX instance too (#153);
+    // our feature and parameters are released above, which is all that is ours.
+    if (g.ngx_inited && g.dev12 != nullptr)
+    {
+        if (!g_ngx_dying && !g_uplift_device_shared) NVSDK_NGX_D3D12_Shutdown1(g.dev12);
+        g.ngx_inited = false;
+    }
+    g_uplift_device_shared = false;
     SafeRelease(g.blit_vs);
     SafeRelease(g.blit_ps);
     SafeRelease(g.resample_ps);
