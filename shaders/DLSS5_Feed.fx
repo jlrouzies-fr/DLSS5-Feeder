@@ -277,6 +277,29 @@ uniform float FLOW_NOISE <
                  "make a pixel move. Raise it with the static tolerance for a noisy source.";
 > = 0.0015;
 
+uniform bool CAMERA_MODEL <
+    ui_category = "Vector refinement (per pixel)";
+    ui_label = "Fit the camera's motion and use it where it fits (experimental)";
+    ui_tooltip = "When the camera turns, the whole picture moves by one smooth rule. With this on, 900\n"
+                 "points of the frame are tracked against the previous frame, one camera motion is fitted\n"
+                 "to those that agree (the HUD and moving objects are thrown out), and a pixel takes the\n"
+                 "fitted vector wherever that explains it about as well as the provider's own.\n\n"
+                 "Measured on tools/fx-testbed's 3D scene with LumeniteFX, 4K: while the camera PANS, twice\n"
+                 "as many pixels get a vector that is right to a quarter pixel (58-76% against 15-35%)\n"
+                 "and DLAA's output is 6% steadier and 3% closer to its input. While the camera TRAVELS\n"
+                 "the fit is refused or, where it is not, wrong: 2-4% less steady. About half a millisecond\n"
+                 "a frame at 4K on the test machine (RTX 5090).\n"
+                 "Off by default: a gain for footage that mostly pans, not a general one.";
+> = false;
+
+uniform bool CAMERA_DEPTH <
+    ui_category = "Vector refinement (per pixel)";
+    ui_label = "Camera fit: use the depth buffer";
+    ui_tooltip = "Adds the terms of a camera that travels (near things shift more than far ones) to the\n"
+                 "fit. Needs a depth buffer ReShade can read, so it is of no use on a capture; and on\n"
+                 "fx-testbed's scene it did not make the travelling shots better. Off by default.";
+> = false;
+
 uniform int MV_SNAP <
     ui_category = "Vector refinement (per pixel)";
     ui_type = "combo";
@@ -366,6 +389,17 @@ uniform float RESTORE_MIN_CONTRAST <
                  "Raise it if distant scenery gets marked while the camera travels (debug view 'Restore');\n"
                  "lower it if faint HUD text is missed.";
 > = 0.06;
+
+uniform bool RESTORE_HOLD_REPEATS <
+    ui_category = "Restore (DLSS5_Feed_Restore technique)";
+    ui_label = "Hold repeated frames (30 fps content at 60)";
+    ui_tooltip = "A 30 fps game through a 60 Hz capture arrives as every picture twice. A temporal model\n"
+                 "does not answer the second showing the way it answered the first -- it goes on settling\n"
+                 "-- so the output changes on a frame where nothing in the input did, and the picture\n"
+                 "pulses at 30 Hz. With this on, a frame that is the previous one again is shown exactly\n"
+                 "as that one was (for up to three repeats in a row; a picture that simply stands still\n"
+                 "is let through after that, so it still settles).";
+> = true;
 
 uniform float RESTORE_STRENGTH <
     ui_category = "Restore (DLSS5_Feed_Restore technique)";
@@ -568,8 +602,8 @@ uniform int DEBUG_VIEW <
                "Geometry model vectors (colour = direction, brightness = speed)\0"
                "Geometry decision over the image (green = model, red = provider won as moving object, blue = provider rejected)\0"
                "Geometry fit quality (grey = inlier share; top strip = fit error, black 0 px .. white 8 px)\0"
-               "Refine: what each pixel took (dark = static lock, green = zero, blue = the provider's vector, cyan = a neighbouring cell, magenta = last frame's vector, yellow = snapped to whole pixels)\0"
-               "Vector dump for tools/fx-testbed (10-bit codes: R = 512 + 16 x, G = 512 + 16 y, B = mask)\0"
+               "Refine: what each pixel took (dark = static lock, green = zero, blue = the provider's vector, cyan = a neighbouring cell, magenta = last frame's vector, yellow = snapped to whole pixels, orange = the fitted camera motion)\0"
+               "Vector dump for tools/fx-testbed (10-bit codes: R = 512 + 8 x, G = 512 + 8 y, B = mask)\0"
                "Restore: where DLSS5_Feed_Restore puts the input's fine detail back (white)\0";
     ui_label = "Debug view (DLSS5_Feed_Debug technique)";
 > = 0;
@@ -599,9 +633,17 @@ sampler sDLSS5_PrevMV    { Texture = DLSS5_PrevMV;    AddressU = Clamp; AddressV
 // For DLSS5_Feed_Restore. Hud: how sure it is that a pixel is a still element over a moving
 // picture (0..1, built up over frames, see the feed pass); PrevHud: last frame's. Before: the
 // frame as it came in, kept in the back buffer's own format so that nothing is lost in it.
-// x: the share of the frame the provider reports as moving (a 16x9 probe).
-texture DLSS5_Global  { Width = 1; Height = 1; Format = R16F; };
-sampler sDLSS5_Global { Texture = DLSS5_Global; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+// x: the share of the frame the provider reports as moving (a 16x9 probe); y: how many frames
+// in a row have been the previous frame again (0 = this one is new); z: the share of 8x8 blocks
+// that changed. PrevGlobal: last frame's, for the count.
+texture DLSS5_Global     { Width = 1; Height = 1; Format = RGBA16F; };
+texture DLSS5_PrevGlobal { Width = 1; Height = 1; Format = RGBA16F; };
+sampler sDLSS5_Global     { Texture = DLSS5_Global;     MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+sampler sDLSS5_PrevGlobal { Texture = DLSS5_PrevGlobal; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+// 1 where anything in an 8x8 block changed since the last frame, 0 where nothing did; its small
+// mips say how much of the frame that is.
+texture DLSS5_Changed  { Width = BUFFER_WIDTH / 8; Height = BUFFER_HEIGHT / 8; Format = R16F; MipLevels = 7; };
+sampler sDLSS5_Changed { Texture = DLSS5_Changed; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
 texture DLSS5_Hud     { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R8; };
 texture DLSS5_PrevHud { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R8; };
 sampler sDLSS5_Hud     { Texture = DLSS5_Hud;     AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
@@ -616,6 +658,15 @@ sampler sDLSS5_PrevHud { Texture = DLSS5_PrevHud; AddressU = Clamp; AddressV = C
 #else
     texture DLSS5_Before { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA8; };
 #endif
+// What was shown last frame, after everything: a repeated frame is shown as this again.
+#if BUFFER_COLOR_BIT_DEPTH == 16
+    texture DLSS5_LastOut { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA16F; };
+#elif BUFFER_COLOR_BIT_DEPTH == 10
+    texture DLSS5_LastOut { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGB10A2; };
+#else
+    texture DLSS5_LastOut { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA8; };
+#endif
+sampler sDLSS5_LastOut { Texture = DLSS5_LastOut; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
 sampler sDLSS5_Before { Texture = DLSS5_Before; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
 
 // This frame's vector as decided, in delta UV -- DLSS5_MV cannot be read back for that: it is
@@ -824,7 +875,7 @@ float SubCell(float l, float c, float r)
 // pick it sends every finer level looking in the wrong place (measured: a 32 px-pitch list
 // scrolling at 1.25 px a frame, 1080p, read as -30.75). Measured from the coarser level's
 // answer and not from zero, because from zero it is a tax on speed: a 38 px pan is 19 cells
-// long at the finest level, and was read as 25 px.
+// long at the finest level, and came out well short.
 #define DLSS5_FLOW_TRY(V) \
     { const float2 v_ = (V); \
       if (any(abs(v_ - best) > 0.125 * cell)) { \
@@ -956,6 +1007,49 @@ float4 PS_FlowMedian(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Targe
 #endif   // DLSS5_MV_BUILTIN
 
 // ---------------------------------------------------------------------------------------------
+// Camera model. Screen position x, y in -0.5..0.5, inverse-depth term w = s / (depth + s).
+// Basis (9 terms):  1, x, y, x^2, xy, y^2, w, xw, yw  -- the small-rotation flow field of a
+// pinhole camera is quadratic in the image position, and translation adds terms in 1/Z.
+// Both flow components share the basis; the fit solves them together (two right-hand sides).
+// ---------------------------------------------------------------------------------------------
+
+#define DLSS5_BASIS(B, x, y, w) \
+    B[0] = 1.0; B[1] = x; B[2] = y; B[3] = x * x; B[4] = x * y; B[5] = y * y; B[6] = w; B[7] = x * w; B[8] = y * w;
+
+// Without a depth buffer worth the name (a capture, a game ReShade cannot read depth from) the
+// three parallax terms are switched off and the model is what a camera that only turns and
+// zooms does to a picture.
+float ParallaxW(float d) { return (CAMERA_DEPTH || GEOM_ENABLE) ? GEOM_PARALLAX / (d + GEOM_PARALLAX) : 0.0; }
+
+// The model's predicted delta-UV at uv for linear depth d.
+float2 PredictMV(float2 uv, float d)
+{
+    const float4 c = float4(0.5, 0.5, 0.0, 0.0);
+    const float4 p0 = tex2Dlod(sDLSS5_Cam0, c), p1 = tex2Dlod(sDLSS5_Cam1, c), p2 = tex2Dlod(sDLSS5_Cam2, c);
+    const float4 p3 = tex2Dlod(sDLSS5_Cam3, c), p4 = tex2Dlod(sDLSS5_Cam4, c);
+    const float x = uv.x - 0.5, y = uv.y - 0.5, w = ParallaxW(d);
+    float B[9]; DLSS5_BASIS(B, x, y, w)
+    // u: p0.xyzw p1.xyzw p2.x     v: p2.yzw p3.xyzw p4.xy
+    const float u = p0.x * B[0] + p0.y * B[1] + p0.z * B[2] + p0.w * B[3] + p1.x * B[4] + p1.y * B[5] + p1.z * B[6] + p1.w * B[7] + p2.x * B[8];
+    const float v = p2.y * B[0] + p2.z * B[1] + p2.w * B[2] + p3.x * B[3] + p3.y * B[4] + p3.z * B[5] + p3.w * B[6] + p4.x * B[7] + p4.y * B[8];
+    return float2(u, v);
+}
+
+bool FitIsUsable()
+{
+    // x = inlier share of the whole grid, y = rms px, z = samples used, w = samples offered
+    const float4 s = tex2Dlod(sDLSS5_Cam5, float4(0.5, 0.5, 0.0, 0.0));
+    // For the experimental geometry vectors: a quarter of the grid. For the per-pixel stage's
+    // camera vector, whose samples are only the trackable ones: two thirds of those -- one
+    // motion has to explain that much of what can be followed at all, or there is no "the
+    // camera". (It is a blunt test. With some hundred samples a pan scores 0.7-0.9 and a
+    // camera travelling past things at different distances 0.45-0.7. At 0.65 most of
+    // fx-testbed's travelling frames are refused and those shots come out 2-3% less steady
+    // than without the fit; at 0.5 it is 5-7%, with no test at all 9-10%.)
+    return s.z >= 40.0 && (GEOM_ENABLE ? s.x >= 0.25 : s.z >= 0.65 * s.w);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Per-pixel refinement (MV_PIPELINE = 0), for every provider. Returns the vector in PIXELS.
 //
 // A provider's field is coarse -- 1/8 of the frame for LumeniteFX, half for the built-in one,
@@ -982,7 +1076,7 @@ float4 PS_FlowMedian(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Targe
 //      nearest whole-pixel vector is taken where it reproduces the pixel (history is then
 //      fetched pixel for pixel).
 // code: 0 static lock, 1 zero, 2 the provider's vector, 3 a neighbouring cell, 4 last frame's
-// vector, 5 snapped to whole pixels.
+// vector, 5 snapped to whole pixels, 6 the fitted camera motion.
 // ---------------------------------------------------------------------------------------------
 
 // Scored at two scales at once: the 3x3 pixels around the pixel, and a 3x3 of 4 px cells around
@@ -1052,10 +1146,25 @@ float2 RefineMV(float2 uv, out float distrust, out float code, out float detail,
     // The provider's own answer for this pixel.
     float2 best = ProviderMV(uv) * BUFFER_SCREEN_SIZE;
     code = 2.0;
+    // And the camera's: what the motion fitted to the whole frame says this pixel did.
+    float2 cam = best;
+    bool   has_cam = false;
+    if (CAMERA_MODEL && FitIsUsable())
+    {
+        cam = PredictMV(uv, ReShade::GetLinearizedDepth(uv)) * BUFFER_SCREEN_SIZE;
+        has_cam = true;
+    }
     // Nothing here to tell one place from another (flat colour, a soft gradient, plain noise):
     // nothing can be shown to be better than the provider's vector, whose estimate comes from
     // the structure around the pixel -- the inside of a moving surface moves with its outline.
-    if (contrast < 4.0 * FLOW_NOISE) { stale = 1.0; return best; }
+    // Where that agrees with the camera's motion to within a pixel or so, the camera's is the
+    // more exact of the two.
+    if (contrast < 4.0 * FLOW_NOISE)
+    {
+        stale = 1.0;
+        if (has_cam && length(cam - best) <= 1.0 + 0.1 * length(cam)) { code = 6.0; return cam; }
+        return best;
+    }
 
     // "Reproduces": last frame, fetched PIXEL FOR PIXEL at a whole-pixel vector, is this pixel
     // -- its nine samples, as they are, to within the noise and a tenth of the patch's own
@@ -1070,20 +1179,33 @@ float2 RefineMV(float2 uv, out float distrust, out float code, out float detail,
     const float e_zero = P9Cost(c0, m0, p0);
     const float t_zero = e_zero + P9Cost(c2, m2, p2);
     float t_best = PickCost(c0, m0, c2, m2, uv, best);
+    // The camera's vector is taken wherever it explains the pixel about as well as the
+    // provider's -- within a quarter, which is no more than the match cost differs between two
+    // vectors a fraction of a pixel apart. It has two things the provider's does not: it is
+    // smooth by construction, and it comes from the whole frame (on a 38 px pan LumeniteFX is
+    // 2.3 px out on average, the fit 0.3-0.4). A pixel that moves by itself fails this test and
+    // keeps the provider's vector.
+    if (has_cam && any(abs(cam - best) > 0.02))
+    {
+        const float t_cam = PickCost(c0, m0, c2, m2, uv, cam);
+        if (t_cam <= t_best * 1.25 + 2.0 * FLOW_NOISE) { best = cam; t_best = t_cam; code = 6.0; }
+    }
 
-    // Still: it has pixel-scale structure and those very pixels are where they were, or "did
-    // not move" explains it at least twice as well as the provider does (by match cost, so the
-    // wall under the flickering lamp goes to zero by this one). Twice, not "somewhat better":
-    // under a slow pan a provider that is a third of a pixel off and "did not move" are about
-    // equally wrong, and a small head start for zero was enough to freeze every edge in the
-    // picture (the tile joints and mortar lines of fx-testbed's courtyard, at 0.6 px a frame).
-    // "In place" has to hold around the pixel as well as on it: a horizontal mortar line under
-    // a horizontal pan slides along itself, and its own nine samples do not change at all.
-    const bool in_place = detail >= 4.0 * FLOW_NOISE && r_zero <= exact && P9RawDiff(c2, p2) <= FLOW_NOISE + 0.1 * wide;
-    if (in_place || t_zero < 0.5 * t_best - FLOW_NOISE)
+    // Still: "did not move" explains the pixel at least twice as well as the provider does (by
+    // match cost, so the wall under the flickering lamp goes to zero by this too). Twice, not
+    // "somewhat better": under a slow pan a provider that is a third of a pixel off and "did
+    // not move" are about equally wrong, and a small head start for zero was enough to freeze
+    // every edge in the picture (the tile joints and mortar lines of fx-testbed's courtyard, at
+    // 0.6 px a frame).
+    // There used to be a second way to zero here: "the pixel's own nine samples are where they
+    // were". It is true of a caption -- and of a mortar line that slides along itself under a
+    // pan. With EXACT vectors as the provider (fxlab_Oracle.fx) that rule alone cost 6% of the
+    // scene's accuracy, and with LumeniteFX the picture was 2% steadier without it, while the
+    // captions it was written for kept their zero by the rule above (98.6-100% of glyph pixels
+    // either way). So it is gone.
+    if (t_zero < 0.5 * t_best - FLOW_NOISE)
     {
         best = 0.0; t_best = t_zero; code = 1.0;
-        if (in_place) return float2(0.0, 0.0);
     }
 
     // The vector in hand leaves a real part of the pixel unexplained: the border between two
@@ -1111,7 +1233,9 @@ float2 RefineMV(float2 uv, out float distrust, out float code, out float detail,
     const bool zero_now = dot(best, best) == 0.0;
     float e_best    = zero_now ? e_zero : SymCost(c0, m0, uv, best, 1.0, 0.0);
     bool  from_zero = false;
-    if (REFINE_SUBPIXEL && MV_SNAP != 1)
+    // (Not on the camera's vector: a 3x3 patch has nothing to teach a fit of the whole frame,
+    // and polishing it took a tenth of the pixels it had right to a quarter pixel away again.)
+    if (REFINE_SUBPIXEL && MV_SNAP != 1 && code != 6.0)
     {
         float2 f  = best;
         float  ef = e_best;
@@ -1265,53 +1389,149 @@ float4 ValidateTests(float2 uv, float2 mv)
     return bad;
 }
 
-// ---------------------------------------------------------------------------------------------
-// Camera model. Screen position x, y in -0.5..0.5, inverse-depth term w = s / (depth + s).
-// Basis (9 terms):  1, x, y, x^2, xy, y^2, w, xw, yw  -- the small-rotation flow field of a
-// pinhole camera is quadratic in the image position, and translation adds terms in 1/Z.
-// Both flow components share the basis; the fit solves them together (two right-hand sides).
-// ---------------------------------------------------------------------------------------------
-
-#define DLSS5_BASIS(B, x, y, w) \
-    B[0] = 1.0; B[1] = x; B[2] = y; B[3] = x * x; B[4] = x * y; B[5] = y * y; B[6] = w; B[7] = x * w; B[8] = y * w;
-
-float ParallaxW(float d) { return GEOM_PARALLAX / (d + GEOM_PARALLAX); }
-
-// The model's predicted delta-UV at uv for linear depth d.
-float2 PredictMV(float2 uv, float d)
+// One gradient step (Lucas-Kanade) of a fit sample's vector v (pixels): a 7x7 window of taps
+// `cell` pixels apart on mip `lod`, read symmetrically like SymCost (the fraction of v split
+// between the two frames, so both carry the same blur), each frame's own mean brightness taken
+// out (a flicker is not motion). Returns the corrected vector.
+//   lmin: the smaller eigenvalue of the window's gradient matrix, per tap -- how well the window
+//         pins motion down in its WEAKEST direction. An edge, however strong, has none along
+//         itself, and a sample that only knows the motion across its edge is no use to a fit.
+//   res:  what the corrected vector leaves unexplained (rms, luma);  dev: the window's own rms
+//         contrast, to hold that against.
+float2 TrackStep(float2 uv, float2 v, float cell, float lod, out float lmin, out float res, out float dev)
 {
-    const float4 c = float4(0.5, 0.5, 0.0, 0.0);
-    const float4 p0 = tex2Dlod(sDLSS5_Cam0, c), p1 = tex2Dlod(sDLSS5_Cam1, c), p2 = tex2Dlod(sDLSS5_Cam2, c);
-    const float4 p3 = tex2Dlod(sDLSS5_Cam3, c), p4 = tex2Dlod(sDLSS5_Cam4, c);
-    const float x = uv.x - 0.5, y = uv.y - 0.5, w = ParallaxW(d);
-    float B[9]; DLSS5_BASIS(B, x, y, w)
-    // u: p0.xyzw p1.xyzw p2.x     v: p2.yzw p3.xyzw p4.xy
-    const float u = p0.x * B[0] + p0.y * B[1] + p0.z * B[2] + p0.w * B[3] + p1.x * B[4] + p1.y * B[5] + p1.z * B[6] + p1.w * B[7] + p2.x * B[8];
-    const float v = p2.y * B[0] + p2.z * B[1] + p2.w * B[2] + p3.x * B[3] + p3.y * B[4] + p3.z * B[5] + p3.w * B[6] + p4.x * B[7] + p4.y * B[8];
-    return float2(u, v);
-}
-
-bool FitIsUsable()
-{
-    const float4 s = tex2Dlod(sDLSS5_Cam5, float4(0.5, 0.5, 0.0, 0.0));   // x = inlier share, y = rms px, z = samples used
-    return s.z >= 40.0 && s.x >= 0.25;
+    const float2 px = BUFFER_PIXEL_SIZE;
+    const float2 vi = round(v), vf = v - vi;
+    float a[81], b[81];
+    [loop] for (int k = 0; k < 81; ++k)
+    {
+        const float2 o = float2(k % 9 - 4, k / 9 - 4) * cell;
+        a[k] = tex2Dlod(sDLSS5_CurLuma,  float4(uv + (o - 0.5 * vf) * px, 0.0, lod)).x;
+        b[k] = tex2Dlod(sDLSS5_PrevLuma, float4(uv + (o + vi + 0.5 * vf) * px, 0.0, lod)).x;
+    }
+    float sxx = 0.0, sxy = 0.0, syy = 0.0, sxt = 0.0, syt = 0.0, stt = 0.0;
+    float sx = 0.0, sy = 0.0, st = 0.0, sa = 0.0, saa = 0.0;
+    [loop] for (int j = 1; j < 8; ++j)
+    {
+        [loop] for (int i = 1; i < 8; ++i)
+        {
+            const int   c  = j * 9 + i;
+            const float gx = 0.25 * ((a[c + 1] - a[c - 1]) + (b[c + 1] - b[c - 1])) / cell;
+            const float gy = 0.25 * ((a[c + 9] - a[c - 9]) + (b[c + 9] - b[c - 9])) / cell;
+            const float t  = b[c] - a[c];
+            sxx += gx * gx; sxy += gx * gy; syy += gy * gy;
+            sxt += gx * t;  syt += gy * t;  stt += t * t;
+            sx  += gx;      sy  += gy;      st  += t;
+            sa  += a[c];    saa += a[c] * a[c];
+        }
+    }
+    const float n = 49.0;
+    sxx -= sx * sx / n; sxy -= sx * sy / n; syy -= sy * sy / n;
+    sxt -= sx * st / n; syt -= sy * st / n; stt -= st * st / n;
+    dev  = sqrt(max(saa - sa * sa / n, 0.0) / n);
+    lmin = 0.5 * (sxx + syy - sqrt((sxx - syy) * (sxx - syy) + 4.0 * sxy * sxy)) / n;
+    const float det = sxx * syy - sxy * sxy;
+    float2 d = 0.0;
+    if (det > 1e-14) d = clamp(-float2(syy * sxt - sxy * syt, sxx * syt - sxy * sxt) / det, -cell, cell);
+    res = sqrt(max(stt + d.x * sxt + d.y * syt, 0.0) / n);
+    return v + d;
 }
 
 // Pass 1: sample the provider's flow and the depth on a sparse grid.
 //
 // ReShade cannot skip a whole pass on a uniform, so both fit passes start by checking the
-// one uniform that decides whether anything downstream will ever read them. It matters:
-// PS_FitSolve is a ONE-pixel shader that runs 2 x 920 iterations with two fetches each and
-// a 9x9 Gauss-Jordan solve -- a long serial latency chain on a single lane, every frame,
-// for a result only GeometryDecide consumes. GEOM_ENABLE is off by default.
+// uniforms that decide whether anything downstream will ever read them. It matters:
+// PS_FitSolve is a ONE-pixel shader that runs 2 x 920 iterations (6 x 920 for the per-pixel
+// stage's camera vector) with two fetches each and a 9x9 Gauss-Jordan solve every time -- a
+// long serial chain on a single lane, half a millisecond of it, every frame. Both consumers
+// (GEOM_ENABLE, CAMERA_MODEL) are off by default.
 void PS_FitSamples(float4 vpos : SV_Position, float2 uv : TEXCOORD, out float4 A : SV_Target0, out float4 B : SV_Target1)
 {
-    if (!GEOM_ENABLE) { A = 0.0; B = 0.0; return; }
-    const float2 suv = (floor(vpos.xy) + 0.5) / float2(DLSS5_FIT_W, DLSS5_FIT_H);
-    const float  d   = ReShade::GetLinearizedDepth(suv);
-    const float2 mv  = ProviderMV(suv);
-    const bool valid = d > 0.001 && all(abs(mv * BUFFER_SCREEN_SIZE) < 512.0);
-    A = float4(suv.x - 0.5, suv.y - 0.5, ParallaxW(d), valid ? 1.0 : 0.0);
+    if (!GEOM_ENABLE && !(CAMERA_MODEL && MV_PIPELINE == 0)) { A = 0.0; B = 0.0; return; }
+    float2 suv = (floor(vpos.xy) + 0.5) / float2(DLSS5_FIT_W, DLSS5_FIT_H);
+    float2 mv  = ProviderMV(suv);
+    bool  valid  = true;
+    float weight = 1.0;
+    if (CAMERA_MODEL && MV_PIPELINE == 0 && !GEOM_ENABLE)
+    {
+        // For the per-pixel stage's camera vector the samples are made exact first. A provider's
+        // errors are not noise that a fit averages away -- LumeniteFX reads a 0.64 px pan as
+        // 0.50 nearly everywhere, and a model fitted to that says 0.50 too. So each sample is
+        // moved to the most structured of five spots in its cell (a vector on a blank wall is
+        // a guess) and TRACKED against the two frames themselves, starting from the provider's
+        // vector: one step on 4 px cells to get within reach, three on 2 px cells. It is kept
+        // only if its window pins the motion down in both directions, the tracking settled,
+        // and the result explains the window -- about one sample in eight, on fx-testbed's
+        // courtyard.
+        // Half resolution is where it ends on purpose. Steps at full resolution were tried,
+        // through the sampler and with a Catmull-Rom spline from whole pixels, and were worse
+        // either way (a slow pan right to a quarter pixel on 53% of the frame against 77%):
+        // the pixel-scale detail of a rendered 4K frame is not a shifted copy of the last
+        // frame's. Even started from EXACT vectors no version of this tracker kept more than
+        // about two samples in three within a quarter pixel; it is the fit over all of them
+        // that makes them usable.
+        // Fitted to exact vectors the model is right to a quarter pixel on 96% of a panning
+        // frame (tools/fx-testbed, fxlab_Oracle.fx); fitted to these samples, on 73-83%.
+        const float2 px   = BUFFER_PIXEL_SIZE;
+        const float2 step = 0.25 / float2(DLSS5_FIT_W, DLSS5_FIT_H);
+        // (Structure is judged on 4 px cells: at 4K a 3x3 of single pixels is flat nearly
+        // everywhere in a rendered scene, and a first version that asked for contrast there
+        // was left with 27 samples of 920.)
+        float2 at = (floor(suv * BUFFER_SCREEN_SIZE) + 0.5) * px;
+        P9     c0 = Patch9(sDLSS5_CurLuma, at, px * 4.0, 2.0);
+        float  detail = P9Contrast(c0, P9Mean(c0));
+        [unroll] for (int k = 0; k < 4; ++k)
+        {
+            const float2 o  = float2(k < 2 ? -1.0 : 1.0, (k & 1) ? 1.0 : -1.0) * step;
+            const float2 a2 = (floor((suv + o) * BUFFER_SCREEN_SIZE) + 0.5) * px;
+            const P9     c2 = Patch9(sDLSS5_CurLuma, a2, px * 4.0, 2.0);
+            const float  d2 = P9Contrast(c2, P9Mean(c2));
+            if (d2 > detail) { at = a2; detail = d2; }
+        }
+        suv = at;
+        // What did not change at all is left out: a still HUD is not the camera, and under a
+        // slow pan it sits well inside any outlier tolerance -- a fifth of the samples at zero
+        // made a 0.64 px pan come out as 0.55. (A still frame leaves nothing to fit, and the
+        // per-pixel stage then has no camera vector, which is right: it needs none.)
+        const P9 s0 = Patch9(sDLSS5_CurLuma, suv, px, 0.0), s2 = Patch9(sDLSS5_CurLuma, suv, px * 4.0, 2.0);
+        valid = !(P9MaxDiff(s0, Patch9(sDLSS5_PrevLuma, suv, px, 0.0)) <= STATIC_NOISE
+               && P9MaxDiff(s2, Patch9(sDLSS5_PrevLuma, suv, px * 4.0, 2.0)) <= 0.25 * STATIC_NOISE);
+        // Nor anything within the window that the feed pass has marked as a still element over
+        // a moving picture (last frame's map: this frame's is written after the fit).
+        {
+            const float2 h = px * 6.0;
+            const float hud = max(tex2Dlod(sDLSS5_PrevHud, float4(suv, 0.0, 0.0)).x,
+                              max(max(tex2Dlod(sDLSS5_PrevHud, float4(suv + float2(-h.x, -h.y), 0.0, 0.0)).x, tex2Dlod(sDLSS5_PrevHud, float4(suv + float2(h.x, -h.y), 0.0, 0.0)).x),
+                                  max(tex2Dlod(sDLSS5_PrevHud, float4(suv + float2(-h.x,  h.y), 0.0, 0.0)).x, tex2Dlod(sDLSS5_PrevHud, float4(suv + float2(h.x,  h.y), 0.0, 0.0)).x)));
+            valid = valid && hud < 0.25;
+        }
+        if (valid)
+        {
+            float lmin, res, dev;
+            float2 v = ProviderMV(suv) * BUFFER_SCREEN_SIZE;
+            float2 v1 = v;
+            [loop] for (int it = 0; it < 4; ++it)
+            {
+                const float lod = it == 0 ? 2.0 : 1.0;
+                v  = v1;
+                v1 = TrackStep(suv, v, exp2(lod), lod, lmin, res, dev);
+            }
+            // Gradients are small numbers in a rendered frame: asking for 6 noise floors left 30
+            // samples of 920, 1.5 leaves a hundred, and below that the vectors get worse faster
+            // than they get more.
+            const float  g  = 1.5 * FLOW_NOISE;
+            valid = lmin >= g * g && all(abs(v1 - v) <= 0.25) && res <= 0.35 * dev + 2.0 * FLOW_NOISE;
+            // The error of a tracked vector goes with one over the gradient energy, so a window
+            // with a corner in it counts for more than one with a faint texture.
+            const float g1 = 2.0 * FLOW_NOISE;
+            weight = lmin / (lmin + g1 * g1);
+            mv = v1 * px;
+        }
+    }
+    // (A capture has no depth; the fit without parallax terms must not wait for one.)
+    const float d = ReShade::GetLinearizedDepth(suv);
+    valid = valid && (d > 0.001 || !(CAMERA_DEPTH || GEOM_ENABLE)) && all(abs(mv * BUFFER_SCREEN_SIZE) < 512.0);
+    A = float4(suv.x - 0.5, suv.y - 0.5, ParallaxW(d), valid ? weight : 0.0);
     B = float4(mv, 0.0, 0.0);
 }
 
@@ -1324,14 +1544,26 @@ void PS_FitSolve(float4 vpos : SV_Position, float2 uv : TEXCOORD,
 {
     // See PS_FitSamples. P5.z is the sample count FitIsUsable() tests against 40, so a zeroed
     // P5 also reads as "no usable fit" for anything that looks at it anyway.
-    if (!GEOM_ENABLE) { P0 = 0.0; P1 = 0.0; P2 = 0.0; P3 = 0.0; P4 = 0.0; P5 = 0.0; return; }
+    if (!GEOM_ENABLE && !(CAMERA_MODEL && MV_PIPELINE == 0)) { P0 = 0.0; P1 = 0.0; P2 = 0.0; P3 = 0.0; P4 = 0.0; P5 = 0.0; return; }
     float p[18];
     [unroll] for (int z = 0; z < 18; ++z) p[z] = 0.0;
     float inlier = 0.0, rms = 0.0, used = 0.0;
     const int total = DLSS5_FIT_W * DLSS5_FIT_H;
 
-    [loop] for (int it = 0; it < 2; ++it)
+    // Tracked samples (the per-pixel stage's camera vector) get four more passes that keep only
+    // what the one before explains closely, down to a quarter of the motion at the middle of
+    // the frame (between 0.2 and 1 px). A moving object is thrown out by the second pass; what
+    // sits a little off the model -- something half transparent over the scene, parallax
+    // without depth -- by these. The tolerance closes in a step at a time -- 4 px, 2, 1, then
+    // twice at the tight one -- so that each pass is judged against a fit that the worst of
+    // the samples have already left.
+    const int passes = GEOM_ENABLE ? 2 : 6;
+    float valid = 0.0;
+    [loop] for (int it = 0; it < 6; ++it)
     {
+        if (it >= passes) break;
+        const float tight = clamp(0.25 * length(float2(p[0], p[9]) * BUFFER_SCREEN_SIZE), 0.2, 1.0);
+        const float limit = GEOM_ENABLE || it < 2 ? GEOM_OUTLIER_PX : max(tight, it == 2 ? 2.0 : it == 3 ? 1.0 : 0.0);
         float M[45];   // upper triangle of the 9x9 normal matrix
         float ru[9], rv[9];
         [unroll] for (int z0 = 0; z0 < 45; ++z0) M[z0] = 0.0;
@@ -1344,23 +1576,24 @@ void PS_FitSolve(float4 vpos : SV_Position, float2 uv : TEXCOORD,
             const int2   cell = int2(s % DLSS5_FIT_W, s / DLSS5_FIT_W);
             const float4 a = tex2Dfetch(sDLSS5_FitA, cell);
             const float4 b = tex2Dfetch(sDLSS5_FitB, cell);
-            if (a.w < 0.5) continue;
+            if (a.w <= 0.0) continue;
+            if (it == 0) valid += 1.0;
             float B[9]; DLSS5_BASIS(B, a.x, a.y, a.z)
             if (it > 0)
             {
                 float pu = 0.0, pv = 0.0;
                 [unroll] for (int i0 = 0; i0 < 9; ++i0) { pu += p[i0] * B[i0]; pv += p[9 + i0] * B[i0]; }
                 const float r = length((float2(pu, pv) - b.xy) * BUFFER_SCREEN_SIZE);
-                if (r > GEOM_OUTLIER_PX) continue;
+                if (r > limit) continue;
                 se += r * r;
             }
             ++n;
             int k = 0;
             [unroll] for (int i = 0; i < 9; ++i)
             {
-                ru[i] += B[i] * b.x;
-                rv[i] += B[i] * b.y;
-                [unroll] for (int j = i; j < 9; ++j) { M[k] += B[i] * B[j]; ++k; }
+                ru[i] += a.w * B[i] * b.x;
+                rv[i] += a.w * B[i] * b.y;
+                [unroll] for (int j = i; j < 9; ++j) { M[k] += a.w * B[i] * B[j]; ++k; }
             }
         }
         if (n < 40) break;   // not enough evidence: keep whatever the previous pass produced
@@ -1414,7 +1647,7 @@ void PS_FitSolve(float4 vpos : SV_Position, float2 uv : TEXCOORD,
     P2 = float4(p[8],  p[9],  p[10], p[11]);
     P3 = float4(p[12], p[13], p[14], p[15]);
     P4 = float4(p[16], p[17], 0.0, 0.0);
-    P5 = float4(inlier, rms, used, 0.0);
+    P5 = float4(inlier, rms, used, valid);
 }
 
 // Per-pixel decision: x = final delta-UV vector, .z = 0 model / 1 provider (moving object) /
@@ -1434,15 +1667,44 @@ float4 GeometryDecide(float2 uv, float d, float2 flow)
     return float4(pred, 2.0, GEOM_MASK_REJECTED * saturate((r - agree) / (4.0 * agree)));
 }
 
-// The share of the frame the provider reports as moving (more than half a pixel), on a 16x9
-// probe. One pixel; it only tells "the picture as a whole is in motion" from "something in it is".
-float PS_Global(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+// Did anything in this 8x8 block of pixels change since the last frame? Every pixel is looked
+// at: a frame counts as "the previous one again" only if not one block says yes.
+float PS_Changed(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+    const float2 px = BUFFER_PIXEL_SIZE;
+    float d = 0.0;
+    [unroll] for (int y = 0; y < 8; ++y)
+    [unroll] for (int x = 0; x < 8; ++x)
+    {
+        const float4 at = float4(uv + (float2(x, y) - 3.5) * px, 0.0, 0.0);
+        d = max(d, abs(tex2Dlod(sDLSS5_CurLuma, at).x - tex2Dlod(sDLSS5_PrevLuma, at).x));
+    }
+    return d > STATIC_NOISE ? 1.0 : 0.0;
+}
+
+// One pixel of frame-wide facts.
+//   x: the share of the frame the provider reports as moving (more than half a pixel), on a
+//      16x9 probe -- "the picture as a whole is in motion", as opposed to "something in it is";
+//   y: for how many frames in a row this has been the previous frame again;
+//   z: the share of 8x8 blocks that changed.
+float4 PS_Global(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
     float n = 0.0;
     [unroll] for (int y = 0; y < 9; ++y)
     [unroll] for (int x = 0; x < 16; ++x)
         n += any(abs(ProviderMV((float2(x, y) + 0.5) / float2(16.0, 9.0))) > 0.5 * BUFFER_PIXEL_SIZE) ? 1.0 : 0.0;
-    return n / 144.0;
+    float changed = 0.0;
+    [unroll] for (int j = 0; j < 4; ++j)
+    [unroll] for (int i = 0; i < 4; ++i)
+        changed += tex2Dlod(sDLSS5_Changed, float4((float2(i, j) + 0.5) / 4.0, 0.0, 6.0)).x;
+    changed /= 16.0;
+    const float before = tex2Dlod(sDLSS5_PrevGlobal, float4(0.5, 0.5, 0.0, 0.0)).y;
+    return float4(n / 144.0, changed > 0.0 ? 0.0 : min(before + 1.0, 1000.0), changed, 0.0);
+}
+
+float4 PS_GlobalHistory(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+    return tex2Dlod(sDLSS5_Global, float4(0.5, 0.5, 0.0, 0.0));
 }
 
 float RawDepth(float2 uv)
@@ -1674,14 +1936,16 @@ float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
         const float3 img  = tex2Dlod(sDLSS5_ColorInput, float4(uv, 0.0, 0.0)).rgb * 0.35;
         const float  code = tex2Dlod(sDLSS5_StaticNow, float4(uv, 0.0, 0.0)).x * 8.0;
         const float3 tint = code < 0.5 ? float3(0.0, 0.0, 0.0) : code < 1.5 ? float3(0.0, 0.55, 0.0) : code < 2.5 ? float3(0.1, 0.25, 0.9)
-                          : code < 3.5 ? float3(0.0, 0.6, 0.6) : code < 4.5 ? float3(0.8, 0.0, 0.7) : float3(0.85, 0.75, 0.0);
+                          : code < 3.5 ? float3(0.0, 0.6, 0.6) : code < 4.5 ? float3(0.8, 0.0, 0.7) : code < 5.5 ? float3(0.85, 0.75, 0.0) : float3(0.9, 0.4, 0.0);
         return saturate(img + tint);
     }
     if (DEBUG_VIEW == 10)
     {
         const float2 v = tex2Dlod(sDLSS5_MV, float4(uv, 0.0, 0.0)).xy;
-        // Whole 10-bit codes, 1/16 px a step, so a zero vector reads back as exactly 512.
-        return float3((round(clamp(v, -31.0, 31.0) * 16.0) + 512.0) / 1023.0, tex2Dlod(sDLSS5_Mask, float4(uv, 0.0, 0.0)).x);
+        // Whole 10-bit codes, 1/8 px a step and +-63 px, so a zero vector reads back as exactly
+        // 512. (It used to be 1/16 px and +-31 px, and a 38 px pan read back as 30 from every
+        // provider, exact vectors included -- an "underestimate" that was only this clamp.)
+        return float3((round(clamp(v, -63.0, 63.0) * 8.0) + 512.0) / 1023.0, tex2Dlod(sDLSS5_Mask, float4(uv, 0.0, 0.0)).x);
     }
     if (DEBUG_VIEW == 11)
     {
@@ -1718,6 +1982,10 @@ float3 Blur5(sampler2D s, float2 uv)
 
 float4 PS_Restore(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
+    // The previous frame again (a 30 fps game at 60): shown as it was shown then. Not for
+    // more than three in a row -- that is a picture standing still, and it should settle.
+    const float repeats = tex2Dlod(sDLSS5_Global, float4(0.5, 0.5, 0.0, 0.0)).y;
+    if (RESTORE_HOLD_REPEATS && repeats > 0.5 && repeats < 3.5) return tex2Dfetch(sDLSS5_LastOut, int2(vpos.xy));
     const float4 now = tex2Dlod(ReShade::BackBuffer, float4(uv, 0.0, 0.0));
     // The mark, grown by a pixel: the antialiased rim of a glyph belongs to it.
     const float2 px = BUFFER_PIXEL_SIZE;
@@ -1732,6 +2000,11 @@ float4 PS_Restore(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     const float3 hi_was = was - Blur5(sDLSS5_Before, uv);
     const float3 hi_now = now.rgb - Blur5(ReShade::BackBuffer, uv);
     return float4(now.rgb + w * (hi_was - hi_now), now.a);
+}
+
+float4 PS_KeepShown(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+    return tex2Dfetch(ReShade::BackBuffer, int2(vpos.xy));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1758,21 +2031,25 @@ technique DLSS5_Feed
 #endif
     pass FitSamples    { VertexShader = PostProcessVS; PixelShader = PS_FitSamples;    RenderTarget0 = DLSS5_FitA; RenderTarget1 = DLSS5_FitB; }
     pass FitSolve      { VertexShader = PostProcessVS; PixelShader = PS_FitSolve;      RenderTarget0 = DLSS5_Cam0; RenderTarget1 = DLSS5_Cam1; RenderTarget2 = DLSS5_Cam2; RenderTarget3 = DLSS5_Cam3; RenderTarget4 = DLSS5_Cam4; RenderTarget5 = DLSS5_Cam5; }
+    pass Changed       { VertexShader = PostProcessVS; PixelShader = PS_Changed;       RenderTarget0 = DLSS5_Changed; }
     pass Global        { VertexShader = PostProcessVS; PixelShader = PS_Global;        RenderTarget0 = DLSS5_Global; }
     pass Guides        { VertexShader = PostProcessVS; PixelShader = PS_MotionVectors; RenderTarget0 = DLSS5_MV; RenderTarget1 = DLSS5_Mask; RenderTarget2 = DLSS5_Depth; RenderTarget3 = DLSS5_StaticNow; RenderTarget4 = DLSS5_VecNow; RenderTarget5 = DLSS5_Hud; }
     pass History       { VertexShader = PostProcessVS; PixelShader = PS_StoreHistory;  RenderTarget0 = DLSS5_PrevLuma; RenderTarget1 = DLSS5_PrevDepth; RenderTarget2 = DLSS5_PrevMV; RenderTarget3 = DLSS5_PrevStatic; RenderTarget4 = DLSS5_PrevHud; RenderTarget5 = DLSS5_Before; }
+    pass GlobalHistory { VertexShader = PostProcessVS; PixelShader = PS_GlobalHistory; RenderTarget0 = DLSS5_PrevGlobal; }
     DLSS5_MV_REQUEST_PASS   // Launchpad only: ask it to compute optical flow again next frame
 }
 
 technique DLSS5_Feed_Restore
 <
-    ui_label   = "DLSS 5 Feed - restore text and HUD (place BELOW DLSS 5 Feed)";
+    ui_label   = "DLSS 5 Feed - restore text and HUD, hold repeated frames (place BELOW DLSS 5 Feed)";
     ui_tooltip = "Puts the fine detail of the frame as it came in back on captions and HUD elements, after\n"
-                 "DLSS and the neural pass have had it. Needs the Refine vector pipeline. Settings are in\n"
-                 "DLSS5_Feed's own list, under Restore.";
+                 "DLSS and the neural pass have had it, and shows a repeated frame (30 fps content at 60)\n"
+                 "exactly as it was shown the first time. Needs the Refine vector pipeline for the first.\n"
+                 "Settings are in DLSS5_Feed's own list, under Restore.";
 >
 {
-    pass { VertexShader = PostProcessVS; PixelShader = PS_Restore; }
+    pass Restore   { VertexShader = PostProcessVS; PixelShader = PS_Restore; }
+    pass KeepShown { VertexShader = PostProcessVS; PixelShader = PS_KeepShown; RenderTarget0 = DLSS5_LastOut; }
 }
 
 technique DLSS5_Feed_Debug

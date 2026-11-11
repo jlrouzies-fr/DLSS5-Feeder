@@ -312,11 +312,13 @@ static void Init3D()
 
 // The picture of frame `frame` into g.scene, its true motion into s3.truth, its depth left in
 // s3.depth for ReShade.
-static void Render3D(int frame)
+// `before` is the scene frame that was presented last -- the same one again when a 30 fps game
+// is fed at 60 -- and the true motion written is the motion since THAT picture.
+static void Render3D(int frame, int before)
 {
     const float W = static_cast<float>(g.W), H = static_cast<float>(g.H);
     const D3D11_VIEWPORT vp = { 0, 0, W, H, 0, 1 };
-    const int fp = frame > 0 ? frame - 1 : 0;
+    const int fp = before >= 0 ? before : 0;
     const XMMATRIX P   = XMMatrixPerspectiveFovLH(XMConvertToRadians(60.0f), W / H, 400.0f, 0.1f);   // far and near swapped: reversed depth
     const XMMATRIX VP  = View3D(frame) * P, PVP = View3D(fp) * P;
     XMVECTOR cam; float yaw;
@@ -527,7 +529,7 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
                     if (!moving) { if (grad < 0.06f) continue; k = 1; }
                     else k = edge ? 4 : (grad >= 0.06f ? 2 : 3);
                 }
-                const float mx = (c.post[i * 3] * 1023.0f - 512.0f) / 16.0f, my = (c.post[i * 3 + 1] * 1023.0f - 512.0f) / 16.0f;
+                const float mx = (c.post[i * 3] * 1023.0f - 512.0f) / 8.0f, my = (c.post[i * 3 + 1] * 1023.0f - 512.0f) / 8.0f;
                 const float e = hypotf(mx - tx, my - ty);
                 Acc &a = acc[k];
                 a.n += 1; a.err += e; a.sx += mx; a.sy += my; a.tx += tx; a.ty += ty;

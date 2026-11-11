@@ -944,8 +944,8 @@ model told "this text moved 0.3 px" resamples its history by 0.3 px on every fra
 smeared text. The default **Vector pipeline** (`MV_PIPELINE`, *Refine*) keeps the provider's vector
 unless the pixel itself says otherwise:
 
-* a pixel whose neighbourhood did not change, or whose own structure is where it was, gets a
-  vector of **exactly zero**;
+* a pixel whose neighbourhood did not change, or that "did not move" explains at least twice as
+  well as the provider's vector does, gets a vector of **exactly zero**;
 * where the vector leaves the pixel unexplained (the border between two motions), the provider's
   whole cells around it and last frame's vector are tried, and one is taken only if it is clearly
   better;
@@ -979,7 +979,8 @@ relative to the input (1.00 = exactly as steady as the frame that went in):
 | *no vectors at all* | 1.21 | 1.03 | 1.38 | 1.54 |
 
 (Neural pass: OptiScaler DLSS-NR. The built-in estimator scores 1.36 / 1.38 here — see the
-provider table.) Refine costs about 0.5 ms of GPU time at 4K over Classic on that card.
+provider table.) Refine costs GPU time over Classic — on the order of half a millisecond at 4K on
+that card; that figure was taken with another program sharing the GPU, so read it as rough.
 
 Three things the same measurements say that no shader can change:
 
@@ -1003,9 +1004,29 @@ is on and DLSS runs in HDR mode) show the same pattern: static 14 px text keeps 
 energy with Classic, 0.82 with Refine, 0.99 with `preset=5`; in 3D the HUD error goes from 1.05 to
 0.53. scRGB (FP16) input is not covered by the rig yet.
 
+**What exact vectors would give.** No optical flow is exact, so the rig has a cheat to measure the
+distance: `fxlab_Oracle.fx` rebuilds the test scene's camera and writes the true vector of every
+pixel (`-Oracle -Provider 0`). With those, plain DLAA's scene error drops from 0.73 to 0.46 and the
+picture is *steadier* than the input (0.85); with the neural pass 0.93–0.95, and the neural edit
+itself flickers a sixth less. A slow pan is where an estimate hurts most: 1.60 times as restless as
+the input with LumeniteFX, 1.27 with exact vectors. That gap is what a game's own motion vectors
+would close, and what an estimator on a finished picture cannot: the same measurement shows
+LumeniteFX about 2 px out on a 38 px/frame pan, and a few tenths of a pixel out on a slow one —
+a large share of a motion of 0.6 px.
+
+**Camera fit (optional, off).** *Fit the camera's motion and use it where it fits*
+(`CAMERA_MODEL`) is an attempt on that gap for a camera that turns: 900 points are tracked against
+the previous frame, one camera motion is fitted to the ones that agree, and a pixel takes the
+fitted vector where that explains it about as well as the provider's. While the camera pans, twice
+as many pixels get a vector right to a quarter pixel (58–76% against 15–35%), and DLAA's output is
+6% steadier and 3% closer to its input. While the camera travels there is no single motion to fit
+without depth, and the picture is 2–4% less steady. A gain for footage that mostly pans, a small
+loss otherwise, about half a millisecond either way — which is why it is off by default.
+
 `tools\fx-testbed\Run-FxLab.ps1` reproduces all of it (`-Scene 3d`, `-Hdr`, `-Consumer optiscaler`,
-and `-Interactive` to look at either scene yourself); the headers of `fxlab.cpp` and `fxlab3d.h`
-explain the method.
+`-Mv` to score the vectors themselves against the truth, `-Oracle` for exact vectors, `-Cadence 2`
+for 30 fps content, and `-Interactive` to look at either scene yourself); the headers of
+`fxlab.cpp` and `fxlab3d.h` explain the method.
 
 ### Restoring text and HUD (`DLSS5_Feed_Restore`)
 
@@ -1032,6 +1053,15 @@ its edit. Debug view *Restore* shows the marked pixels.
 reach where it is wrong, which is why it is not the default. *What to restore → Everything that
 stands still* also covers a menu with nothing moving behind it (static text on a flat background:
 sharp 0.89 → 0.97), at the price of taking a neural pass's fine detail out of a still scene.
+
+**30 fps content at 60.** A 30 fps game captured or presented at 60 shows every picture twice, and
+a temporal model does not hand back the same output for the same input: on the repeated present the
+output differed from the one before by 0.25–0.67 8-bit steps with Classic and 0.18–0.38 with
+Refine — a flicker at 30 Hz laid over a picture that did not change. With *Hold repeated frames*
+(`RESTORE_HOLD_REPEATS`, on by default) the restore technique recognises a frame that is the last
+one again (up to three in a row, so 20 fps content at 60 too) and shows exactly what it showed
+the first time: 0.000. 60 fps content is not affected. This needs the restore technique enabled;
+`DLSS5_Feed` alone cannot do it, because it runs before DLSS.
 
 ### Validation and the trust mask
 

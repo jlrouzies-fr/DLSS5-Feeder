@@ -33,6 +33,9 @@ param(
     [double]$Fps = -1,                    # frames a second; -1 = 120, or 60 with a neural consumer (see below); 0 = unpaced
     [string[]]$ExtraShaderDirs = @(),
     [double]$Noise = 0,                   # temporal noise on the picture, +- 8-bit steps
+    [string]$Hold = '',                   # 'A,B': the scene moves for A presents, stands still for B, over and over
+    [int]$Cadence = 1,                    # 2 = a 30 fps game at 60: every picture presented twice
+    [switch]$Oracle,                      # exact vectors for the 3D scene: adds fxlab_Oracle.fx (use -Provider 0)
     [switch]$Hdr,                         # present HDR10 (PQ, BT.2020, 10-bit) instead of SDR
     [switch]$Mv,                          # measure the VECTORS against the truth instead of the picture
     [switch]$NoReShade,
@@ -112,6 +115,7 @@ Copy-Item (Join-Path $repo 'deploy\motion-vectors\lumenitefx\Shaders\*') $sh -Re
 Copy-Item (Join-Path $repo 'deploy\motion-vectors\lumenitefx\Textures\*') (Join-Path $rig 'reshade-shaders\Textures') -Force
 foreach ($d in $ExtraShaderDirs) { Copy-Item (Join-Path $d '*') $sh -Recurse -Force }
 Copy-Item $Shader (Join-Path $sh 'DLSS5_Feed.fx') -Force
+if ($Oracle) { Copy-Item (Join-Path $PSScriptRoot 'fxlab_Oracle.fx') $sh -Force }
 
 @"
 [ADDON]
@@ -161,6 +165,9 @@ if ($Show -and -not $Interactive) { $args_ += '--show' }
 if ($Full) { $args_ += '--full' }
 if ($Mv) { $args_ += '--mv' }
 if ($Hdr) { $args_ += '--hdr' }
+if ($Cadence -gt 1) { $args_ += @('--cadence', $Cadence) }
+if ($Oracle) { $args_ += '--oracle' }
+if ($Hold -ne '') { $args_ += @('--hold', $Hold) }
 if ($Noise -gt 0) { $args_ += @('--noise', $Noise) }
 Push-Location $rig
 try { & (Join-Path $rig 'fxlab.exe') @args_; $code = $LASTEXITCODE } finally { Pop-Location }

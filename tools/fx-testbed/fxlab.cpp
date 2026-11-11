@@ -16,7 +16,19 @@
 //
 //   fxlab.exe [--scene ui|3d] [--size WxH] [--frames N] [--capture a,b,c] [--out dir] [--tag name]
 //             [--show] [--loop] [--lat N] [--full] [--fmt 8|10] [--preroll seconds] [--fps N]
-//             [--noise N] [--mv] [--hdr]
+//             [--noise N] [--mv] [--hdr] [--hold A,B] [--cadence N] [--oracle]
+//
+// --cadence 2 is a 30 fps game through a 60 Hz capture: every picture is presented twice, and
+// what moves moves twice as far when it does. Frame numbers on the command line and in the
+// results stay PRESENT numbers; an odd one is then the second showing of a picture, for which
+// the only right output is the same picture again.
+// --oracle stamps the scene frame number being presented, and the previous one, into the first
+// two pixels; fxlab_Oracle.fx turns them into exact motion vectors for the 3D scene.
+//
+// --hold A,B makes the scene move for A presents and stand still for B, over and over: a game
+// that is paused and resumed, a menu that opens and closes. Every change between the two is
+// written with its wall-clock time to <out>\<tag>.events.txt, to be laid next to the add-on's
+// log (some failures in the chain happen exactly there).
 //
 // --hdr presents HDR10: the same picture converted to PQ / BT.2020 at a paper white of 203 nits
 // with highlights up to ~600, in a 10-bit swap chain tagged ST.2084. That is what a capture
@@ -256,6 +268,9 @@ struct App
     bool show = false, full = false;
     bool scene3d = false;   // --scene 3d
     bool hdr = false;       // --hdr: HDR10 (PQ, BT.2020) instead of SDR
+    int  cadence = 1;       // --cadence N: a new scene frame every N presents, the same one in between (2 = a 30 fps game at 60)
+    bool oracle = false;    // --oracle: stamp the scene frame numbers into the first two pixels, for fxlab_Oracle.fx
+    int  hold_run = 0, hold_still = 0;   // --hold A,B: the scene moves for A presents, then stands still for B, over and over
     bool loop = false;      // run until Esc instead of for g.frames
     bool paused = false;    // Space, in --loop: the frame number stands still
     bool mvdump = false;    // the read-back is DLSS5_Feed_Debug view 10 (vectors), not a picture
@@ -503,12 +518,14 @@ static void Analyse(int frame, const std::vector<float> &pre, const std::vector<
             // Vectors against the truth, over the pixels that have enough structure to have a
             // well-defined motion at all (a flat pixel can be given any vector and look the same).
             float tx = 0, ty = 0;
-            if (p.truth == 2) { tx = p.vx * g.S; ty = p.vy * g.S; }
-            if (p.truth == 3) { tx = p.vx; ty = p.vy; }
+            const int   now_f = frame - frame % g.cadence, was_f = (frame - 1) - (frame - 1) % g.cadence;
+            const float steps = static_cast<float>(now_f - was_f);     // 0 on the second showing of a picture
+            if (p.truth == 2) { tx = p.vx * g.S * steps; ty = p.vy * g.S * steps; }
+            if (p.truth == 3) { tx = p.vx * steps; ty = p.vy * steps; }
             if (p.truth == 4)
             {
                 auto off = [](int f) { return 440.0f * (static_cast<float>(f / 90) + Smooth(static_cast<float>(f % 90) / 24.0f)); };
-                tx = (off(frame) - off(frame - 1)) * g.S;
+                tx = (off(now_f) - off(was_f)) * g.S;
             }
             double n = 0, serr = 0, in025 = 0, in1 = 0, zero = 0, sx = 0, sy = 0, smask = 0;
             for (int y = y0; y < y1; ++y)
@@ -517,7 +534,7 @@ static void Analyse(int frame, const std::vector<float> &pre, const std::vector<
                     const size_t i = static_cast<size_t>(y) * W + x;
                     const float grad = fabsf(lp[i + 1] - lp[i - 1]) + fabsf(lp[i + W] - lp[i - W]);
                     if (grad < (p.kind[1] == 'i' ? 0.30f : 0.08f)) continue;   // "mixed": glyph edges only, not the soft background
-                    const float mx_ = (post[i * 3] * 1023.0f - 512.0f) / 16.0f, my_ = (post[i * 3 + 1] * 1023.0f - 512.0f) / 16.0f;
+                    const float mx_ = (post[i * 3] * 1023.0f - 512.0f) / 8.0f, my_ = (post[i * 3 + 1] * 1023.0f - 512.0f) / 8.0f;
                     const float e = hypotf(mx_ - tx, my_ - ty);
                     n += 1; serr += e; sx += mx_; sy += my_; smask += post[i * 3 + 2];
                     if (e < 0.25f) in025 += 1;
@@ -666,6 +683,9 @@ int main(int argc, char **argv)
         else if (a == "--show")    g.show = true;
         else if (a == "--loop")    g.loop = true;
         else if (a == "--hdr")     g.hdr = true;
+        else if (a == "--cadence") { g.cadence = std::max(1, atoi(v)); ++i; }
+        else if (a == "--oracle")  g.oracle = true;
+        else if (a == "--hold")    { sscanf_s(v, "%d,%d", &g.hold_run, &g.hold_still); ++i; }
         else if (a == "--scene")   { g.scene3d = std::string(v) == "3d"; ++i; }
         else if (a == "--full")    g.full = true;
         else if (a == "--mv")      g.mvdump = true;
@@ -794,6 +814,15 @@ int main(int argc, char **argv)
         CHECK(g.dev->CreateQuery(&qd, &q_t1), "query");
     }
     double gpu_ms = 0.0; int gpu_n = 0;
+    int  rolled = 0;
+    int  last_shown = 0;
+    bool was_moving = false;
+    FILE *events = nullptr;
+    {
+        char ev_path[MAX_PATH];
+        sprintf_s(ev_path, "%s\\%s.events.txt", g.out.c_str(), g.tag.c_str());
+        fopen_s(&events, ev_path, "w");
+    }
     for (int frame = 0; (g.loop || frame < g.frames) && !quit; ++presents)
     {
         MSG msg;
@@ -815,13 +844,14 @@ int main(int argc, char **argv)
 
         // A frame is kept if it is reported on, or (3D) if the next one is: stability is
         // measured from one frame to the next.
+        const int  shown  = frame - frame % g.cadence;     // the scene frame this present shows
         const bool report = std::find(g.captures.begin(), g.captures.end(), frame) != g.captures.end();
         const bool keep   = report || (g.scene3d && std::find(g.captures.begin(), g.captures.end(), frame + 1) != g.captures.end());
         ID3D11ShaderResourceView *null_srv = nullptr;
         ID3D11RenderTargetView *null_rtv = nullptr;
         if (g.scene3d)
         {
-            Render3D(frame);
+            Render3D(shown, last_shown);
             if (keep)
             {
                 g.ctx->CopyResource(g.scene_staging.Get(), g.scene.Get());
@@ -836,7 +866,7 @@ int main(int argc, char **argv)
         }
         else
         {
-            const float cbv[4] = { static_cast<float>(frame), g.S, static_cast<float>(g.W), static_cast<float>(g.H) };
+            const float cbv[4] = { static_cast<float>(shown), g.S, static_cast<float>(g.W), static_cast<float>(g.H) };
             g.ctx->UpdateSubresource(g.cb.Get(), 0, nullptr, cbv, 0, 0);
             g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             g.ctx->IASetInputLayout(nullptr);
@@ -853,12 +883,12 @@ int main(int argc, char **argv)
             g.ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
             g.ctx->Flush();
 
-            DrawUi(frame);
+            DrawUi(shown);
         }
 
         if (g.noise > 0.0f)
         {
-            const float nv[4] = { static_cast<float>(frame), g.S, static_cast<float>(g.W), g.noise };   // H carries the amplitude here
+            const float nv[4] = { static_cast<float>(shown), g.S, static_cast<float>(g.W), g.noise };   // H carries the amplitude here
             g.ctx->UpdateSubresource(g.cb.Get(), 0, nullptr, nv, 0, 0);
             g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             g.ctx->IASetInputLayout(nullptr);
@@ -893,7 +923,16 @@ int main(int argc, char **argv)
         g.ctx->Draw(3, 0);
         g.ctx->PSSetShaderResources(0, 1, &null_srv);
         g.ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
-        bb_rtv.Reset(); bb.Reset();
+        bb_rtv.Reset();
+        if (g.oracle && g.bb_fmt == DXGI_FORMAT_R10G10B10A2_UNORM)
+        {
+            auto code = [](int f) { const uint32_t u = static_cast<uint32_t>(std::max(f, 0)); return (u & 1023u) | (((u >> 10) & 1023u) << 10) | (3u << 30); };
+            const uint32_t stamp[2] = { code(shown), code(last_shown) };
+            const D3D11_BOX box = { 0, 0, 0, 2, 1, 1 };
+            g.ctx->UpdateSubresource(bb.Get(), 0, &box, stamp, 8, 8);
+        }
+        bb.Reset();
+        last_shown = shown;
 
         if (keep && g_caps.find(frame) == g_caps.end()) Capture(frame, report, &nohud);
 
@@ -917,11 +956,24 @@ int main(int argc, char **argv)
             g.ctx->GetData(q_t1.Get(), &t1, sizeof(t1), 0);
             if (!dj.Disjoint && dj.Frequency && t1 > t0) { gpu_ms += 1000.0 * static_cast<double>(t1 - t0) / static_cast<double>(dj.Frequency); gpu_n += 1; }
         }
-        if (rolling && !g.paused) ++frame;   // during the pre-roll the same frame 0 is presented over and over
+        // during the pre-roll the same frame 0 is presented over and over
+        bool moving = rolling && !g.paused;
+        if (moving && g.hold_run > 0 && g.hold_still > 0) moving = (rolled % (g.hold_run + g.hold_still)) < g.hold_run;
+        if (rolling) ++rolled;
+        if (moving != was_moving && events != nullptr)
+        {
+            SYSTEMTIME st; GetLocalTime(&st);
+            fprintf(events, "%02d:%02d:%02d.%03d  %s  (scene frame %d, present %d)\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                    moving ? "starts moving" : "stands still", frame, presents);
+            fflush(events);
+        }
+        was_moving = moving;
+        if (moving) ++frame;
         if (rolling && frame == 100) QueryPerformanceCounter(&q100);
         if (rolling && frame == 400) QueryPerformanceCounter(&q400);
     }
     if (g.csv) fclose(g.csv);
+    if (events) fclose(events);
     if (q400.QuadPart > q100.QuadPart)
         printf("frame time %.2f ms (frames 100-400%s)\n", 1000.0 * static_cast<double>(q400.QuadPart - q100.QuadPart) / qpf.QuadPart / 300.0,
                g.fps > 0.0 ? ", paced" : ", unpaced");
