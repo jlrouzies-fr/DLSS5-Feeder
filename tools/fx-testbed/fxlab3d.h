@@ -458,7 +458,8 @@ static void DrawHud3D()
 
 struct Cap3
 {
-    std::vector<uint8_t>  pre, nohud;   // RGBA8: the frame as fed, and the same before the HUD went on
+    std::vector<uint8_t>  scene, nohud; // RGBA8: the frame as drawn, and the same before the HUD went on (3D only)
+    std::vector<float>    pre;          // RGB 0..1: the frame as fed -- the swap chain's own code values
     std::vector<uint16_t> truth;        // RGBA16F: see ps_truth
     std::vector<float>    post;         // RGB 0..1: what came back
     bool report = false;                // false: only kept as the previous frame of one that is
@@ -484,9 +485,9 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
     std::vector<uint8_t> cls(N);   // 0 sky, 1 scene, 2 HUD
     for (size_t i = 0; i < N; ++i)
     {
-        lin[i]  = (0.299f * c.pre[i * 4] + 0.587f * c.pre[i * 4 + 1] + 0.114f * c.pre[i * 4 + 2]) / 255.0f;
+        lin[i]  = 0.299f * c.pre[i * 3] + 0.587f * c.pre[i * 3 + 1] + 0.114f * c.pre[i * 3 + 2];
         lout[i] = 0.299f * c.post[i * 3] + 0.587f * c.post[i * 3 + 1] + 0.114f * c.post[i * 3 + 2];
-        const bool hud = memcmp(&c.pre[i * 4], &c.nohud[i * 4], 3) != 0;
+        const bool hud = memcmp(&c.scene[i * 4], &c.nohud[i * 4], 3) != 0;
         cls[i] = hud ? 2 : (XMConvertHalfToFloat(c.truth[i * 4 + 2]) > 0.0f ? 1 : 0);
     }
     auto emit = [&](const char *probe, const char *kind, double a, double b, double cc, double d)
@@ -577,7 +578,7 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
         std::vector<float> pin(N), pout(N);
         for (size_t i = 0; i < N; ++i)
         {
-            pin[i]  = (0.299f * prev->pre[i * 4] + 0.587f * prev->pre[i * 4 + 1] + 0.114f * prev->pre[i * 4 + 2]) / 255.0f;
+            pin[i]  = 0.299f * prev->pre[i * 3] + 0.587f * prev->pre[i * 3 + 1] + 0.114f * prev->pre[i * 3 + 2];
             pout[i] = 0.299f * prev->post[i * 3] + 0.587f * prev->post[i * 3 + 1] + 0.114f * prev->post[i * 3 + 2];
         }
         double n = 0, fin = 0, fout = 0, fed = 0, ed = 0;
@@ -590,7 +591,7 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
                 const float px = x + tx, py = y + ty;
                 if (px < 2 || py < 2 || px > W - 3 || py > H - 3) continue;
                 const size_t j = static_cast<size_t>(py + 0.5f) * W + static_cast<size_t>(px + 0.5f);
-                if (memcmp(&prev->pre[j * 4], &prev->nohud[j * 4], 3) != 0) continue;        // was under the HUD
+                if (memcmp(&prev->scene[j * 4], &prev->nohud[j * 4], 3) != 0) continue;      // was under the HUD
                 const float zw = XMConvertHalfToFloat(c.truth[i * 4 + 3]), zp = XMConvertHalfToFloat(prev->truth[j * 4 + 2]);
                 if (zp <= 0.0f || fabsf(zp - zw) > 0.03f * zw + 0.03f) continue;             // was hidden: nothing to compare with
                 const float a = Bilin(pin, W, H, px, py), b = Bilin(pout, W, H, px, py);

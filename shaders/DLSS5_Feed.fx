@@ -72,6 +72,11 @@
 
     The add-on runs DLSS + DLSS 5 neural rendering right after the "DLSS5_Feed" technique has
     rendered, so anything placed below it in the list is applied on top of the neural output.
+
+    One such thing is in this file: the technique DLSS5_Feed_Restore (optional; enable it below
+    DLSS5_Feed). It puts the fine detail of the frame as it came in back on captions and HUD
+    elements -- pixels seen standing still while the picture around them moved -- which DLSS
+    softens a little whatever the vectors and a neural pass redraws. See PS_Restore.
 */
 
 #include "ReShade.fxh"
@@ -317,6 +322,58 @@ uniform bool REFINE_SUBPIXEL <
                  "full-resolution frames. Slow scrolling text and fine patterns need it; costs a few fetches.";
 > = true;
 
+uniform int RESTORE_SCOPE <
+    ui_category = "Restore (DLSS5_Feed_Restore technique)";
+    ui_type = "combo";
+    ui_items = "Text and HUD: what stands still while the picture around it moves\0Everything that stands still\0";
+    ui_label = "What to restore";
+    ui_tooltip = "DLSS softens a finished picture a little even with perfect vectors, and a neural pass\n"
+                 "redraws lettering it has no business with. The DLSS5_Feed_Restore technique (enable it\n"
+                 "BELOW DLSS 5 Feed) puts the fine detail of the frame as it came in back on pixels that\n"
+                 "stand still, and leaves everything broader -- the neural pass's lighting, its colour --\n"
+                 "as it comes out.\n"
+                 "Text and HUD: only pixels that have been seen standing still while the picture around\n"
+                 "them moved -- a caption over video, a HUD over the game. They stay marked for as long as\n"
+                 "they do not change. The world itself is never touched, so a neural pass keeps the detail\n"
+                 "it adds to it, moving or not.\n"
+                 "Everything: any pixel that stands still. Sharpest for a menu with nothing moving behind\n"
+                 "it; with a neural pass, detail it adds to a still scene is taken out again.";
+> = 0;
+
+uniform int RESTORE_WHAT <
+    ui_category = "Restore (DLSS5_Feed_Restore technique)";
+    ui_type = "combo";
+    ui_items = "Fine detail only\0The whole pixel\0";
+    ui_label = "How much of it";
+    ui_tooltip = "Fine detail only: what is finer than a few pixels -- the edges of a glyph -- comes from the\n"
+                 "frame as it came in; broader changes (a neural pass's lighting, a tint) stay.\n"
+                 "The whole pixel: a marked pixel is simply the input again. Exact, but a pixel marked by\n"
+                 "mistake then shows as a patch the neural pass did not reach.";
+> = 0;
+
+uniform float RESTORE_WIDTH <
+    ui_category = "Restore (DLSS5_Feed_Restore technique)";
+    ui_type = "drag"; ui_min = 1.0; ui_max = 4.0; ui_step = 0.25;
+    ui_label = "Fine detail: up to (px)";
+    ui_tooltip = "What counts as fine detail: structure up to about twice this many pixels across.";
+> = 1.5;
+
+uniform float RESTORE_MIN_CONTRAST <
+    ui_category = "Restore (DLSS5_Feed_Restore technique)";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 0.3; ui_step = 0.005;
+    ui_label = "Text and HUD: minimum contrast";
+    ui_tooltip = "How much local contrast a still pixel needs to be taken for lettering or HUD line work.\n"
+                 "Raise it if distant scenery gets marked while the camera travels (debug view 'Restore');\n"
+                 "lower it if faint HUD text is missed.";
+> = 0.06;
+
+uniform float RESTORE_STRENGTH <
+    ui_category = "Restore (DLSS5_Feed_Restore technique)";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.05;
+    ui_label = "Strength";
+    ui_tooltip = "How much of the difference in fine detail is put back. 1 = the input's own.";
+> = 1.0;
+
 // ---------------------------------------------------------------------------------------------
 // Geometry vectors. A game's motion vectors for static geometry come from camera motion and
 // depth, not from pixels. We have depth; the camera motion is fitted each frame from the
@@ -512,7 +569,8 @@ uniform int DEBUG_VIEW <
                "Geometry decision over the image (green = model, red = provider won as moving object, blue = provider rejected)\0"
                "Geometry fit quality (grey = inlier share; top strip = fit error, black 0 px .. white 8 px)\0"
                "Refine: what each pixel took (dark = static lock, green = zero, blue = the provider's vector, cyan = a neighbouring cell, magenta = last frame's vector, yellow = snapped to whole pixels)\0"
-               "Vector dump for tools/fx-testbed (10-bit codes: R = 512 + 16 x, G = 512 + 16 y, B = mask)\0";
+               "Vector dump for tools/fx-testbed (10-bit codes: R = 512 + 16 x, G = 512 + 16 y, B = mask)\0"
+               "Restore: where DLSS5_Feed_Restore puts the input's fine detail back (white)\0";
     ui_label = "Debug view (DLSS5_Feed_Debug technique)";
 > = 0;
 
@@ -538,6 +596,28 @@ texture DLSS5_PrevMV    { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format =
 sampler sDLSS5_PrevLuma  { Texture = DLSS5_PrevLuma;  AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
 sampler sDLSS5_PrevDepth { Texture = DLSS5_PrevDepth; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT;  MagFilter = POINT;  MipFilter = POINT; };
 sampler sDLSS5_PrevMV    { Texture = DLSS5_PrevMV;    AddressU = Clamp; AddressV = Clamp; MinFilter = POINT;  MagFilter = POINT;  MipFilter = POINT; };
+// For DLSS5_Feed_Restore. Hud: how sure it is that a pixel is a still element over a moving
+// picture (0..1, built up over frames, see the feed pass); PrevHud: last frame's. Before: the
+// frame as it came in, kept in the back buffer's own format so that nothing is lost in it.
+// x: the share of the frame the provider reports as moving (a 16x9 probe).
+texture DLSS5_Global  { Width = 1; Height = 1; Format = R16F; };
+sampler sDLSS5_Global { Texture = DLSS5_Global; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+texture DLSS5_Hud     { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R8; };
+texture DLSS5_PrevHud { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R8; };
+sampler sDLSS5_Hud     { Texture = DLSS5_Hud;     AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+sampler sDLSS5_PrevHud { Texture = DLSS5_PrevHud; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+#ifndef BUFFER_COLOR_BIT_DEPTH
+    #define BUFFER_COLOR_BIT_DEPTH 8
+#endif
+#if BUFFER_COLOR_BIT_DEPTH == 16
+    texture DLSS5_Before { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA16F; };
+#elif BUFFER_COLOR_BIT_DEPTH == 10
+    texture DLSS5_Before { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGB10A2; };
+#else
+    texture DLSS5_Before { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA8; };
+#endif
+sampler sDLSS5_Before { Texture = DLSS5_Before; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
+
 // This frame's vector as decided, in delta UV -- DLSS5_MV cannot be read back for that: it is
 // in the add-on's units and sign, and may deliberately carry an off-screen vector.
 texture DLSS5_VecNow  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F; };
@@ -945,7 +1025,9 @@ bool PolishStep(P9 c0, float m0, float2 uv, inout float2 f, inout float ef)
 // stale:  1 if history cannot simply be reused for this pixel -- the vector is fractional, or
 //         it is a whole-pixel one (zero included) that does not reproduce the pixel: something
 //         creeping along at a fraction of a pixel a frame, a fade, an animation in place.
-float2 RefineMV(float2 uv, out float distrust, out float code, out float detail, out float stale)
+// rich:   pixel-scale plus wide contrast -- lettering and line work have a lot of it, a far
+//         hillside in haze has little.
+float2 RefineMV(float2 uv, out float distrust, out float code, out float detail, out float stale, out float rich)
 {
     const float2 px = BUFFER_PIXEL_SIZE;
     const P9 c0 = Patch9(sDLSS5_CurLuma, uv, px, 0.0);
@@ -954,18 +1036,18 @@ float2 RefineMV(float2 uv, out float distrust, out float code, out float detail,
     const P9 p2 = Patch9(sDLSS5_PrevLuma, uv, px * 4.0, 2.0);
     distrust = 0.0;
     code     = 0.0;
-    detail   = 0.0;
     stale    = 0.0;
+    const float m0 = P9Mean(c0);
+    const float m2 = P9Mean(c2);
+    detail = P9Contrast(c0, m0);
+    const float wide     = P9Contrast(c2, m2);
+    const float contrast = detail + wide;
+    rich = contrast;
     // Static lock: the same picture, here and around here. The wide patch averages 16 pixels a
     // sample, which makes it the sensitive one: a surface drifting a fraction of a pixel a
     // frame changes few of its pixels by a whole step, but every one of those averages a
     // little. It gets a quarter of the tolerance, so a slow pan does not lock.
     if (P9MaxDiff(c0, p0) <= STATIC_NOISE && P9MaxDiff(c2, p2) <= 0.25 * STATIC_NOISE) return float2(0.0, 0.0);
-
-    const float m0 = P9Mean(c0);
-    const float m2 = P9Mean(c2);
-    detail = P9Contrast(c0, m0);
-    const float contrast = detail + P9Contrast(c2, m2);
 
     // The provider's own answer for this pixel.
     float2 best = ProviderMV(uv) * BUFFER_SCREEN_SIZE;
@@ -997,7 +1079,6 @@ float2 RefineMV(float2 uv, out float distrust, out float code, out float detail,
     // picture (the tile joints and mortar lines of fx-testbed's courtyard, at 0.6 px a frame).
     // "In place" has to hold around the pixel as well as on it: a horizontal mortar line under
     // a horizontal pan slides along itself, and its own nine samples do not change at all.
-    const float wide = P9Contrast(c2, m2);
     const bool in_place = detail >= 4.0 * FLOW_NOISE && r_zero <= exact && P9RawDiff(c2, p2) <= FLOW_NOISE + 0.1 * wide;
     if (in_place || t_zero < 0.5 * t_best - FLOW_NOISE)
     {
@@ -1353,6 +1434,17 @@ float4 GeometryDecide(float2 uv, float d, float2 flow)
     return float4(pred, 2.0, GEOM_MASK_REJECTED * saturate((r - agree) / (4.0 * agree)));
 }
 
+// The share of the frame the provider reports as moving (more than half a pixel), on a 16x9
+// probe. One pixel; it only tells "the picture as a whole is in motion" from "something in it is".
+float PS_Global(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+    float n = 0.0;
+    [unroll] for (int y = 0; y < 9; ++y)
+    [unroll] for (int x = 0; x < 16; ++x)
+        n += any(abs(ProviderMV((float2(x, y) + 0.5) / float2(16.0, 9.0))) > 0.5 * BUFFER_PIXEL_SIZE) ? 1.0 : 0.0;
+    return n / 144.0;
+}
+
 float RawDepth(float2 uv)
 {
     // Raw hardware depth, exactly as the game wrote it -- the same orientation/offset
@@ -1379,9 +1471,11 @@ float RawDepth(float2 uv)
 
 void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
                       out float2 mv_out : SV_Target0, out float mask : SV_Target1,
-                      out float depth : SV_Target2, out float static_now : SV_Target3, out float2 vec_now : SV_Target4)
+                      out float depth : SV_Target2, out float static_now : SV_Target3, out float2 vec_now : SV_Target4,
+                      out float hud : SV_Target5)
 {
     bool drop_history = false;
+    hud = 0.0;
     // Providers hand out "delta UV": previous position = uv + mv. DLSS wants the same
     // direction, in pixels.
     const float2 flow = ProviderMV(uv);
@@ -1410,8 +1504,8 @@ void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
     }
     else if (MV_PIPELINE == 0)
     {
-        float code, detail, stale;
-        mv = RefineMV(uv, distrust, code, detail, stale) * BUFFER_PIXEL_SIZE;
+        float code, detail, stale, rich;
+        mv = RefineMV(uv, distrust, code, detail, stale, rich) * BUFFER_PIXEL_SIZE;
         static_now = code / 8.0;   // what was decided, for the debug view
 
         // Disocclusion, where there is a depth buffer to see it with: the vector points at a
@@ -1430,6 +1524,32 @@ void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
             }
         }
         drop_history = MOVING_HISTORY > 0 && stale > 0.5 && (MOVING_HISTORY == 2 || detail >= DETAIL_CONTRAST);
+
+        // For DLSS5_Feed_Restore: is this a still element over a moving picture -- a caption, a
+        // HUD? A pixel that stands still says nothing by itself (a paused game stands still
+        // too, and a neural pass is welcome to its detail). One that stands still while the
+        // picture as a whole moves -- at least a quarter of the frame, AND right around it --
+        // does. (Around it alone is not enough: the wall behind a walking figure stands still
+        // next to motion too, and is no HUD.) And it has to look the part: lettering and line
+        // work are full of contrast, whereas the other thing that stands still while a camera
+        // travels -- scenery too far away to shift -- mostly is not. That evidence is gathered
+        // over a few frames, kept for as long as the pixel goes on standing still -- so a HUD
+        // stays marked when the camera stops -- and lost quickly once the pixel itself changes.
+        const float was = tex2Dlod(sDLSS5_PrevHud, float4(uv, 0.0, 0.0)).x;
+        if (dot(mv, mv) == 0.0)
+        {
+            bool around = RESTORE_SCOPE == 1;
+            if (!around && rich >= RESTORE_MIN_CONTRAST && tex2Dlod(sDLSS5_Global, float4(0.5, 0.5, 0.0, 0.0)).x >= 0.25)
+            {
+                const float2 r = BUFFER_PIXEL_SIZE * 24.0;
+                const float2 lim = 0.5 * BUFFER_PIXEL_SIZE;
+                around = any(abs(flow) > lim)
+                      || any(abs(ProviderMV(uv + float2( r.x, 0.0))) > lim) || any(abs(ProviderMV(uv + float2(-r.x, 0.0))) > lim)
+                      || any(abs(ProviderMV(uv + float2(0.0,  r.y))) > lim) || any(abs(ProviderMV(uv + float2(0.0, -r.y))) > lim);
+            }
+            hud = around ? min(was + 0.125, 1.0) : was;
+        }
+        else hud = max(was - 0.25, 0.0);
     }
     else if (MV_VALIDATE)
     {
@@ -1471,8 +1591,10 @@ void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
 // both sample and write one texture, so it lands here).
 void PS_StoreHistory(float4 vpos : SV_Position, float2 uv : TEXCOORD,
                      out float luma : SV_Target0, out float depth : SV_Target1, out float2 mv : SV_Target2,
-                     out float prev_static : SV_Target3)
+                     out float prev_static : SV_Target3, out float prev_hud : SV_Target4, out float4 before : SV_Target5)
 {
+    prev_hud = tex2Dfetch(sDLSS5_Hud, int2(vpos.xy)).x;
+    before   = tex2Dfetch(sDLSS5_ColorInput, int2(vpos.xy));   // the frame as it came in, for DLSS5_Feed_Restore
     luma  = tex2Dfetch(sDLSS5_CurLuma, int2(vpos.xy)).x;
     depth = ReShade::GetLinearizedDepth(uv);
     // Refine: the vector this pixel was given (it is next frame's "where this pixel went last
@@ -1561,11 +1683,55 @@ float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
         // Whole 10-bit codes, 1/16 px a step, so a zero vector reads back as exactly 512.
         return float3((round(clamp(v, -31.0, 31.0) * 16.0) + 512.0) / 1023.0, tex2Dlod(sDLSS5_Mask, float4(uv, 0.0, 0.0)).x);
     }
+    if (DEBUG_VIEW == 11)
+    {
+        const float3 img = tex2Dlod(sDLSS5_ColorInput, float4(uv, 0.0, 0.0)).rgb * 0.3;
+        return saturate(img + smoothstep(0.35, 0.85, tex2Dlod(sDLSS5_Hud, float4(uv, 0.0, 0.0)).x) * 0.7);
+    }
     float2 mv = tex2Dlod(sDLSS5_MV, float4(uv, 0.0, 0.0)).xy; // pixels
     float angle = atan2(mv.y, mv.x);
     float speed = length(mv);
     float3 rgb = saturate(3.0 * abs(2.0 * frac(angle / 6.283185 + float3(0.0, -1.0 / 3.0, 1.0 / 3.0)) - 1.0) - 1.0);
     return lerp(0.5, rgb, saturate(speed / 16.0)); // 16 px/frame saturates the colour
+}
+
+// ---------------------------------------------------------------------------------------------
+// DLSS5_Feed_Restore. Runs after the add-on has put DLSS's (and the neural consumer's) picture
+// into the frame, and puts the FINE DETAIL of the frame as it came in back on the pixels marked
+// above: output + (input - blur(input)) - (output - blur(output)). What is broader than a few
+// pixels -- a relit surface, a colour shift -- stays as it came out; only what DLSS softened
+// or a neural pass redrew at the scale of a glyph stroke is replaced by the original.
+// On a still element with no neural pass that is, to within the blur, the input itself.
+// ---------------------------------------------------------------------------------------------
+
+// Nine bilinear taps RESTORE_WIDTH pixels apart: at 1.5, about a 5x5 binomial.
+float3 Blur5(sampler2D s, float2 uv)
+{
+    const float2 o = BUFFER_PIXEL_SIZE * RESTORE_WIDTH;
+    float3 c = tex2Dlod(s, float4(uv, 0.0, 0.0)).rgb * 0.25;
+    c += (tex2Dlod(s, float4(uv + float2( o.x, 0.0), 0.0, 0.0)).rgb + tex2Dlod(s, float4(uv + float2(-o.x, 0.0), 0.0, 0.0)).rgb
+        + tex2Dlod(s, float4(uv + float2(0.0,  o.y), 0.0, 0.0)).rgb + tex2Dlod(s, float4(uv + float2(0.0, -o.y), 0.0, 0.0)).rgb) * 0.125;
+    c += (tex2Dlod(s, float4(uv + float2( o.x,  o.y), 0.0, 0.0)).rgb + tex2Dlod(s, float4(uv + float2(-o.x,  o.y), 0.0, 0.0)).rgb
+        + tex2Dlod(s, float4(uv + float2( o.x, -o.y), 0.0, 0.0)).rgb + tex2Dlod(s, float4(uv + float2(-o.x, -o.y), 0.0, 0.0)).rgb) * 0.0625;
+    return c;
+}
+
+float4 PS_Restore(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+    const float4 now = tex2Dlod(ReShade::BackBuffer, float4(uv, 0.0, 0.0));
+    // The mark, grown by a pixel: the antialiased rim of a glyph belongs to it.
+    const float2 px = BUFFER_PIXEL_SIZE;
+    float h = 0.0;
+    [unroll] for (int y = -1; y <= 1; ++y)
+    [unroll] for (int x = -1; x <= 1; ++x)
+        h = max(h, tex2Dlod(sDLSS5_Hud, float4(uv + float2(x, y) * px, 0.0, 0.0)).x);
+    const float w = smoothstep(0.35, 0.85, h) * RESTORE_STRENGTH;
+    if (w <= 0.0) return now;
+    const float3 was    = tex2Dlod(sDLSS5_Before, float4(uv, 0.0, 0.0)).rgb;
+    if (RESTORE_WHAT == 1) return float4(lerp(now.rgb, was, w), now.a);
+    const float3 hi_was = was - Blur5(sDLSS5_Before, uv);
+    const float3 hi_now = now.rgb - Blur5(ReShade::BackBuffer, uv);
+    return float4(now.rgb + w * (hi_was - hi_now), now.a);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1592,9 +1758,21 @@ technique DLSS5_Feed
 #endif
     pass FitSamples    { VertexShader = PostProcessVS; PixelShader = PS_FitSamples;    RenderTarget0 = DLSS5_FitA; RenderTarget1 = DLSS5_FitB; }
     pass FitSolve      { VertexShader = PostProcessVS; PixelShader = PS_FitSolve;      RenderTarget0 = DLSS5_Cam0; RenderTarget1 = DLSS5_Cam1; RenderTarget2 = DLSS5_Cam2; RenderTarget3 = DLSS5_Cam3; RenderTarget4 = DLSS5_Cam4; RenderTarget5 = DLSS5_Cam5; }
-    pass Guides        { VertexShader = PostProcessVS; PixelShader = PS_MotionVectors; RenderTarget0 = DLSS5_MV; RenderTarget1 = DLSS5_Mask; RenderTarget2 = DLSS5_Depth; RenderTarget3 = DLSS5_StaticNow; RenderTarget4 = DLSS5_VecNow; }
-    pass History       { VertexShader = PostProcessVS; PixelShader = PS_StoreHistory;  RenderTarget0 = DLSS5_PrevLuma; RenderTarget1 = DLSS5_PrevDepth; RenderTarget2 = DLSS5_PrevMV; RenderTarget3 = DLSS5_PrevStatic; }
+    pass Global        { VertexShader = PostProcessVS; PixelShader = PS_Global;        RenderTarget0 = DLSS5_Global; }
+    pass Guides        { VertexShader = PostProcessVS; PixelShader = PS_MotionVectors; RenderTarget0 = DLSS5_MV; RenderTarget1 = DLSS5_Mask; RenderTarget2 = DLSS5_Depth; RenderTarget3 = DLSS5_StaticNow; RenderTarget4 = DLSS5_VecNow; RenderTarget5 = DLSS5_Hud; }
+    pass History       { VertexShader = PostProcessVS; PixelShader = PS_StoreHistory;  RenderTarget0 = DLSS5_PrevLuma; RenderTarget1 = DLSS5_PrevDepth; RenderTarget2 = DLSS5_PrevMV; RenderTarget3 = DLSS5_PrevStatic; RenderTarget4 = DLSS5_PrevHud; RenderTarget5 = DLSS5_Before; }
     DLSS5_MV_REQUEST_PASS   // Launchpad only: ask it to compute optical flow again next frame
+}
+
+technique DLSS5_Feed_Restore
+<
+    ui_label   = "DLSS 5 Feed - restore text and HUD (place BELOW DLSS 5 Feed)";
+    ui_tooltip = "Puts the fine detail of the frame as it came in back on captions and HUD elements, after\n"
+                 "DLSS and the neural pass have had it. Needs the Refine vector pipeline. Settings are in\n"
+                 "DLSS5_Feed's own list, under Restore.";
+>
+{
+    pass { VertexShader = PostProcessVS; PixelShader = PS_Restore; }
 }
 
 technique DLSS5_Feed_Debug

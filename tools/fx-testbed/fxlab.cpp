@@ -16,7 +16,13 @@
 //
 //   fxlab.exe [--scene ui|3d] [--size WxH] [--frames N] [--capture a,b,c] [--out dir] [--tag name]
 //             [--show] [--loop] [--lat N] [--full] [--fmt 8|10] [--preroll seconds] [--fps N]
-//             [--noise N] [--mv]
+//             [--noise N] [--mv] [--hdr]
+//
+// --hdr presents HDR10: the same picture converted to PQ / BT.2020 at a paper white of 203 nits
+// with highlights up to ~600, in a 10-bit swap chain tagged ST.2084. That is what a capture
+// preview hands ReShade on an HDR desktop, and the add-on treats it differently from SDR (its
+// PQ bridge decodes it to linear light for DLSS). All comparisons are then made on PQ code
+// values, which are perceptually spaced like SDR ones.
 //
 // --scene 3d is a small 3D courtyard with a depth buffer, a game HUD and exact per-pixel motion
 // vectors to score against (fxlab3d.h). --loop --show runs either scene in a visible window
@@ -32,7 +38,7 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <d3d11.h>
-#include <dxgi1_2.h>
+#include <dxgi1_4.h>
 #include <d2d1_1.h>
 #include <dwrite.h>
 #include <d3dcompiler.h>
@@ -226,6 +232,17 @@ static const char kBlitHlsl[] = R"(
 Texture2D<float4> src : register(t0);
 float4 vs(uint id : SV_VertexID) : SV_Position { return float4(float2((id << 1) & 2, id & 2) * float2(2, -2) + float2(-1, 1), 0, 1); }
 float4 ps(float4 pos : SV_Position) : SV_Target { return float4(src.Load(int3(pos.xy, 0)).rgb, 1.0); }
+// The SDR picture as HDR10: display gamma off, paper white at 203 nits, the top of the range
+// lifted to ~600 nits (so there is something above paper white), BT.709 -> BT.2020, ST.2084.
+float4 ps_pq(float4 pos : SV_Position) : SV_Target
+{
+    float3 lin = pow(saturate(src.Load(int3(pos.xy, 0)).rgb), 2.2);
+    float  l   = dot(lin, float3(0.2126, 0.7152, 0.0722));
+    lin *= 203.0 * (1.0 + 2.0 * l * l * l * l);
+    float3 c = float3(dot(lin, float3(0.6274, 0.3293, 0.0433)), dot(lin, float3(0.0691, 0.9195, 0.0114)), dot(lin, float3(0.0164, 0.0880, 0.8956)));
+    float3 y = pow(saturate(c / 10000.0), 0.1593017578125);
+    return float4(pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375), 1.0);
+}
 )";
 
 // ---------------------------------------------------------------------------------------------
@@ -238,6 +255,7 @@ struct App
     int latency = 2;
     bool show = false, full = false;
     bool scene3d = false;   // --scene 3d
+    bool hdr = false;       // --hdr: HDR10 (PQ, BT.2020) instead of SDR
     bool loop = false;      // run until Esc instead of for g.frames
     bool paused = false;    // Space, in --loop: the frame number stands still
     bool mvdump = false;    // the read-back is DLSS5_Feed_Debug view 10 (vectors), not a picture
@@ -256,7 +274,7 @@ struct App
     ComPtr<ID3D11RenderTargetView> scene_rtv;
     ComPtr<ID3D11ShaderResourceView> scene_srv;
     ComPtr<ID3D11VertexShader> vs;
-    ComPtr<ID3D11PixelShader> ps_bg, ps_blit, ps_noise_add, ps_noise_sub;
+    ComPtr<ID3D11PixelShader> ps_bg, ps_blit, ps_pq, ps_noise_add, ps_noise_sub;
     ComPtr<ID3D11BlendState> bs_add, bs_sub;
     ComPtr<ID3D11Buffer> cb;
     ComPtr<ID3D11RasterizerState> rs;
@@ -443,7 +461,7 @@ static void SavePng(const std::string &path, const std::vector<uint8_t> &bgr, in
 }
 
 // input | output | difference x8, as one PNG
-static void SaveCrop(const char *name, int frame, const std::vector<uint8_t> &pre, const std::vector<float> &post, int x0, int y0, int x1, int y1)
+static void SaveCrop(const char *name, int frame, const std::vector<float> &pre, const std::vector<float> &post, int x0, int y0, int x1, int y1)
 {
     const int W = g.W, cw = x1 - x0, ch = y1 - y0;
     if (cw <= 0 || ch <= 0) return;
@@ -455,8 +473,8 @@ static void SaveCrop(const char *name, int frame, const std::vector<uint8_t> &pr
             uint8_t *row = img.data() + static_cast<size_t>(y) * cw * 9;
             for (int c = 0; c < 3; ++c)
             {
-                const float a = pre[s * 4 + c] / 255.0f, b = post[s * 3 + c];
-                row[x * 3 + (2 - c)]               = pre[s * 4 + c];
+                const float a = pre[s * 3 + c], b = post[s * 3 + c];
+                row[x * 3 + (2 - c)]               = static_cast<uint8_t>(std::clamp(a * 255.0f + 0.5f, 0.0f, 255.0f));
                 row[(cw + x) * 3 + (2 - c)]        = static_cast<uint8_t>(std::clamp(b * 255.0f + 0.5f, 0.0f, 255.0f));
                 row[(2 * cw + x) * 3 + (2 - c)]    = static_cast<uint8_t>(std::clamp(fabsf(b - a) * 8.0f * 255.0f, 0.0f, 255.0f));
             }
@@ -467,13 +485,13 @@ static void SaveCrop(const char *name, int frame, const std::vector<uint8_t> &pr
 }
 
 // One finished frame against the picture fxlab drew for it.
-static void Analyse(int frame, const std::vector<uint8_t> &pre, const std::vector<float> &post /* rgb, 0..1 */)
+static void Analyse(int frame, const std::vector<float> &pre, const std::vector<float> &post /* both rgb, 0..1 */)
 {
     const int W = g.W, H = g.H;
     std::vector<float> lp(static_cast<size_t>(W) * H), lq(static_cast<size_t>(W) * H);
     for (size_t i = 0, n = lp.size(); i < n; ++i)
     {
-        lp[i] = (0.299f * pre[i * 4] + 0.587f * pre[i * 4 + 1] + 0.114f * pre[i * 4 + 2]) / 255.0f;
+        lp[i] = 0.299f * pre[i * 3] + 0.587f * pre[i * 3 + 1] + 0.114f * pre[i * 3 + 2];
         lq[i] = 0.299f * post[i * 3] + 0.587f * post[i * 3 + 1] + 0.114f * post[i * 3 + 2];
     }
     for (const Probe &p : kProbes)
@@ -555,17 +573,14 @@ static void Crop3(const char *name, int frame, const Cap3 &c, float bx0, float b
 
 static std::map<int, Cap3> g_caps;   // frame -> what fxlab drew for it, and later what came back
 
-static void ReadBack(int frame)
+// The current back buffer as RGB 0..1 (its code values, whatever they encode).
+static void ReadBuffer(std::vector<float> &post)
 {
-    auto it = g_caps.find(frame);
-    if (it == g_caps.end()) return;
-    Cap3 &cap = it->second;
     ComPtr<ID3D11Texture2D> bb;
     CHECK(g.swap->GetBuffer(0, IID_PPV_ARGS(&bb)), "GetBuffer");
     g.ctx->CopyResource(g.bb_staging.Get(), bb.Get());
     D3D11_MAPPED_SUBRESOURCE m;
     CHECK(g.ctx->Map(g.bb_staging.Get(), 0, D3D11_MAP_READ, 0, &m), "Map backbuffer");
-    std::vector<float> &post = cap.post;
     post.resize(static_cast<size_t>(g.W) * g.H * 3);
     for (int y = 0; y < g.H; ++y)
     {
@@ -585,6 +600,15 @@ static void ReadBack(int frame)
         }
     }
     g.ctx->Unmap(g.bb_staging.Get(), 0);
+}
+
+static void ReadBack(int frame)
+{
+    auto it = g_caps.find(frame);
+    if (it == g_caps.end()) return;
+    Cap3 &cap = it->second;
+    std::vector<float> &post = cap.post;
+    ReadBuffer(post);
     if (cap.report)
     {
         if (g.scene3d)
@@ -597,7 +621,9 @@ static void ReadBack(int frame)
     g_caps.erase(g_caps.begin(), g_caps.lower_bound(frame));   // this frame stays: it may be the next one's "previous"
 }
 
-// The frame just drawn (g.scene), copied out for the comparison two presents from now.
+// The frame just drawn, copied out for the comparison two presents from now: the back buffer as
+// it is about to be presented (that is the input ReShade gets), and for the 3D scene what its
+// analysis needs besides.
 static void Capture(int frame, bool report, const std::vector<uint8_t> *nohud)
 {
     auto grab = [](ID3D11Texture2D *staging, ID3D11Texture2D *src, void *dst, size_t row_bytes)
@@ -611,10 +637,11 @@ static void Capture(int frame, bool report, const std::vector<uint8_t> *nohud)
     };
     Cap3 &cap = g_caps[frame];
     cap.report = report;
-    cap.pre.resize(static_cast<size_t>(g.W) * g.H * 4);
-    grab(g.scene_staging.Get(), g.scene.Get(), cap.pre.data(), static_cast<size_t>(g.W) * 4);
+    ReadBuffer(cap.pre);
     if (g.scene3d)
     {
+        cap.scene.resize(static_cast<size_t>(g.W) * g.H * 4);
+        grab(g.scene_staging.Get(), g.scene.Get(), cap.scene.data(), static_cast<size_t>(g.W) * 4);
         cap.nohud = *nohud;
         cap.truth.resize(static_cast<size_t>(g.W) * g.H * 4);
         grab(s3.truth_staging.Get(), s3.truth.Get(), cap.truth.data(), static_cast<size_t>(g.W) * 8);
@@ -638,6 +665,7 @@ int main(int argc, char **argv)
         else if (a == "--noise")   { g.noise = static_cast<float>(atof(v)); ++i; }
         else if (a == "--show")    g.show = true;
         else if (a == "--loop")    g.loop = true;
+        else if (a == "--hdr")     g.hdr = true;
         else if (a == "--scene")   { g.scene3d = std::string(v) == "3d"; ++i; }
         else if (a == "--full")    g.full = true;
         else if (a == "--mv")      g.mvdump = true;
@@ -678,6 +706,16 @@ int main(int argc, char **argv)
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT; sd.BufferCount = 2;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL; sd.Scaling = DXGI_SCALING_STRETCH; sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
     CHECK(factory->CreateSwapChainForHwnd(g.dev.Get(), g.hwnd, &sd, nullptr, nullptr, &g.swap), "CreateSwapChainForHwnd");
+    if (g.hdr)
+    {
+        ComPtr<IDXGISwapChain3> sc3;
+        UINT support = 0;
+        CHECK(g.swap.As(&sc3), "IDXGISwapChain3");
+        sc3->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, &support);
+        const HRESULT hr = sc3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+        printf("HDR10: ST.2084 / BT.2020 colour space %s (support flags 0x%X, SetColorSpace1 0x%08lX)\n",
+               SUCCEEDED(hr) ? "set" : "NOT set", support, static_cast<unsigned long>(hr));
+    }
 
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = g.W; td.Height = g.H; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
@@ -696,6 +734,8 @@ int main(int argc, char **argv)
         auto p = Compile(kBackgroundHlsl, "main", "ps_5_0");
         CHECK(g.dev->CreateVertexShader(v->GetBufferPointer(), v->GetBufferSize(), nullptr, &g.vs), "VS");
         CHECK(g.dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g.ps_blit), "blit PS");
+        auto q = Compile(kBlitHlsl, "ps_pq", "ps_5_0");
+        CHECK(g.dev->CreatePixelShader(q->GetBufferPointer(), q->GetBufferSize(), nullptr, &g.ps_pq), "PQ PS");
         CHECK(g.dev->CreatePixelShader(p->GetBufferPointer(), p->GetBufferSize(), nullptr, &g.ps_bg), "background PS");
         auto na = Compile(kBackgroundHlsl, "noise_add", "ps_5_0");
         auto ns = Compile(kBackgroundHlsl, "noise_sub", "ps_5_0");
@@ -837,8 +877,6 @@ int main(int argc, char **argv)
             g.ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
         }
 
-        if (keep && g_caps.find(frame) == g_caps.end()) Capture(frame, report, &nohud);
-
         ComPtr<ID3D11Texture2D> bb; ComPtr<ID3D11RenderTargetView> bb_rtv;
         CHECK(g.swap->GetBuffer(0, IID_PPV_ARGS(&bb)), "GetBuffer");
         CHECK(g.dev->CreateRenderTargetView(bb.Get(), nullptr, &bb_rtv), "backbuffer RTV");
@@ -849,13 +887,15 @@ int main(int argc, char **argv)
         g.ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
         g.ctx->OMSetDepthStencilState(nullptr, 0);
         g.ctx->VSSetShader(g.vs.Get(), nullptr, 0);
-        g.ctx->PSSetShader(g.ps_blit.Get(), nullptr, 0);
+        g.ctx->PSSetShader(g.hdr ? g.ps_pq.Get() : g.ps_blit.Get(), nullptr, 0);
         g.ctx->OMSetRenderTargets(1, bb_rtv.GetAddressOf(), nullptr);
         g.ctx->PSSetShaderResources(0, 1, g.scene_srv.GetAddressOf());
         g.ctx->Draw(3, 0);
         g.ctx->PSSetShaderResources(0, 1, &null_srv);
         g.ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
         bb_rtv.Reset(); bb.Reset();
+
+        if (keep && g_caps.find(frame) == g_caps.end()) Capture(frame, report, &nohud);
 
         // GPU time of everything issued on this device inside Present -- that is ReShade's whole
         // effect chain, DLSS5_Feed.fx and its provider included. (The DLSS evaluate itself runs

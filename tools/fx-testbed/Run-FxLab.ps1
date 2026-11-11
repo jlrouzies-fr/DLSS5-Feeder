@@ -30,15 +30,21 @@ param(
     [string]$Size = '3840x2160',
     [string]$Capture = '',
     [double]$Preroll = 14,
-    [double]$Fps = 120,
+    [double]$Fps = -1,                    # frames a second; -1 = 120, or 60 with a neural consumer (see below); 0 = unpaced
     [string[]]$ExtraShaderDirs = @(),
     [double]$Noise = 0,                   # temporal noise on the picture, +- 8-bit steps
+    [switch]$Hdr,                         # present HDR10 (PQ, BT.2020, 10-bit) instead of SDR
     [switch]$Mv,                          # measure the VECTORS against the truth instead of the picture
     [switch]$NoReShade,
     [switch]$Show,
     [switch]$Full
 )
 $ErrorActionPreference = 'Stop'
+# With the neural model in the chain (about 8 ms at 4K on an RTX 5090) 120 frames a second is
+# more than the GPU retires: the add-on's D3D12 queue falls behind, its 2 s allocator wait times
+# out, the device is removed (0x887A0006) and the feed stops for the rest of the run -- which
+# reads as a perfect score, because the output is then the input. 60 is what a capture feed runs at.
+if ($Fps -lt 0) { $Fps = if ($Consumer -ne '') { 60 } else { 120 } }
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $lab  = Join-Path $repo 'build\fxlab'
 $rig  = Join-Path $lab 'rig'
@@ -154,6 +160,7 @@ if ($Capture -ne '') { $args_ += @('--capture', $Capture) }
 if ($Show -and -not $Interactive) { $args_ += '--show' }
 if ($Full) { $args_ += '--full' }
 if ($Mv) { $args_ += '--mv' }
+if ($Hdr) { $args_ += '--hdr' }
 if ($Noise -gt 0) { $args_ += @('--noise', $Noise) }
 Push-Location $rig
 try { & (Join-Path $rig 'fxlab.exe') @args_; $code = $LASTEXITCODE } finally { Pop-Location }
@@ -165,7 +172,11 @@ if (-not $NoReShade) {
     $rl = Join-Path $rig 'ReShade.log'
     if (Test-Path $rl) { Select-String -Path $rl -Pattern 'error|failed to compile|warning X' | Select-Object -First 12 | ForEach-Object { "ReShade.log: $($_.Line)" } }
     $fl = Join-Path $rig 'dlss5-feed.log'
-    if (Test-Path $fl) { Select-String -Path $fl -Pattern 'feature ready|effects:|FAILED|failed|error|preset' | Select-Object -First 12 | ForEach-Object { "feed.log: $($_.Line)" } }
+    if (Test-Path $fl) {
+        Select-String -Path $fl -Pattern 'feature ready|effects:|FAILED|failed|error|preset' | Select-Object -First 12 | ForEach-Object { "feed.log: $($_.Line)" }
+        $gone = Select-String -Path $fl -Pattern 'device is removed|stopped:' | Select-Object -First 1
+        if ($gone) { "feed.log: THE FEED STOPPED DURING THIS RUN -- its numbers are not a measurement: $($gone.Line)" }
+    }
     else { 'feed.log: MISSING -- the add-on did not load' }
     if ($Consumer -eq 'optiscaler') {
         $ol = Join-Path $rig 'OptiScaler.log'

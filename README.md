@@ -998,9 +998,40 @@ Three things the same measurements say that no shader can change:
   times as restless as the input.
 * **The vectors matter more with a neural pass, not less** (last row of the 3D table).
 
-`tools\fx-testbed\Run-FxLab.ps1` reproduces all of it (`-Scene 3d`, `-Consumer optiscaler`, and
-`-Interactive` to look at either scene yourself); the headers of `fxlab.cpp` and `fxlab3d.h`
+**HDR10.** The same measurements on a PQ / BT.2020 10-bit swap chain (`-Hdr`; the add-on's PQ bridge
+is on and DLSS runs in HDR mode) show the same pattern: static 14 px text keeps 0.67 of its edge
+energy with Classic, 0.82 with Refine, 0.99 with `preset=5`; in 3D the HUD error goes from 1.05 to
+0.53. scRGB (FP16) input is not covered by the rig yet.
+
+`tools\fx-testbed\Run-FxLab.ps1` reproduces all of it (`-Scene 3d`, `-Hdr`, `-Consumer optiscaler`,
+and `-Interactive` to look at either scene yourself); the headers of `fxlab.cpp` and `fxlab3d.h`
 explain the method.
+
+### Restoring text and HUD (`DLSS5_Feed_Restore`)
+
+Even with perfect vectors the default DLSS preset softens lettering, and a neural pass redraws it.
+The optional technique **DLSS 5 Feed - restore text and HUD** — enable it **below** `DLSS 5 Feed` —
+runs after the add-on has put DLSS's (and the neural consumer's) picture into the frame, and puts
+the fine detail of the frame *as it came in* back on captions and HUD elements. Everything broader
+than a few pixels (a relit surface, a tint) stays as it came out.
+
+What counts as text or HUD is decided per pixel, over time: a pixel that stands still while at
+least a quarter of the frame and its own surroundings move, and that has the local contrast of
+lettering or line work. It stays marked for as long as it does not change, so a HUD stays sharp
+when the camera stops. The world is not touched; in the 3D test scene the neural pass keeps 99% of
+its edit. Debug view *Restore* shows the marked pixels.
+
+| default preset, LumeniteFX Kernel, Refine | without | fine detail only *(default)* | the whole pixel |
+| --- | --- | --- | --- |
+| 2D static 14 px text over a moving background | sharp 0.84, error 3.4 | sharp 0.99, error 2.1 | sharp 1.00, error 0.5 |
+| 2D static 20 px text | sharp 0.94, error 2.1 | sharp 1.00, error 1.4 | sharp 1.00, error 0.4 |
+| 3D HUD, plain DLAA | error 1.12 | error 0.86 | error 0.43 |
+| 3D HUD, with the neural pass | error 2.78 | error 2.40 | error 1.75 |
+
+*The whole pixel* is exact where the mark is right and shows as a patch the neural pass did not
+reach where it is wrong, which is why it is not the default. *What to restore → Everything that
+stands still* also covers a menu with nothing moving behind it (static text on a flat background:
+sharp 0.89 → 0.97), at the price of taking a neural pass's fine detail out of a still scene.
 
 ### Validation and the trust mask
 
