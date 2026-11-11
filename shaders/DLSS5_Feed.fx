@@ -401,6 +401,30 @@ uniform bool RESTORE_HOLD_REPEATS <
                  "is let through after that, so it still settles).";
 > = true;
 
+uniform int RESTORE_TEXTURE <
+    ui_category = "Restore (DLSS5_Feed_Restore technique)";
+    ui_type = "combo";
+    ui_items = "Off\0Fine texture the model has softened\0";
+    ui_label = "Moving fine texture";
+    ui_tooltip = "A temporal model resamples its history between pixels wherever the picture moves by a\n"
+                 "fraction of a pixel, and a pattern a few pixels a period -- perforated metal, a grille,\n"
+                 "a halftone, fabric -- loses a fifth to two fifths of its contrast to that, by an amount\n"
+                 "that changes with the fraction: across a floor in perspective that shows as moire, bands\n"
+                 "and rings of soft and sharp that crawl as the camera moves. Exact vectors do not help\n"
+                 "(measured: they make it a little worse, the history is then used everywhere).\n"
+                 "With this on, wherever the output holds clearly less fine contrast than the frame that\n"
+                 "went in, on texture (not along a plain edge, which the model may antialias as it likes),\n"
+                 "the fine detail is the input's again; everything broader stays the model's.";
+> = 1;
+
+uniform float RESTORE_TEXTURE_CONTRAST <
+    ui_category = "Restore (DLSS5_Feed_Restore technique)";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 0.2; ui_step = 0.002;
+    ui_label = "Moving fine texture: minimum contrast";
+    ui_tooltip = "5x5 contrast (mean absolute deviation of luma) from which a patch counts as texture worth\n"
+                 "putting back. Below it -- film grain, noise, banding dither -- the model's smoothing stays.";
+> = 0.012;
+
 uniform float RESTORE_STRENGTH <
     ui_category = "Restore (DLSS5_Feed_Restore technique)";
     ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.05;
@@ -1968,15 +1992,61 @@ float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 // On a still element with no neural pass that is, to within the blur, the input itself.
 // ---------------------------------------------------------------------------------------------
 
-// Nine bilinear taps RESTORE_WIDTH pixels apart: at 1.5, about a 5x5 binomial.
-float3 Blur5(sampler2D s, float2 uv)
+// Nine bilinear taps `width` pixels apart: at 1.5, about a 5x5 binomial.
+float3 Blur5(sampler2D s, float2 uv, float width)
 {
-    const float2 o = BUFFER_PIXEL_SIZE * RESTORE_WIDTH;
+    const float2 o = BUFFER_PIXEL_SIZE * width;
     float3 c = tex2Dlod(s, float4(uv, 0.0, 0.0)).rgb * 0.25;
     c += (tex2Dlod(s, float4(uv + float2( o.x, 0.0), 0.0, 0.0)).rgb + tex2Dlod(s, float4(uv + float2(-o.x, 0.0), 0.0, 0.0)).rgb
         + tex2Dlod(s, float4(uv + float2(0.0,  o.y), 0.0, 0.0)).rgb + tex2Dlod(s, float4(uv + float2(0.0, -o.y), 0.0, 0.0)).rgb) * 0.125;
     c += (tex2Dlod(s, float4(uv + float2( o.x,  o.y), 0.0, 0.0)).rgb + tex2Dlod(s, float4(uv + float2(-o.x,  o.y), 0.0, 0.0)).rgb
         + tex2Dlod(s, float4(uv + float2( o.x, -o.y), 0.0, 0.0)).rgb + tex2Dlod(s, float4(uv + float2(-o.x, -o.y), 0.0, 0.0)).rgb) * 0.0625;
+    return c;
+}
+
+// How much of its fine texture has the output lost here? 0 = none worth acting on, 1 = clearly.
+// The contrast (mean absolute deviation of luma) of a 5x5 of both pictures. There is no test
+// for "texture, not an edge" on purpose: a step that the model has antialiased keeps nearly
+// all of its 5x5 contrast (the step is still there) and falls under the threshold by itself,
+// while a gradient-direction test threw out the very case this is for -- perforated metal seen
+// at a shallow angle is five pixels a period one way and two the other, which reads as lines.
+float TextureLoss(float2 uv)
+{
+    const float2 px = BUFFER_PIXEL_SIZE;
+    const float3 lw = float3(0.299, 0.587, 0.114);
+    float a[25], b[25];
+    float ma = 0.0, mb = 0.0;
+    [unroll] for (int k = 0; k < 25; ++k)
+    {
+        const float4 at = float4(uv + float2(k % 5 - 2, k / 5 - 2) * px, 0.0, 0.0);
+        a[k] = dot(tex2Dlod(sDLSS5_Before, at).rgb, lw);
+        b[k] = dot(tex2Dlod(ReShade::BackBuffer, at).rgb, lw);
+        ma += a[k]; mb += b[k];
+    }
+    ma /= 25.0; mb /= 25.0;
+    float ca = 0.0, cb = 0.0;
+    [unroll] for (int k1 = 0; k1 < 25; ++k1) { ca += abs(a[k1] - ma); cb += abs(b[k1] - mb); }
+    const float loss = 1.0 - cb / max(ca, 1e-6);
+    return smoothstep(0.02, 0.10, loss) * smoothstep(1.0, 2.0, ca / 25.0 / max(RESTORE_TEXTURE_CONTRAST, 1e-4));
+}
+
+// The low-pass for texture: sixteen bilinear taps, all BETWEEN pixels (half a pixel and two and
+// a half out on each axis), which makes it 0.10 0.10 0.15 0.30 0.15 0.10 0.10 across seven
+// pixels. Every tap averages two pixels, so a pattern two pixels a period -- perforated metal
+// seen at a shallow angle -- cancels exactly; five pixels a period leaves 7%. Blur5 at any
+// width lets a third to a half of such patterns through (its taps land on pixel centres), and
+// what gets through counts as "broad" and stays the model's: the moire, at half strength.
+float3 BlurWide(sampler2D s, float2 uv)
+{
+    const float2 px = BUFFER_PIXEL_SIZE;
+    float3 c = 0.0;
+    [unroll] for (int j = 0; j < 4; ++j)
+    [unroll] for (int i = 0; i < 4; ++i)
+    {
+        const float2 o = float2(i < 2 ? (i == 0 ? -2.5 : -0.5) : (i == 2 ? 0.5 : 2.5), j < 2 ? (j == 0 ? -2.5 : -0.5) : (j == 2 ? 0.5 : 2.5));
+        const float  k = ((i == 0 || i == 3) ? 0.2 : 0.3) * ((j == 0 || j == 3) ? 0.2 : 0.3);
+        c += k * tex2Dlod(s, float4(uv + o * px, 0.0, 0.0)).rgb;
+    }
     return c;
 }
 
@@ -2008,12 +2078,17 @@ float4 PS_Restore(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
         h += k * m; wsum += k;
     }
     h /= wsum;
-    const float w = smoothstep(0.35, 0.85, h) * RESTORE_STRENGTH;
+    const float w_hud = smoothstep(0.35, 0.85, h) * RESTORE_STRENGTH;
+    const float3 was  = tex2Dlod(sDLSS5_Before, float4(uv, 0.0, 0.0)).rgb;
+    if (RESTORE_WHAT == 1 && w_hud > 0.0) return float4(lerp(now.rgb, was, w_hud), now.a);
+    // And texture the model has softened, marked or not (always fine detail only: the pixel
+    // is moving, and what the model did to it at any broader scale is its to keep).
+    float w = w_hud;
+    if (RESTORE_TEXTURE == 1 && w < 1.0) w = max(w, TextureLoss(uv) * RESTORE_STRENGTH);
     if (w <= 0.0) return now;
-    const float3 was    = tex2Dlod(sDLSS5_Before, float4(uv, 0.0, 0.0)).rgb;
-    if (RESTORE_WHAT == 1) return float4(lerp(now.rgb, was, w), now.a);
-    const float3 lo_was = Blur5(sDLSS5_Before, uv);
-    const float3 lo_now = Blur5(ReShade::BackBuffer, uv);
+    const bool   hud    = w_hud > 0.0;
+    const float3 lo_was = hud ? Blur5(sDLSS5_Before, uv, RESTORE_WIDTH)      : BlurWide(sDLSS5_Before, uv);
+    const float3 lo_now = hud ? Blur5(ReShade::BackBuffer, uv, RESTORE_WIDTH) : BlurWide(ReShade::BackBuffer, uv);
     const float3 mixed  = now.rgb + w * ((was - lo_was) - (now.rgb - lo_now));
     // Never outside what the two pictures hold here. Swapping one picture's detail onto the
     // other's base overshoots wherever the two disagree about the base -- a neural pass that

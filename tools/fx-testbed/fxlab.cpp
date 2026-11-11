@@ -273,6 +273,7 @@ struct App
     int  hold_run = 0, hold_still = 0;   // --hold A,B: the scene moves for A presents, then stands still for B, over and over
     bool loop = false;      // run until Esc instead of for g.frames
     bool paused = false;    // Space, in --loop: the frame number stands still
+    bool mesh = false;      // 3D scene: a perforated-metal floor panel in front of the camera (fine repeating dots)
     bool mvdump = false;    // the read-back is DLSS5_Feed_Debug view 10 (vectors), not a picture
     double preroll = 0.0;   // seconds of frame 0 before the clock starts (ReShade compiles its effects meanwhile)
     double fps = 0.0;       // 0 = as fast as it goes
@@ -689,6 +690,7 @@ int main(int argc, char **argv)
         else if (a == "--scene")   { g.scene3d = std::string(v) == "3d"; ++i; }
         else if (a == "--full")    g.full = true;
         else if (a == "--mv")      g.mvdump = true;
+        else if (a == "--mesh")    g.mesh = true;
         else if (a == "--capture") { for (const char *s = v; *s; ) { g.captures.push_back(atoi(s)); while (*s && *s != ',') ++s; if (*s) ++s; } ++i; }
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }

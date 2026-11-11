@@ -101,6 +101,20 @@ float3 albedo(float mat, float3 wp, float3 op, float3 on)
         return lerp(0.55, 1.15, s) + (vnoise(op.xz * 14.0) - 0.5) * 0.12;
     }
     if (mat < 3.5) return 1.0;
+    if (mat > 4.5)
+    {
+        // Perforated metal: round dots in staggered rows, 14 mm apart -- a few pixels a period
+        // from where the camera stands, and less than that along the view. Nothing in a patch
+        // of it tells one dot from the next, which is the point.
+        float2 q = wp.xz / 0.014;
+        float aa = max(fwidth(q.x), fwidth(q.y));
+        q.x += 0.5 * fmod(abs(floor(q.y)), 2.0);
+        float d = length(frac(q) - 0.5);
+        float hole = 1.0 - smoothstep(0.30, 0.30 + min(aa, 0.4), d);
+        float2 e = 0.5 * Size.xz - abs(op.xz);
+        float frame = 1.0 - smoothstep(0.06, 0.06 + 1.5 * fwidth(op.x), min(e.x, e.y));
+        return lerp(1.0 - 0.72 * hole, 1.25, frame);
+    }
     {
         float aa = max(fwidth(uv.x), fwidth(uv.y));
         float2 e = 0.5 * Size.xy - abs(uv);                           // distance to the face's edge
@@ -163,6 +177,8 @@ static Scene3D s3;
 
 static const int kJitters = 8;
 static const float kJitter[kJitters][2] = { { 1, -3 }, { -1, 3 }, { 5, 1 }, { -3, -5 }, { -5, 5 }, { -7, -1 }, { 3, 7 }, { 7, -7 } };   // sixteenths of a pixel
+
+static const float kMesh[4] = { -3.2f, 1.0f, -5.4f, -1.4f };   // the perforated panel: x0, x1, z0, z1 (metres)
 
 static void Camera3D(int frame, XMVECTOR *pos, float *yaw)
 {
@@ -308,6 +324,17 @@ static void Init3D()
     for (int i = 0; i < 12; ++i)                                                          // fence: thin bars, close
         add(0, 3, 0.13f, 0.13f, 0.15f, 0.05f, 1.4f, 0.05f, 1.4f + 0.35f * i, 0.7f, -3.6f);
     add(0, 3, 0.13f, 0.13f, 0.15f, 4.2f, 0.05f, 0.05f, 3.33f, 1.4f, -3.6f);
+    if (g.mesh) add(0, 5, 0.25f, 0.33f, 0.85f, kMesh[1] - kMesh[0], 0.02f, kMesh[3] - kMesh[2], 0.5f * (kMesh[0] + kMesh[1]), 0.01f, 0.5f * (kMesh[2] + kMesh[3]));
+}
+
+// Is the scene pixel (x, y), at view depth z, on the perforated panel's top face?
+static bool OnMesh3D(const XMMATRIX &inv_view, int x, int y, float z)
+{
+    if (!g.mesh || z <= 0.0f) return false;
+    const float t = tanf(XMConvertToRadians(30.0f));
+    const float nx = (x + 0.5f) / g.W * 2.0f - 1.0f, ny = 1.0f - (y + 0.5f) / g.H * 2.0f;
+    XMFLOAT3 w; XMStoreFloat3(&w, XMVector3TransformCoord(XMVectorSet(nx * z * t * g.W / g.H, ny * z * t, z, 1.0f), inv_view));
+    return fabsf(w.y - 0.02f) < 0.02f && w.x > kMesh[0] + 0.1f && w.x < kMesh[1] - 0.1f && w.z > kMesh[2] + 0.1f && w.z < kMesh[3] - 0.1f;
 }
 
 // The picture of frame `frame` into g.scene, its true motion into s3.truth, its depth left in
@@ -502,8 +529,10 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
         // Vectors against the truth. "Textured" pixels have a motion one can see; "flat" ones
         // do not, but a consumer that tracks surfaces still wants them to move with the rest.
         struct Acc { double n = 0, err = 0, q = 0, o = 0, z = 0, sx = 0, sy = 0, tx = 0, ty = 0; };
-        Acc acc[5];   // hud, still textured, moving textured, moving flat, moving thin (near a depth edge)
-        static const char *const names[5] = { "3d.hud", "3d.still", "3d.moving", "3d.moving.flat", "3d.moving.edge" };
+        const XMMATRIX inv_view = XMMatrixInverse(nullptr, View3D(frame));
+        Acc acc[6];   // + the perforated panel (its pixels are counted in their own class as well)
+        //            hud, still textured, moving textured, moving flat, moving thin (near a depth edge)
+        static const char *const names[6] = { "3d.hud", "3d.still", "3d.moving", "3d.moving.flat", "3d.moving.edge", "3d.mesh" };
         for (int y = 2; y < H - 2; ++y)
             for (int x = 2; x < W - 2; ++x)
             {
@@ -531,13 +560,17 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
                 }
                 const float mx = (c.post[i * 3] * 1023.0f - 512.0f) / 8.0f, my = (c.post[i * 3 + 1] * 1023.0f - 512.0f) / 8.0f;
                 const float e = hypotf(mx - tx, my - ty);
-                Acc &a = acc[k];
-                a.n += 1; a.err += e; a.sx += mx; a.sy += my; a.tx += tx; a.ty += ty;
-                if (e < 0.25f) a.q += 1;
-                if (e < 1.0f) a.o += 1;
-                if (fabsf(mx) < 0.01f && fabsf(my) < 0.01f) a.z += 1;
+                const bool mesh = cls[i] == 1 && OnMesh3D(inv_view, x, y, XMConvertHalfToFloat(c.truth[i * 4 + 2]));
+                for (int pass = 0; pass < (mesh ? 2 : 1); ++pass)
+                {
+                    Acc &a = acc[pass ? 5 : k];
+                    a.n += 1; a.err += e; a.sx += mx; a.sy += my; a.tx += tx; a.ty += ty;
+                    if (e < 0.25f) a.q += 1;
+                    if (e < 1.0f) a.o += 1;
+                    if (fabsf(mx) < 0.01f && fabsf(my) < 0.01f) a.z += 1;
+                }
             }
-        for (int k = 0; k < 5; ++k)
+        for (int k = 0; k < (g.mesh ? 6 : 5); ++k)
         {
             const Acc &a = acc[k];
             const double n = a.n > 0 ? a.n : 1;
@@ -584,6 +617,8 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
             pout[i] = 0.299f * prev->post[i * 3] + 0.587f * prev->post[i * 3 + 1] + 0.114f * prev->post[i * 3 + 2];
         }
         double n = 0, fin = 0, fout = 0, fed = 0, ed = 0;
+        double mn = 0, mfin = 0, mfout = 0, mgp = 0, mgq = 0, mae = 0;
+        const XMMATRIX inv_view = XMMatrixInverse(nullptr, View3D(frame));
         for (int y = 2; y < H - 2; ++y)
             for (int x = 2; x < W - 2; ++x)
             {
@@ -599,7 +634,19 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
                 const float a = Bilin(pin, W, H, px, py), b = Bilin(pout, W, H, px, py);
                 const float e = lout[i] - lin[i];
                 fin += fabsf(lin[i] - a); fout += fabsf(lout[i] - b); fed += fabsf(e - (b - a)); ed += fabsf(e); n += 1;
+                if (OnMesh3D(inv_view, x, y, XMConvertHalfToFloat(c.truth[i * 4 + 2])))
+                {
+                    mfin += fabsf(lin[i] - a); mfout += fabsf(lout[i] - b); mae += fabsf(e); mn += 1;
+                    mgp += fabsf(lin[i + 1] - lin[i]) + fabsf(lin[i + W] - lin[i]);
+                    mgq += fabsf(lout[i + 1] - lout[i]) + fabsf(lout[i + W] - lout[i]);
+                }
             }
+        if (mn > 0)
+        {
+            printf("  f%-4d 3d.mesh         input %6.3f  output %6.3f (x%4.2f)   mae %6.2f  sharp %5.3f   [%0.1f%% of the frame]\n",
+                   frame, 255 * mfin / mn, 255 * mfout / mn, mfin > 0 ? mfout / mfin : 0.0, 255 * mae / mn, mgp > 0 ? mgq / mgp : 1.0, 100.0 * mn / N);
+            emit("3d.mesh", "stab", 255 * mfout / mn, 255 * mae / mn, mfin > 0 ? mfout / mfin : 0, mgp > 0 ? mgq / mgp : 1.0);
+        }
         if (n < 1) n = 1;
         printf("  f%-4d 3d.stability    input %6.3f  output %6.3f (x%4.2f)   edit size %6.3f  edit change %6.3f (%3.0f%% of it)   [8-bit steps, %0.0f%% of the frame]\n",
                frame, 255 * fin / n, 255 * fout / n, fin > 0 ? fout / fin : 0.0, 255 * ed / n, 255 * fed / n, ed > 0 ? 100 * fed / ed : 0.0, 100.0 * n / N);
@@ -614,4 +661,5 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
     Crop3("3d.centre", frame, c, 1380, 780, 2460, 1380);
     Crop3("3d.fence", frame, c, 2300, 900, 3380, 1500);
     Crop3("3d.left", frame, c, 300, 700, 1380, 1300);
+    if (g.mesh) Crop3("3d.mesh", frame, c, 1100, 1500, 2180, 2100);
 }

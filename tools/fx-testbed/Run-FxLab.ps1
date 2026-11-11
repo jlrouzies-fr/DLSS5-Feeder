@@ -38,6 +38,7 @@ param(
     [switch]$Oracle,                      # exact vectors for the 3D scene: adds fxlab_Oracle.fx (use -Provider 0)
     [switch]$Hdr,                         # present HDR10 (PQ, BT.2020, 10-bit) instead of SDR
     [string]$ReShadeDll = '',             # another ReShade build to load as dxgi.dll (default: deploy\reshade-dxgi\dxgi_x64.dll)
+    [switch]$Mesh,                        # 3D scene: add a perforated-metal floor panel (fine repeating dots), scored apart as 3d.mesh
     [switch]$Mv,                          # measure the VECTORS against the truth instead of the picture
     [switch]$NoReShade,
     [switch]$Show,
@@ -165,6 +166,7 @@ if ($Capture -ne '') { $args_ += @('--capture', $Capture) }
 if ($Show -and -not $Interactive) { $args_ += '--show' }
 if ($Full) { $args_ += '--full' }
 if ($Mv) { $args_ += '--mv' }
+if ($Mesh) { $args_ += '--mesh' }
 if ($Hdr) { $args_ += '--hdr' }
 if ($Cadence -gt 1) { $args_ += @('--cadence', $Cadence) }
 if ($Oracle) { $args_ += '--oracle' }
