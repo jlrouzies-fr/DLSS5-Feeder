@@ -27,9 +27,13 @@ powershell -ExecutionPolicy Bypass -File tools\elgato\Deploy-ElgatoStudio.ps1 -P
   `PsychoV_HDR_Post.fx` (PQ only) and `PsychoV_SDR_Post.fx` (3184 presents 8-bit sRGB). Seed preset:
   `tools\elgato\ReShadePreset.ini`. `-AllShaders` adds crosire's full package list via
   `tools\Install-ReShadeShaders.ps1` (44 packages, ~510 effects; mdapt, RadiantGI, dh_uber_rt fail on D3D11).
-- `ReShade.ini` and `OptiScaler.ini` have to sit next to the DLLs: `-Pull` copies them to
-  `<store>\saved\` (older versions kept in `saved\history\`); a deploy pulls first, restores them,
-  and re-forces the WinUI-critical OptiScaler keys from `tools\elgato\OptiScaler.overrides.ini`.
+- `ReShade.ini`, `OptiScaler.ini` and `dlss5-feed.cfg` have to sit next to the DLLs: `-Pull` copies
+  them to `<store>\saved\` (older versions kept in `saved\history\`); a deploy pulls first, restores
+  them, and re-forces the WinUI-critical OptiScaler keys from `tools\elgato\OptiScaler.overrides.ini`.
+- `tools\elgato\dlss5-feed.defaults.cfg` is what this setup wants different from the add-on's own
+  defaults: DLSS render preset E (`preset=5`), the one that leaves text, HUD and 2D content closest
+  to the input (README, *Per-pixel refinement*). Each line is applied once per value
+  (`saved\dlss5-feed.defaults-applied.txt` remembers), so a preset picked in the overlay later is kept.
 - Binaries: `deploy\reshade-winui3\dxgi_x64.dll` (rebuild from `tools\elgato\reshade-6.8.0-winui3.patch`
   if lost -- `deploy\` is gitignored), `build\dlss5-feed.addon64`, `deploy\shared\nvngx_*.dll`, and the
   OptiScaler fork from `deploy\optiscaler-fork\` (`winmm.dll` + `OptiScaler\` + stock ini; source is

@@ -10,9 +10,12 @@
       * reshade-shaders\ and ReShadePreset.ini live in the store folder (default
         %USERPROFILE%\DLSS5-Feeder\ElgatoStudio -- not Documents, often OneDrive); ReShade.ini points at them with absolute paths, so
         shaders and presets you add survive updates on their own.
-      * ReShade.ini and OptiScaler.ini must sit next to the DLLs. -Pull copies them back to
-        <store>\saved\ (run it after tuning); a deploy always pulls first and then restores
-        them, re-forcing the WinUI-critical OptiScaler keys from OptiScaler.overrides.ini.
+      * ReShade.ini, OptiScaler.ini and dlss5-feed.cfg must sit next to the DLLs. -Pull copies
+        them back to <store>\saved\ (run it after tuning); a deploy always pulls first and then
+        restores them, re-forcing the WinUI-critical OptiScaler keys from OptiScaler.overrides.ini.
+      * dlss5-feed.defaults.cfg holds what this setup wants different from the add-on's own
+        defaults (the DLSS render preset). Each of its lines is applied once per value, so a
+        choice made in the overlay afterwards is kept.
 
     Binaries come from the repo checkout (all rebuildable, see docs/STATUS-ELGATO-STUDIO.md):
       dxgi.dll           deploy\reshade-winui3\dxgi_x64.dll  (ReShade 6.8.0 + reshade-6.8.0-winui3.patch)
@@ -27,7 +30,7 @@
 .EXAMPLE
     .\Deploy-ElgatoStudio.ps1            # deploy into the newest installed Elgato Studio
 .EXAMPLE
-    .\Deploy-ElgatoStudio.ps1 -Pull      # save live ReShade.ini / OptiScaler.ini to the store
+    .\Deploy-ElgatoStudio.ps1 -Pull      # save live ReShade.ini / OptiScaler.ini / dlss5-feed.cfg to the store
 #>
 [CmdletBinding()]
 param(
@@ -66,7 +69,7 @@ $Saved = Join-Path $Store 'saved'
 
 function Invoke-Pull {
     New-Item -ItemType Directory -Force $Saved | Out-Null
-    foreach ($n in 'ReShade.ini', 'OptiScaler.ini') {
+    foreach ($n in 'ReShade.ini', 'OptiScaler.ini', 'dlss5-feed.cfg') {
         $src = Join-Path $Target $n
         if (-not (Test-Path $src)) { continue }
         $dst = Join-Path $Saved $n
@@ -189,6 +192,29 @@ foreach ($line in [IO.File]::ReadAllLines((Join-Path $PSScriptRoot 'OptiScaler.o
 }
 [IO.File]::WriteAllLines((Join-Path $Target 'OptiScaler.ini'), $L, $Utf8)
 Say "OptiScaler.ini (from $(Split-Path $oi -Leaf) in $(Split-Path $oi), overrides applied)"
+
+# --- dlss5-feed.cfg: the saved copy (or none: the add-on writes its defaults), plus this setup's own ---
+# A partial file is fine: the add-on reads the keys that are there and keeps its defaults for the rest.
+$cf = Join-Path $Saved 'dlss5-feed.cfg'
+$L = if (Test-Path $cf) { Read-Lines $cf } else { New-Object 'System.Collections.Generic.List[string]' }
+$appliedPath = Join-Path $Saved 'dlss5-feed.defaults-applied.txt'
+$applied = New-Object 'System.Collections.Generic.List[string]'
+if (Test-Path $appliedPath) { foreach ($x in [IO.File]::ReadAllLines($appliedPath)) { if ($x.Trim() -ne '') { $applied.Add($x.Trim()) } } }
+$news = @()
+foreach ($line in [IO.File]::ReadAllLines((Join-Path $PSScriptRoot 'dlss5-feed.defaults.cfg'))) {
+    $t = $line.Trim()
+    if ($t -eq '' -or $t.StartsWith(';') -or $t -notmatch '^([^=]+?)\s*=\s*(.*)$') { continue }
+    $k = $Matches[1]; $v = $Matches[2]; $kv = "$k=$v"
+    if ($applied.Contains($kv)) { continue }                 # applied before: the user's later choice stands
+    $hit = $false
+    for ($i = 0; $i -lt $L.Count; $i++) { if ($L[$i] -match "^\s*$([regex]::Escape($k))\s*=") { $L[$i] = $kv; $hit = $true } }
+    if (-not $hit) { $L.Add($kv) }
+    $applied.Add($kv); $news += $kv
+}
+if ($L.Count) { [IO.File]::WriteAllLines((Join-Path $Target 'dlss5-feed.cfg'), $L, $Utf8) }
+New-Item -ItemType Directory -Force $Saved | Out-Null
+[IO.File]::WriteAllLines($appliedPath, $applied, $Utf8)
+Say ("dlss5-feed.cfg (" + $(if (Test-Path $cf) { 'saved copy' } else { 'new' }) + $(if ($news) { ', setup defaults applied: ' + ($news -join ', ') } else { ', setup defaults already applied' }) + ')')
 
 # --- record what went where ---
 $m = @("Deployed $(Get-Date -Format s) to $Target", "repo $(& git -C $Repo rev-parse --short HEAD 2>$null)")

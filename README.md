@@ -990,6 +990,26 @@ Three things the same measurements say that no shader can change:
   against 2.6), and the hint does reach DLSS through OptiScaler. This add-on never feeds DLSS
   anything *but* finished, unjittered pictures. What `5` maps to is specific to the DLSS DLL
   (310.8 here; NVIDIA's guide no longer lists presets A–E).
+
+  The other presets, same rig, LumeniteFX Kernel, Refine (`preset=` 5 E, 10 J, 12 L, 13 M):
+
+  | plain DLAA | default (K) | E | L | M |
+  | --- | --- | --- | --- | --- |
+  | 3D scene error | 0.72 | 0.47 | 0.37 | 0.35 |
+  | 3D restlessness on a slow pan | 1.58 | 1.59 | 1.36 | 1.26 |
+  | 3D restlessness on a still frame | 0.57 | 0.65 | 0.76 | 0.99 |
+  | 3D HUD error, without / with restore | 1.12 / 0.86 | 0.43 / 0.39 | 1.62 / 1.21 | 1.58 / 1.27 |
+  | 2D static 14 px text, sharp, without / with restore | 0.84 / 0.99 | 0.99 / 1.00 | 0.77 / 0.97 | 0.76 / 0.96 |
+  | 2D static text on a still background, sharp | 0.89 | 0.99 | 0.82 | 0.86 |
+  | 2D fine moving texture (noise), error | 0.93 | 0.54 | 2.19 | 2.49 |
+  | with the neural pass: HUD error / flicker of the neural edit | 2.39 / 0.39 | 2.20 / 0.35 | 2.58 / 0.33 | 2.61 / 0.33 |
+
+  **E** is the best all-rounder and by far the best for text, HUD and capture-style content. **L**
+  and **M** leave a moving 3D world most alone — a slow pan on M is as steady as exact vectors made
+  it on K — but are the hardest on small still text and fine texture; the restore technique gives
+  most of the text back. The default, K, is the best column only on a still frame. With a neural
+  pass behind DLSS the differences shrink. HDR10 shows the same
+  order. E is a legacy model that NVIDIA no longer documents, so it may not outlive a DLSS update.
 * **Fractional motion cannot be reprojected losslessly without jitter.** Text scrolling at 2.5 px
   a frame is softer with the *right* vector than with none, because history is resampled between
   pixels every frame and a finished picture brings no new detail to rebuild it from. The
@@ -1349,7 +1369,7 @@ if you prefer editing the file directly:
 | `rebuild` | 0 | change the number to re-create the feature once, by hand. |
 | `log_frames` | 3 | first N frames logged in detail. |
 | `create_delay` | 60 | frames to hold a feature (re)build after a runtime (re)init — the neural consumer arms its NGX hooks asynchronously, and calling in too early can crash. 0 disables. |
-| `preset` | 0 | DLSS render-preset hint: `0` default, `5`/`6` = legacy CNN presets E/F (clamp history harder — try these if motion warps around transparents like dust or flames), `10`/`11` = transformer presets J/K. |
+| `preset` | 0 | DLSS render-preset hint: `0` default (K), `5`/`6` = legacy CNN presets E/F (clamp history harder — try these if motion warps around transparents like dust or flames), `10`/`11` = transformer presets J/K, `12`/`13` = second-generation transformer presets L/M. On a finished picture E is the closest to what went in for text, HUD and 2D content, L/M for a moving 3D scene — the measured table is under *Per-pixel refinement*. Also in the overlay. The Elgato Studio deploy sets `5`. |
 | `gpu_timeout_ms` | 2000 | how long a frame waits for the GPU to retire a command allocator before that frame is abandoned. Three abandoned frames in a row stop the feed. Raise it on a heavily contended GPU; clamped to 100–60000. |
 | `mv_scale_x/y` | 1.0 | extra motion-vector multiplier. |
 | `stall_log_ms` | 50 | **Diagnostic.** Log a breakdown for any frame whose present-to-present interval exceeds this, in ms (0 = off). Each `STALL frame` line splits the interval into the time inside the NGX evaluate call — which is where the neural consumer's own work runs — the rest of this add-on's work, and everything outside it, then names which of the three dominated. The `600 frames:` summary also carries the worst frame and a stall count. Use it to tell "the feed is slow" apart from "the neural consumer is slow" apart from "neither, something else in the process stalled". |
