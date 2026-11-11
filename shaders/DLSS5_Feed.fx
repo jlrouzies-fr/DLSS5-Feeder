@@ -1987,12 +1987,27 @@ float4 PS_Restore(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     const float repeats = tex2Dlod(sDLSS5_Global, float4(0.5, 0.5, 0.0, 0.0)).y;
     if (RESTORE_HOLD_REPEATS && repeats > 0.5 && repeats < 3.5) return tex2Dfetch(sDLSS5_LastOut, int2(vpos.xy));
     const float4 now = tex2Dlod(ReShade::BackBuffer, float4(uv, 0.0, 0.0));
-    // The mark, grown by a pixel: the antialiased rim of a glyph belongs to it.
+    // The mark, grown by a pixel (the antialiased rim of a glyph belongs to it) and then
+    // SMOOTHED over a 5x5: the mark is decided pixel by pixel, on contrast, so inside a fat
+    // stroke or on a textured still picture it comes out as a mosaic of marked and unmarked
+    // pixels, and a weight that follows it swaps the detail of two different pictures from
+    // one pixel to the next. With a neural pass that had redrawn the surface, HDR screenshots
+    // from Elgato Studio showed exactly that: checkerboard and block patterns on a parchment,
+    // stripes and coloured sparkle inside bright lettering. The weight now changes over a few
+    // pixels, never between neighbours.
     const float2 px = BUFFER_PIXEL_SIZE;
-    float h = 0.0;
-    [unroll] for (int y = -1; y <= 1; ++y)
-    [unroll] for (int x = -1; x <= 1; ++x)
-        h = max(h, tex2Dlod(sDLSS5_Hud, float4(uv + float2(x, y) * px, 0.0, 0.0)).x);
+    float h = 0.0, wsum = 0.0;
+    [unroll] for (int y = -2; y <= 2; ++y)
+    [unroll] for (int x = -2; x <= 2; ++x)
+    {
+        const float k = (3.0 - abs(float(x))) * (3.0 - abs(float(y)));   // 1 2 3 2 1, squared
+        float m = 0.0;
+        [unroll] for (int v = -1; v <= 1; ++v)
+        [unroll] for (int u = -1; u <= 1; ++u)
+            m = max(m, tex2Dlod(sDLSS5_Hud, float4(uv + float2(x + u, y + v) * px, 0.0, 0.0)).x);
+        h += k * m; wsum += k;
+    }
+    h /= wsum;
     const float w = smoothstep(0.35, 0.85, h) * RESTORE_STRENGTH;
     if (w <= 0.0) return now;
     const float3 was    = tex2Dlod(sDLSS5_Before, float4(uv, 0.0, 0.0)).rgb;
