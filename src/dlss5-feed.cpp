@@ -1593,6 +1593,7 @@ struct Feed
     ID3D11Buffer       *pq_cb;          // the encode scale, for the copy-home pass
     bool   bridge_shaders_ok;
     bool   pq_bridge;                   // the bridge is active for the current build
+    bool   pq_wanted;                   // what BridgePqWanted() answered when that build was made (see BridgeStale)
     DXGI_FORMAT bb_view_fmt;            // the backbuffer's own typed format, for reading it.
                                         // Distinct from color_fmt once the bridge is on: that
                                         // becomes FP16 while this stays R10G10B10A2_UNORM.
@@ -3888,6 +3889,23 @@ static bool BridgePqWanted(DXGI_FORMAT bb_fmt, const char **why)
     return true;
 }
 
+// Has the answer changed since the resources in hand were built? The bridge decides what format
+// DLSS's colour pair is made in, so a build made under one answer cannot serve the other -- and
+// two things change the answer without changing the backbuffer's size or format, which is all the
+// rebuild tests used to look at: the hdr_bridge key, and the swapchain's colour space (an app
+// that switches HDR on or off on the same 10-bit swap chain).
+// Measured the hard way in Elgato Studio: hdr_bridge 0 -> -1 in the cfg took the feature-only
+// shortcut, the shared pair stayed 10-bit, and the "HDR" picture went on being handed to DLSS
+// and the neural consumer as SDR until something else forced a full build.
+// Compared against what was WANTED at build time, not against pq_bridge: on a GPU where the
+// bridge cannot be set up, wanted stays true and active stays false, and that must not read as
+// a change on every frame.
+static bool BridgeStale(DXGI_FORMAT bb_fmt)
+{
+    const char *why = "";
+    return BridgePqWanted(bb_fmt, &why) != g.pq_wanted;
+}
+
 static bool BridgeWanted(DXGI_FORMAT bb_fmt, const char **why)
 {
     if (!BridgePqWanted(bb_fmt, why)) return false;
@@ -3967,7 +3985,8 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
     const bool want_sr = g_cfg.work_upscale == 2 && g_cfg.mode >= 2 && (w != backbuffer_w || h != backbuffer_h);   // mode 1 copies COLOR->OUTPUT, so sizes must match
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
         w == g.width && h == g.height && backbuffer_w == g.backbuffer_width &&
-        backbuffer_h == g.backbuffer_height && bb_fmt == g.bb_fmt && want_sr == g.sr_requested)
+        backbuffer_h == g.backbuffer_height && bb_fmt == g.bb_fmt && want_sr == g.sr_requested &&
+        !BridgeStale(bb_fmt))
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building shared textures");
@@ -3998,6 +4017,7 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
     if (!MakeBlitShaders()) { dev1->Release(); ReleaseFrameResources(); return false; }
 
     const char *bridge_why = "";
+    g.pq_wanted  = BridgePqWanted(bb_fmt, &bridge_why);
     g.pq_bridge  = BridgeWanted(bb_fmt, &bridge_why);
     // The bridge hands the consumer linear light in FP16 -- which is what it wants, and what
     // its own format test accepts. Without it, a PQ frame goes across described as SDR and
@@ -5486,7 +5506,7 @@ static bool MakeTex12(int i, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, D3D12_RE
 static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
-        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt && !BridgeStale(bb_fmt))
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building same-device textures");
@@ -5512,7 +5532,8 @@ static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     // keeps the swapchain's own 10-bit format either way, so nothing the game copies changes.
     {
         const char *bridge_why = "";
-        g.pq_bridge = BridgePqWanted(bb_fmt, &bridge_why) &&
+        g.pq_wanted = BridgePqWanted(bb_fmt, &bridge_why);
+        g.pq_bridge = g.pq_wanted &&
                       SetupPq12Bridge(g.width, g.height, g.color_fmt, "same-device D3D12, on the GAME device");
         if (g.pq_bridge) g.hdr = true;
         else if (TypedColorFormat(bb_fmt) == DXGI_FORMAT_R10G10B10A2_UNORM)
@@ -5770,7 +5791,7 @@ static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
 static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
-        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt && !BridgeStale(bb_fmt))
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building the Vulkan-shared textures");
@@ -5799,7 +5820,8 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     // keeps the swapchain's own 10-bit format either way, so nothing the game copies changes.
     {
         const char *bridge_why = "";
-        g.pq_bridge = BridgePqWanted(bb_fmt, &bridge_why) &&
+        g.pq_wanted = BridgePqWanted(bb_fmt, &bridge_why);
+        g.pq_bridge = g.pq_wanted &&
                       SetupPq12Bridge(g.width, g.height, g.color_fmt, "Vulkan transport, on our private device");
         if (g.pq_bridge) g.hdr = true;
         else if (TypedColorFormat(bb_fmt) == DXGI_FORMAT_R10G10B10A2_UNORM)
@@ -6218,7 +6240,7 @@ static bool MakeSharedTexGl(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
 static bool BuildResourcesGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handle)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
-        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt && !BridgeStale(bb_fmt))
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building the OpenGL-shared textures");
@@ -6244,7 +6266,8 @@ static bool BuildResourcesGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_ha
     // keeps the swapchain's own 10-bit format either way, so nothing the game copies changes.
     {
         const char *bridge_why = "";
-        g.pq_bridge = BridgePqWanted(bb_fmt, &bridge_why) &&
+        g.pq_wanted = BridgePqWanted(bb_fmt, &bridge_why);
+        g.pq_bridge = g.pq_wanted &&
                       SetupPq12Bridge(g.width, g.height, g.color_fmt, "OpenGL transport, on our private device");
         if (g.pq_bridge) g.hdr = true;
         else if (TypedColorFormat(bb_fmt) == DXGI_FORMAT_R10G10B10A2_UNORM)
@@ -6799,7 +6822,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
     // add-on may still be patching its vtable (that has crashed the process at EXEC 0x0),
     // and it re-patches after every runtime recreation.
     const bool needs_build12 = !g.frame_ready || w != g.width || h != g.height || cd.Format != g.bb_fmt ||
-                               FeatureMissingForMode();
+                               BridgeStale(cd.Format) || FeatureMissingForMode();
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
@@ -7115,7 +7138,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
     const DXGI_FORMAT bbf = static_cast<DXGI_FORMAT>(cd.texture.format);
     const bool needs_build_vk = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt ||
-                                FeatureMissingForMode();
+                                BridgeStale(bbf) || FeatureMissingForMode();
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
@@ -7821,7 +7844,7 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
     const DXGI_FORMAT bbf = have_bb_desc ? static_cast<DXGI_FORMAT>(cd.texture.format)
                                          : DXGI_FORMAT_R8G8B8A8_UNORM;   // default FB: assume 8-bit; the blit converts anyway
     const bool needs_build_gl = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt ||
-                                FeatureMissingForMode();
+                                BridgeStale(bbf) || FeatureMissingForMode();
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
@@ -8102,7 +8125,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     const bool needs_build11 = !g.frame_ready || work_w != g.width || work_h != g.height ||
                                cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height ||
                                cd.Format != g.bb_fmt || want_sr != g.sr_requested ||
-                               FeatureMissingForMode();
+                               BridgeStale(cd.Format) || FeatureMissingForMode();
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
