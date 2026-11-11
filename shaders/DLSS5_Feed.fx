@@ -1997,9 +1997,20 @@ float4 PS_Restore(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     if (w <= 0.0) return now;
     const float3 was    = tex2Dlod(sDLSS5_Before, float4(uv, 0.0, 0.0)).rgb;
     if (RESTORE_WHAT == 1) return float4(lerp(now.rgb, was, w), now.a);
-    const float3 hi_was = was - Blur5(sDLSS5_Before, uv);
-    const float3 hi_now = now.rgb - Blur5(ReShade::BackBuffer, uv);
-    return float4(now.rgb + w * (hi_was - hi_now), now.a);
+    const float3 lo_was = Blur5(sDLSS5_Before, uv);
+    const float3 lo_now = Blur5(ReShade::BackBuffer, uv);
+    const float3 mixed  = now.rgb + w * ((was - lo_was) - (now.rgb - lo_now));
+    // Never outside what the two pictures hold here. Swapping one picture's detail onto the
+    // other's base overshoots wherever the two disagree about the base -- a neural pass that
+    // dims or tints a white caption leaves the input's full-strength strokes standing on a
+    // lower floor. In SDR that is a slightly-too-bright rim nobody sees. On an HDR10 back buffer
+    // the values are PQ codes, where a few percent of overshoot near white is several times the
+    // light, and what clips at code 1.0 is 10,000 nits: white text came out peppered with
+    // full-brightness specks (Elgato Studio, HDR, with the neural pass; not visible in an SDR
+    // capture of the same frame, which is how it got past the test rig).
+    const float3 floor_ = min(min(now.rgb, was), min(lo_now, lo_was));
+    const float3 ceil_  = max(max(now.rgb, was), max(lo_now, lo_was));
+    return float4(clamp(mixed, floor_, ceil_), now.a);
 }
 
 float4 PS_KeepShown(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
