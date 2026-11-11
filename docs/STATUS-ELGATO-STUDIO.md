@@ -116,12 +116,13 @@ mouse interaction inside *its* menu may be unreliable even though the keyboard t
 
 ## The custom ReShade — `deploy/reshade-winui3/`
 
-`dxgi_x64.dll`, sha256 starts `49c828cb8947b1cc`, byte-identical to what is deployed. Built from
-crosire/reshade tag `v6.8.0` (commit `18deaa5`) + `reshade-6.8.0-winui3.patch` (330 added lines over
-`res/exports.def`, `source/d2d1/d2d1.cpp`, `source/d3d11/d3d11.cpp`, `source/input.hpp`,
+`dxgi_x64.dll`, sha256 starts `d8897d981ef24910` (2026-11-11; the build before the input fix of
+problem 6, `49c828cb8947b1cc`, is kept beside it as `dxgi_x64.49c828cb-before-input-fix.dll`). Built
+from crosire/reshade tag `v6.8.0` (commit `18deaa5`) + `reshade-6.8.0-winui3.patch` (359 added lines
+over `res/exports.def`, `source/d2d1/d2d1.cpp`, `source/d3d11/d3d11.cpp`, `source/input.hpp`,
 `source/input_windows.cpp`, `source/runtime.cpp`).
 
-Five problems, each found by bisection or by logging rather than guesswork:
+Six problems, each found by bisection or by logging rather than guesswork:
 
 1. **Crash at start** — `dwmcorei.dll`, `0x88990003` (`D2DERR_UNSUPPORTED_OPERATION`), fault offset
    `0x724d3`. The lifted compositor hands its D3D11 device to D2D through a private path ReShade's
@@ -150,6 +151,22 @@ Five problems, each found by bisection or by logging rather than guesswork:
    top-left under the title bar, where WinUI treats input as non-client and sends no click. Final
    bug: `handle_window_message` reset `_mouse_position` from every routed message, pinning the
    pointer to the warped cursor — polling is now authoritative when active.
+6. **One tap of a hotkey toggles several times** (2026-11-11) — after the app re-creates its swap
+   chain (seen twice in one session, with a layout or full-screen change). Elgato Studio creates the
+   new composition swap chain *before* it releases the old one, and with fix 3 every one of them is
+   bound to the same fallback window, i.e. to one shared input object. ReShade decides once, in
+   `runtime::on_init`, which runtime advances that object each frame (`_primary_input_handler =
+   _input.use_count() == 1`): the new runtime is the second holder, so it is not, and when the old
+   one is destroyed nobody calls `input::next_frame()` any more. A key then reads as "just pressed"
+   on every frame for as long as it is held — the effects key toggled 3–6 times a tap, and whether
+   effects ended up on or off was luck — and the polled cursor, the overlay's input blocking, wheel
+   and text input all hang off the same call. Found from two logs side by side: one `WM_KEYDOWN`
+   line in `ReShade.log` per tap, and in `dlss5-feed.log` a `STALL` 2–3 frames after effects came
+   back on. Fix: `input::claim_frame(owner)`, called at the top of `runtime::on_present` — whoever
+   presents keeps or takes the job unless another runtime advanced the input within the last 250 ms
+   (`ReShade.log`: `Input of window … is now advanced by runtime …`). With one runtime per window
+   nothing changes. Verified so far in `tools/fx-testbed` only (loads, same picture figures as the
+   previous build, the hand-over line is logged); not yet confirmed in Elgato Studio.
 
 Behaviour for ordinary games is unchanged: the compositor bypass keys off two module names, and
 the input changes only engage when a swap chain has no output window.
@@ -172,7 +189,13 @@ MSBuild ReShade.sln /t:ReShade /p:Configuration=Release /p:Platform=64-bit /p:Pl
 ```
 
 Build the **.sln**, not the .vcxproj (`stb.props` keys off `$(SolutionDir)`), and note the solution
-platform is literally named `64-bit`, not `x64`.
+platform is literally named `64-bit`, not `x64`. On the development machine that means the MSBuild
+of the VS 18 **Build Tools** (`C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\…`; the
+Community install on G: has no C++ targets and fails with MSB4019) and `Python313` put first on
+PATH (the first `python` there is SVP's, which has no pip). About a minute. A `--depth 1` clone
+builds as version `6.8.0.1` instead of `6.8.0.18` (the last number is the commit count); nothing
+depends on it. `Run-FxLab.ps1 -ReShadeDll <path>` runs the test rig on a freshly built DLL before
+it goes anywhere near the app.
 
 ## Verified in the running app
 

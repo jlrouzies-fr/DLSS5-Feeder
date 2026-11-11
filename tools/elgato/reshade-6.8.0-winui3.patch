@@ -208,10 +208,10 @@ index 22d6183..9c5d781 100644
 +	return hr;
 +}
 diff --git a/source/input.hpp b/source/input.hpp
-index 7f09ac2..4b50241 100644
+index 7f09ac2..3ac0073 100644
 --- a/source/input.hpp
 +++ b/source/input.hpp
-@@ -154,6 +154,19 @@ namespace reshade
+@@ -154,6 +154,24 @@ namespace reshade
  		unsigned int mouse_position_y() const { return _mouse_position[1]; }
  		void max_mouse_position(unsigned int position[2]) const;
  
@@ -228,11 +228,25 @@ index 7f09ac2..4b50241 100644
 +		// window centre every frame (the way games do), so the whole surface is reachable whatever its on-screen scale.
 +		bool poll_cursor_relative_active = false;
 +
++		// DLSS5-Feeder local patch (2026-11-11): which runtime advances this object's frame ('next_frame'). Returns true
++		// if 'owner' holds that job after the call: nobody held it, 'owner' already did, or the holder has not presented
++		// for a quarter of a second. See the call in 'runtime::on_present' for why this is not decided once at init.
++		bool claim_frame(const void *owner);
++
  		/// <summary>
  		/// Gets the character input as captured by 'WM_CHAR' for the current frame.
  		/// </summary>
+@@ -223,6 +241,8 @@ namespace reshade
+ 		unsigned int _mouse_position[2] = {};
+ 		unsigned int _last_mouse_position[2] = {};
+ 		uint64_t _frame_count = 0; // Keep track of frame count to identify windows with a lot of rendering
++		const void *_frame_owner = nullptr; // DLSS5-Feeder local patch (2026-11-11), see 'claim_frame'
++		unsigned long _frame_owner_time = 0;
+ 		std::wstring _text_input;
+ 	};
+ 
 diff --git a/source/input_windows.cpp b/source/input_windows.cpp
-index d022aeb..05f6ff5 100644
+index d022aeb..9d1646f 100644
 --- a/source/input_windows.cpp
 +++ b/source/input_windows.cpp
 @@ -16,6 +16,8 @@
@@ -375,7 +389,31 @@ index d022aeb..05f6ff5 100644
  	case WM_KEYDOWN:
  	case WM_SYSKEYDOWN:
  		assert(details.wParam > 0 && details.wParam < std::size(input->_keys));
-@@ -307,6 +381,64 @@ void reshade::input::next_frame()
+@@ -292,6 +366,23 @@ bool reshade::input::handle_window_message(const void *message_data)
+ 	return (is_mouse_message && input->is_blocking_mouse_input()) || (is_keyboard_message && input->is_blocking_keyboard_input());
+ }
+ 
++// DLSS5-Feeder local patch (2026-11-11): see 'claim_frame' in input.hpp
++bool reshade::input::claim_frame(const void *owner)
++{
++	const std::unique_lock<std::recursive_mutex> input_lock(_mutex);
++
++	const DWORD now = GetTickCount();
++	if (_frame_owner != nullptr && _frame_owner != owner && (now - _frame_owner_time) <= 250)
++		return false; // another runtime is presenting and advancing this input
++
++	if (_frame_owner != owner)
++		reshade::log::message(reshade::log::level::info, "Input of window %p is now advanced by runtime %p (was %p).", _window, owner, _frame_owner);
++
++	_frame_owner = owner;
++	_frame_owner_time = now;
++	return true;
++}
++
+ void reshade::input::max_mouse_position(unsigned int position[2]) const
+ {
+ 	RECT rect = {};
+@@ -307,6 +398,64 @@ void reshade::input::next_frame()
  
  	_frame_count++;
  
@@ -441,7 +479,7 @@ index d022aeb..05f6ff5 100644
  	std::copy_n(_keys, 256, _last_keys);
  
 diff --git a/source/runtime.cpp b/source/runtime.cpp
-index 9ad4b62..bd011a1 100644
+index 9ad4b62..9a690eb 100644
 --- a/source/runtime.cpp
 +++ b/source/runtime.cpp
 @@ -35,6 +35,25 @@
@@ -497,3 +535,21 @@ index 9ad4b62..bd011a1 100644
  		else
  			_input.reset();
  
+@@ -694,6 +729,17 @@ void reshade::runtime::on_present()
+ 	if (!_is_initialized)
+ 		return;
+ 
++	// DLSS5-Feeder local patch (2026-11-11): '_primary_input_handler' used to be decided once, in 'on_init', from how many
++	// runtimes held the input object at that moment. Elgato Studio creates a new composition swap chain BEFORE it releases
++	// the old one (entering full screen, changing the layout), and every one of them is bound to the same fallback window,
++	// so the new runtime was never primary -- and once the old one was gone nobody called 'next_frame' any more. A key then
++	// read as "just pressed" on every frame for as long as it was held (the effects key toggled three to six times a tap),
++	// the polled cursor stopped, the overlay's input blocking froze, wheel and text input piled up.
++	// So the job goes to whoever is presenting: this runtime keeps or takes it unless another one advanced the input within
++	// the last quarter second. With one runtime per window, which is every ordinary game, nothing changes.
++	if (_input != nullptr)
++		_primary_input_handler = _input->claim_frame(this);
++
+ #if RESHADE_ADDON
+ 	_is_in_present_call = true;
+ #endif

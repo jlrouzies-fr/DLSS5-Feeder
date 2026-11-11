@@ -37,6 +37,7 @@ param(
     [int]$Cadence = 1,                    # 2 = a 30 fps game at 60: every picture presented twice
     [switch]$Oracle,                      # exact vectors for the 3D scene: adds fxlab_Oracle.fx (use -Provider 0)
     [switch]$Hdr,                         # present HDR10 (PQ, BT.2020, 10-bit) instead of SDR
+    [string]$ReShadeDll = '',             # another ReShade build to load as dxgi.dll (default: deploy\reshade-dxgi\dxgi_x64.dll)
     [switch]$Mv,                          # measure the VECTORS against the truth instead of the picture
     [switch]$NoReShade,
     [switch]$Show,
@@ -79,7 +80,7 @@ function Set-IniValue([System.Collections.Generic.List[string]] $L, [string] $se
     $L.Insert($lastInSec + 1, "$key=$value")
 }
 if (-not $NoReShade) {
-    Sync (Join-Path $repo 'deploy\reshade-dxgi\dxgi_x64.dll') (Join-Path $rig 'dxgi.dll')
+    Sync $(if ($ReShadeDll -ne '') { $ReShadeDll } else { Join-Path $repo 'deploy\reshade-dxgi\dxgi_x64.dll' }) (Join-Path $rig 'dxgi.dll')
     Sync (Join-Path $repo 'build\dlss5-feed.addon64')         (Join-Path $rig 'dlss5-feed.addon64')
     Sync (Join-Path $repo 'deploy\shared\nvngx_dlss.dll')     (Join-Path $rig 'nvngx_dlss.dll')
     if ($Consumer -eq 'optiscaler') {
