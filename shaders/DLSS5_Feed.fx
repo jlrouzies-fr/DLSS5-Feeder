@@ -24,21 +24,38 @@
       1  Launchpad           iMMERSE Launchpad (MartysMods_LAUNCHPAD.fx): Deferred::MotionVectorsTex.
                              Launchpad only runs its optical flow when asked to, so this mode also
                              files that per-frame request (Launchpad's IPC buffer, see below).
-      2  VORT                vort_Motion.fx (MIT): MotVectTexVort -- the recommended provider
+      2  VORT                vort_Motion.fx: MotVectTexVort
       3  LumeniteFX Kernel   lumenite_Kernel.fx ("LUMENITE: Kernel"): Kernel::tFlow -- pyramidal
                              optical flow with per-level median + a-trous filtering and previous-
                              frame seeding. 1/8 resolution, upsampled here. Needs no depth buffer.
       4  LumeniteFX QuantMotion
                              lumenite_QuantMotion.fx: QuantMotion::tFlow -- the light cut of 3.
+      5  Built in            this file's own estimator: hierarchical block matching on a luma
+                             pyramid, 1/64 of the frame down to 1/2, written for finished 2D
+                             pictures (UI over video, menus, scrolling lists). Nothing to install
+                             and no technique to enable. Under 3D camera motion it is clearly
+                             behind 3 (measured, tools/fx-testbed) -- use 3 for a 3D game.
 
-    This is the same mechanism dh_uber_rt (USE_MARTY_LAUNCHPAD_MOTION / USE_VORT_MOTION) and
-    vort (V_MV_MODE) use: the selected provider's OUTPUT texture is declared here exactly as the
-    provider declares it, so ReShade binds the same resource, and only that one is allocated.
+    For 0-4 this is the same mechanism dh_uber_rt (USE_MARTY_LAUNCHPAD_MOTION / USE_VORT_MOTION)
+    and vort (V_MV_MODE) use: the selected provider's OUTPUT texture is declared here exactly as
+    the provider declares it, so ReShade binds the same resource, and only that one is allocated.
     Every provider above hands out delta UV with prev_uv = uv + mv. Nothing of any provider is
-    included or bundled: this file contains no third-party code and includes no third-party
-    files beyond ReShade's own headers.
+    included or bundled: this file contains no third-party code (the built-in estimator is
+    written from scratch) and includes no third-party files beyond ReShade's own headers.
 
-    VALIDATION -- why it exists. A game's motion vectors are geometric: a static wall under a
+    REFINEMENT (the default "Vector pipeline"). Whatever the provider, its field is coarse and
+    a coarse field cannot follow the outline of a glyph. It gives the pixels of a still caption
+    -- or of a game's HUD -- a fraction of the motion behind them, and a temporal model that is
+    told "this text moved 0.3 px" resamples its history by 0.3 px every frame: soft, smeared
+    text. So the provider's vector stands unless the pixel itself says otherwise: a pixel that
+    did not change, or whose own structure is where it was, gets exactly zero; where the vector
+    leaves the pixel unexplained, the provider's cells around it and last frame's vector are
+    tried; and the nearest whole-pixel vector is sent wherever it reproduces the pixel, so
+    history is fetched pixel for pixel. See RefineMV().
+    tools/fx-testbed measures all of it through the real add-on and DLSS, in 2D and in 3D,
+    with and without a neural consumer.
+
+    VALIDATION (the "Classic" pipeline, 1.19 and earlier) -- why it exists. A game's motion vectors are geometric: a static wall under a
     flickering light has vectors of exactly zero. Every provider above is OPTICAL FLOW: it
     matches pixels, so a lighting change (flicker, flames, particles) is answered with a vector
     that points at whatever happened to match -- confidently wrong, and DLSS then warps its
@@ -154,6 +171,16 @@ sampler sDLSS5_ColorInput { Texture = DLSS5_ColorInput; AddressU = Clamp; Addres
     sampler sDLSS5_ProviderConfidence{ Texture = QuantMotion::tConfidence; AddressU = Clamp; AddressV = Clamp; };
     #define DLSS5_MV_PROVIDER_NAME "LumeniteFX QuantMotion (QuantMotion::tFlow, 1/8 res)"
     #define DLSS5_MV_LOWRES 1
+#elif DLSS5_MV_PROVIDER == 5
+    // Built in: the pyramid estimator further down in this file. Nothing to install or enable.
+    // Its finest level is half resolution, vectors in full-resolution PIXELS (.xy), the match
+    // cost in .z and the patch contrast in .w.
+    texture DLSS5_Flow1 { Width = BUFFER_WIDTH / 2; Height = BUFFER_HEIGHT / 2; Format = RGBA16F; };
+    sampler sDLSS5_ProviderMV      { Texture = DLSS5_Flow1; AddressU = Clamp; AddressV = Clamp; MipFilter = Point; MinFilter = Linear; MagFilter = Linear; };
+    sampler sDLSS5_ProviderMVPoint { Texture = DLSS5_Flow1; AddressU = Clamp; AddressV = Clamp; MipFilter = Point; MinFilter = Point;  MagFilter = Point;  };
+    #define DLSS5_MV_PROVIDER_NAME "Built in (DLSS5_Feed's own estimator)"
+    #define DLSS5_MV_BUILTIN 1
+    #define DLSS5_MV_CELL 2.0
 #else
     // The community-standard shared texture (ReshadeMotionEstimation, qUINT, dh_uber_motion, ...)
     texture texMotionVectors < pooled = false; > { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F; };
@@ -163,6 +190,21 @@ sampler sDLSS5_ColorInput { Texture = DLSS5_ColorInput; AddressU = Clamp; Addres
 
 #ifndef DLSS5_MV_LOWRES
     #define DLSS5_MV_LOWRES 0
+#endif
+#ifndef DLSS5_MV_BUILTIN
+    #define DLSS5_MV_BUILTIN 0
+#endif
+// How far apart, in pixels, two neighbouring vectors of the provider are -- the spacing at which
+// the refinement stage looks for a better candidate than the one under the pixel.
+#ifndef DLSS5_MV_CELL
+    #if DLSS5_MV_LOWRES
+        #define DLSS5_MV_CELL 8.0
+    #else
+        #define DLSS5_MV_CELL 3.0
+    #endif
+#endif
+#ifndef BUFFER_COLOR_SPACE
+    #define BUFFER_COLOR_SPACE 1
 #endif
 #ifndef DLSS5_MV_REQUEST_PASS
     #define DLSS5_MV_REQUEST_PASS
@@ -176,7 +218,7 @@ uniform int MV_PROVIDER_INFO <
     ui_text = "Motion vector provider: " DLSS5_MV_PROVIDER_NAME "\n"
               "Change it with the DLSS5_MV_PROVIDER preprocessor definition:\n"
               "  0 texMotionVectors (DRME, qUINT, dh_uber_motion)   1 Launchpad   2 VORT\n"
-              "  3 LumeniteFX Kernel   4 LumeniteFX QuantMotion\n"
+              "  3 LumeniteFX Kernel   4 LumeniteFX QuantMotion   5 built in (nothing to enable)\n"
               "Enable that provider's technique ABOVE DLSS 5 Feed.";
 >;
 
@@ -189,6 +231,91 @@ uniform int MV_LOWRES_FILTER <
                  "Bilinear smooths across flow cells; point keeps each 8x8 cell's vector as-is.";
 > = 0;
 #endif
+
+uniform int MV_PIPELINE <
+    ui_category = "Vector refinement (per pixel)";
+    ui_type = "combo";
+    ui_items = "Refine: pick the best vector per pixel\0Classic validation (1.19 and earlier)\0";
+    ui_label = "Vector pipeline";
+    ui_tooltip = "Refine: the provider's vector stands unless the pixel itself says otherwise. A pixel that\n"
+                 "did not change, or whose own structure is where it was, gets exactly zero -- so a caption\n"
+                 "or a HUD over a moving picture keeps a clean zero right up to the glyph edge. Where the\n"
+                 "vector leaves the pixel unexplained (the border between two motions), the provider's\n"
+                 "cells around it and last frame's vector are tried. Whole-pixel vectors are preferred where\n"
+                 "they reproduce the pixel.\n"
+                 "Classic: the provider's vector with the validation tests below.";
+> = 0;
+
+uniform float STATIC_NOISE <
+    ui_category = "Vector refinement (per pixel)";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 0.05; ui_step = 0.0005;
+    ui_label = "Static lock: noise tolerance";
+    ui_tooltip = "A pixel whose 3x3 neighbourhood changed by no more than this since the last frame (luma,\n"
+                 "0..1) is static: vector exactly zero, full history. Raise it for a noisy source (analogue\n"
+                 "capture, film grain or an animated dither ahead of this effect); 0 turns the lock off.";
+> = 0.003;
+
+uniform float ZERO_BIAS <
+    ui_category = "Vector refinement (per pixel)";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 0.5; ui_step = 0.01;
+    ui_label = "Preference for 'did not move'";
+    ui_tooltip = "Head start (relative) that the zero vector gets over every other candidate, in the built-in\n"
+                 "estimator and in the per-pixel pick. Higher = steadier still images and UI, at the price\n"
+                 "of very slow motion being ignored a little longer.";
+> = 0.15;
+
+uniform float FLOW_NOISE <
+    ui_category = "Vector refinement (per pixel)";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 0.02; ui_step = 0.0002;
+    ui_label = "Match noise floor";
+    ui_tooltip = "Differences in match quality below this (luma, 0..1) are treated as noise: they cannot\n"
+                 "make a pixel move. Raise it with the static tolerance for a noisy source.";
+> = 0.0015;
+
+uniform int MV_SNAP <
+    ui_category = "Vector refinement (per pixel)";
+    ui_type = "combo";
+    ui_items = "Where the whole-pixel vector reproduces the pixel\0Always (every vector rounded)\0Never (sub-pixel vectors)\0";
+    ui_label = "Snap vectors to whole pixels";
+    ui_tooltip = "A fractional vector makes a temporal model resample its history between pixels on every\n"
+                 "frame. A game renders with sub-pixel jitter, which gives the model new detail to rebuild\n"
+                 "that from; a finished picture has none, so the resampling only ever softens. A whole-pixel\n"
+                 "vector fetches history pixel for pixel, and most 2D motion (menus, lists, tickers) IS in\n"
+                 "whole pixels. The default takes the whole-pixel vector wherever last frame, fetched at\n"
+                 "it, IS this pixel; genuinely fractional motion keeps its fraction.";
+> = 0;
+
+uniform int MOVING_HISTORY <
+    ui_category = "Vector refinement (per pixel)";
+    ui_type = "combo";
+    ui_items = "Keep (send the vector)\0Drop where it cannot be reused: fine detail only\0Drop where it cannot be reused: everything\0";
+    ui_label = "History of moving pixels (experimental)";
+    ui_tooltip = "History can only be reused as it is where a whole-pixel vector (zero included) reproduces\n"
+                 "the pixel. Anywhere else -- fractional motion, something creeping along at a fraction of\n"
+                 "a pixel a frame, a fade -- it has to be resampled or is simply out of date, and on a\n"
+                 "finished picture that only softens. 'Drop' sends a vector that points far outside the\n"
+                 "frame there: the model then has no history for that pixel and answers from the current\n"
+                 "frame alone. Measured with plain DLAA this is what keeps scrolling text crisp.\n"
+                 "A neural consumer receives the same vectors, and what IT does with a moving pixel that\n"
+                 "has no history is untested -- compare by eye before keeping it on.\n"
+                 "'Fine detail' limits it to pixels with pixel-scale structure (text, lines, edges), so\n"
+                 "smooth surfaces keep their real vectors.";
+> = 0;
+
+uniform float DETAIL_CONTRAST <
+    ui_category = "Vector refinement (per pixel)";
+    ui_type = "drag"; ui_min = 0.0; ui_max = 0.2; ui_step = 0.001;
+    ui_label = "Fine detail: minimum contrast";
+    ui_tooltip = "3x3 contrast (mean absolute deviation of luma) from which a pixel counts as fine detail\n"
+                 "for the option above.";
+> = 0.02;
+
+uniform bool REFINE_SUBPIXEL <
+    ui_category = "Vector refinement (per pixel)";
+    ui_label = "Sub-pixel polish at full resolution";
+    ui_tooltip = "After the pick, the vector of a moving pixel is fitted to a fraction of a pixel against the\n"
+                 "full-resolution frames. Slow scrolling text and fine patterns need it; costs a few fetches.";
+> = true;
 
 // ---------------------------------------------------------------------------------------------
 // Geometry vectors. A game's motion vectors for static geometry come from camera motion and
@@ -383,7 +510,9 @@ uniform int DEBUG_VIEW <
                "Validation tests over the image (red = luma, green = depth, blue = consistency, yellow = vector zeroed, orange = static held back)\0"
                "Geometry model vectors (colour = direction, brightness = speed)\0"
                "Geometry decision over the image (green = model, red = provider won as moving object, blue = provider rejected)\0"
-               "Geometry fit quality (grey = inlier share; top strip = fit error, black 0 px .. white 8 px)\0";
+               "Geometry fit quality (grey = inlier share; top strip = fit error, black 0 px .. white 8 px)\0"
+               "Refine: what each pixel took (dark = static lock, green = zero, blue = the provider's vector, cyan = a neighbouring cell, magenta = last frame's vector, yellow = snapped to whole pixels)\0"
+               "Vector dump for tools/fx-testbed (10-bit codes: R = 512 + 16 x, G = 512 + 16 y, B = mask)\0";
     ui_label = "Debug view (DLSS5_Feed_Debug technique)";
 > = 0;
 
@@ -396,7 +525,12 @@ sampler sDLSS5_Depth { Texture = DLSS5_Depth; MinFilter = POINT; MagFilter = POI
 sampler sDLSS5_Mask  { Texture = DLSS5_Mask;  MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
 
 // Previous-frame history for validation (written at the end of the technique)
-texture DLSS5_PrevLuma  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R16F;  };
+// The matching feature (luma) of this frame and the last, with a mip chain: the built-in
+// estimator matches coarse to fine on it, and everything that compares frames reads these two
+// rather than converting the colour buffer again.
+texture DLSS5_CurLuma   { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R16F; MipLevels = 7; };
+sampler sDLSS5_CurLuma  { Texture = DLSS5_CurLuma; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
+texture DLSS5_PrevLuma  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R16F; MipLevels = 7; };
 texture DLSS5_PrevDepth { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R16F;  };
 texture DLSS5_PrevMV    { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F; };
 // Luma may be interpolated (a smooth quantity); depth and vectors must NOT be -- bilinear
@@ -404,6 +538,10 @@ texture DLSS5_PrevMV    { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format =
 sampler sDLSS5_PrevLuma  { Texture = DLSS5_PrevLuma;  AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
 sampler sDLSS5_PrevDepth { Texture = DLSS5_PrevDepth; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT;  MagFilter = POINT;  MipFilter = POINT; };
 sampler sDLSS5_PrevMV    { Texture = DLSS5_PrevMV;    AddressU = Clamp; AddressV = Clamp; MinFilter = POINT;  MagFilter = POINT;  MipFilter = POINT; };
+// This frame's vector as decided, in delta UV -- DLSS5_MV cannot be read back for that: it is
+// in the add-on's units and sign, and may deliberately carry an off-screen vector.
+texture DLSS5_VecNow  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F; };
+sampler sDLSS5_VecNow { Texture = DLSS5_VecNow; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
 
 // The static-hypothesis decision, this frame and last. The test has no memory of its own,
 // so on a low-contrast surface under a slow pan it can win on one frame and lose on the
@@ -438,22 +576,518 @@ sampler sDLSS5_Cam3 { Texture = DLSS5_Cam3; MinFilter = POINT; MagFilter = POINT
 sampler sDLSS5_Cam4 { Texture = DLSS5_Cam4; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
 sampler sDLSS5_Cam5 { Texture = DLSS5_Cam5; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
 
+#if DLSS5_MV_BUILTIN
+// The built-in estimator's coarser levels (level n is 1/2^n of the frame). Same layout as Flow1.
+// The finest level as matched, before the median that makes DLSS5_Flow1 out of it.
+texture DLSS5_Flow1Raw { Width = BUFFER_WIDTH / 2; Height = BUFFER_HEIGHT / 2; Format = RGBA16F; };
+sampler sDLSS5_Flow1Raw { Texture = DLSS5_Flow1Raw; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+texture DLSS5_Flow2 { Width = BUFFER_WIDTH / 4;  Height = BUFFER_HEIGHT / 4;  Format = RGBA16F; };
+texture DLSS5_Flow3 { Width = BUFFER_WIDTH / 8;  Height = BUFFER_HEIGHT / 8;  Format = RGBA16F; };
+texture DLSS5_Flow4 { Width = BUFFER_WIDTH / 16; Height = BUFFER_HEIGHT / 16; Format = RGBA16F; };
+texture DLSS5_Flow5 { Width = BUFFER_WIDTH / 32; Height = BUFFER_HEIGHT / 32; Format = RGBA16F; };
+texture DLSS5_Flow6 { Width = BUFFER_WIDTH / 64; Height = BUFFER_HEIGHT / 64; Format = RGBA16F; };
+sampler sDLSS5_Flow2 { Texture = DLSS5_Flow2; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+sampler sDLSS5_Flow3 { Texture = DLSS5_Flow3; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+sampler sDLSS5_Flow4 { Texture = DLSS5_Flow4; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+sampler sDLSS5_Flow5 { Texture = DLSS5_Flow5; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+sampler sDLSS5_Flow6 { Texture = DLSS5_Flow6; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+#endif
+
 // ---------------------------------------------------------------------------------------------
 
 // The selected provider's vector at uv, as delta UV (prev_uv = uv + mv).
 float2 ProviderMV(float2 uv)
 {
     float4 c = float4(uv, 0.0, 0.0);
-#if DLSS5_MV_LOWRES
+#if DLSS5_MV_BUILTIN
+    return tex2Dlod(sDLSS5_ProviderMV, c).xy * BUFFER_PIXEL_SIZE;
+#elif DLSS5_MV_LOWRES
     return MV_LOWRES_FILTER == 0 ? tex2Dlod(sDLSS5_ProviderMV, c).xy : tex2Dlod(sDLSS5_ProviderMVPoint, c).xy;
 #else
     return tex2Dlod(sDLSS5_ProviderMV, c).xy;
 #endif
 }
 
+// One whole vector of the provider -- the cell under uv, NOT an interpolation between cells --
+// in pixels. Half of one object's motion plus half of its neighbour's is the motion of nothing.
+float2 ProviderCellPx(float2 uv)
+{
+    float4 c = float4(uv, 0.0, 0.0);
+#if DLSS5_MV_BUILTIN
+    return tex2Dlod(sDLSS5_ProviderMVPoint, c).xy;
+#elif DLSS5_MV_LOWRES
+    return tex2Dlod(sDLSS5_ProviderMVPoint, c).xy * BUFFER_SCREEN_SIZE;
+#else
+    return tex2Dlod(sDLSS5_ProviderMV, c).xy * BUFFER_SCREEN_SIZE;
+#endif
+}
+
+// The quantity frames are compared in. Display-referred input (SDR, PQ, HLG) is already
+// perceptually spaced; linear scRGB is not and has no upper bound, so it is compressed first.
+float FeatureLuma(float3 c)
+{
+#if BUFFER_COLOR_SPACE == 2
+    const float l = dot(max(c, 0.0), float3(0.299, 0.587, 0.114));
+    return sqrt(l / (1.0 + l));
+#else
+    return dot(c, float3(0.299, 0.587, 0.114));
+#endif
+}
+
 float Luma(float2 uv)
 {
-    return dot(tex2Dlod(sDLSS5_ColorInput, float4(uv, 0.0, 0.0)).rgb, float3(0.299, 0.587, 0.114));
+    return FeatureLuma(tex2Dlod(sDLSS5_ColorInput, float4(uv, 0.0, 0.0)).rgb);
+}
+
+float PS_Luma(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+    return Luma(uv);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 3x3 patches. Every decision below -- in the built-in estimator and in the per-pixel pick --
+// is made by comparing a 3x3 patch of this frame with a 3x3 patch of the last one.
+// ---------------------------------------------------------------------------------------------
+
+struct P9 { float3 r0, r1, r2; };
+
+// t = tap spacing in UV, lod = mip level sampled.
+P9 Patch9(sampler2D s, float2 uv, float2 t, float lod)
+{
+    P9 p;
+    p.r0 = float3(tex2Dlod(s, float4(uv + float2(-t.x, -t.y), 0.0, lod)).x, tex2Dlod(s, float4(uv + float2(0.0, -t.y), 0.0, lod)).x, tex2Dlod(s, float4(uv + float2(t.x, -t.y), 0.0, lod)).x);
+    p.r1 = float3(tex2Dlod(s, float4(uv + float2(-t.x,  0.0), 0.0, lod)).x, tex2Dlod(s, float4(uv,                       0.0, lod)).x, tex2Dlod(s, float4(uv + float2(t.x,  0.0), 0.0, lod)).x);
+    p.r2 = float3(tex2Dlod(s, float4(uv + float2(-t.x,  t.y), 0.0, lod)).x, tex2Dlod(s, float4(uv + float2(0.0,  t.y), 0.0, lod)).x, tex2Dlod(s, float4(uv + float2(t.x,  t.y), 0.0, lod)).x);
+    return p;
+}
+
+float Sum3(float3 v) { return v.x + v.y + v.z; }
+float P9Mean(P9 p) { return (Sum3(p.r0) + Sum3(p.r1) + Sum3(p.r2)) / 9.0; }
+// Mean absolute deviation: how much structure the patch has to judge a match by.
+float P9Contrast(P9 p, float m) { return (Sum3(abs(p.r0 - m)) + Sum3(abs(p.r1 - m)) + Sum3(abs(p.r2 - m))) / 9.0; }
+// Largest change of any of the nine samples.
+float P9MaxDiff(P9 a, P9 b)
+{
+    const float3 d = max(abs(a.r0 - b.r0), max(abs(a.r1 - b.r1), abs(a.r2 - b.r2)));
+    return max(d.x, max(d.y, d.z));
+}
+// Mean change of the nine samples, as they are. This is what "the same pixels" means; the match
+// cost below is not it (see there).
+float P9RawDiff(P9 a, P9 b)
+{
+    return (Sum3(abs(a.r0 - b.r0)) + Sum3(abs(a.r1 - b.r1)) + Sum3(abs(a.r2 - b.r2))) / 9.0;
+}
+// Match cost: the patterns compared with each patch's own mean removed (so a brightness change --
+// flicker, a fade -- is not motion), plus a quarter of the brightness difference itself (so a
+// smooth gradient, which has no pattern, still prefers the place it came from).
+float P9Cost(P9 c, float mc, P9 p)
+{
+    const float mp = P9Mean(p);
+    const float d  = mc - mp;
+    return (Sum3(abs(c.r0 - p.r0 - d)) + Sum3(abs(c.r1 - p.r1 - d)) + Sum3(abs(c.r2 - p.r2 - d))) / 9.0 + 0.25 * abs(d);
+}
+
+// The cost of vector v (pixels) for the patch at uv, on mip `lod` with taps `cell` pixels apart,
+// sampled SYMMETRICALLY: the fractional part of v (in cells) is split between the two frames,
+// this one read a quarter cell one way at most and the last one the same the other way.
+// Reading only the last frame off-grid compares a sharp patch with a bilinearly blurred one,
+// and that blur costs about as much as being half a cell out of place -- so a correct half
+// pixel vector lost to "did not move" every time, and a camera turning at two thirds of a pixel
+// a frame came out as a still one. Split, both sides carry the same blur and it cancels.
+// A vector on the grid needs no second read: c and mc are the patch at uv as it is.
+float SymCost(P9 c, float mc, float2 uv, float2 v, float cell, float lod)
+{
+    const float2 px = BUFFER_PIXEL_SIZE;
+    const float2 vi = round(v / cell) * cell;
+    const float2 vf = v - vi;
+    if (dot(vf, vf) < 1e-4 * cell * cell) return P9Cost(c, mc, Patch9(sDLSS5_PrevLuma, uv + vi * px, px * cell, lod));
+    const P9 cs = Patch9(sDLSS5_CurLuma, uv - 0.5 * vf * px, px * cell, lod);
+    return P9Cost(cs, P9Mean(cs), Patch9(sDLSS5_PrevLuma, uv + (vi + 0.5 * vf) * px, px * cell, lod));
+}
+
+// Where between three equally spaced costs (left, centre, right) the minimum lies, in steps:
+// -1..1, from the parabola through them. If a neighbour is already lower than the centre the
+// minimum is at or past it: step there. (Intersecting the two flanks as straight lines -- the
+// textbook fit for a sum of absolute differences -- measured WORSE on tools/fx-testbed's
+// fractional scrolls: 44% of text pixels within a quarter pixel against 52% for the parabola.)
+float SubCell(float l, float c, float r)
+{
+    if (min(l, r) < c) return l < r ? -1.0 : 1.0;
+    const float a = l - 2.0 * c + r;
+    return a > 1e-6 ? clamp(0.5 * (l - r) / a, -0.5, 0.5) : 0.0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The built-in estimator (DLSS5_MV_PROVIDER = 5). Hierarchical block matching on the luma mip
+// chain, 1/64 of the frame down to 1/2, written for what this effect is fed with -- finished
+// pictures, often 2D ones: UI over video, menus, scrolling lists. What it does differently from
+// a general-purpose optical flow:
+//   - "did not move" is a candidate at EVERY level, with a head start. A still element inside a
+//     moving scene is found still at the first level fine enough to see it, instead of
+//     inheriting the motion around it and having to be argued out of it later;
+//   - candidates are whole vectors (the coarser level's cells around the pixel, last frame's
+//     vector, zero), compared by what they do to the picture. Nothing is averaged, so there is
+//     no half-way vector on the border between two motions;
+//   - each level then searches one cell around the winner and fits the last half cell, so the
+//     half-resolution result is already good to a fraction of a pixel.
+// ---------------------------------------------------------------------------------------------
+
+#if DLSS5_MV_BUILTIN
+
+// A candidate is only worth nine fetches if it differs from the vector already in hand: inside
+// anything that moves as one piece -- and in everything that does not move -- the cells around
+// a pixel all say the same thing.
+// Of two candidates that match about equally well, the one closer to what the coarser level
+// found is taken (at the coarsest level: the shorter one): each cell of distance costs 4% and a
+// quarter of the noise floor. Without that, anything that repeats -- the rows of a list, a
+// fence, brickwork -- matches the NEXT repeat as well as itself, and a level that happened to
+// pick it sends every finer level looking in the wrong place (measured: a 32 px-pitch list
+// scrolling at 1.25 px a frame, 1080p, read as -30.75). Measured from the coarser level's
+// answer and not from zero, because from zero it is a tax on speed: a 38 px pan is 19 cells
+// long at the finest level, and was read as 25 px.
+#define DLSS5_FLOW_TRY(V) \
+    { const float2 v_ = (V); \
+      if (any(abs(v_ - best) > 0.125 * cell)) { \
+          const float e_ = P9Cost(c, mc, Patch9(sDLSS5_PrevLuma, uv + v_ * BUFFER_PIXEL_SIZE, t, lod)); \
+          const float n_ = length(v_ - ref) / cell; \
+          const float w_ = e_ * (1.0 + 0.04 * n_) + 0.25 * FLOW_NOISE * n_; \
+          if (w_ < best_cost) { best_cost = w_; best_raw = e_; best = v_; } } }
+
+float4 FlowLevel(float2 uv, float lod, sampler2D coarse, bool has_coarse)
+{
+    const float  cell = exp2(lod);                 // one texel of this level, in pixels
+    const float2 t    = BUFFER_PIXEL_SIZE * cell;
+    const P9     c    = Patch9(sDLSS5_CurLuma, uv, t, lod);
+    const float  mc   = P9Mean(c);
+    const float  contrast = P9Contrast(c, mc);
+    float2 ref = 0.0;                              // the coarser level's answer for this spot
+    if (has_coarse) ref = tex2Dlod(coarse, float4(uv, 0.0, 0.0)).xy;
+
+    const float zero_raw = P9Cost(c, mc, Patch9(sDLSS5_PrevLuma, uv, t, lod));
+    // The patch is where it was, to within the noise. (This is most of a menu, and all of a
+    // still picture -- the estimator costs next to nothing there.) That is only evidence of
+    // standing still if there was enough in the patch to see it move: with a contrast of 16
+    // times the noise floor, anything over a sixteenth of a cell would have shown. A patch
+    // with less than that -- the middle of a plain wall, of a sky, a soft gradient -- looks the
+    // same wherever it goes, so it takes the coarser level's word for it: the inside of a
+    // moving surface moves with its outline. (A flat patch that really is still, next to
+    // something that moves, inherits that too; the per-pixel stage sees that its pixels did
+    // not change and gives them zero.)
+    if (zero_raw <= FLOW_NOISE)
+        return float4(contrast >= 16.0 * FLOW_NOISE ? float2(0.0, 0.0) : ref, zero_raw, contrast);
+
+    // Zero first, with its head start: everything else has to beat it by a margin.
+    const float n0 = length(ref) / cell;
+    float2 best      = 0.0;
+    float  best_raw  = zero_raw;
+    float  best_cost = (zero_raw * (1.0 + 0.04 * n0) + 0.25 * FLOW_NOISE * n0) * (1.0 - ZERO_BIAS) - FLOW_NOISE;
+
+    // Where this pixel went last frame (the previous frame's final vector, in delta UV).
+    DLSS5_FLOW_TRY(tex2Dlod(sDLSS5_PrevMV, float4(uv, 0.0, 0.0)).xy * BUFFER_SCREEN_SIZE)
+
+    if (has_coarse)
+    {
+        // The coarser level's 3x3 cells around this pixel.
+        const float2 ct = t * 2.0;
+        [unroll] for (int y = -1; y <= 1; ++y)
+        [unroll] for (int x = -1; x <= 1; ++x)
+            DLSS5_FLOW_TRY(tex2Dlod(coarse, float4(uv + float2(x, y) * ct, 0.0, 0.0)).xy)
+    }
+    else
+    {
+        // Coarsest level: nothing to inherit, so look two cells in every direction.
+        [unroll] for (int y = -2; y <= 2; ++y)
+        [unroll] for (int x = -2; x <= 2; ++x)
+            if (x != 0 || y != 0)
+                DLSS5_FLOW_TRY(float2(x, y) * cell)
+    }
+
+    // One cell around the winner...
+    const float2 b0 = best;
+    [unroll] for (int y1 = -1; y1 <= 1; ++y1)
+    [unroll] for (int x1 = -1; x1 <= 1; ++x1)
+        if (x1 != 0 || y1 != 0)
+            DLSS5_FLOW_TRY(b0 + float2(x1, y1) * cell)
+
+    // ...then half a cell either side on each axis and the fitted minimum.
+    const float2 b1 = best;
+    const float  h  = 0.5 * cell;
+    const float  c0 = SymCost(c, mc, uv, b1, cell, lod);
+    const float  cl = SymCost(c, mc, uv, b1 + float2(-h, 0.0), cell, lod);
+    const float  cr = SymCost(c, mc, uv, b1 + float2( h, 0.0), cell, lod);
+    const float  cu = SymCost(c, mc, uv, b1 + float2(0.0, -h), cell, lod);
+    const float  cd = SymCost(c, mc, uv, b1 + float2(0.0,  h), cell, lod);
+    const float2 f  = b1 + h * float2(SubCell(cl, c0, cr), SubCell(cu, c0, cd));
+    if (dot(b1, b1) > 0.0)
+    {
+        best = f;
+        best_raw = min(c0, min(min(cl, cr), min(cu, cd)));
+    }
+    else if (any(abs(f) > 0.0))
+    {
+        // The winner is zero, yet the patch changed. Motion of less than half a cell lands
+        // here -- at the finest level that is anything under a pixel a frame, i.e. every slow
+        // pan -- and leaving it at zero is how a slowly turning camera came out as a still one.
+        // But away from zero only on evidence: the fitted fraction has to beat "did not move"
+        // by the margin everything else had to.
+        const float ef = SymCost(c, mc, uv, f, cell, lod);
+        if (ef < c0 * (1.0 - ZERO_BIAS) - FLOW_NOISE) { best = f; best_raw = ef; }
+    }
+    return float4(best, best_raw, contrast);
+}
+
+float4 PS_Flow6(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return FlowLevel(uv, 6.0, sDLSS5_PrevMV, false); }   // no coarser level: that sampler is never read
+float4 PS_Flow5(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return FlowLevel(uv, 5.0, sDLSS5_Flow6, true); }
+float4 PS_Flow4(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return FlowLevel(uv, 4.0, sDLSS5_Flow5, true); }
+float4 PS_Flow3(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return FlowLevel(uv, 3.0, sDLSS5_Flow4, true); }
+float4 PS_Flow2(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return FlowLevel(uv, 2.0, sDLSS5_Flow3, true); }
+float4 PS_Flow1(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return FlowLevel(uv, 1.0, sDLSS5_Flow2, true); }
+
+// Every cell above chose for itself, and on brickwork, tiles, planks -- anything that matches in
+// more than one place -- neighbours do not always choose alike. Taken as it is, that field made
+// the picture shimmer: on fx-testbed's 3D scene the output changed 1.39 times as much from one
+// frame to the next as the input did (1.04 for LumeniteFX, which filters at every level). A
+// 3x3 median of the vectors, each component for itself, removes the odd one out and leaves an
+// edge between two motions where it is -- which a blur would not. What it does take away is a
+// structure thinner than two cells, a glyph stroke on a moving background for one; that is the
+// per-pixel stage's to put back, and it does.
+#define DLSS5_SORT2(A, B) { const float2 lo_ = min(A, B); B = max(A, B); A = lo_; }
+float4 PS_FlowMedian(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+    const float2 t = BUFFER_PIXEL_SIZE * 2.0;
+    const float4 c = tex2Dlod(sDLSS5_Flow1Raw, float4(uv, 0.0, 0.0));
+    float2 p0 = tex2Dlod(sDLSS5_Flow1Raw, float4(uv + float2(-t.x, -t.y), 0.0, 0.0)).xy;
+    float2 p1 = tex2Dlod(sDLSS5_Flow1Raw, float4(uv + float2( 0.0, -t.y), 0.0, 0.0)).xy;
+    float2 p2 = tex2Dlod(sDLSS5_Flow1Raw, float4(uv + float2( t.x, -t.y), 0.0, 0.0)).xy;
+    float2 p3 = tex2Dlod(sDLSS5_Flow1Raw, float4(uv + float2(-t.x,  0.0), 0.0, 0.0)).xy;
+    float2 p4 = c.xy;
+    float2 p5 = tex2Dlod(sDLSS5_Flow1Raw, float4(uv + float2( t.x,  0.0), 0.0, 0.0)).xy;
+    float2 p6 = tex2Dlod(sDLSS5_Flow1Raw, float4(uv + float2(-t.x,  t.y), 0.0, 0.0)).xy;
+    float2 p7 = tex2Dlod(sDLSS5_Flow1Raw, float4(uv + float2( 0.0,  t.y), 0.0, 0.0)).xy;
+    float2 p8 = tex2Dlod(sDLSS5_Flow1Raw, float4(uv + float2( t.x,  t.y), 0.0, 0.0)).xy;
+    // the 19-exchange median-of-nine network
+    DLSS5_SORT2(p1, p2) DLSS5_SORT2(p4, p5) DLSS5_SORT2(p7, p8) DLSS5_SORT2(p0, p1) DLSS5_SORT2(p3, p4) DLSS5_SORT2(p6, p7)
+    DLSS5_SORT2(p1, p2) DLSS5_SORT2(p4, p5) DLSS5_SORT2(p7, p8) DLSS5_SORT2(p0, p3) DLSS5_SORT2(p5, p8) DLSS5_SORT2(p4, p7)
+    DLSS5_SORT2(p3, p6) DLSS5_SORT2(p1, p4) DLSS5_SORT2(p2, p5) DLSS5_SORT2(p4, p7) DLSS5_SORT2(p4, p2) DLSS5_SORT2(p6, p4)
+    DLSS5_SORT2(p4, p2)
+    return float4(p4, c.zw);
+}
+
+#endif   // DLSS5_MV_BUILTIN
+
+// ---------------------------------------------------------------------------------------------
+// Per-pixel refinement (MV_PIPELINE = 0), for every provider. Returns the vector in PIXELS.
+//
+// A provider's field is coarse -- 1/8 of the frame for LumeniteFX, half for the built-in one,
+// smoothed for the rest -- and a coarse field cannot follow the outline of a glyph. It hands the
+// pixels of a still caption a fraction of the motion behind it, and a temporal model that is
+// told "this text moved 0.3 px" resamples its history by 0.3 px every single frame: soft,
+// smeared text. A game's HUD over a moving world is the same thing.
+//
+// What the field IS good at is being smooth: neighbouring pixels of one surface get nearly the
+// same vector, frame after frame. A first cut of this stage let every pixel pick freely among
+// candidates and lost that -- on a 3D scene with known vectors (tools/fx-testbed, --scene 3d)
+// the output changed 1.21 times as much from frame to frame as the input did, against 1.04 for
+// the untouched field: brickwork and tiles match in more than one place, and independent
+// pixels disagree about which. So the provider's vector STANDS unless the pixel itself says
+// otherwise:
+//   1. a pixel whose neighbourhood did not change is static: vector exactly zero;
+//   2. so is one with structure of its own that last frame reproduces in place, and one that
+//      "did not move" explains clearly better than the provider does -- that is the caption,
+//      the HUD, the still wall under a flickering lamp;
+//   3. only where the vector in hand leaves a real part of the pixel unexplained are the
+//      provider's whole cells around it and last frame's vector tried, and each has to be a
+//      clear improvement to be taken -- the pixel on the border between two motions;
+//   4. the result is polished to sub-pixel accuracy where that is a clear gain too, and the
+//      nearest whole-pixel vector is taken where it reproduces the pixel (history is then
+//      fetched pixel for pixel).
+// code: 0 static lock, 1 zero, 2 the provider's vector, 3 a neighbouring cell, 4 last frame's
+// vector, 5 snapped to whole pixels.
+// ---------------------------------------------------------------------------------------------
+
+// Scored at two scales at once: the 3x3 pixels around the pixel, and a 3x3 of 4 px cells around
+// that (mip 2). One scale is not enough either way round -- the pixels alone cannot tell a
+// vertical stroke that slides along itself from one that stands still (both look unchanged
+// through a 3x3 hole), and the wide patch alone cannot find a glyph edge.
+float PickCost(P9 c0, float m0, P9 c2, float m2, float2 uv, float2 v_px)
+{
+    const float2 px = BUFFER_PIXEL_SIZE;
+    return SymCost(c0, m0, uv, v_px, 1.0, 0.0)
+         + P9Cost(c2, m2, Patch9(sDLSS5_PrevLuma, uv + v_px * px, px * 4.0, 2.0));
+}
+
+// One step of the sub-pixel polish around f (cost ef): half a pixel either side on each axis
+// and the minimum of the curve through the three costs. Moves f only if that is an improvement;
+// returns true if it moved AND ran into the half pixel limit on an axis, i.e. the minimum may
+// lie further out and a second step from the new place is worth taking.
+bool PolishStep(P9 c0, float m0, float2 uv, inout float2 f, inout float ef)
+{
+    const float  cl = SymCost(c0, m0, uv, f + float2(-0.5, 0.0), 1.0, 0.0);
+    const float  cr = SymCost(c0, m0, uv, f + float2( 0.5, 0.0), 1.0, 0.0);
+    const float  cu = SymCost(c0, m0, uv, f + float2(0.0, -0.5), 1.0, 0.0);
+    const float  cd = SymCost(c0, m0, uv, f + float2(0.0,  0.5), 1.0, 0.0);
+    const float2 o  = float2(SubCell(cl, ef, cr), SubCell(cu, ef, cd));
+    const float2 g  = f + 0.5 * o;
+    const float  eg = SymCost(c0, m0, uv, g, 1.0, 0.0);
+    if (eg >= ef) return false;
+    f = g; ef = eg;
+    return any(abs(o) > 0.999);
+}
+
+// A challenger is taken only if it explains the pixel a fifth better than what is in hand.
+#define DLSS5_PICK_TRY(V, CODE) \
+    { const float2 v_ = (V); \
+      if (any(abs(v_ - best) > 0.125)) { \
+          const float e_ = PickCost(c0, m0, c2, m2, uv, v_); \
+          if (e_ < t_best * 0.8) { t_best = e_; best = v_; code = CODE; } } }
+
+// detail: the pixel-scale contrast of the patch (how much fine structure there is to lose).
+// stale:  1 if history cannot simply be reused for this pixel -- the vector is fractional, or
+//         it is a whole-pixel one (zero included) that does not reproduce the pixel: something
+//         creeping along at a fraction of a pixel a frame, a fade, an animation in place.
+float2 RefineMV(float2 uv, out float distrust, out float code, out float detail, out float stale)
+{
+    const float2 px = BUFFER_PIXEL_SIZE;
+    const P9 c0 = Patch9(sDLSS5_CurLuma, uv, px, 0.0);
+    const P9 c2 = Patch9(sDLSS5_CurLuma, uv, px * 4.0, 2.0);
+    const P9 p0 = Patch9(sDLSS5_PrevLuma, uv, px, 0.0);
+    const P9 p2 = Patch9(sDLSS5_PrevLuma, uv, px * 4.0, 2.0);
+    distrust = 0.0;
+    code     = 0.0;
+    detail   = 0.0;
+    stale    = 0.0;
+    // Static lock: the same picture, here and around here. The wide patch averages 16 pixels a
+    // sample, which makes it the sensitive one: a surface drifting a fraction of a pixel a
+    // frame changes few of its pixels by a whole step, but every one of those averages a
+    // little. It gets a quarter of the tolerance, so a slow pan does not lock.
+    if (P9MaxDiff(c0, p0) <= STATIC_NOISE && P9MaxDiff(c2, p2) <= 0.25 * STATIC_NOISE) return float2(0.0, 0.0);
+
+    const float m0 = P9Mean(c0);
+    const float m2 = P9Mean(c2);
+    detail = P9Contrast(c0, m0);
+    const float contrast = detail + P9Contrast(c2, m2);
+
+    // The provider's own answer for this pixel.
+    float2 best = ProviderMV(uv) * BUFFER_SCREEN_SIZE;
+    code = 2.0;
+    // Nothing here to tell one place from another (flat colour, a soft gradient, plain noise):
+    // nothing can be shown to be better than the provider's vector, whose estimate comes from
+    // the structure around the pixel -- the inside of a moving surface moves with its outline.
+    if (contrast < 4.0 * FLOW_NOISE) { stale = 1.0; return best; }
+
+    // "Reproduces": last frame, fetched PIXEL FOR PIXEL at a whole-pixel vector, is this pixel
+    // -- its nine samples, as they are, to within the noise and a tenth of the patch's own
+    // contrast. On the raw values, not on the match cost: the cost removes each patch's mean
+    // (that is what makes a flickering lamp not count as motion), and with the mean goes any
+    // plain slope -- a gentle gradient that has slid two thirds of a pixel costs next to
+    // nothing, and "reproduces" by cost turned every slow pan over a smooth surface into a
+    // still picture. And at pixel scale only: the wide patch is read from a mip, which a shift
+    // that is not a multiple of its 4 px cells never reproduces, however right the vector.
+    const float exact  = 2.0 * FLOW_NOISE + 0.1 * detail;
+    const float r_zero = P9RawDiff(c0, p0);
+    const float e_zero = P9Cost(c0, m0, p0);
+    const float t_zero = e_zero + P9Cost(c2, m2, p2);
+    float t_best = PickCost(c0, m0, c2, m2, uv, best);
+
+    // Still: it has pixel-scale structure and those very pixels are where they were, or "did
+    // not move" explains it at least twice as well as the provider does (by match cost, so the
+    // wall under the flickering lamp goes to zero by this one). Twice, not "somewhat better":
+    // under a slow pan a provider that is a third of a pixel off and "did not move" are about
+    // equally wrong, and a small head start for zero was enough to freeze every edge in the
+    // picture (the tile joints and mortar lines of fx-testbed's courtyard, at 0.6 px a frame).
+    // "In place" has to hold around the pixel as well as on it: a horizontal mortar line under
+    // a horizontal pan slides along itself, and its own nine samples do not change at all.
+    const float wide = P9Contrast(c2, m2);
+    const bool in_place = detail >= 4.0 * FLOW_NOISE && r_zero <= exact && P9RawDiff(c2, p2) <= FLOW_NOISE + 0.1 * wide;
+    if (in_place || t_zero < 0.5 * t_best - FLOW_NOISE)
+    {
+        best = 0.0; t_best = t_zero; code = 1.0;
+        if (in_place) return float2(0.0, 0.0);
+    }
+
+    // The vector in hand leaves a real part of the pixel unexplained: the border between two
+    // motions, or a provider that is simply off here. The provider's whole cells -- the one
+    // under the pixel and the four around it, not interpolations of them -- and last frame's
+    // vector get a hearing.
+    if (t_best > 0.3 * contrast + 2.0 * FLOW_NOISE)
+    {
+        const float2 cell = px * DLSS5_MV_CELL;
+        DLSS5_PICK_TRY(ProviderCellPx(uv), 3.0)
+        DLSS5_PICK_TRY(ProviderCellPx(uv + float2(-cell.x, 0.0)), 3.0)
+        DLSS5_PICK_TRY(ProviderCellPx(uv + float2( cell.x, 0.0)), 3.0)
+        DLSS5_PICK_TRY(ProviderCellPx(uv + float2(0.0, -cell.y)), 3.0)
+        DLSS5_PICK_TRY(ProviderCellPx(uv + float2(0.0,  cell.y)), 3.0)
+        DLSS5_PICK_TRY(tex2Dlod(sDLSS5_PrevMV, float4(uv, 0.0, 0.0)).xy * BUFFER_SCREEN_SIZE, 4.0)
+    }
+
+    // Nothing explains this pixel well (disocclusion, something translucent, a cut): say so.
+    distrust = saturate((t_best - 2.0 * FLOW_NOISE) / (0.5 * contrast + 4.0 * FLOW_NOISE) - 0.5);
+
+    // Sub-pixel polish: half a pixel either side on each axis (pixel scale only: this is about
+    // the last fraction of a pixel) and the minimum of the curve through those three costs.
+    // If that runs into its half pixel limit, once more from there: up to a pixel in all, which
+    // is exactly the range a half-resolution estimate cannot see -- every slow pan lives in it.
+    const bool zero_now = dot(best, best) == 0.0;
+    float e_best    = zero_now ? e_zero : SymCost(c0, m0, uv, best, 1.0, 0.0);
+    bool  from_zero = false;
+    if (REFINE_SUBPIXEL && MV_SNAP != 1)
+    {
+        float2 f  = best;
+        float  ef = e_best;
+        if (PolishStep(c0, m0, uv, f, ef)) PolishStep(c0, m0, uv, f, ef);
+        if (zero_now)
+        {
+            // Away from zero only on evidence: the fraction has to beat "did not move" by a
+            // margin. (A glyph edge with something passing behind it must not pick up a tenth
+            // of a pixel from this.)
+            if (ef < e_zero * (1.0 - ZERO_BIAS) - FLOW_NOISE) { best = f; e_best = ef; code = 2.0; from_zero = true; }
+        }
+        // Elsewhere only for a clear gain: on a surface the provider already has right to a
+        // fraction of a pixel, a fit that moves every pixel a little differently takes the
+        // field's smoothness and gives nothing back.
+        else if (ef < e_best * 0.9 - 0.5 * FLOW_NOISE) { best = f; e_best = ef; }
+    }
+
+    // A whole-pixel vector fetches history pixel for pixel: nothing is resampled, so nothing
+    // softens. Where the nearest one reproduces the pixel it is the vector to send -- anything
+    // that really moves in whole pixels, which is most 2D motion (a list scrolling 4 px a frame
+    // came back from DLAA with an error of 0.12 against 1.4 for the same list at 2.5 px).
+    // "Reproduces" is meant strictly here, stricter than for standing still: the noise floor
+    // and a few percent of the patch's contrast, on the pixel and around it. In a 3D scene
+    // nothing moves in whole pixels, and with a looser test (or with "about as good as the
+    // fractional vector", which was tried for fine repeating patterns) vectors hopped between
+    // whole values from pixel to pixel and from frame to frame: fx-testbed's courtyard came out
+    // 1.12 times as restless as it went in, against 1.06 without any snapping.
+    // Motion that is genuinely fractional keeps its fraction: rounding 1.25 px a frame to 1
+    // would have the picture slip a quarter pixel against its history on every frame.
+    // (Half-way cases go AWAY from zero: a polish that started at zero and ran into its limit
+    // is pointing at the next pixel over, not back at the one it left.)
+    // "Around it" is eight pixels on a ring three pixels out, read at full resolution: a
+    // whole-pixel shift lands on pixel centres there, so real whole-pixel motion reproduces
+    // them exactly -- which the mip the wide patch comes from never does, and a tolerance wide
+    // enough for the mip is wide enough for an edge sliding along itself.
+    const float2 whole = round(best + sign(best) * 0.01);
+    float rw = r_zero;
+    if (dot(whole, whole) > 0.0) rw = P9RawDiff(c0, Patch9(sDLSS5_PrevLuma, uv + whole * px, px, 0.0));
+    float ring = 0.0, ring_lo = 1e3, ring_hi = -1e3;
+    [unroll] for (int k = 0; k < 8; ++k)
+    {
+        const float2 o  = float2(k == 0 || k == 3 || k == 5 ? -3.0 : (k == 1 || k == 6 ? 0.0 : 3.0), k < 3 ? -3.0 : (k < 5 ? 0.0 : 3.0)) * px;
+        const float  a_ = tex2Dlod(sDLSS5_CurLuma,  float4(uv + o, 0.0, 0.0)).x;
+        const float  b_ = tex2Dlod(sDLSS5_PrevLuma, float4(uv + o + whole * px, 0.0, 0.0)).x;
+        ring += abs(a_ - b_); ring_lo = min(ring_lo, a_); ring_hi = max(ring_hi, a_);
+    }
+    ring /= 8.0;
+    const float ring_range = ring_hi - ring_lo;
+    const bool fits  = rw <= exact && ring <= 2.0 * FLOW_NOISE + 0.05 * ring_range;          // history can be reused as it is
+    const bool tight = rw <= FLOW_NOISE + 0.03 * detail && ring <= FLOW_NOISE + 0.015 * ring_range;
+    if (MV_SNAP == 1 || (MV_SNAP == 0 && tight)) { best = whole; code = dot(whole, whole) > 0.0 ? 5.0 : 1.0; }
+    // A polish that left zero and did not at least halve the mismatch found no motion, only a
+    // slope to slide down (fine repeating patterns have plenty), and a fraction of a pixel of
+    // nothing in particular is worse than the zero it left.
+    else if (from_zero && e_best > 0.5 * e_zero) { best = float2(0.0, 0.0); code = 1.0; }
+    stale = (fits && all(best == whole)) ? 0.0 : 1.0;
+    return best;
 }
 
 // Illumination-normalised 3x3 structure difference between the current frame at uv_cur and
@@ -745,8 +1379,9 @@ float RawDepth(float2 uv)
 
 void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
                       out float2 mv_out : SV_Target0, out float mask : SV_Target1,
-                      out float depth : SV_Target2, out float static_now : SV_Target3)
+                      out float depth : SV_Target2, out float static_now : SV_Target3, out float2 vec_now : SV_Target4)
 {
+    bool drop_history = false;
     // Providers hand out "delta UV": previous position = uv + mv. DLSS wants the same
     // direction, in pixels.
     const float2 flow = ProviderMV(uv);
@@ -773,6 +1408,29 @@ void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
             }
         }
     }
+    else if (MV_PIPELINE == 0)
+    {
+        float code, detail, stale;
+        mv = RefineMV(uv, distrust, code, detail, stale) * BUFFER_PIXEL_SIZE;
+        static_now = code / 8.0;   // what was decided, for the debug view
+
+        // Disocclusion, where there is a depth buffer to see it with: the vector points at a
+        // different surface, so it is dropped and the pixel flagged.
+        const float d = ReShade::GetLinearizedDepth(uv);
+        if (VALIDATE_DEPTH && d < 0.999 && code > 1.5)
+        {
+            const float2 puv = uv + mv;
+            if (all(puv >= 0.0) && all(puv <= 1.0))
+            {
+                const float dp  = tex2Dlod(sDLSS5_PrevDepth, float4(puv, 0.0, 0.0)).x;
+                const float tol = DEPTH_TOLERANCE * max(d, 1e-3);
+                const float bad_depth = saturate((abs(dp - d) - tol) / (tol + 1e-5));
+                distrust = max(distrust, bad_depth);
+                if (bad_depth > 0.5) mv = float2(0.0, 0.0);
+            }
+        }
+        drop_history = MOVING_HISTORY > 0 && stale > 0.5 && (MOVING_HISTORY == 2 || detail >= DETAIL_CONTRAST);
+    }
     else if (MV_VALIDATE)
     {
         const float4 bad = ValidateTests(uv, flow);
@@ -798,7 +1456,11 @@ void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
         mv = zero_vector ? float2(0.0, 0.0) : flow;
     }
 
-    mv_out = mv * float2(BUFFER_WIDTH, BUFFER_HEIGHT) * MV_SIGN * MV_SCALE;
+    float2 mv_px = mv * float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+    if (MV_SNAP == 1) mv_px = round(mv_px);
+    vec_now = mv_px * BUFFER_PIXEL_SIZE;   // the real vector, for next frame -- whatever is sent below
+    if (drop_history) mv_px = float2(BUFFER_WIDTH, BUFFER_HEIGHT) * 4.0;   // off screen from anywhere
+    mv_out = mv_px * MV_SIGN * MV_SCALE;
     mask   = saturate(distrust) * MASK_STRENGTH;
     depth  = RawDepth(uv);
 }
@@ -811,9 +1473,11 @@ void PS_StoreHistory(float4 vpos : SV_Position, float2 uv : TEXCOORD,
                      out float luma : SV_Target0, out float depth : SV_Target1, out float2 mv : SV_Target2,
                      out float prev_static : SV_Target3)
 {
-    luma  = Luma(uv);
+    luma  = tex2Dfetch(sDLSS5_CurLuma, int2(vpos.xy)).x;
     depth = ReShade::GetLinearizedDepth(uv);
-    mv    = ProviderMV(uv);
+    // Refine: the vector this pixel was given (it is next frame's "where this pixel went last
+    // time" candidate). Classic: the raw provider vector, as before.
+    mv    = MV_PIPELINE == 0 ? tex2Dfetch(sDLSS5_VecNow, int2(vpos.xy)).xy : ProviderMV(uv);
     prev_static = tex2Dfetch(sDLSS5_StaticNow, int2(vpos.xy)).x;
 }
 
@@ -883,6 +1547,20 @@ float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
         if (uv.y < 0.05) return saturate(s.y / 8.0).xxx;   // fit error strip
         return s.x.xxx;                                    // inlier share
     }
+    if (DEBUG_VIEW == 9)
+    {
+        const float3 img  = tex2Dlod(sDLSS5_ColorInput, float4(uv, 0.0, 0.0)).rgb * 0.35;
+        const float  code = tex2Dlod(sDLSS5_StaticNow, float4(uv, 0.0, 0.0)).x * 8.0;
+        const float3 tint = code < 0.5 ? float3(0.0, 0.0, 0.0) : code < 1.5 ? float3(0.0, 0.55, 0.0) : code < 2.5 ? float3(0.1, 0.25, 0.9)
+                          : code < 3.5 ? float3(0.0, 0.6, 0.6) : code < 4.5 ? float3(0.8, 0.0, 0.7) : float3(0.85, 0.75, 0.0);
+        return saturate(img + tint);
+    }
+    if (DEBUG_VIEW == 10)
+    {
+        const float2 v = tex2Dlod(sDLSS5_MV, float4(uv, 0.0, 0.0)).xy;
+        // Whole 10-bit codes, 1/16 px a step, so a zero vector reads back as exactly 512.
+        return float3((round(clamp(v, -31.0, 31.0) * 16.0) + 512.0) / 1023.0, tex2Dlod(sDLSS5_Mask, float4(uv, 0.0, 0.0)).x);
+    }
     float2 mv = tex2Dlod(sDLSS5_MV, float4(uv, 0.0, 0.0)).xy; // pixels
     float angle = atan2(mv.y, mv.x);
     float speed = length(mv);
@@ -899,12 +1577,22 @@ technique DLSS5_Feed
                  "Provider: " DLSS5_MV_PROVIDER_NAME "\n"
                  "Change it with the DLSS5_MV_PROVIDER preprocessor definition (0 texMotionVectors,\n"
                  "1 Launchpad, 2 VORT, 3 LumeniteFX Kernel, 4 LumeniteFX QuantMotion) and enable\n"
-                 "that provider's technique ABOVE this one.";
+                 "that provider's technique ABOVE this one. 5 = built in, nothing to enable.";
 >
 {
+    pass Luma          { VertexShader = PostProcessVS; PixelShader = PS_Luma;          RenderTarget0 = DLSS5_CurLuma; }
+#if DLSS5_MV_BUILTIN
+    pass Flow6         { VertexShader = PostProcessVS; PixelShader = PS_Flow6;         RenderTarget0 = DLSS5_Flow6; }
+    pass Flow5         { VertexShader = PostProcessVS; PixelShader = PS_Flow5;         RenderTarget0 = DLSS5_Flow5; }
+    pass Flow4         { VertexShader = PostProcessVS; PixelShader = PS_Flow4;         RenderTarget0 = DLSS5_Flow4; }
+    pass Flow3         { VertexShader = PostProcessVS; PixelShader = PS_Flow3;         RenderTarget0 = DLSS5_Flow3; }
+    pass Flow2         { VertexShader = PostProcessVS; PixelShader = PS_Flow2;         RenderTarget0 = DLSS5_Flow2; }
+    pass Flow1         { VertexShader = PostProcessVS; PixelShader = PS_Flow1;         RenderTarget0 = DLSS5_Flow1Raw; }
+    pass FlowMedian    { VertexShader = PostProcessVS; PixelShader = PS_FlowMedian;    RenderTarget0 = DLSS5_Flow1; }
+#endif
     pass FitSamples    { VertexShader = PostProcessVS; PixelShader = PS_FitSamples;    RenderTarget0 = DLSS5_FitA; RenderTarget1 = DLSS5_FitB; }
     pass FitSolve      { VertexShader = PostProcessVS; PixelShader = PS_FitSolve;      RenderTarget0 = DLSS5_Cam0; RenderTarget1 = DLSS5_Cam1; RenderTarget2 = DLSS5_Cam2; RenderTarget3 = DLSS5_Cam3; RenderTarget4 = DLSS5_Cam4; RenderTarget5 = DLSS5_Cam5; }
-    pass Guides        { VertexShader = PostProcessVS; PixelShader = PS_MotionVectors; RenderTarget0 = DLSS5_MV; RenderTarget1 = DLSS5_Mask; RenderTarget2 = DLSS5_Depth; RenderTarget3 = DLSS5_StaticNow; }
+    pass Guides        { VertexShader = PostProcessVS; PixelShader = PS_MotionVectors; RenderTarget0 = DLSS5_MV; RenderTarget1 = DLSS5_Mask; RenderTarget2 = DLSS5_Depth; RenderTarget3 = DLSS5_StaticNow; RenderTarget4 = DLSS5_VecNow; }
     pass History       { VertexShader = PostProcessVS; PixelShader = PS_StoreHistory;  RenderTarget0 = DLSS5_PrevLuma; RenderTarget1 = DLSS5_PrevDepth; RenderTarget2 = DLSS5_PrevMV; RenderTarget3 = DLSS5_PrevStatic; }
     DLSS5_MV_REQUEST_PASS   // Launchpad only: ask it to compute optical flow again next frame
 }

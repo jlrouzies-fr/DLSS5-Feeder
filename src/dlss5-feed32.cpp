@@ -666,7 +666,10 @@ static const struct { int mode; const char *file, *tech; } kMvProviders[] = {
     { 3, "lumenite_Kernel.fx",      "Lumenite_Kernel" },
     { 4, "lumenite_QuantMotion.fx", "Lumenite_QuantMotion" },
 };
-static const char *kMvModeName[] = { "texMotionVectors", "Launchpad", "VORT", "LumeniteFX Kernel", "LumeniteFX QuantMotion" };
+// 5 is DLSS5_Feed.fx's own estimator: it lives in the effect itself, so there is no provider
+// technique to look for, nothing that can be missing or disabled, and nothing to warn about.
+static const char *kMvModeName[] = { "texMotionVectors", "Launchpad", "VORT", "LumeniteFX Kernel", "LumeniteFX QuantMotion", "built in" };
+static const int   kMvModeBuiltIn = 5;
 static const int   kMvModeCount  = static_cast<int>(sizeof(kMvModeName) / sizeof(kMvModeName[0]));
 
 static char g_mv_status[192]  = "not checked yet";
@@ -5604,14 +5607,21 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     if (signature == last_signature) return;
     last_signature = signature;
 
-    _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> %s (%s)",
-                mode, kMvModeName[mode], provider,
-                g.launchpad.handle ? (provider_broken ? "FAILED TO COMPILE" : provider_on ? "enabled" : "DISABLED") : "not installed");
+    const bool builtin = mode == kMvModeBuiltIn;
+    if (builtin)
+        _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> DLSS5_Feed.fx's own estimator (nothing to enable)",
+                    mode, kMvModeName[mode]);
+    else
+        _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> %s (%s)",
+                    mode, kMvModeName[mode], provider,
+                    g.launchpad.handle ? (provider_broken ? "FAILED TO COMPILE" : provider_on ? "enabled" : "DISABLED") : "not installed");
     g_mv_problem[0] = '\0';
     Log("[feed32] effects: technique %s, DLSS5_MV %s, DLSS5_Depth %s, %s, depth reversed=%d",
         g.technique.handle ? "found" : "MISSING", g.mv_var.handle ? "found" : "MISSING",
         g.depth_var.handle ? "found" : "MISSING", g_mv_status, g.depth_reversed ? 1 : 0);
-    if (g.handles_ok && g.launchpad.handle == 0)
+    if (builtin)
+        ;   // nothing can be missing: the estimator is part of the effect itself
+    else if (g.handles_ok && g.launchpad.handle == 0)
         _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
                     "DLSS5_Feed.fx is compiled for motion-vector provider %d (%s) but no known %s shader is installed: motion vectors will be zero. "
                     "Install one, or change the DLSS5_MV_PROVIDER preprocessor definition.", mode, kMvModeName[mode], kMvModeName[mode]);

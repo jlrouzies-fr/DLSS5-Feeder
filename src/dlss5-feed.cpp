@@ -1311,7 +1311,10 @@ static const struct { int mode; const char *file, *tech; } kMvProviders[] = {
     { 3, "lumenite_Kernel.fx",      "Lumenite_Kernel" },
     { 4, "lumenite_QuantMotion.fx", "Lumenite_QuantMotion" },
 };
-static const char *kMvModeName[] = { "texMotionVectors", "Launchpad", "VORT", "LumeniteFX Kernel", "LumeniteFX QuantMotion" };
+// 5 is DLSS5_Feed.fx's own estimator: it lives in the effect itself, so there is no provider
+// technique to look for, nothing that can be missing or disabled, and nothing to warn about.
+static const char *kMvModeName[] = { "texMotionVectors", "Launchpad", "VORT", "LumeniteFX Kernel", "LumeniteFX QuantMotion", "built in" };
+static const int   kMvModeBuiltIn = 5;
 static const int   kMvModeCount  = static_cast<int>(sizeof(kMvModeName) / sizeof(kMvModeName[0]));
 
 // What the overlay shows under "Motion vectors": the resolved provider line, and the problem
@@ -8561,9 +8564,14 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     last_signature = signature;
     last_rt = rt;
 
-    _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> %s (%s)",
-                mode, kMvModeName[mode], provider,
-                g.launchpad.handle ? (provider_broken ? "FAILED TO COMPILE" : provider_on ? "enabled" : "DISABLED") : "not installed");
+    const bool builtin = mode == kMvModeBuiltIn;
+    if (builtin)
+        _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> DLSS5_Feed.fx's own estimator (nothing to enable)",
+                    mode, kMvModeName[mode]);
+    else
+        _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> %s (%s)",
+                    mode, kMvModeName[mode], provider,
+                    g.launchpad.handle ? (provider_broken ? "FAILED TO COMPILE" : provider_on ? "enabled" : "DISABLED") : "not installed");
     g_mv_problem[0] = '\0';
 
     Log("[feed] effects: %s technique %s, ColorInput %s, DLSS5_MV %s, DLSS5_Depth %s, DLSS5_Mask %s, %s, depth reversed=%d",
@@ -8601,6 +8609,8 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
                 "before calling it missing", kEffectFile);
         }
     }
+    else if (builtin)
+        ;   // nothing can be missing: the estimator is part of the effect that just resolved
     else if (g.launchpad.handle == 0)
         _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
                     "DLSS5_Feed.fx is compiled for motion-vector provider %d (%s) but no known %s shader is installed: motion vectors will be zero (still images only). "
@@ -9097,7 +9107,8 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "provider matches the shader's DLSS5_MV_PROVIDER");
     ImGui::TextWrapped("%s", g_mv_probe);
     ImGui::TextWrapped("Change the provider with DLSS5_Feed.fx's DLSS5_MV_PROVIDER preprocessor definition: "
-                       "0 texMotionVectors (qUINT, dh_uber_motion), 1 Launchpad, 2 VORT, 3 LumeniteFX Kernel, 4 LumeniteFX QuantMotion.");
+                       "0 texMotionVectors (qUINT, dh_uber_motion), 1 Launchpad, 2 VORT, 3 LumeniteFX Kernel, 4 LumeniteFX QuantMotion, "
+                       "5 built in (DLSS5_Feed.fx's own estimator, nothing to enable).");
     if (ImGui::SliderFloat("MV scale X", &g_cfg.mv_scale_x, 0.0f, 4.0f)) dirty = true;
     if (ImGui::SliderFloat("MV scale Y", &g_cfg.mv_scale_y, 0.0f, 4.0f)) dirty = true;
 

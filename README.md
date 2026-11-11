@@ -894,8 +894,8 @@ install both halves from the same release.
 
 ## Motion vectors: choosing a provider
 
-DLSS5-Feeder does not estimate motion itself — it reads the output of a motion-vector shader you
-install. Which one it reads is fixed **at compile time** by the `DLSS5_MV_PROVIDER` preprocessor
+DLSS5-Feeder reads the output of a motion-vector shader you install, or (`5`) estimates motion
+itself. Which one it uses is fixed **at compile time** by the `DLSS5_MV_PROVIDER` preprocessor
 definition on `DLSS5_Feed.fx` (ReShade overlay → select `DLSS5_Feed.fx` → *Preprocessor
 definitions* → reload effects):
 
@@ -906,6 +906,7 @@ definitions* → reload effects):
 | `2` | **VORT** | `vort_Motion` | MIT. |
 | **`3`** | **LumeniteFX Kernel** ← **recommended** | `LUMENITE: Kernel 2.0` | 1/8-resolution flow **plus a confidence map**, which the feed uses. The configuration this beta was tuned on. |
 | `4` | **LumeniteFX QuantMotion** | `LUMENITE: QuantMotion` | Same shape as Kernel, different estimator. |
+| `5` | **Built in** — `DLSS5_Feed.fx`'s own estimator | nothing | Hierarchical block matching written for finished 2D pictures: UI over video, menus, scrolling lists. Nothing to install or enable, and on a par with Kernel there. **Under 3D camera motion it is clearly behind** (`tools/fx-testbed`'s 3D scene: 1.36 times as restless as the input, against 1.08 for Kernel) — for a 3D game, or a capture of one, use `3`. Needs an add-on newer than 1.19.1-beta.1 for a correct status line (an older one works, but reports provider `0`). |
 
 Rules that apply to all of them:
 
@@ -934,7 +935,78 @@ The add-on checks both configuration and the actual textures handed to DLSS:
   min/max/mean/variance/finite share. It warns when sampled depth is flat without disabling the feed.
   Both readbacks analyse an older, completed copy, so they do not introduce a per-frame GPU stall.
 
+### Per-pixel refinement
+
+A provider's field is coarse — 1/8 of the frame for LumeniteFX, half for the built-in estimator,
+smoothed for the rest — and a coarse field cannot follow the outline of a glyph. It hands the
+pixels of a still caption, or of a game's HUD, a fraction of the motion behind them, and a temporal
+model told "this text moved 0.3 px" resamples its history by 0.3 px on every frame. That is soft,
+smeared text. The default **Vector pipeline** (`MV_PIPELINE`, *Refine*) keeps the provider's vector
+unless the pixel itself says otherwise:
+
+* a pixel whose neighbourhood did not change, or whose own structure is where it was, gets a
+  vector of **exactly zero**;
+* where the vector leaves the pixel unexplained (the border between two motions), the provider's
+  whole cells around it and last frame's vector are tried, and one is taken only if it is clearly
+  better;
+* the nearest **whole-pixel** vector is sent wherever last frame, fetched at it, *is* the pixel
+  (most 2D motion): history is then fetched pixel for pixel and nothing is resampled.
+
+*Classic validation* (the behaviour up to 1.19.1-beta.1, described below) is one combo box away.
+
+All of this is measured with `tools/fx-testbed`: synthetic 4K scenes with known content run through
+the real ReShade → add-on → DLSS chain (DLSS 310.8, RTX 5090) and compared with what went in.
+"Sharp" is the share of the input's edge energy that survives; errors are in 8-bit steps.
+
+**2D, capture-style UI** (static text over a moving background, scrolling lists), plain DLAA:
+
+| | static 14 px text | static 20 px text | text scrolling at 4 px/frame |
+| --- | --- | --- | --- |
+| Classic, LumeniteFX Kernel, default preset | sharp 0.65, error 5.1 | sharp 0.82, error 3.5 | error 3.1 |
+| Refine, LumeniteFX Kernel, default preset | sharp 0.84, error 3.4 | sharp 0.95, error 2.1 | error 1.6 |
+| Refine, LumeniteFX Kernel, `preset=5` | sharp 0.99, error 1.2 | sharp 1.02, error 1.0 | error 0.32 |
+| Refine, built-in estimator, `preset=5` | sharp 0.99, error 1.3 | sharp 1.02, error 1.5 | error 0.11 |
+
+**3D, a game-like scene with a HUD** (camera pan, dolly and strafe; exact motion vectors known).
+"Restlessness" is how much the output changes from one frame to the next along the true motion,
+relative to the input (1.00 = exactly as steady as the frame that went in):
+
+| LumeniteFX Kernel | HUD error | scene error | restlessness, DLAA | restlessness, DLAA + neural pass |
+| --- | --- | --- | --- | --- |
+| Classic | 1.96 | 0.85 | 1.04 | 1.06 |
+| Refine | 1.14 | 0.75 | 1.08 | 1.05 |
+| Refine, `preset=5` | 0.45 | 0.50 | 1.07 | 1.04 |
+| *no vectors at all* | 1.21 | 1.03 | 1.38 | 1.54 |
+
+(Neural pass: OptiScaler DLSS-NR. The built-in estimator scores 1.36 / 1.38 here — see the
+provider table.) Refine costs about 0.5 ms of GPU time at 4K over Classic on that card.
+
+Three things the same measurements say that no shader can change:
+
+* **The default DLSS preset (K) softens a finished picture by itself** — static text keeps about
+  0.89 of its edge energy with perfect (zero) vectors, and with no history at all. `preset=5` in
+  `dlss5-feed.cfg` selects a model that leaves a still picture practically untouched (error 0.3
+  against 2.6), and the hint does reach DLSS through OptiScaler. This add-on never feeds DLSS
+  anything *but* finished, unjittered pictures. What `5` maps to is specific to the DLSS DLL
+  (310.8 here; NVIDIA's guide no longer lists presets A–E).
+* **Fractional motion cannot be reprojected losslessly without jitter.** Text scrolling at 2.5 px
+  a frame is softer with the *right* vector than with none, because history is resampled between
+  pixels every frame and a finished picture brings no new detail to rebuild it from. The
+  experimental **History of moving pixels** option sends an off-screen vector for exactly those
+  pixels, so the model answers from the current frame alone — scrolling text error 3.2 → 1.3 with
+  plain DLAA. **Leave it off with a neural consumer in 3D:** there it made the picture 1.4 to 1.9
+  times as restless as the input.
+* **The vectors matter more with a neural pass, not less** (last row of the 3D table).
+
+`tools\fx-testbed\Run-FxLab.ps1` reproduces all of it (`-Scene 3d`, `-Consumer optiscaler`, and
+`-Interactive` to look at either scene yourself); the headers of `fxlab.cpp` and `fxlab3d.h`
+explain the method.
+
 ### Validation and the trust mask
+
+> This section describes **Classic validation**. Note also that NVIDIA's programming guide
+> (310.6) states that the bias-current-colour mask is honoured by Preset F only; with the default
+> preset the mask described here has no effect on DLSS itself.
 
 Every provider here is *optical flow*: it answers a lighting change — a flickering light, a flame —
 with a confident vector pointing at whatever happened to match, and DLSS then warps history in from
