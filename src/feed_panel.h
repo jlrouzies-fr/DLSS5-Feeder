@@ -3,7 +3,7 @@
 // PROTOTYPE. One panel, drawn by the GAME's ReShade with plain Dear ImGui, in front of
 // whichever neural tool does the work: the "RenoDX DLSS5 Generic" add-on or the OptiScaler
 // DLSS-NR fork. It slides in from an edge of the picture on a
-// shortcut (Alt+C unless dlss5-feed.cfg says otherwise), dims the game behind it, and takes
+// shortcut (Alt+C unless dlss5-feed.cfg says otherwise), leaves the rest of the picture as it is, and takes
 // the mouse and keyboard while it is up.
 //
 // It is included by three builds and knows nothing about how any of them works:
@@ -595,8 +595,8 @@ static void FeedPanelDraw(reshade::api::effect_runtime *rt)
     const float x = right ? disp.x - w * ease : -w * (1.0f - ease);
 
     const ImU32 accent = IM_COL32(118, 185, 0, 255);
-    ImDrawList *bg = ImGui::GetBackgroundDrawList(nullptr);
-    if (bg != nullptr) bg->AddRectFilled(ImVec2(0.0f, 0.0f), disp, IM_COL32(0, 0, 0, static_cast<int>(110.0f * ease)));
+    // The picture beside the panel is left exactly as it is: the panel is there to judge what
+    // the settings do to it, and a dim over it hid that (user, 2026-11-12).
 
     ImGui::SetNextWindowPos(ImVec2(x, 0.0f), ImGuiCond_Always, ImVec2(0.0f, 0.0f));
     ImGui::SetNextWindowSize(ImVec2(w, disp.y), ImGuiCond_Always);
