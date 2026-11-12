@@ -1063,9 +1063,9 @@ float FlowTrust(float corner, float contrast, float cost)
 P9 Patch9Y(sampler2D s, float2 uv, float2 t)
 {
     P9 p;
-    p.r0 = float3(tex2Dlod(s, float4(uv + float2(-t.x, -t.y), 0.0, 0.0)).y, tex2Dlod(s, float4(uv + float2(0.0, -t.y), 0.0, 0.0)).y, tex2Dlod(s, float4(uv + float2(t.x, -t.y), 0.0, 0.0)).y);
-    p.r1 = float3(tex2Dlod(s, float4(uv + float2(-t.x,  0.0), 0.0, 0.0)).y, tex2Dlod(s, float4(uv,                       0.0, 0.0)).y, tex2Dlod(s, float4(uv + float2(t.x,  0.0), 0.0, 0.0)).y);
-    p.r2 = float3(tex2Dlod(s, float4(uv + float2(-t.x,  t.y), 0.0, 0.0)).y, tex2Dlod(s, float4(uv + float2(0.0,  t.y), 0.0, 0.0)).y, tex2Dlod(s, float4(uv + float2(t.x,  t.y), 0.0, 0.0)).y);
+    p.r0 = float3(abs(tex2Dlod(s, float4(uv + float2(-t.x, -t.y), 0.0, 0.0)).y), abs(tex2Dlod(s, float4(uv + float2(0.0, -t.y), 0.0, 0.0)).y), abs(tex2Dlod(s, float4(uv + float2(t.x, -t.y), 0.0, 0.0)).y));
+    p.r1 = float3(abs(tex2Dlod(s, float4(uv + float2(-t.x,  0.0), 0.0, 0.0)).y), abs(tex2Dlod(s, float4(uv,                       0.0, 0.0)).y), abs(tex2Dlod(s, float4(uv + float2(t.x,  0.0), 0.0, 0.0)).y));
+    p.r2 = float3(abs(tex2Dlod(s, float4(uv + float2(-t.x,  t.y), 0.0, 0.0)).y), abs(tex2Dlod(s, float4(uv + float2(0.0,  t.y), 0.0, 0.0)).y), abs(tex2Dlod(s, float4(uv + float2(t.x,  t.y), 0.0, 0.0)).y));
     return p;
 }
 #ifndef DPEN
@@ -1106,7 +1106,7 @@ float PyrDown(sampler2D src, float2 uv, float2 st)
     float2 PS_PyrC##N(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target \
     { \
         const float c = PyrDown(SRC_C, uv, BUFFER_PIXEL_SIZE * K) * (K > 1.5 ? PYR_GAIN : 1.0); \
-        return float2(c, abs(c - tex2Dlod(sDLSS5_PrevL##N, float4(uv, 0.0, 0.0)).x)); \
+        return float2(c, c - tex2Dlod(sDLSS5_PrevL##N, float4(uv, 0.0, 0.0)).x); \
     }
 DLSS5_PYR(1, sDLSS5_CurLuma, sDLSS5_PrevLuma, 1.0)
 DLSS5_PYR(2, sDLSS5_CurL1, sDLSS5_PrevL1, 2.0)
@@ -1144,6 +1144,25 @@ float FlowSym(P9 c, P9 m, float2 uv, float2 v, float cell, sampler2D sC, sampler
 //   lmin: the smaller eigenvalue of the window's gradient matrix, per cell and tap -- how well
 //         it pins motion down in its weakest direction (a line: not at all along itself);
 //   res, dev: what the corrected vector leaves unexplained, and the window's own contrast.
+// Gradients that stayed where they were. A window over a game's picture often holds a still
+// edge with a moving picture on both sides of it -- the border of a translucent panel, a HUD
+// frame -- and that edge is the strongest gradient in the window. In the sums it says "no
+// motion across me", with all its weight, and the cells around every such edge came out with
+// the part of their motion ACROSS the edge missing: left of the subtitle box under a dolly
+// (+0.6, -17.0) for a true (+14.8, -19.8), above it (-0.1, -1.1) for (0.0, -16.7), fifty to a
+// hundred pixels out. A sample that changed as a whole does not give it away (everything under
+// a translucent panel changes); but its GRADIENT did not change in place, while the gradients
+// of what moves did. So each sample is weighed by how much its gradient changed in place
+// against how much the window's gradients did on average: a still edge among moving texture
+// falls out, and a window that is all still, or all moving slowly, is left as it is (every
+// sample is then alike).
+//   g2: the sample's squared gradient, d2: the squared in-place change of it (the gradient of
+//   this frame minus last frame, in place); returns the ratio the average is taken of.
+#ifndef SGK
+    #define SGK 0.25
+#endif
+float FlowStillRatio(float g2, float d2, float eg) { return d2 / (g2 + eg); }
+
 // Motion, or a change of brightness? A window's sums can be solved either way: for a motion
 // alone, or for a motion and a brightness offset (the sums with their means taken off). The
 // second never explains less -- but it is blind to the commonest thing in a rendered picture, a
@@ -1170,13 +1189,13 @@ float2 FlowTrack(sampler2D sC, sampler2D sP, float2 uv, float2 v, float cell, ou
 {
     const float2 px = BUFFER_PIXEL_SIZE;
     const float2 vi = round(v / cell) * cell, vf = v - vi;
-    float a[49], b[49], w[49];
+    float a[49], b[49], w[49], dd[49];
     float wn = 0.0;
     [loop] for (int k = 0; k < 49; ++k)
     {
         const float2 o  = float2(k % 7 - 3, k / 7 - 3) * cell;
         const float2 ca = tex2Dlod(sC, float4(uv + (o - 0.5 * vf) * px, 0.0, 0.0)).xy;
-        a[k] = ca.x; w[k] = ca.y; wn += ca.y;
+        a[k] = ca.x; dd[k] = ca.y; w[k] = abs(ca.y); wn += abs(ca.y);
         b[k] = tex2Dlod(sP, float4(uv + (o + vi + 0.5 * vf) * px, 0.0, 0.0)).x;
     }
     // A sample that standing still explains better than the vector does belongs to something
@@ -1191,6 +1210,20 @@ float2 FlowTrack(sampler2D sC, sampler2D sP, float2 uv, float2 v, float cell, ou
     #define LKMASK 1
 #endif
     const bool all_in = cnt < 10.0 || LKMASK == 0 || (LKMASK == 2 && cell > 6.0);
+    // (see FlowStillRatio)
+    float sr[49];
+    float srm = 0.0;
+    [loop] for (int j0 = 1; j0 < 6; ++j0)
+    {
+        [loop] for (int i0 = 1; i0 < 6; ++i0)
+        {
+            const int    c0 = j0 * 7 + i0;
+            const float2 g0 = 0.5 * float2(a[c0 + 1] - a[c0 - 1], a[c0 + 7] - a[c0 - 7]);
+            const float2 d0 = 0.5 * float2(dd[c0 + 1] - dd[c0 - 1], dd[c0 + 7] - dd[c0 - 7]);
+            sr[c0] = FlowStillRatio(dot(g0, g0), dot(d0, d0), 4.0 * DLSS5_FLOW_FLOOR * DLSS5_FLOW_FLOOR);
+            srm += sr[c0] / 25.0;
+        }
+    }
     float sxx = 0.0, sxy = 0.0, syy = 0.0, sxt = 0.0, syt = 0.0, stt = 0.0;
     float sx = 0.0, sy = 0.0, st = 0.0, sa = 0.0, saa = 0.0, n = 0.0;
     [loop] for (int j = 1; j < 6; ++j)
@@ -1198,7 +1231,7 @@ float2 FlowTrack(sampler2D sC, sampler2D sP, float2 uv, float2 v, float cell, ou
         [loop] for (int i = 1; i < 6; ++i)
         {
             const int   c  = j * 7 + i;
-            const float q  = all_in ? 1.0 : w[c];
+            const float q  = (all_in ? 1.0 : w[c]) * (SGK > 0.0 ? saturate(sr[c] / (SGK * srm + 1e-12)) : 1.0);
             const float gx = 0.25 * ((a[c + 1] - a[c - 1]) + (b[c + 1] - b[c - 1]));   // per cell
             const float gy = 0.25 * ((a[c + 7] - a[c - 7]) + (b[c + 7] - b[c - 7]));
             const float t  = b[c] - a[c];
@@ -1524,12 +1557,12 @@ void FlowEq(sampler2D raw, sampler2D sC, sampler2D sP, sampler2D sS, bool has_pr
     const float4 ag = FlowAgree(raw, uv, lod);
     const float2 v0 = ag.xy;
     const float2 vi = round(v0 / cell) * cell, vf = v0 - vi;
-    float a[49], b[49], w[49];
+    float a[49], b[49], w[49], dd[49];
     [loop] for (int k = 0; k < 49; ++k)
     {
         const float2 o  = float2(k % 7 - 3, k / 7 - 3) * cell;
         const float2 ca = tex2Dlod(sC, float4(uv + (o - 0.5 * vf) * px, 0.0, 0.0)).xy;
-        a[k] = 64.0 * ca.x; w[k] = ca.y;
+        a[k] = 64.0 * ca.x; dd[k] = 64.0 * ca.y; w[k] = abs(ca.y);
         b[k] = 64.0 * tex2Dlod(sP, float4(uv + (o + vi + 0.5 * vf) * px, 0.0, 0.0)).x;
     }
     // (as in FlowTrack: a sample that standing still explains better has no say)
@@ -1540,6 +1573,20 @@ void FlowEq(sampler2D raw, sampler2D sC, sampler2D sP, sampler2D sS, bool has_pr
         cnt += w[k9];
     }
     const bool all_in = cnt < 10.0;
+    // (see FlowStillRatio)
+    float sr[49];
+    float srm = 0.0;
+    [loop] for (int j0 = 1; j0 < 6; ++j0)
+    {
+        [loop] for (int i0 = 1; i0 < 6; ++i0)
+        {
+            const int    c0 = j0 * 7 + i0;
+            const float2 g0 = 0.5 * float2(a[c0 + 1] - a[c0 - 1], a[c0 + 7] - a[c0 - 7]);
+            const float2 d0 = 0.5 * float2(dd[c0 + 1] - dd[c0 - 1], dd[c0 + 7] - dd[c0 - 7]);
+            sr[c0] = FlowStillRatio(dot(g0, g0), dot(d0, d0), 4.0 * DLSS5_FLOW_FLOOR * DLSS5_FLOW_FLOOR * 4096.0);
+            srm += sr[c0] / 25.0;
+        }
+    }
     float sxx = 0.0, sxy = 0.0, syy = 0.0, sxt = 0.0, syt = 0.0, stt = 0.0;
     float sx = 0.0, sy = 0.0, st = 0.0, sa = 0.0, saa = 0.0, n = 0.0;
     [loop] for (int j = 1; j < 6; ++j)
@@ -1547,7 +1594,7 @@ void FlowEq(sampler2D raw, sampler2D sC, sampler2D sP, sampler2D sS, bool has_pr
         [loop] for (int i = 1; i < 6; ++i)
         {
             const int   c  = j * 7 + i;
-            const float wq = all_in ? 1.0 : w[c];
+            const float wq = (all_in ? 1.0 : w[c]) * (SGK > 0.0 ? saturate(sr[c] / (SGK * srm + 1e-12)) : 1.0);
             const float gx = 0.25 * ((a[c + 1] - a[c - 1]) + (b[c + 1] - b[c - 1]));
             const float gy = 0.25 * ((a[c + 7] - a[c - 7]) + (b[c + 7] - b[c - 7]));
             const float t  = b[c] - a[c];
