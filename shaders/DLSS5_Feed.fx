@@ -1037,8 +1037,14 @@ P9 Patch9Y(sampler2D s, float2 uv, float2 t)
     p.r2 = float3(tex2Dlod(s, float4(uv + float2(-t.x,  t.y), 0.0, 0.0)).y, tex2Dlod(s, float4(uv + float2(0.0,  t.y), 0.0, 0.0)).y, tex2Dlod(s, float4(uv + float2(t.x,  t.y), 0.0, 0.0)).y);
     return p;
 }
-float P9CostL(P9 c, P9 p, P9 r0)
+float P9CostL(P9 c, P9 p, P9 rs)
 {
+    // (Only where standing still explains a sample nearly: a sample that changed a lot is
+    // moving, and letting "still" cap its cost as well made every wrong candidate on a moving
+    // pattern -- a checker, a grille -- as cheap as the right one.)
+    P9 r0;
+    const float cap = 8.0 * FLOW_NOISE;
+    r0.r0 = rs.r0 + step(cap, rs.r0) * 1e3; r0.r1 = rs.r1 + step(cap, rs.r1) * 1e3; r0.r2 = rs.r2 + step(cap, rs.r2) * 1e3;
     // The samples the candidate explains at least as well as standing still does: the ones
     // whose brightness difference the candidate is judged on.
     const float3 g0 = step(abs(c.r0 - p.r0), r0.r0 + 1e-5), g1 = step(abs(c.r1 - p.r1), r0.r1 + 1e-5), g2 = step(abs(c.r2 - p.r2), r0.r2 + 1e-5);
@@ -1159,7 +1165,13 @@ float2 FlowRefine(sampler2D sC, sampler2D sP, float2 uv, float2 v, float cell, i
     const float2 v1 = FlowTrack(sC, sP, uv, v,  cell, lmin, res, dev);
     const float2 v2 = FlowTrack(sC, sP, uv, v1, cell, lmin, res, dev);
     const float  g  = 2.0 * DLSS5_FLOW_FLOOR;
-    const bool   ok = lmin >= g * g && all(abs(v2 - v1) <= 0.25 * cell) && res <= 0.35 * dev + 2.0 * DLSS5_FLOW_FLOOR;
+#ifndef LKMAX
+    #define LKMAX 0.6
+#endif
+    // (and it stayed within reach of where it started: the block match is right to half a cell
+    // where it is right at all, so a step further than that is the gradients sliding along a
+    // line of text or the rows of a list, not a correction)
+    const bool   ok = lmin >= g * g && all(abs(v2 - v1) <= 0.25 * cell) && all(abs(v2 - v) <= LKMAX * cell) && res <= 0.35 * dev + 2.0 * DLSS5_FLOW_FLOOR;
     // The window's weakest direction has the last word on trust either way: a block match on a
     // line is a perfect match, at any point along the line. (P9Corner, which is all the block
     // match has to go by, lets a line through that does not run along a row, a column or a
