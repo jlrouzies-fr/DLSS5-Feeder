@@ -2907,13 +2907,15 @@ static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r, U
     cp.InEnableOutputSubrects     = false;
 
     // The render-preset hint the game's dlss5-feed.cfg asks for (FeedBuild::preset, v12), as the
-    // 64-bit add-on sets it. Written on every create, 0 included, so that going back to the
-    // default takes the last hint off again.
+    // 64-bit add-on sets it. Written on every create. 0 is the default, and the default is L
+    // (12; see kDefaultPreset in the 64-bit add-on for why): a current add-on never sends 0, an
+    // older one that does gets the same answer here.
     if (h.params != nullptr)
     {
-        const char *key = sr && h.sr_quality_hint != nullptr ? h.sr_quality_hint : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA;
-        h.params->Set(key, h.preset);
-        if (h.preset != 0) Log("[host] DLSS render preset hint: %u", h.preset);
+        const char    *key    = sr && h.sr_quality_hint != nullptr ? h.sr_quality_hint : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA;
+        const unsigned preset = h.preset != 0 ? h.preset : 12u;
+        h.params->Set(key, preset);
+        Log("[host] DLSS render preset hint: %u%s", preset, h.preset != 0 ? "" : " (L, the default)");
     }
 
     if (!BeginCommands()) return false;

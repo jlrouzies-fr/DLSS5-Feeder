@@ -1074,7 +1074,13 @@ that card; that figure was taken with another program sharing the GPU, so read i
 
 Three things the same measurements say that no shader can change:
 
-* **The default DLSS preset (K) softens a finished picture by itself** — static text keeps about
+* **The add-on's default preset is L, and it is always sent.** On a real capture (PS5 menus, 4K
+  HDR10, the neural pass behind DLSS) every preset but L and M left white text and plain bright
+  areas speckled after the neural pass; with L or M they are clean. The table below does not
+  show that — it measures plain DLAA against the picture that went in, where E wins on text —
+  so where no neural pass follows, `preset=5` is still worth a try. `preset=0` used to mean
+  "whatever the DLSS DLL picks" (K) and now means L; K is `preset=11`.
+* **DLSS's own default preset (K) softens a finished picture by itself** — static text keeps about
   0.89 of its edge energy with perfect (zero) vectors, and with no history at all. `preset=5` in
   `dlss5-feed.cfg` selects a model that leaves a still picture practically untouched (error 0.3
   against 2.6), and the hint does reach DLSS through OptiScaler. This add-on never feeds DLSS
@@ -1083,7 +1089,7 @@ Three things the same measurements say that no shader can change:
 
   The other presets, same rig, LumeniteFX Kernel, Refine (`preset=` 5 E, 10 J, 12 L, 13 M):
 
-  | plain DLAA | default (K) | E | L | M |
+  | plain DLAA | K | E | L | M |
   | --- | --- | --- | --- | --- |
   | 3D scene error | 0.72 | 0.47 | 0.37 | 0.35 |
   | 3D restlessness on a slow pan | 1.58 | 1.59 | 1.36 | 1.26 |
@@ -1097,7 +1103,7 @@ Three things the same measurements say that no shader can change:
   **E** is the best all-rounder and by far the best for text, HUD and capture-style content. **L**
   and **M** leave a moving 3D world most alone — a slow pan on M is as steady as exact vectors made
   it on K — but are the hardest on small still text and fine texture; the restore technique gives
-  most of the text back. The default, K, is the best column only on a still frame. With a neural
+  most of the text back. K is the best column only on a still frame. With a neural
   pass behind DLSS the differences shrink. HDR10 shows the same
   order. E is a legacy model that NVIDIA no longer documents, so it may not outlive a DLSS update.
 * **Fractional motion cannot be reprojected losslessly without jitter.** Text scrolling at 2.5 px
@@ -1462,7 +1468,7 @@ if you prefer editing the file directly:
 | `rebuild` | 0 | change the number to re-create the feature once, by hand. |
 | `log_frames` | 3 | first N frames logged in detail. |
 | `create_delay` | 60 | frames to hold a feature (re)build after a runtime (re)init — the neural consumer arms its NGX hooks asynchronously, and calling in too early can crash. 0 disables. |
-| `preset` | 0 | DLSS render-preset hint: `0` default (K), `5`/`6` = legacy CNN presets E/F (clamp history harder — try these if motion warps around transparents like dust or flames), `10`/`11` = transformer presets J/K, `12`/`13` = second-generation transformer presets L/M. On a finished picture E is the closest to what went in for text, HUD and 2D content, L/M for a moving 3D scene — the measured table is under *Per-pixel refinement*. Also in the overlay. The Elgato Studio deploy sets `5`. |
+| `preset` | 0 | DLSS render-preset hint: `0` = the add-on's default, **L** (always sent; it was "the DLL's choice", K, before), `5`/`6` = legacy CNN presets E/F (clamp history harder — try these if motion warps around transparents like dust or flames), `10`/`11` = transformer presets J/K, `12`/`13` = second-generation transformer presets L/M. Behind a neural pass L and M are the ones that keep white text clean (seen on a 4K HDR capture); in plain DLAA E is the closest to what went in for text, HUD and 2D content, L/M for a moving 3D scene — the measured table is under *Per-pixel refinement*. Also in the overlay. The Elgato Studio deploy sets `12`. |
 | `gpu_timeout_ms` | 2000 | how long a frame waits for the GPU to retire a command allocator before that frame is abandoned. Three abandoned frames in a row stop the feed. Raise it on a heavily contended GPU; clamped to 100–60000. |
 | `mv_scale_x/y` | 1.0 | extra motion-vector multiplier. |
 | `stall_log_ms` | 50 | **Diagnostic.** Log a breakdown for any frame whose present-to-present interval exceeds this, in ms (0 = off). Each `STALL frame` line splits the interval into the time inside the NGX evaluate call — which is where the neural consumer's own work runs — the rest of this add-on's work, and everything outside it, then names which of the three dominated. The `600 frames:` summary also carries the worst frame and a stall count. Use it to tell "the feed is slow" apart from "the neural consumer is slow" apart from "neither, something else in the process stalled". |

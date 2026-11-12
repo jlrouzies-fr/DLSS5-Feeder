@@ -966,8 +966,9 @@ struct Cfg
     int   rebuild;         // any change of this number re-creates the feature once (manual trigger)
     int   log_frames;      // how many first frames get a full parameter dump in the log
     int   create_delay;    // frames to hold the FIRST feature create (the DLSS 5 add-on arms its NGX hooks asynchronously)
-    int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer),
-                           // 12=L, 13=M (second-generation transformer). See PresetName().
+    int   preset;          // DLSS render preset hint: 0 = the add-on's default, which is L (kDefaultPreset);
+                           // 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer), 12=L, 13=M (second-generation
+                           // transformer). See PresetName().
     int   work_resolution; // 64-bit D3D11 only: 50..100 percent of each backbuffer axis
     int   work_upscale;    // how the work-size output is expanded back over the backbuffer:
                            // 0 = bilinear stretch, 1 = AMD FSR 1 (EASU + RCAS), 2 = DLSS
@@ -1057,6 +1058,15 @@ static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 0, 0.3f, 2000, 
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
+
+// The preset that is sent when the configuration says 0. It used to be no hint at all, which
+// leaves the choice to the DLSS DLL (K). It is L now, and it is always sent: on a real capture
+// (PS5 menus, 4K HDR10, the neural pass behind it) every preset but L and M left white text
+// and plain bright areas speckled once the neural pass had been over them -- single pixels
+// well above anything in the picture that went in. tools/fx-testbed, which measures plain DLAA
+// against the input, does not show that and prefers E for text; the picture people look at is
+// the one after the neural pass.
+static const int kDefaultPreset = 12;   // L
 
 // The letter NVIDIA gives a render-preset number, for the log and the overlay. The value is passed
 // to NGX as it is, so a number this table does not know still works if the DLSS DLL knows it.
@@ -4310,10 +4320,12 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
     // closest to what went in (static 14 px text keeps 0.99 of its edge energy against 0.84 on
     // K); L and M leave a moving 3D scene most alone (error 0.37 / 0.35 against 0.72) and are
     // the hardest on small still text (0.77). K is the best of them only on a still frame.
-    if (g_cfg.preset > 0)
+    // The hint is always sent: 0 in the configuration means the add-on's default (kDefaultPreset,
+    // L), not "whatever the DLL picks".
     {
-        g.params->Set(sr ? g.sr_quality_hint : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, static_cast<unsigned int>(g_cfg.preset));
-        Log("[feed] DLSS render preset hint: %d (%s)", g_cfg.preset, PresetName(g_cfg.preset));
+        const int preset = g_cfg.preset > 0 ? g_cfg.preset : kDefaultPreset;
+        g.params->Set(sr ? g.sr_quality_hint : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, static_cast<unsigned int>(preset));
+        Log("[feed] DLSS render preset hint: %d (%s)%s", preset, PresetName(preset), g_cfg.preset > 0 ? "" : " -- the default");
     }
 
     if (!BeginCommands()) { Log("[feed] could not start a command list"); return false; }
@@ -9219,18 +9231,18 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
 
     ImGui::Separator();
     ImGui::TextUnformatted("DLSS render preset");
-    static const char *kPresetNames[] = { "Default (K)", "E (legacy CNN) - text, HUD, 2D, capture", "F (legacy CNN)", "J (transformer)", "K (transformer)",
-                                          "L (transformer, 2nd gen) - moving 3D", "M (transformer, 2nd gen) - moving 3D" };
+    static const char *kPresetNames[] = { "Default (L)", "E (legacy CNN) - closest to the input without a neural pass", "F (legacy CNN)", "J (transformer)", "K (transformer)",
+                                          "L (transformer, 2nd gen) - clean text behind a neural pass", "M (transformer, 2nd gen) - clean text behind a neural pass" };
     static const int   kPresetValues[] = { 0, 5, 6, 10, 11, 12, 13 };
     const int preset_count = static_cast<int>(sizeof(kPresetValues) / sizeof(kPresetValues[0]));
     int preset_idx = 0;
     for (int i = 0; i < preset_count; ++i) if (kPresetValues[i] == g_cfg.preset) preset_idx = i;
     if (ImGui::Combo("Preset", &preset_idx, kPresetNames, preset_count)) { g_cfg.preset = kPresetValues[preset_idx]; dirty = true; rebuild = true; }
-    ImGui::TextWrapped("Presets differ in how hard DLSS clamps history against the current frame, and DLSS is "
-                       "only ever given finished pictures here. Measured that way: E leaves text, a HUD and 2D "
-                       "or captured content closest to what went in; L and M leave a moving 3D scene most alone "
-                       "but soften small still text (enable the 'restore text and HUD' technique with them). "
-                       "If motion warps around transparents (dust, smoke, flames), try E or F.");
+    ImGui::TextWrapped("The default is L. With a neural pass behind DLSS, L and M are the presets that leave "
+                       "white text and plain bright areas clean; the others speckle them (seen on a 4K HDR capture). "
+                       "Without a neural pass E is the one that leaves text, a HUD and 2D content closest to what "
+                       "went in, and L and M soften small still text a little (the 'restore text and HUD' technique "
+                       "gives it back). If motion warps around transparents (dust, smoke, flames), try E or F.");
 
     ImGui::Separator();
     ImGui::TextUnformatted("Motion vectors");

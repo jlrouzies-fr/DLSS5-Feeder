@@ -408,12 +408,14 @@ struct Cfg
                            // Far Cry 2 at 32 fps with the GPU 60% busy). The game shows the result from
                            // two frames back. 0 = the original drain of the current frame.
                            // Parse-only, not written back, not on the overlay.
-    int   preset;          // DLSS render-preset hint, as in the 64-bit add-on: 0 = the model's default,
-                           // 5 = E, 6 = F (legacy CNN), 10 = J, 11 = K, 12 = L, 13 = M. Sent to the host
-                           // in FeedBuild (v12); changing it rebuilds the feature.
+    int   preset;          // DLSS render-preset hint, as in the 64-bit add-on: 0 = the add-on's default,
+                           // which is L (kDefaultPreset; see the 64-bit add-on for why), 5 = E, 6 = F
+                           // (legacy CNN), 10 = J, 11 = K, 12 = L, 13 = M. Sent to the host in FeedBuild
+                           // (v12), always as a number the host can pass on; changing it rebuilds the feature.
 };
 
 //                                        host_window --v  v-- host_gpu_priority (off)          settle_evals --v  v-- hold_input
+static const uint32_t kDefaultPreset = 12;   // L
 static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 0, 100, 0, 1, 0, 0, 0, 0,
                      /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f, /* d3d10_pipeline */ 1, /* preset */ 0 };
 static int       g_work_resolution_ui = 100;
@@ -3815,7 +3817,7 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
-    b.preset         = g_cfg.preset > 0 ? static_cast<uint32_t>(g_cfg.preset) : 0;
+    b.preset         = g_cfg.preset > 0 ? static_cast<uint32_t>(g_cfg.preset) : kDefaultPreset;
     if (want_sr) { b.target_width = g.output_width; b.target_height = g.output_height; }
     if (g_cfg.async_home) b.client_flags |= FEED_BUILD_ASYNC_HOME;
     if (g.host_creates)
@@ -4088,7 +4090,7 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
-    b.preset         = g_cfg.preset > 0 ? static_cast<uint32_t>(g_cfg.preset) : 0;
+    b.preset         = g_cfg.preset > 0 ? static_cast<uint32_t>(g_cfg.preset) : kDefaultPreset;
     if (g_cfg.async_home) b.client_flags |= FEED_BUILD_ASYNC_HOME;
     // b.tex stays zero: on this path the host creates, and answers with its handles.
 
@@ -4326,7 +4328,7 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
-    b.preset         = g_cfg.preset > 0 ? static_cast<uint32_t>(g_cfg.preset) : 0;
+    b.preset         = g_cfg.preset > 0 ? static_cast<uint32_t>(g_cfg.preset) : kDefaultPreset;
     // Under async_home the game copies home the PREVIOUS frame's result and is never
     // waiting on the evaluate the host is running, so the host may take its own time to
     // get a present slot rather than dropping the present. That drop is what starved the
