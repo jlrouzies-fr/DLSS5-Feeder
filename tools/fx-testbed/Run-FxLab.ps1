@@ -32,6 +32,7 @@ param(
     [double]$Preroll = 14,
     [double]$Fps = -1,                    # frames a second; -1 = 120, or 60 with a neural consumer (see below); 0 = unpaced
     [string[]]$ExtraShaderDirs = @(),
+    [string[]]$PresetExtra = @(),         # more lines for ReShadePreset.ini (other effects' sections), as they are
     [double]$Noise = 0,                   # temporal noise on the picture, +- 8-bit steps
     [string]$Hold = '',                   # 'A,B': the scene moves for A presents, stands still for B, over and over
     [int]$Cadence = 1,                    # 2 = a 30 fps game at 60: every picture presented twice
@@ -40,6 +41,7 @@ param(
     [string]$ReShadeDll = '',             # another ReShade build to load as dxgi.dll (default: deploy\reshade-dxgi\dxgi_x64.dll)
     [int]$Fade = 0,                       # the whole picture fades down and up, once every this many frames (nothing moves for it)
     [int]$Flash = 0,                      # lightning: 45% brightness, full for three frames every this many frames
+    [double]$LogoNits = 1000,             # with -Hdr: the logo's white in nits (0 = the normal SDR-to-HDR mapping, ~600 at most)
     [int]$Logo = 0,                          # 3D scene: a still logo on black whose brightness drifts a little (scored as 3d.logo)
     [switch]$Mesh,                        # 3D scene: add a perforated-metal floor panel (fine repeating dots), scored apart as 3d.mesh
     [switch]$Mv,                          # measure the VECTORS against the truth instead of the picture
@@ -153,6 +155,7 @@ $defs = "DLSS5_MV_PROVIDER=$Provider"
 if ($Defines -ne '') { $defs += ",$Defines" }
 $preset = @("Techniques=$Techniques", "TechniqueSorting=$Techniques", '', '[DLSS5_Feed.fx]', "PreprocessorDefinitions=$defs")
 foreach ($k in $Fx.Keys) { $preset += "$k=$($Fx[$k])" }
+if ($PresetExtra.Count -gt 0) { $preset += ''; $preset += $PresetExtra }
 $preset | Set-Content (Join-Path $rig 'ReShadePreset.ini') -Encoding ascii
 
 $c = [ordered]@{ enabled = 1; mode = 2; hdr = -1; reset_every = 0; warmup_rebuild = 180; log_frames = 3; create_delay = 60
@@ -170,7 +173,7 @@ if ($Show -and -not $Interactive) { $args_ += '--show' }
 if ($Full) { $args_ += '--full' }
 if ($Mv) { $args_ += '--mv' }
 if ($Mesh) { $args_ += '--mesh' }
-if ($Logo -gt 0) { $args_ += @('--logo', $Logo) }   # 1 = grey plate with a black mark, 2 = white mark and lettering on black
+if ($Logo -gt 0) { $args_ += @('--logo', $Logo, '--logo-nits', $LogoNits) }   # 1 = grey plate with a black mark, 2 = white mark and lettering on black
 if ($Fade -gt 0) { $args_ += @('--fade', $Fade) }
 if ($Flash -gt 0) { $args_ += @('--flash', $Flash) }
 if ($Hdr) { $args_ += '--hdr' }

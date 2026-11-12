@@ -246,11 +246,15 @@ float4 vs(uint id : SV_VertexID) : SV_Position { return float4(float2((id << 1) 
 float4 ps(float4 pos : SV_Position) : SV_Target { return float4(src.Load(int3(pos.xy, 0)).rgb, 1.0); }
 // The SDR picture as HDR10: display gamma off, paper white at 203 nits, the top of the range
 // lifted to ~600 nits (so there is something above paper white), BT.709 -> BT.2020, ST.2084.
+// LogoRect (pixels) / LogoNits: inside the rectangle the picture is taken as linear light with
+// 1.0 at LogoNits -- a logo screen mastered in HDR, whose white is far above paper white.
+cbuffer P : register(b1) { float4 LogoRect; float LogoNits; float3 PadP; };
 float4 ps_pq(float4 pos : SV_Position) : SV_Target
 {
     float3 lin = pow(saturate(src.Load(int3(pos.xy, 0)).rgb), 2.2);
     float  l   = dot(lin, float3(0.2126, 0.7152, 0.0722));
-    lin *= 203.0 * (1.0 + 2.0 * l * l * l * l);
+    if (LogoNits > 0.0 && all(pos.xy >= LogoRect.xy) && all(pos.xy < LogoRect.zw)) lin *= LogoNits;
+    else lin *= 203.0 * (1.0 + 2.0 * l * l * l * l);
     float3 c = float3(dot(lin, float3(0.6274, 0.3293, 0.0433)), dot(lin, float3(0.0691, 0.9195, 0.0114)), dot(lin, float3(0.0164, 0.0880, 0.8956)));
     float3 y = pow(saturate(c / 10000.0), 0.1593017578125);
     return float4(pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375), 1.0);
@@ -295,7 +299,8 @@ struct App
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps_bg, ps_blit, ps_pq, ps_noise_add, ps_noise_sub;
     ComPtr<ID3D11BlendState> bs_add, bs_sub;
-    ComPtr<ID3D11Buffer> cb;
+    ComPtr<ID3D11Buffer> cb, cb_pq;
+    float logo_nits = 1000.0f;   // --logo-nits: the logo's white in nits on an HDR10 swap chain (0 = the normal SDR-to-HDR mapping)
     ComPtr<ID3D11RasterizerState> rs;
 
     ComPtr<ID2D1DeviceContext> dc;
@@ -695,6 +700,7 @@ int main(int argc, char **argv)
         else if (a == "--mv")      g.mvdump = true;
         else if (a == "--mesh")    g.mesh = true;
         else if (a == "--logo")    { g.logo = atoi(v); ++i; }
+        else if (a == "--logo-nits") { g.logo_nits = static_cast<float>(atof(v)); ++i; }
         else if (a == "--fade")    { g.fade = atoi(v); ++i; }
         else if (a == "--flash")   { g.flash = atoi(v); ++i; }
         else if (a == "--capture") { for (const char *s = v; *s; ) { g.captures.push_back(atoi(s)); while (*s && *s != ',') ++s; if (*s) ++s; } ++i; }
@@ -779,6 +785,8 @@ int main(int argc, char **argv)
         CHECK(g.dev->CreateBlendState(&bl, &g.bs_sub), "blend state");
         D3D11_BUFFER_DESC bd = { 16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
         CHECK(g.dev->CreateBuffer(&bd, nullptr, &g.cb), "constant buffer");
+        bd.ByteWidth = 32;
+        CHECK(g.dev->CreateBuffer(&bd, nullptr, &g.cb_pq), "PQ constant buffer");
         D3D11_RASTERIZER_DESC rd = {}; rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE;
         CHECK(g.dev->CreateRasterizerState(&rd, &g.rs), "rasterizer");
     }
@@ -958,6 +966,13 @@ int main(int argc, char **argv)
         g.ctx->OMSetDepthStencilState(nullptr, 0);
         g.ctx->VSSetShader(g.vs.Get(), nullptr, 0);
         g.ctx->PSSetShader(g.hdr ? g.ps_pq.Get() : g.ps_blit.Get(), nullptr, 0);
+        if (g.hdr)
+        {
+            const bool on = g.scene3d && g.logo > 0 && g.logo_nits > 0.0f;
+            const float pq[8] = { kLogo[0] * g.S, kLogo[1] * g.S, kLogo[2] * g.S, kLogo[3] * g.S, on ? g.logo_nits : 0.0f, 0, 0, 0 };
+            g.ctx->UpdateSubresource(g.cb_pq.Get(), 0, nullptr, pq, 0, 0);
+            g.ctx->PSSetConstantBuffers(1, 1, g.cb_pq.GetAddressOf());
+        }
         g.ctx->OMSetRenderTargets(1, bb_rtv.GetAddressOf(), nullptr);
         g.ctx->PSSetShaderResources(0, 1, g.scene_srv.GetAddressOf());
         g.ctx->Draw(3, 0);
