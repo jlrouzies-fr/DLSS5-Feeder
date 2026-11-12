@@ -663,6 +663,23 @@ static void FeedPanelTick(reshade::api::effect_runtime *rt)
     }
     if (!g_panel_wanted && g_panel_t <= 0.0f) { g_panel_tick = 0; return; }
     if (!g_br_loaded) BridgeLoad();
+    // RenoDX in the helper: which settings it takes while running is known only once the helper
+    // has started and listed them. A panel opened before that looks again every two seconds, a
+    // few times, as long as nothing on it has been changed.
+    {
+        static ULONGLONG looked = 0;
+        static int       tries = 0;
+        const ULONGLONG  now = GetTickCount64();
+        if (!g_panel_wanted) tries = 0;
+        else if (g_br_backend == BR_BACKEND_RENODX && g_panel_env.helper && g_panel_env.send_setting != nullptr &&
+                 tries < 15 && now - looked > 2000)
+        {
+            looked = now;
+            bool any = false, dirty = false;
+            for (int i = 0; i < kBridgeCount; ++i) { any = any || g_br_rowlive[i]; dirty = dirty || g_br[i] != g_br_saved[i]; }
+            if (!any && !dirty) { ++tries; g_br_loaded = false; }
+        }
+    }
     FeedPanelStep(g_panel_wanted);
     if (g_br_mv_do == 1 && g_panel_env.mv_use_builtin != nullptr) g_panel_env.mv_use_builtin();
     else if (g_br_mv_do == 2 && g_panel_env.mv_disable_others != nullptr) g_panel_env.mv_disable_others();
