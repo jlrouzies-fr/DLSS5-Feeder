@@ -464,12 +464,6 @@ Things to know:
 
 ## The DLSS 5 Feeder menu (Alt+C)
 
-<!-- DRAFT for the release that ships the menu. Before publishing:
-     - retake the picture (this one is Fable Anniversary in a 1080p window, from the prototype);
-     - RenoDX: run in the lab against v6.1 and against 10.8.0 (RHI's newest on 2026-11-12); a newer
-       one the installer may fetch by then is untested;
-     - try it in an exclusive-fullscreen game before saying anything about fullscreen. -->
-
 Press **Alt+C** in the game. A panel slides in from the right edge with the settings of the neural
 tool that is doing the work, and **Alt+C** or **Esc** closes it again. It is the same panel in a
 32-bit game, in the 64-bit helper mode and in an ordinary 64-bit game, and it is drawn by the game's
