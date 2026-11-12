@@ -8845,12 +8845,14 @@ static void PanelRefresh()
     g_panel_env.opti_live = g_panel_env.opti_nr && live;
     _snprintf_s(g_panel_env.opti_ini, sizeof(g_panel_env.opti_ini), _TRUNCATE, "%s" OPTI_INI, o.dir);
 }
+#include "feed_panel_mv.h"   // the menu's motion-vector notice: what it asks ReShade and what its buttons do
 static void PanelSetup()
 {
     static bool done = false;
     if (done) return;
     done = true;
     g_panel_env.helper       = false;
+    PanelMvSetup();
     g_panel_env.send_setting = [](const char *key, float value) { const int r = FeedRenoApiSet(key, value);
                                                                  Log("[panel] %s=%g -> RenoDX control interface: %s", key, value, r == 1 ? "taken" : r == 0 ? "REFUSED" : "not available");
                                                                  return r == 1; };

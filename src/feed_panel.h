@@ -59,6 +59,13 @@ struct FeedPanelEnv
     bool  (*send_setting)(const char *key, float value);  // hand the tool one setting while it runs (RenoDX's control interface)
     int   (*live_keys)(char *out, size_t cb);             // tool in THIS process: the names it takes that way, one per line
     float (*gpu_ms)();                                    // GPU time of the feed's work on one frame (DLSS + neural pass); <= 0 unknown
+    // Motion vectors (feed_panel_mv.h fills these in). The panel warns at its top when the
+    // built-in estimator is not the one in use.
+    int         (*mv_mode)();                       // DLSS5_MV_PROVIDER DLSS5_Feed.fx is compiled for (5 = built in); < 0 not known
+    const char *(*mv_name)();                       // that provider's name
+    int         (*mv_enabled)(char *out, size_t cb);// the motion-vector shaders switched on in ReShade, as the user sees them; returns how many
+    void        (*mv_use_builtin)();                // set DLSS5_MV_PROVIDER = 5 on DLSS5_Feed.fx
+    void        (*mv_disable_others)();             // switch those shaders off
     void (*log)(const char *fmt, ...);
 };
 static FeedPanelEnv g_panel_env;
@@ -78,6 +85,8 @@ static int g_panel_side = 1;      // 0 left, 1 right
 // A game that is NOT DPI-aware reports 100% and renders a picture Windows then enlarges, so
 // it needs nothing.
 static int g_panel_scale = 0;
+// The motion-vector notice at the top of the panel: 0 = never shown ("Never show again").
+static int g_panel_mv_notice = 1;
 
 static bool FeedPanelCfg(const char *key, int value)
 {
@@ -85,6 +94,7 @@ static bool FeedPanelCfg(const char *key, int value)
     else if (_stricmp(key, "panel_mods") == 0) g_panel_mods = value & 7;
     else if (_stricmp(key, "panel_side") == 0) g_panel_side = value != 0 ? 1 : 0;
     else if (_stricmp(key, "panel_scale") == 0) g_panel_scale = value <= 0 ? 0 : value < 50 ? 50 : value > 400 ? 400 : value;
+    else if (_stricmp(key, "panel_mv_notice") == 0) g_panel_mv_notice = value != 0 ? 1 : 0;
     else return false;
     return true;
 }
@@ -354,6 +364,8 @@ static int       g_br_backend;
 static float     g_br[64], g_br_saved[64];
 static bool      g_br_reno8;          // the RenoDX build behind the panel is v8 or newer (see BridgeLoad)
 static bool      g_br_rowlive[64];    // the tool takes this row's setting while it runs (see BridgeLoad)
+static bool      g_br_mv_hidden;      // the motion-vector notice was hidden for this run of the game ("Hide")
+static int       g_br_mv_do;         // asked for on the panel, done at the next tick: 1 use the built-in vectors, 2 switch the other shaders off
 static bool      g_br_apply_full;     // the Apply button was pressed: rows that need a restart go too
 static char      g_br_livekeys[8192]; // RenoDX: the names its control interface lists, each between line ends
 static bool      g_br_absent[64];     // this build of the tool has no such setting (see BridgeLoad)
@@ -652,6 +664,9 @@ static void FeedPanelTick(reshade::api::effect_runtime *rt)
     if (!g_panel_wanted && g_panel_t <= 0.0f) { g_panel_tick = 0; return; }
     if (!g_br_loaded) BridgeLoad();
     FeedPanelStep(g_panel_wanted);
+    if (g_br_mv_do == 1 && g_panel_env.mv_use_builtin != nullptr) g_panel_env.mv_use_builtin();
+    else if (g_br_mv_do == 2 && g_panel_env.mv_disable_others != nullptr) g_panel_env.mv_disable_others();
+    g_br_mv_do = 0;
     if (g_panel_wanted) rt->block_input_next_frame();   // the panel owns mouse and keyboard while it is up
 }
 
@@ -752,8 +767,59 @@ static void FeedPanelDraw(reshade::api::effect_runtime *rt)
             // What it costs: the GPU time of the feed's own work on one frame, which is DLSS and
             // the neural pass together (the tool runs inside that work).
             const float gpu = g_panel_env.gpu_ms != nullptr ? g_panel_env.gpu_ms() : 0.0f;
-            if (gpu > 0.0f) ImGui::TextColored(muted, "GPU cost  %.1f ms per frame  (DLSS + neural pass)", gpu);
-            else            ImGui::TextColored(muted, "GPU cost  not measured yet");
+            // Beside it, the game's frame rate as ReShade counts presented frames (a 120-frame average).
+            const float fps = io.Framerate;
+            if (gpu > 0.0f) ImGui::TextColored(muted, "GPU %.1f ms/frame (DLSS + neural)  -  %.0f fps", gpu, fps);
+            else            ImGui::TextColored(muted, "GPU cost not measured yet  -  %.0f fps", fps);
+        }
+
+        // Motion vectors. The feeder has its own estimator now (DLSS5_MV_PROVIDER = 5); when the
+        // shader is set to read another provider's, say so here, with the way to change it --
+        // by hand, or with the button. Once on the built-in ones, name the motion-vector shaders
+        // that are still switched on: nothing reads them for the feeder any more, and they cost.
+        if (g_panel_env.mv_mode != nullptr && g_panel_mv_notice != 0 && !g_br_mv_hidden)
+        {
+            // Two ways out of the notice: for this run of the game, or for good (panel_mv_notice=0).
+            const auto dismiss = [&]() {
+                const float hw = (cw - S(6.0f)) * 0.5f;
+                ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(34, 36, 44, 255));
+                if (ImGui::Button("Hide##brmvh", ImVec2(hw, S(24.0f)))) g_br_mv_hidden = true;
+                ImGui::SameLine(0.0f, S(6.0f));
+                if (ImGui::Button("Never show again##brmvn", ImVec2(hw, S(24.0f)))) { g_panel_mv_notice = 0; FeedPanelSaveCfg("panel_mv_notice", 0); }
+                ImGui::PopStyleColor(1);
+            };
+            const int mode = g_panel_env.mv_mode();
+            char others[512] = "";
+            const int n_on = g_panel_env.mv_enabled != nullptr ? g_panel_env.mv_enabled(others, sizeof(others)) : 0;
+            const ImVec4 warn(1.0f, 0.70f, 0.28f, 1.0f);
+            if (mode >= 0 && mode != 5)
+            {
+                ImGui::Dummy(ImVec2(1.0f, S(2.0f)));
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + cw);
+                ImGui::TextColored(warn, "Motion vectors: not the feeder's built-in ones (in use: %s).",
+                                   g_panel_env.mv_name != nullptr ? g_panel_env.mv_name() : "another provider");
+                ImGui::TextColored(muted, "To switch: 1. ReShade overlay (Home) > DLSS5_Feed.fx > Preprocessor definitions > "
+                                          "DLSS5_MV_PROVIDER = 5.  2. Untick the motion-vector shader you used%s%s.",
+                                   n_on > 0 ? ": " : "", n_on > 0 ? others : "");
+                ImGui::PopTextWrapPos();
+                ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(150, 96, 20, 255));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(180, 116, 26, 255));
+                if (g_panel_env.mv_use_builtin != nullptr && ImGui::Button("Use the built-in vectors##brmv", ImVec2(cw, S(28.0f)))) g_br_mv_do = 1;
+                ImGui::PopStyleColor(2);
+                dismiss();
+            }
+            else if (mode == 5 && n_on > 0)
+            {
+                ImGui::Dummy(ImVec2(1.0f, S(2.0f)));
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + cw);
+                ImGui::TextColored(warn, "Still switched on: %s.", others);
+                ImGui::TextColored(muted, "The feeder uses its built-in motion vectors and no longer reads %s. Untick %s in ReShade "
+                                          "unless another effect of yours needs %s.",
+                                   n_on > 1 ? "these" : "this one", n_on > 1 ? "them" : "it", n_on > 1 ? "them" : "it");
+                ImGui::PopTextWrapPos();
+                if (g_panel_env.mv_disable_others != nullptr && ImGui::Button(n_on > 1 ? "Switch them off##brmv" : "Switch it off##brmv", ImVec2(cw, S(28.0f)))) g_br_mv_do = 2;
+                dismiss();
+            }
         }
 
         // Two tabs: what every tool has under one name, and what only the tool behind has.

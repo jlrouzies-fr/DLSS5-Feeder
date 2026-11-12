@@ -32,6 +32,8 @@ param(
     [string]$OptiDll = '',                # another OptiScaler build to load as winmm.dll (default: deploy\optiscaler-fork\winmm.dll)
     [string]$MainRepo = 'G:\AI\DLSS5-Feeder',   # where the gitignored deploy\ cache lives
     [switch]$KeepHostIni,                 # do not reset the tool's ini files: it starts from what the last run left
+    [switch]$Lumenite,                    # also install LumeniteFX's Kernel, enable it and compile DLSS5_Feed.fx for it (provider 3):
+                                          # the state of a user who has not moved to the built-in motion vectors yet
     [switch]$NoPlace,                     # cast A/B: leave the host's unseen window where it is
     [hashtable]$Cfg = @{}
 )
@@ -58,6 +60,14 @@ if ($Bits -eq 32) { Copy-Item (Join-Path $repo 'build\dlss5-feed.addon32') $rig 
 elseif ($inproc)  { Copy-Item (Join-Path $repo 'build\dlss5-feed.addon64') $rig -Force }
 else              { Copy-Item (Join-Path $repo 'build\helper64\dlss5-feed-helper.addon64') $rig -Force }
 Copy-Item (Join-Path $dep 'reshade-framework\*.fxh') $sh -Force
+Remove-Item (Join-Path $sh 'lumenite_*.fx') -ErrorAction SilentlyContinue
+if ($Lumenite) {
+    $lum = Join-Path $dep 'motion-vectors\lumenitefx'
+    Copy-Item (Join-Path $lum 'Shaders\lumenite_Kernel.fx') $sh -Force
+    Copy-Item (Join-Path $lum 'Shaders\include') $sh -Recurse -Force
+    $tx = Join-Path $rig 'reshade-shaders\Textures'; New-Item -ItemType Directory -Force $tx | Out-Null
+    Copy-Item (Join-Path $lum 'Textures\*') $tx -Force
+}
 Copy-Item (Join-Path $repo 'shaders\DLSS5_Feed.fx') $sh -Force
 
 # --- the helper (not for in-process)
@@ -129,7 +139,8 @@ ShowFrameTime=0
 "@
 # In-process the tool shares the game's ReShade.ini, so -KeepHostIni keeps that one.
 if (-not ($inproc -and $KeepHostIni -and (Test-Path (Join-Path $rig 'ReShade.ini')))) { $gameIni | Set-Content (Join-Path $rig 'ReShade.ini') -Encoding ascii }
-@('Techniques=DLSS5_Feed@DLSS5_Feed.fx', 'TechniqueSorting=DLSS5_Feed@DLSS5_Feed.fx', '', '[DLSS5_Feed.fx]', 'PreprocessorDefinitions=DLSS5_MV_PROVIDER=0') |
+$(if ($Lumenite) { @('Techniques=Lumenite_Kernel@lumenite_Kernel.fx,DLSS5_Feed@DLSS5_Feed.fx', 'TechniqueSorting=Lumenite_Kernel@lumenite_Kernel.fx,DLSS5_Feed@DLSS5_Feed.fx', '', '[DLSS5_Feed.fx]', 'PreprocessorDefinitions=DLSS5_MV_PROVIDER=3') }
+  else { @('Techniques=DLSS5_Feed@DLSS5_Feed.fx', 'TechniqueSorting=DLSS5_Feed@DLSS5_Feed.fx', '', '[DLSS5_Feed.fx]', 'PreprocessorDefinitions=DLSS5_MV_PROVIDER=0') }) |
     Set-Content (Join-Path $rig 'ReShadePreset.ini') -Encoding ascii
 if (-not $inproc -and -not ($KeepHostIni -and (Test-Path (Join-Path $tool 'ReShade.ini')))) {
     @"

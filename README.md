@@ -519,9 +519,20 @@ Either tool reads its settings from its own file (`OptiScaler.ini`, or the `[Ren
 of the ReShade.ini beside it), and that is where the menu writes them, so its own page and the menu
 always agree.
 
-**GPU cost.** Under the tool's name the menu shows what the feed's work costs on the GPU per
-frame, DLSS and the neural pass together, as a short average. It is measured where the work
-runs: in the game for an ordinary 64-bit install, in the helper otherwise.
+**GPU cost and frame rate.** Under the tool's name the menu shows what the feed's work costs on
+the GPU per frame, DLSS and the neural pass together, as a short average, and the game's frame
+rate beside it. The GPU time is measured where the work runs: in the game for an ordinary 64-bit
+install, in the helper otherwise.
+
+**Motion vectors.** When `DLSS5_Feed.fx` is not using its own built-in motion vectors
+(`DLSS5_MV_PROVIDER` is not `5`), the menu says so at its top, names the provider in use, and
+gives the two steps to change it. **Use the built-in vectors** does the first step for you: it
+sets the definition on `DLSS5_Feed.fx` and ReShade recompiles the effect (the built-in estimator
+takes several seconds to compile). After that the menu lists any motion-vector shader that is
+still switched on, with **Switch it off**: nothing reads it for the feeder any more, but leave
+it on if another effect of yours needs it (LumeniteFX's own effects read its Kernel). **Hide**
+puts the notice away until the game is next started; **Never show again** saves
+`panel_mv_notice=0`.
 
 **Size.** The **Panel size** row at the foot of the menu makes everything on it larger or smaller
 in steps of 10%. **Auto** follows the larger of two things: the height of the picture (a 4K picture
@@ -1489,6 +1500,7 @@ if you prefer editing the file directly:
 | `panel_mods` | 1 | Modifiers that must be held with `panel_key`: 1 = Alt, 2 = Ctrl, 4 = Shift, added together. The match is exact both ways, so Alt+C does not also answer to Ctrl+Alt+C (AltGr+C). |
 | `panel_side` | 1 | Which edge of the picture the menu slides in from: 0 left, 1 right. |
 | `panel_scale` | 0 | Size of the menu in percent, 50..400. 0 = automatic: the larger of the picture's height over 1080 and the Windows display scaling of the game's window, never below 100. Written by the menu's own **Panel size** row. |
+| `panel_mv_notice` | 1 | 1 = the menu shows its notice when the built-in motion vectors are not in use, or when another motion-vector shader is still switched on beside them. 0 = never (what **Never show again** writes). |
 | `native_dlss_ok` | 0 | **D3D12 games (64-bit), parse-only.** Since 1.17.0-beta.2 the same-device D3D12 session refuses to open when the game has loaded a DLSS runtime of its own (`nvngx_dlss.dll` / `nvngx_dlssd.dll` from anywhere other than this add-on's folder or the driver, or Streamline's `sl.dlss.dll`). A second DLSS contract on the game's device is what crashed the neural consumer in #130; in such a game, turn DLSS on in its own settings and let the DLSS 5 add-on use that instead. `1` opens the session anyway. |
 | `hold_strength` | 0 | **Experimental output stabiliser, since 1.17.0-beta.2 (32-bit games) / beta.3 (64-bit, all four transports).** The neural consumer re-decides what a still region should look like from small frame-to-frame differences in its input: a slope under a tree is bright while the camera pans and darkens over the frames after the stop, although the game drew it the same way on every one of them (and a reset on every frame still darkens, so it is not history). The helper runs one compute pass after the evaluate: per output pixel it compares a 3x3 box of the game's frame with an anchor (that box as it was when the pixel last moved), relative to local brightness. Where the input moved, the model's answer shows as is and the anchor follows; where it did not, the shown pixel keeps this much of last frame's value and takes the rest from the model. 0 = off, 1 = a still region never moves until its input changes, 0.9 = the model's new opinion fades in over about ten frames. No reprojection, so nothing ghosts: a pixel whose input changed shows the current output that frame. A slider on the overlay page ("Output stabiliser"), applied live. On the 64-bit add-on it runs on the same device as the evaluate, so on the same-device D3D12 transport that is the game's device. |
 | `hold_tolerance` | 0.04 | How much a pixel's input (3x3 box, relative to its brightness) may differ from its anchor and still count as still: 0.04 = 4%. Below it the pixel is held; at twice it the model shows through fully. Raise it if a held region unlocks by itself (exposure drift, shimmer), lower it if slow animation lags behind. |

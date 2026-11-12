@@ -3328,6 +3328,7 @@ static void PanelRestartTool()
     g.consecutive_fails = 0;
     g_retry_at = 0;
 }
+#include "feed_panel_mv.h"   // the menu's motion-vector notice: what it asks ReShade and what its buttons do
 // One setting for a tool that takes them while it runs: pipe tag 'S'; the helper hands it to the
 // tool's own control interface. Called from FeedPanelApply, inside the feed lock.
 static bool PanelSendSetting(const char *key, float value)
@@ -3367,6 +3368,7 @@ static void PanelSetup()
     if (done) return;
     done = true;
     g_panel_env.helper         = true;
+    PanelMvSetup();
     g_panel_env.send_setting   = PanelSendSetting;
     g_panel_env.gpu_ms         = PanelGpuMs;
     g_panel_env.refresh        = PanelRefresh;
