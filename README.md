@@ -511,12 +511,17 @@ its own page.
 | OptiScaler DLSS-NR, [this project's fork](https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases) from **v0.8.93** (what the installer fetches) | anywhere | at once; the menu shows **LIVE** and has no Apply button |
 | OptiScaler DLSS-NR, an older build | the helper (`host64\`) | on **Apply**, which restarts the helper: a few seconds, the game keeps running |
 | OptiScaler DLSS-NR, an older build | the game's own process | on **Apply** it is saved, and used from the next start of the game |
-| RenoDX add-on | the helper (`host64\`) | on **Apply**, which restarts the helper |
-| RenoDX add-on | the game's own process | on **Apply** it is saved, and used from the next start of the game |
+| RenoDX add-on, **v10 or newer** (what the installer fetches) | anywhere | at once for the settings RenoDX itself offers for outside control: intensity, preset, style, tone, structure, skin, the mask and HUD switches and the whole look group. The other rows are marked with a star (neural rendering on/off, passes, working resolution, strengths, white point) and wait for **Apply**, as in the two rows below |
+| RenoDX add-on, an older build | the helper (`host64\`) | on **Apply**, which restarts the helper |
+| RenoDX add-on, an older build | the game's own process | on **Apply** it is saved, and used from the next start of the game |
 
 Either tool reads its settings from its own file (`OptiScaler.ini`, or the `[RenoDX.DLSS5]` section
 of the ReShade.ini beside it), and that is where the menu writes them, so its own page and the menu
 always agree.
+
+**GPU cost.** Under the tool's name the menu shows what the feed's work costs on the GPU per
+frame, DLSS and the neural pass together, as a short average. It is measured where the work
+runs: in the game for an ordinary 64-bit install, in the helper otherwise.
 
 **Size.** The **Panel size** row at the foot of the menu makes everything on it larger or smaller
 in steps of 10%. **Auto** follows the larger of two things: the height of the picture (a 4K picture

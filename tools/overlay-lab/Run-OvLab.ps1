@@ -156,7 +156,8 @@ if ($HostIni.Count -gt 0) {
 
 # --- dlss5-feed.cfg. F3 opens the feeder's panel (-Mode 3) or toggles the cast (-Mode 1 / 2), never both.
 $panel = $Mode -eq 3
-$c = [ordered]@{ enabled = 1; mode = 2; log_frames = 3; host_window = 0; cast_key = $(if ($panel) { 0 } else { 114 }); cast_mods = 0
+$c = [ordered]@{ enabled = 1; mode = 2; log_frames = 3; host_window = $(if ($panel) { 2 } else { 0 });   # the menu needs no helper window: none on the desktop
+                 cast_key = $(if ($panel) { 0 } else { 114 }); cast_mods = 0
                  cast_scale = 100; cast_mode = $(if ($panel) { 0 } else { $Mode }); cast_anchor = $Anchor
                  panel_key = $(if ($panel) { 114 } else { 0 }); panel_mods = 0; panel_side = $Anchor }
 foreach ($k in $Cfg.Keys) { $c[$k] = $Cfg[$k] }

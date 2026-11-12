@@ -44,7 +44,31 @@
 #include "../src/feed_fmt.h"
 #include "../src/feed_dfc.h"   // Deep Fried Chicken interop ABI 1 (producer side, HostMode=1 here)
 #include "../src/feed_opti.h"  // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
+#include "../src/feed_renodx_api.h" // RenoDX DLSS5's control interface: its settings, set while it runs
 #include "../src/feed_hold12.h" // the output stabiliser (experimentHold): one compute pass after the evaluate
+
+// The GPU cost of a frame, for the game's menu (FeedStats in feed_ipc.h). Averaged over 30
+// timed frames so the number on screen is steady.
+static FeedStats *g_stats = nullptr;
+static double     g_stats_sum = 0.0;
+static unsigned   g_stats_n = 0;
+static void StatsOpen(DWORD game_pid)
+{
+    char name[64];
+    sprintf_s(name, FEED_STATS_FMT, static_cast<unsigned long>(game_pid));
+    HANDLE m = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(FeedStats), name);
+    if (m == nullptr) return;
+    g_stats = static_cast<FeedStats *>(MapViewOfFile(m, FILE_MAP_WRITE, 0, 0, sizeof(FeedStats)));
+    if (g_stats != nullptr) { g_stats->magic = FEED_STATS_MAGIC; g_stats->gpu_ms = 0.0f; g_stats->tick = GetTickCount(); }
+}
+static void StatsSample(double gpu_ms)
+{
+    g_stats_sum += gpu_ms;
+    if (++g_stats_n < 30) return;
+    if (g_stats != nullptr) { g_stats->gpu_ms = static_cast<float>(g_stats_sum / g_stats_n); g_stats->tick = GetTickCount(); }
+    g_stats_sum = 0.0;
+    g_stats_n = 0;
+}
 
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
@@ -1081,6 +1105,7 @@ static void TimingCollect(int slot)
     {
         h.ts_sum_ms += 1000.0 * double(t[base + 1] - t[base]) / double(h.ts_freq);
         ++h.ts_n;
+        StatsSample(1000.0 * double(t[base + 1] - t[base]) / double(h.ts_freq));
     }
     const D3D12_RANGE wrote = { 0, 0 };
     h.ts_read->Unmap(0, &wrote);
@@ -1972,6 +1997,73 @@ static bool HostResize(int new_w, int new_h, const char *why)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Settings a neural tool takes while it runs (RenoDX DLSS5 from v10: feed_renodx_api.h).
+// The add-on in the game cannot ask this process a question, so what the tool accepts is
+// written to a small file beside this exe, and the game's menu reads it: every name in it
+// can be changed with tag 'S' and no restart.
+// ---------------------------------------------------------------------------
+static char *g_live_probe = nullptr;   // lab only, see LiveTick
+
+static void LivePath(char *out)
+{
+    GetModuleFileNameA(nullptr, out, MAX_PATH);
+    if (char *s = strrchr(out, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - out), "dlss5-feed-live.txt");
+}
+
+static void LiveSet(const char *key, float value)
+{
+    char module[64] = "";
+    FeedRenoApi(module, sizeof(module));
+    float before = 0.0f;
+    const bool had = FeedRenoApiGet(key, &before);
+    const int  r = FeedRenoApiSet(key, value);
+    if (r < 0)
+        Log("[host] live setting %s=%g: no neural tool here takes settings while running; ignored", key, value);
+    else if (had)
+        Log("[host] live setting %s: %g -> %g, %s by %s", key, before, value, r == 1 ? "taken" : "REFUSED", module);
+    else
+        Log("[host] live setting %s=%g: %s by %s", key, value, r == 1 ? "taken" : "REFUSED", module);
+}
+
+// Once the tool is loaded (ReShade loads it after this process has a device), list what it
+// takes. Looked for on the first frames only; a tool without the interface leaves no file.
+static void LiveTick(uint64_t frame)
+{
+    static int state = 0;   // 0 looking, 1 done
+    if (state != 0) return;
+    if (frame > 900) { state = 1; return; }
+    if (frame % 30 != 1) return;
+    static char keys[8192];
+    char module[64] = "";
+    const int n = FeedRenoApiKeys(keys, sizeof(keys));
+    if (n <= 0) return;
+    FeedRenoApi(module, sizeof(module));
+    state = 1;
+    char path[MAX_PATH];
+    LivePath(path);
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "w") == 0 && f != nullptr)
+    {
+        fprintf(f, "; settings %s takes while it runs (written by dlss5-feed-host64 at start)\n%s", module, keys);
+        fclose(f);
+    }
+    Log("[host] %s takes %d settings while it runs (its control interface, version 1); listed in dlss5-feed-live.txt", module, n);
+
+    // LAB ONLY: DLSS5_FEED_LIVE_SET="Key=1.5;Other=2" -- each pair is set once, 600 frames in.
+    static char env[1024];
+    if (GetEnvironmentVariableA("DLSS5_FEED_LIVE_SET", env, sizeof(env)) != 0) g_live_probe = env;
+}
+
+static void LiveProbe(uint64_t frame)
+{
+    if (g_live_probe == nullptr || frame < 600) return;
+    char *ctx = nullptr;
+    for (char *tok = strtok_s(g_live_probe, ";", &ctx); tok != nullptr; tok = strtok_s(nullptr, ";", &ctx))
+        if (char *eq = strchr(tok, '=')) { *eq = '\0'; LiveSet(tok, static_cast<float>(atof(eq + 1))); }
+    g_live_probe = nullptr;
+}
+
 // After Present: copy the buffer that was just presented -- banner plus whatever ReShade
 // drew on it inside its Present hook -- into the shared panel texture. FLIP_SEQUENTIAL
 // keeps that buffer's contents intact until it is handed back to us.
@@ -2361,7 +2453,14 @@ static bool InitDisguise()
     Log("[host] window: %dx%d client (tall and narrow, fit to the work area height)%s", g_win_w, g_win_h,
         g_behind ? ", behind the game (tool window, no taskbar button)" : "");
     if (h.hwnd == nullptr) { Log("[host] window creation failed"); return false; }
-    if (g_show_window) ShowWindow(h.hwnd, SW_SHOWNOACTIVATE);   // never steal the game's focus
+    // Never the game's focus, and never in front of it either. A new window is shown at the TOP
+    // of the stack even when it is not activated, so the behind-the-game one covered the game
+    // for the seconds this process needs to start (and again after every restart from the
+    // menu's Apply) until it was pushed down further on. It is now shown at the bottom outright.
+    if (g_show_window && g_behind)
+        SetWindowPos(h.hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    else if (g_show_window)
+        ShowWindow(h.hwnd, SW_SHOWNOACTIVATE);
 
     {
         char ini[MAX_PATH];
@@ -3251,6 +3350,7 @@ static bool WriteFull(HANDLE pipe, const void *buf, DWORD len)
 
 static int Serve(DWORD game_pid)
 {
+    StatsOpen(game_pid);
     char name[128];
     sprintf_s(name, FEED_PIPE_FMT, static_cast<unsigned long>(game_pid));
     // The IN buffer (game -> host) is the client's run-ahead reservoir, and it is the
@@ -3773,10 +3873,22 @@ static int Serve(DWORD game_pid)
                     g_overlay_key);
             }
         }
+        else if (tag == 'S')
+        {
+            // One setting from the game's menu, for a tool that takes them while it runs. On
+            // this thread on purpose: it is the one that presents, which is where the tool's
+            // own page would have changed the value.
+            FeedSettingMsg sm = {};
+            if (!ReadFull(pipe, &sm, sizeof(sm))) break;
+            sm.key[sizeof(sm.key) - 1] = '\0';
+            LiveSet(sm.key, sm.value);
+        }
         else if (tag == 'F')
         {
             FeedFrameMsg fm = {};
             if (!ReadFull(pipe, &fm, sizeof(fm))) break;
+            LiveTick(fm.n);
+            LiveProbe(fm.n);
 
             // How far ahead of us the client has run. Under async_home=1 nothing bounds its
             // CPU: its GPU waits on the frame before, but the frame MESSAGES pile up in the

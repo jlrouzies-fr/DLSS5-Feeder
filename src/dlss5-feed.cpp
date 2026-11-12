@@ -64,6 +64,7 @@
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
 #include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
 #include "feed_opti.h" // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
+#include "feed_renodx_api.h"   // RenoDX DLSS5's control interface (settings while it runs)
 #include "feed_panel.h" // the feeder's own in-game panel, the same in every build of the add-on
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 #include "feed_pq12.h" // the D3D12 PQ<->linear pass, for the transports with no shaders of their own
@@ -270,6 +271,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 static char g_renodx_ver[48] = "not found";
 static char g_renodx_gen[16] = "";       // the add-on's own banner, e.g. "v4.7" (v4.6+ only)
 static bool g_renodx_present = false;
+static double g_pg_sum = 0.0; static unsigned g_pg_n = 0; static float g_pg_ms = 0.0f; static ULONGLONG g_pg_tick = 0;   // GPU cost for the menu
 static bool g_renodx_lazy    = false;
 static bool g_renodx_v46     = false;
 static bool g_renodx_v47     = false;
@@ -1979,6 +1981,8 @@ static void TimingCollect(int slot)
     if (t[base + 1] > t[base])
     {
         g.ts_sum_ms += 1000.0 * double(t[base + 1] - t[base]) / double(g.ts_freq);
+        g_pg_sum += 1000.0 * double(t[base + 1] - t[base]) / double(g.ts_freq);   // the menu's readout: a 30-frame average
+        if (++g_pg_n >= 30) { g_pg_ms = static_cast<float>(g_pg_sum / g_pg_n); g_pg_tick = GetTickCount64(); g_pg_sum = 0.0; g_pg_n = 0; }
         ++g.ts_n;
     }
     const D3D12_RANGE wrote = { 0, 0 };   // read-only map
@@ -8835,6 +8839,11 @@ static void PanelSetup()
     if (done) return;
     done = true;
     g_panel_env.helper       = false;
+    g_panel_env.send_setting = [](const char *key, float value) { const int r = FeedRenoApiSet(key, value);
+                                                                 Log("[panel] %s=%g -> RenoDX control interface: %s", key, value, r == 1 ? "taken" : r == 0 ? "REFUSED" : "not available");
+                                                                 return r == 1; };
+    g_panel_env.live_keys    = [](char *out, size_t cb) { return FeedRenoApiKeys(out, cb); };
+    g_panel_env.gpu_ms       = []() { return GetTickCount64() - g_pg_tick < 3000 ? g_pg_ms : 0.0f; };
     g_panel_env.refresh      = PanelRefresh;
     g_panel_env.log          = Log;
     CfgPath(g_panel_env.cfg_path);

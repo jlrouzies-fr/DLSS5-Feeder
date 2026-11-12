@@ -3326,12 +3326,47 @@ static void PanelRestartTool()
     g.consecutive_fails = 0;
     g_retry_at = 0;
 }
+// One setting for a tool that takes them while it runs: pipe tag 'S'; the helper hands it to the
+// tool's own control interface. Called from FeedPanelApply, inside the feed lock.
+static bool PanelSendSetting(const char *key, float value)
+{
+#pragma pack(push, 1)
+    struct { BYTE tag; FeedSettingMsg sm; } msg = { 'S', {} };
+#pragma pack(pop)
+    strcpy_s(msg.sm.key, key);
+    msg.sm.value = value;
+    if (PipeWrite(&msg, sizeof(msg))) return true;
+    HostLost("a setting could not be sent");
+    return false;
+}
+// The helper's GPU time per frame, from the block it shares (FeedStats). 0 = not known.
+static float PanelGpuMs()
+{
+    static const FeedStats *st = nullptr;
+    static ULONGLONG        tried = 0;
+    if (st == nullptr)
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (now - tried < 1000) return 0.0f;
+        tried = now;
+        char name[64];
+        sprintf_s(name, FEED_STATS_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
+        HANDLE m = OpenFileMappingA(FILE_MAP_READ, FALSE, name);
+        if (m == nullptr) return 0.0f;
+        st = static_cast<const FeedStats *>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, sizeof(FeedStats)));
+        if (st == nullptr) return 0.0f;
+    }
+    if (st->magic != FEED_STATS_MAGIC || GetTickCount() - st->tick > 3000) return 0.0f;   // the helper stopped
+    return st->gpu_ms;
+}
 static void PanelSetup()
 {
     static bool done = false;
     if (done) return;
     done = true;
     g_panel_env.helper         = true;
+    g_panel_env.send_setting   = PanelSendSetting;
+    g_panel_env.gpu_ms         = PanelGpuMs;
     g_panel_env.refresh        = PanelRefresh;
     g_panel_env.running        = HostAlive;
     g_panel_env.starting       = HostStarting;

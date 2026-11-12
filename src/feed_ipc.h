@@ -226,6 +226,24 @@ struct FeedCastMsg      // game -> host ('C'), v10+: the cast panel's state, on 
     uint32_t anchor;           // cast_anchor: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right
 };
 
+struct FeedSettingMsg   // game -> host ('S'): one setting for a neural tool that takes them while it
+{                       // runs. The host hands it to RenoDX DLSS5's control interface (feed_renodx_api.h).
+    char  key[64];      // Only sent for a name the host itself listed in host64\dlss5-feed-live.txt, so
+    float value;        // a host that does not know this tag is never sent it.
+};
+
+// What the helper measures and the game's menu shows: a small block of shared memory the helper
+// creates and keeps up to date, named after the game's process id. Read-only for the game.
+#define FEED_STATS_FMT   "Local\\DLSS5FeedStats-%lu"
+#define FEED_STATS_MAGIC 0x54533546u   // "F5ST"
+struct FeedStats
+{
+    uint32_t magic;
+    uint32_t tick;       // GetTickCount() of the last update: a reader ignores a block that stopped moving
+    float    gpu_ms;     // GPU time of the helper's work on one frame (DLSS and the neural pass), a short average
+    uint32_t reserved;
+};
+
 struct FeedFrameMsg     // game -> host, per frame
 {
     uint64_t n;                  // fence value for this frame

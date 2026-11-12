@@ -19,8 +19,10 @@
 // How a change gets to the tool, by tool:
 //   OptiScaler reads OptiScaler.ini. A build of the fork that re-reads [DlssNr] while it runs
 //     (it carries OPTI_LIVE_LITERAL) takes the change live; an older build at its next start.
-//   The Generic add-on reads its ini at start only: the helper is restarted when there is
-//     one, and otherwise the change waits for the next start of the game.
+//   The RenoDX add-on reads its ini at start only: the helper is restarted when there is one,
+//     and otherwise the change waits for the next start of the game. From v10 it also has a
+//     control interface (feed_renodx_api.h) that takes some of its settings while it runs:
+//     those rows apply at once, the others keep the Apply button and are marked with a star.
 //   ShortFuse's renodx-dlss.addon64 is NOT one of the tools (user's decision, 2026-11-12): it is
 //     built to run without the feeder, and in the feeder's own process its neural pass either
 //     faults or does not start. The panel takes no notice of it.
@@ -54,6 +56,9 @@ struct FeedPanelEnv
                                                          // (nullptr: it is called on the spot)
     void (*stop_tool)();                                 // helper only: stop it, so its files can be written under it
     void (*restart_tool)();                              // helper only: let it start again
+    bool  (*send_setting)(const char *key, float value);  // hand the tool one setting while it runs (RenoDX's control interface)
+    int   (*live_keys)(char *out, size_t cb);             // tool in THIS process: the names it takes that way, one per line
+    float (*gpu_ms)();                                    // GPU time of the feed's work on one frame (DLSS + neural pass); <= 0 unknown
     void (*log)(const char *fmt, ...);
 };
 static FeedPanelEnv g_panel_env;
@@ -348,6 +353,9 @@ static_assert(sizeof(kBridge) / sizeof(kBridge[0]) <= 64, "g_br and its companio
 static int       g_br_backend;
 static float     g_br[64], g_br_saved[64];
 static bool      g_br_reno8;          // the RenoDX build behind the panel is v8 or newer (see BridgeLoad)
+static bool      g_br_rowlive[64];    // the tool takes this row's setting while it runs (see BridgeLoad)
+static bool      g_br_apply_full;     // the Apply button was pressed: rows that need a restart go too
+static char      g_br_livekeys[8192]; // RenoDX: the names its control interface lists, each between line ends
 static bool      g_br_absent[64];     // this build of the tool has no such setting (see BridgeLoad)
 static bool      g_br_loaded;
 static int       g_br_tab;            // 0 = the settings tools share, 1 = the ones only this tool has
@@ -477,7 +485,47 @@ static void BridgeLoad()
         }
         g_br_saved[i] = g_br[i];
     }
+    // Which rows the tool takes while it runs. OptiScaler with live settings: all of them.
+    // RenoDX: the names its control interface lists -- asked directly when it is in this
+    // process, read from the file the helper writes at start when it is over there.
+    g_br_livekeys[0] = '\n';
+    g_br_livekeys[1] = '\0';
+    if (g_br_backend == BR_BACKEND_RENODX && g_panel_env.send_setting != nullptr)
+    {
+        if (!g_panel_env.helper && g_panel_env.live_keys != nullptr)
+            g_panel_env.live_keys(g_br_livekeys + 1, sizeof(g_br_livekeys) - 1);
+        else if (g_panel_env.helper)
+        {
+            char lp[MAX_PATH];
+            sprintf_s(lp, "%sdlss5-feed-live.txt", g_panel_env.tool_dir);
+            FILE *lf = nullptr;
+            if (fopen_s(&lf, lp, "r") == 0 && lf != nullptr)
+            {
+                const size_t got = fread(g_br_livekeys + 1, 1, sizeof(g_br_livekeys) - 2, lf);
+                g_br_livekeys[1 + got] = '\0';
+                fclose(lf);
+            }
+        }
+    }
+    int live_rows = 0;
+    for (int i = 0; i < kBridgeCount; ++i)
+    {
+        g_br_rowlive[i] = false;
+        const char *k = BridgeKey(i);
+        if (k == nullptr) continue;
+        if (g_br_backend == BR_BACKEND_OPTI) g_br_rowlive[i] = g_panel_env.opti_live;
+        else if (g_br_backend == BR_BACKEND_RENODX)
+        {
+            char pat[96];
+            sprintf_s(pat, "\n%s\n", k);
+            g_br_rowlive[i] = strstr(g_br_livekeys, pat) != nullptr;
+        }
+        if (g_br_rowlive[i]) ++live_rows;
+    }
     g_br_loaded = true;
+    if (g_br_backend == BR_BACKEND_RENODX && g_panel_env.log != nullptr)
+        g_panel_env.log("[panel] RenoDX control interface: %d of this panel's settings are taken while it runs%s", live_rows,
+                        live_rows == 0 ? " (none: an older build, or the helper has not listed them yet)" : "");
     if (g_panel_env.log != nullptr)
         g_panel_env.log("[panel] tool behind the panel: %s (%s); %s", BridgeBackendName(),
             g_panel_env.helper ? "in the helper process" : "in this process",
@@ -486,43 +534,86 @@ static void BridgeLoad()
                                  : "it reads its file at start only: changes wait for the next start of the game");
 }
 
-// The tool takes a change while it runs, so nothing has to restart.
+// Every row is taken while the tool runs, so nothing ever has to restart (OptiScaler with live settings).
 static bool BridgeLive()
 {
     return g_br_backend == BR_BACKEND_OPTI && g_panel_env.opti_live;
+}
+// Some rows are (RenoDX from v10): those apply at once, the others keep the Apply button.
+static bool BridgeAnyLive()
+{
+    for (int i = 0; i < kBridgeCount; ++i) if (g_br_rowlive[i] && BridgeKey(i) != nullptr) return true;
+    return false;
 }
 static bool BridgeDirty()
 {
     for (int i = 0; i < kBridgeCount; ++i) if (g_br[i] != g_br_saved[i]) return true;
     return false;
 }
+static bool BridgeDirtyLive()
+{
+    for (int i = 0; i < kBridgeCount; ++i) if (g_br_rowlive[i] && g_br[i] != g_br_saved[i]) return true;
+    return false;
+}
+static bool BridgeDirtyRest()
+{
+    for (int i = 0; i < kBridgeCount; ++i) if (!g_br_rowlive[i] && g_br[i] != g_br_saved[i]) return true;
+    return false;
+}
 
-// Write what changed, in the tool's own spelling, and make it count: handed over live where
-// the tool allows it; otherwise the helper is stopped first (its ReShade saves its ini on exit
-// and would write over ours) and started again after; with no helper it waits for a restart.
+static void BridgeFormat(int i, char *buf, size_t cb)
+{
+    const BridgeItem &it = kBridge[i];
+    const float out = BridgeOut(i);
+    if (it.kind == BR_FLOAT && !it.whole) sprintf_s(buf, cb, "%g", out);
+    else if (it.kind == BR_BOOL && g_br_backend == BR_BACKEND_OPTI) strcpy_s(buf, cb, out != 0.0f ? "true" : "false");
+    else sprintf_s(buf, cb, "%d", static_cast<int>(out));
+}
+
+// Make what changed count, in the tool's own spelling.
+//   Rows the tool takes while it runs go to it at once: OptiScaler through its ini, which it
+//     re-reads; RenoDX through its control interface, which also saves the value itself.
+//   The others are written to the tool's file -- only when the Apply button asked for it
+//     (g_br_apply_full): the helper is stopped first (its ReShade saves its ini on exit and
+//     would write over ours) and started again after; with no helper they wait for a restart.
 static void FeedPanelApply()
 {
     const bool running = g_panel_env.running == nullptr || g_panel_env.running();
-    const bool live = BridgeLive() && running;
-    if (!live && g_panel_env.stop_tool != nullptr) g_panel_env.stop_tool();
+    const bool full = g_br_apply_full;
+    g_br_apply_full = false;
     char buf[64], line[512];
-    int n = sprintf_s(line, "[panel] applied %sto %s:", live ? "LIVE " : "", BridgeBackendName()), wrote = 0;
+
+    int n = sprintf_s(line, "[panel] applied LIVE to %s:", BridgeBackendName()), sent = 0;
+    if (running)
+        for (int i = 0; i < kBridgeCount; ++i)
+        {
+            const char *key = BridgeKey(i);
+            if (key == nullptr || !g_br_rowlive[i] || g_br[i] == g_br_saved[i]) continue;
+            BridgeFormat(i, buf, sizeof(buf));
+            if (g_br_backend == BR_BACKEND_OPTI) BridgeWrite(BridgeSection(), key, buf);
+            else if (g_panel_env.send_setting == nullptr || !g_panel_env.send_setting(key, BridgeOut(i))) continue;   // stays changed: Apply can still take it
+            g_br_saved[i] = g_br[i];
+            ++sent;
+            if (n > 0 && n < static_cast<int>(sizeof(line)) - 80) n += sprintf_s(line + n, sizeof(line) - n, " %s=%s", key, buf);
+        }
+    if (sent > 0 && g_panel_env.log != nullptr) g_panel_env.log("%s (%d setting(s), no restart)", line, sent);
+    if (!BridgeDirty()) { if (sent > 0) g_br_note[0] = '\0'; return; }
+    if (!full) return;   // what is left needs the Apply button
+
+    if (g_panel_env.stop_tool != nullptr) g_panel_env.stop_tool();
+    n = sprintf_s(line, "[panel] applied to %s:", BridgeBackendName());
+    int wrote = 0;
     for (int i = 0; i < kBridgeCount; ++i)
     {
         const char *key = BridgeKey(i);
         if (key == nullptr || g_br[i] == g_br_saved[i]) continue;   // only what the user moved
-        const BridgeItem &it = kBridge[i];
-        const float out = BridgeOut(i);
-        if (it.kind == BR_FLOAT && !it.whole) sprintf_s(buf, "%g", out);
-        else if (it.kind == BR_BOOL && g_br_backend == BR_BACKEND_OPTI) strcpy_s(buf, out != 0.0f ? "true" : "false");
-        else sprintf_s(buf, "%d", static_cast<int>(out));
+        BridgeFormat(i, buf, sizeof(buf));
         BridgeWrite(BridgeSection(), key, buf);
         g_br_saved[i] = g_br[i];
         ++wrote;
         if (n > 0 && n < static_cast<int>(sizeof(line)) - 80) n += sprintf_s(line + n, sizeof(line) - n, " %s=%s", key, buf);
     }
     if (g_panel_env.log != nullptr) g_panel_env.log("%s (%d key(s) in [%s])", line, wrote, BridgeSection());
-    if (live) { g_br_note[0] = '\0'; return; }
     if (g_panel_env.restart_tool != nullptr)
     {
         g_panel_env.restart_tool();
@@ -658,6 +749,11 @@ static void FeedPanelDraw(reshade::api::effect_runtime *rt)
                       !g_panel_env.helper ? "in the game" : running ? "running" : starting ? "starting" : "restarting");
             dl->AddText(ImVec2(p.x + S(28.0f), p.y + (h - ImGui::GetFontSize()) * 0.5f), IM_COL32(210, 212, 220, 255), chip);
             ImGui::Dummy(ImVec2(cw, h));
+            // What it costs: the GPU time of the feed's own work on one frame, which is DLSS and
+            // the neural pass together (the tool runs inside that work).
+            const float gpu = g_panel_env.gpu_ms != nullptr ? g_panel_env.gpu_ms() : 0.0f;
+            if (gpu > 0.0f) ImGui::TextColored(muted, "GPU cost  %.1f ms per frame  (DLSS + neural pass)", gpu);
+            else            ImGui::TextColored(muted, "GPU cost  not measured yet");
         }
 
         // Two tabs: what every tool has under one name, and what only the tool behind has.
@@ -693,6 +789,7 @@ static void FeedPanelDraw(reshade::api::effect_runtime *rt)
         // With a tool that takes changes live there is no Apply: a tick or a choice counts at
         // once, a slider when it is let go (a change can rebuild the model, a fifth of a second).
         bool        commit = false;
+        const bool  mixed = !BridgeLive() && BridgeAnyLive();   // some rows apply at once, some need Apply
         const char *group = nullptr;
         for (int i = 0; i < kBridgeCount; ++i)
         {
@@ -716,11 +813,11 @@ static void FeedPanelDraw(reshade::api::effect_runtime *rt)
             if (it.kind == BR_BOOL)
             {
                 bool v = g_br[i] != 0.0f;
-                sprintf_s(id, "%s##br%d", it.label, i);
+                sprintf_s(id, "%s%s##br%d", it.label, (mixed && !g_br_rowlive[i]) ? " *" : "", i);
                 if (ImGui::Checkbox(id, &v)) { g_br[i] = v ? 1.0f : 0.0f; commit = true; }
                 continue;
             }
-            ImGui::TextColored(muted, "%s", it.label);
+            ImGui::TextColored(muted, "%s%s", it.label, (mixed && !g_br_rowlive[i]) ? " *" : "");
             ImGui::SetNextItemWidth(row_w);
             if (it.kind == BR_COMBO)
             {
@@ -747,13 +844,14 @@ static void FeedPanelDraw(reshade::api::effect_runtime *rt)
         ImGui::EndChild();
 
         ImGui::Dummy(ImVec2(1.0f, S(4.0f)));
-        const bool dirty = BridgeDirty(), can = dirty && g_br_backend != BR_BACKEND_NONE && !starting;
+        const bool dirty = BridgeDirtyRest(), can = dirty && g_br_backend != BR_BACKEND_NONE && !starting;
+        const bool some_live = !BridgeLive() && BridgeAnyLive();
         bool apply = false;
         char key[96];
         FeedPanelKeyName(key, sizeof(key));
         if (BridgeLive())
         {
-            apply = commit && dirty && !starting;
+            apply = commit && BridgeDirty() && !starting;   // every row is live here: `dirty` (rows that need Apply) is never set
             const ImVec2 p = ImGui::GetCursorScreenPos();
             dl->AddRectFilled(p, ImVec2(p.x + S(44.0f), p.y + ImGui::GetFrameHeight()), IM_COL32(60, 96, 0, 255), S(5.0f));
             dl->AddText(ImVec2(p.x + S(9.0f), p.y + (ImGui::GetFrameHeight() - ImGui::GetFontSize()) * 0.5f), IM_COL32(236, 248, 210, 255), "LIVE");
@@ -769,11 +867,13 @@ static void FeedPanelDraw(reshade::api::effect_runtime *rt)
             ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(92, 146, 0, 255));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(110, 172, 0, 255));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(128, 200, 0, 255));
-            if (ImGui::Button("Apply", ImVec2(bw, S(34.0f)))) { strcpy_s(g_br_note, "Applying."); apply = true; }
+            if (ImGui::Button("Apply", ImVec2(bw, S(34.0f)))) { strcpy_s(g_br_note, "Applying."); apply = true; g_br_apply_full = true; }
             ImGui::PopStyleColor(3);
             ImGui::SameLine();
             if (ImGui::Button("Revert", ImVec2(bw, S(34.0f)))) { for (int i = 0; i < kBridgeCount; ++i) g_br[i] = g_br_saved[i]; g_br_note[0] = '\0'; }
             if (!can) ImGui::EndDisabled();
+            // The rows the tool takes while it runs go at once, without the button.
+            if (some_live && commit && BridgeDirtyLive() && !starting) apply = true;
 
             ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + cw);
             const bool restarts = g_panel_env.restart_tool != nullptr;
@@ -782,10 +882,14 @@ static void FeedPanelDraw(reshade::api::effect_runtime *rt)
             else if (g_br_note[0] != '\0' && !dirty)
                 ImGui::TextColored(muted, "%s", running && strstr(g_br_note, "restarting") != nullptr ? "Applied. The helper is running with the new settings." : g_br_note);
             else if (dirty)
-                ImGui::TextColored(muted, "%s", restarts ? "Changed. Apply restarts the helper, which takes a few seconds; the game keeps running."
+                ImGui::TextColored(muted, "%s", some_live ? (restarts ? "A row marked * changed. Apply restarts the helper for it (a few seconds; the game keeps running)."
+                                                                   : "A row marked * changed. Apply saves it; it is used when the game starts.")
+                                             : restarts ? "Changed. Apply restarts the helper, which takes a few seconds; the game keeps running."
                                                          : "Changed. Apply saves it; this tool reads its settings when the game starts.");
             else
-                ImGui::TextColored(muted, "%s", restarts ? "These settings are stored in the tool's own file and take effect when the helper starts."
+                ImGui::TextColored(muted, "%s", some_live ? (restarts ? "Changes apply at once, with no restart. Rows marked * need Apply, which restarts the helper."
+                                                                   : "Changes apply at once. Rows marked * need Apply and are used when the game starts.")
+                                             : restarts ? "These settings are stored in the tool's own file and take effect when the helper starts."
                                                          : "These settings are stored in the tool's own file and take effect when the game starts.");
         }
         ImGui::TextColored(muted, g_panel_key > 0 ? "%s or Esc closes this panel." : "Esc closes this panel.", key);
