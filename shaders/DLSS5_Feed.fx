@@ -2411,6 +2411,63 @@ void PS_FitSolve(float4 vpos : SV_Position, float2 uv : TEXCOORD,
         }
         if (singular) break;
         [unroll] for (int i2 = 0; i2 < 9; ++i2) { p[i2] = G[i2 * 11 + 9]; p[9 + i2] = G[i2 * 11 + 10]; }
+        // With depth: a camera has ONE forward speed. It moves a point by (position x speed) /
+        // distance on both axes, so the x.w term of the horizontal motion and the y.w term of the
+        // vertical one are the same number, and the two cross terms (y.w in the horizontal, x.w
+        // in the vertical) do not exist. Left free, those four are fitted to the few samples
+        // close to the camera and the model is wrong exactly there, where everything it says
+        // is multiplied by the largest w in the frame. So: the shared term is the two estimates
+        // weighed by what each rests on, the cross terms are zero, and the other seven of each
+        // axis are solved again with that taken off their right-hand sides.
+#ifndef FITPHYS
+    #define FITPHYS 1
+#endif
+        if (FITPHYS && (CAMERA_DEPTH || GEOM_ENABLE) && wk > 0.0)
+        {
+            // packed upper triangle: (i, j), i <= j  ->  i * 9 - i * (i - 1) / 2 + j - i
+            const float su = M[42], sv = M[44];                       // (7,7), (8,8)
+            const float tz = (su * p[7] + sv * p[17]) / max(su + sv, 1e-20);
+            float H[63];
+            [unroll] for (int i3 = 0; i3 < 7; ++i3)
+            {
+                [unroll] for (int j3 = 0; j3 < 7; ++j3)
+                {
+                    const int lo = min(i3, j3), hi = max(i3, j3);
+                    H[i3 * 9 + j3] = M[lo * 9 - lo * (lo - 1) / 2 + hi - lo];
+                }
+                H[i3 * 9 + i3] += 1e-5 * n;
+                H[i3 * 9 + 7] = ru[i3] - tz * M[i3 * 9 - i3 * (i3 - 1) / 2 + 7 - i3];
+                H[i3 * 9 + 8] = rv[i3] - tz * M[i3 * 9 - i3 * (i3 - 1) / 2 + 8 - i3];
+            }
+            bool bad = false;
+            [loop] for (int col3 = 0; col3 < 7; ++col3)
+            {
+                int   piv3  = col3;
+                float best3 = abs(H[col3 * 9 + col3]);
+                [loop] for (int r3 = col3 + 1; r3 < 7; ++r3)
+                {
+                    const float v3 = abs(H[r3 * 9 + col3]);
+                    if (v3 > best3) { best3 = v3; piv3 = r3; }
+                }
+                if (best3 < 1e-12) { bad = true; break; }
+                if (piv3 != col3)
+                    [unroll] for (int c3 = 0; c3 < 9; ++c3) { const float t3 = H[col3 * 9 + c3]; H[col3 * 9 + c3] = H[piv3 * 9 + c3]; H[piv3 * 9 + c3] = t3; }
+                const float inv3 = 1.0 / H[col3 * 9 + col3];
+                [unroll] for (int c4 = 0; c4 < 9; ++c4) H[col3 * 9 + c4] *= inv3;
+                [loop] for (int r4 = 0; r4 < 7; ++r4)
+                {
+                    if (r4 == col3) continue;
+                    const float f3 = H[r4 * 9 + col3];
+                    if (f3 == 0.0) continue;
+                    [unroll] for (int c5 = 0; c5 < 9; ++c5) H[r4 * 9 + c5] -= f3 * H[col3 * 9 + c5];
+                }
+            }
+            if (!bad)
+            {
+                [unroll] for (int i4 = 0; i4 < 7; ++i4) { p[i4] = H[i4 * 9 + 7]; p[9 + i4] = H[i4 * 9 + 8]; }
+                p[7] = tz; p[8] = 0.0; p[16] = 0.0; p[17] = tz;
+            }
+        }
         used   = n;
         inlier = float(n) / float(total);
         if (it > 0) rms = sqrt(se / max(n, 1));
