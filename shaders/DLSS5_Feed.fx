@@ -1712,6 +1712,12 @@ float4 PS_FlowDbg(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     return FlowAgree(sDLSS5_Flow5Raw, uv, 5.0);
     #elif FLOWDBG == 26
     return FlowAgree(sDLSS5_Flow6Raw, uv, 6.0);
+    #elif FLOWDBG == 42
+    return float4(tex2Dlod(sDLSS5_Cam5, float4(0.5, 0.5, 0.0, 0.0)).zw / 16.0, 0.0, 0.0);
+    #elif FLOWDBG == 43
+    return float4(tex2Dlod(sDLSS5_Cam5, float4(0.5, 0.5, 0.0, 0.0)).y * 8.0, tex2Dlod(sDLSS5_Cam4, float4(0.5, 0.5, 0.0, 0.0)).w, 0.0, 0.0);
+    #elif FLOWDBG == 41
+    return float4(ReShade::GetLinearizedDepth(uv) * 60.0, tex2Dlod(ReShade::DepthBuffer, float4(uv, 0.0, 0.0)).x * 60.0, 0.0, 0.0);
     #else
     return 0.0;
     #endif
@@ -1733,7 +1739,41 @@ float4 PS_FlowDbg(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 // Without a depth buffer worth the name (a capture, a game ReShade cannot read depth from) the
 // three parallax terms are switched off and the model is what a camera that only turns and
 // zooms does to a picture.
-float ParallaxW(float d) { return (CAMERA_DEPTH || GEOM_ENABLE) ? GEOM_PARALLAX / (d + GEOM_PARALLAX) : 0.0; }
+float RawDepth(float2 uv)
+{
+    // Raw hardware depth, exactly as the game wrote it -- the same orientation/offset
+    // corrections ReShade.fxh applies in GetLinearizedDepth(), minus the linearisation
+    // (DLSS must receive the raw values; the add-on tells it whether the range is reversed).
+    float2 t = uv;
+#if RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN
+    t.y = 1.0 - t.y;
+#endif
+    t.x /= RESHADE_DEPTH_INPUT_X_SCALE;
+    t.y /= RESHADE_DEPTH_INPUT_Y_SCALE;
+#if RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET
+    t.x -= RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET * BUFFER_RCP_WIDTH;
+#else
+    t.x -= RESHADE_DEPTH_INPUT_X_OFFSET / 2.000000001;
+#endif
+#if RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET
+    t.y += RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET * BUFFER_RCP_HEIGHT;
+#else
+    t.y += RESHADE_DEPTH_INPUT_Y_OFFSET / 2.000000001;
+#endif
+    return tex2Dlod(ReShade::DepthBuffer, float4(t, 0.0, 0.0)).x;
+}
+
+// The model's depth term: the RAW depth buffer value. A perspective projection writes
+// a + b / distance into it -- whatever its near and far planes, reversed or not -- and the
+// shift of a point under a travelling camera goes with 1 / distance, so with the constant and
+// the two position terms already in the basis the raw value spans exactly what is needed, with
+// nothing to configure. (It used to be s / (linear depth + s): bounded, but not proportional
+// to 1 / distance where it matters, close to the camera -- and dependent on the far plane
+// ReShade was told. Fitted with that, a travelling shot was no better than without depth.)
+// The sky, at the far plane, is then simply "infinitely far": the camera's turning and nothing else.
+// The value is brought to 0..1 over the fitted samples (PS_FitSolve keeps the range in Cam4.zw)
+// to keep the solve well conditioned; that is an affine change and alters nothing else.
+float ParallaxRaw(float2 uv) { return (CAMERA_DEPTH || GEOM_ENABLE) ? RawDepth(uv) : 0.0; }
 
 // The model's predicted delta-UV at uv for linear depth d.
 float2 PredictMV(float2 uv, float d)
@@ -1741,7 +1781,7 @@ float2 PredictMV(float2 uv, float d)
     const float4 c = float4(0.5, 0.5, 0.0, 0.0);
     const float4 p0 = tex2Dlod(sDLSS5_Cam0, c), p1 = tex2Dlod(sDLSS5_Cam1, c), p2 = tex2Dlod(sDLSS5_Cam2, c);
     const float4 p3 = tex2Dlod(sDLSS5_Cam3, c), p4 = tex2Dlod(sDLSS5_Cam4, c);
-    const float x = uv.x - 0.5, y = uv.y - 0.5, w = ParallaxW(d);
+    const float x = uv.x - 0.5, y = uv.y - 0.5, w = (ParallaxRaw(uv) - p4.z) * p4.w;
     float B[9]; DLSS5_BASIS(B, x, y, w)
     // u: p0.xyzw p1.xyzw p2.x     v: p2.yzw p3.xyzw p4.xy
     const float u = p0.x * B[0] + p0.y * B[1] + p0.z * B[2] + p0.w * B[3] + p1.x * B[4] + p1.y * B[5] + p1.z * B[6] + p1.w * B[7] + p2.x * B[8];
@@ -1760,7 +1800,10 @@ bool FitIsUsable()
     // camera travelling past things at different distances 0.45-0.7. At 0.65 most of
     // fx-testbed's travelling frames are refused and those shots come out 2-3% less steady
     // than without the fit; at 0.5 it is 5-7%, with no test at all 9-10%.)
-    return s.z >= 40.0 && (GEOM_ENABLE ? s.x >= 0.25 : s.z >= 0.65 * s.w);
+#ifndef FITK
+    #define FITK 0.65
+#endif
+    return s.z >= 40.0 && s.z >= FITK * s.w;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2166,7 +2209,7 @@ void PS_FitSamples(float4 vpos : SV_Position, float2 uv : TEXCOORD, out float4 A
     float2 mv  = ProviderMV(suv);
     bool  valid  = true;
     float weight = 1.0;
-    if (CAMERA_MODEL && MV_PIPELINE == 0 && !GEOM_ENABLE)
+    if (CAMERA_MODEL || GEOM_ENABLE)
     {
         // For the per-pixel stage's camera vector the samples are made exact first. A provider's
         // errors are not noise that a fit averages away -- LumeniteFX reads a 0.64 px pan as
@@ -2243,9 +2286,8 @@ void PS_FitSamples(float4 vpos : SV_Position, float2 uv : TEXCOORD, out float4 A
         }
     }
     // (A capture has no depth; the fit without parallax terms must not wait for one.)
-    const float d = ReShade::GetLinearizedDepth(suv);
-    valid = valid && (d > 0.001 || !(CAMERA_DEPTH || GEOM_ENABLE)) && all(abs(mv * BUFFER_SCREEN_SIZE) < 512.0);
-    A = float4(suv.x - 0.5, suv.y - 0.5, ParallaxW(d), valid ? weight : 0.0);
+    valid = valid && all(abs(mv * BUFFER_SCREEN_SIZE) < 512.0);
+    A = float4(suv.x - 0.5, suv.y - 0.5, ParallaxRaw(suv), valid ? weight : 0.0);
     B = float4(mv, 0.0, 0.0);
 }
 
@@ -2271,13 +2313,31 @@ void PS_FitSolve(float4 vpos : SV_Position, float2 uv : TEXCOORD,
     // without depth -- by these. The tolerance closes in a step at a time -- 4 px, 2, 1, then
     // twice at the tight one -- so that each pass is judged against a fit that the worst of
     // the samples have already left.
-    const int passes = GEOM_ENABLE ? 2 : 6;
+    const int passes = 6;
     float valid = 0.0;
+    float wlo = 1e9, whi = -1e9, vsum = 0.0, vn = 0.0;
+    [loop] for (int s0 = 0; s0 < total; ++s0)
+    {
+        const int2   c0 = int2(s0 % DLSS5_FIT_W, s0 / DLSS5_FIT_W);
+        const float4 a0 = tex2Dfetch(sDLSS5_FitA, c0);
+        if (a0.w > 0.0)
+        {
+            wlo = min(wlo, a0.z); whi = max(whi, a0.z);
+            vsum += length(tex2Dfetch(sDLSS5_FitB, c0).xy * BUFFER_SCREEN_SIZE); vn += 1.0;
+        }
+    }
+    // How much the picture moves, typically: what the last passes' tolerance is a quarter of.
+    // (It was the motion at the middle of the frame -- which a camera travelling forwards does
+    // not have: the tolerance closed to a fifth of a pixel, the tracked samples are not that
+    // good, and every travelling shot was refused.)
+    const float vtyp = vsum / max(vn, 1.0);
+    const float wk = whi - wlo > 1e-7 ? 1.0 / (whi - wlo) : 0.0;
+    if (wlo > 1e8) wlo = 0.0;
     [loop] for (int it = 0; it < 6; ++it)
     {
         if (it >= passes) break;
-        const float tight = clamp(0.25 * length(float2(p[0], p[9]) * BUFFER_SCREEN_SIZE), 0.2, 1.0);
-        const float limit = GEOM_ENABLE || it < 2 ? GEOM_OUTLIER_PX : max(tight, it == 2 ? 2.0 : it == 3 ? 1.0 : 0.0);
+        const float tight = clamp(0.25 * vtyp, 0.2, 1.0);
+        const float limit = it < 2 ? GEOM_OUTLIER_PX : max(tight, it == 2 ? 2.0 : it == 3 ? 1.0 : 0.0);
         float M[45];   // upper triangle of the 9x9 normal matrix
         float ru[9], rv[9];
         [unroll] for (int z0 = 0; z0 < 45; ++z0) M[z0] = 0.0;
@@ -2292,7 +2352,7 @@ void PS_FitSolve(float4 vpos : SV_Position, float2 uv : TEXCOORD,
             const float4 b = tex2Dfetch(sDLSS5_FitB, cell);
             if (a.w <= 0.0) continue;
             if (it == 0) valid += 1.0;
-            float B[9]; DLSS5_BASIS(B, a.x, a.y, a.z)
+            float B[9]; DLSS5_BASIS(B, a.x, a.y, (a.z - wlo) * wk)
             if (it > 0)
             {
                 float pu = 0.0, pv = 0.0;
@@ -2360,7 +2420,7 @@ void PS_FitSolve(float4 vpos : SV_Position, float2 uv : TEXCOORD,
     P1 = float4(p[4],  p[5],  p[6],  p[7]);
     P2 = float4(p[8],  p[9],  p[10], p[11]);
     P3 = float4(p[12], p[13], p[14], p[15]);
-    P4 = float4(p[16], p[17], 0.0, 0.0);
+    P4 = float4(p[16], p[17], wlo, wk);
     P5 = float4(inlier, rms, used, valid);
 }
 
@@ -2419,30 +2479,6 @@ float4 PS_Global(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 float4 PS_GlobalHistory(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
     return tex2Dlod(sDLSS5_Global, float4(0.5, 0.5, 0.0, 0.0));
-}
-
-float RawDepth(float2 uv)
-{
-    // Raw hardware depth, exactly as the game wrote it -- the same orientation/offset
-    // corrections ReShade.fxh applies in GetLinearizedDepth(), minus the linearisation
-    // (DLSS must receive the raw values; the add-on tells it whether the range is reversed).
-    float2 t = uv;
-#if RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN
-    t.y = 1.0 - t.y;
-#endif
-    t.x /= RESHADE_DEPTH_INPUT_X_SCALE;
-    t.y /= RESHADE_DEPTH_INPUT_Y_SCALE;
-#if RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET
-    t.x -= RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET * BUFFER_RCP_WIDTH;
-#else
-    t.x -= RESHADE_DEPTH_INPUT_X_OFFSET / 2.000000001;
-#endif
-#if RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET
-    t.y += RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET * BUFFER_RCP_HEIGHT;
-#else
-    t.y += RESHADE_DEPTH_INPUT_Y_OFFSET / 2.000000001;
-#endif
-    return tex2Dlod(ReShade::DepthBuffer, float4(t, 0.0, 0.0)).x;
 }
 
 void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
