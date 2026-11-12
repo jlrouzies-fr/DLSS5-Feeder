@@ -554,6 +554,8 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
         struct Acc { double n = 0, err = 0, q = 0, o = 0, z = 0, sx = 0, sy = 0, tx = 0, ty = 0; };
         const XMMATRIX inv_view = XMMatrixInverse(nullptr, View3D(frame));
         Acc acc[6];   // + the perforated panel (its pixels are counted in their own class as well)
+        const int GX = 8, GY = 6;
+        Acc grid[GX * GY];   // the moving scene by region of the screen: where the vectors are wrong, in numbers
         //            hud, still textured, moving textured, moving flat, moving thin (near a depth edge)
         static const char *const names[6] = { "3d.hud", "3d.still", "3d.moving", "3d.moving.flat", "3d.moving.edge", "3d.mesh" };
         for (int y = 2; y < H - 2; ++y)
@@ -584,6 +586,11 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
                 const float mx = (c.post[i * 3] * 1023.0f - 512.0f) / 8.0f, my = (c.post[i * 3 + 1] * 1023.0f - 512.0f) / 8.0f;
                 const float e = hypotf(mx - tx, my - ty);
                 const bool mesh = cls[i] == 1 && OnMesh3D(inv_view, x, y, XMConvertHalfToFloat(c.truth[i * 4 + 2]));
+                if (k >= 2)
+                {
+                    Acc &t = grid[(y * GY / H) * GX + (x * GX / W)];
+                    t.n += 1; t.err += e; t.sx += mx; t.sy += my; t.tx += tx; t.ty += ty;
+                }
                 for (int pass = 0; pass < (mesh ? 2 : 1); ++pass)
                 {
                     Acc &a = acc[pass ? 5 : k];
@@ -600,6 +607,37 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
             printf("  f%-4d %-15s %9.0f px  truth (%6.2f,%6.2f) got (%6.2f,%6.2f)  err %5.2f px  <0.25: %5.1f%%  <1: %5.1f%%  zero %5.1f%%\n",
                    frame, names[k], a.n, a.tx / n, a.ty / n, a.sx / n, a.sy / n, a.err / n, 100 * a.q / n, 100 * a.o / n, 100 * a.z / n);
             emit(names[k], "vec", a.err / n, 100 * a.q / n, 100 * a.o / n, 100 * a.z / n);
+        }
+        for (int gy = 0; gy < GY; ++gy)
+        {
+            printf("  f%-4d grid%d", frame, gy);
+            for (int gx = 0; gx < GX; ++gx)
+            {
+                const Acc &t = grid[gy * GX + gx];
+                if (t.n < 1000) printf(" |        --        ");
+                else printf(" | %4.1f %+5.1f/%+5.1f", t.err / t.n, t.sx / t.n, t.tx / t.n);
+            }
+            printf("\n");
+        }
+        // Probes: the vector found / the true one along three lines -- up from the subtitle box,
+        // left from it, and left from the ammo counter (4K coordinates).
+        {
+            struct Line { const char *name; int x0, y0, dx, dy, n; };
+            static const Line lines[6] = { { "up  ", 1920, 1850, 0, -40, 10 }, { "left", 1200, 1930, -60, 0, 10 }, { "ammo", 3380, 1980, -50, 0, 10 },
+                                           { "bot1", 150, 2080, 380, 0, 10 }, { "bot2", 150, 1800, 380, 0, 10 }, { "fenc", 2900, 1250, 95, 0, 10 } };
+            for (const Line &l : lines)
+            {
+                printf("  f%-4d probe %s", frame, l.name);
+                for (int q = 0; q < l.n; ++q)
+                {
+                    const int x = (l.x0 + l.dx * q) * W / 3840, y = (l.y0 + l.dy * q) * H / 2160;
+                    const size_t i = static_cast<size_t>(y) * W + x;
+                    const float tx = XMConvertHalfToFloat(c.truth[i * 4]), ty = XMConvertHalfToFloat(c.truth[i * 4 + 1]);
+                    const float mx = (c.post[i * 3] * 1023.0f - 512.0f) / 8.0f, my = (c.post[i * 3 + 1] * 1023.0f - 512.0f) / 8.0f;
+                    printf(" |%+6.1f%+6.1f /%+6.1f%+6.1f", mx, my, tx, ty);
+                }
+                printf("\n");
+            }
         }
         // Where the vectors are wrong, as a picture (a third of the size): the frame on top, and
         // under it red = how far off (8 px and more is full red), green = a moving pixel that

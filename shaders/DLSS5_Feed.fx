@@ -806,6 +806,34 @@ texture DLSS5_FlowEqA6 { Width = BUFFER_WIDTH / 64; Height = BUFFER_HEIGHT / 64;
 sampler sDLSS5_FlowEqA6 { Texture = DLSS5_FlowEqA6; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = LINEAR; };
 texture DLSS5_FlowEqB6 { Width = BUFFER_WIDTH / 64; Height = BUFFER_HEIGHT / 64; Format = RGBA32F; MipLevels = 4; };
 sampler sDLSS5_FlowEqB6 { Texture = DLSS5_FlowEqB6; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = LINEAR; };
+// C = the y of the right-hand side, for all cells and for the cells that moved (A.w and B.w hold
+// the x of each).
+texture DLSS5_FlowEqC1 { Width = BUFFER_WIDTH / 2; Height = BUFFER_HEIGHT / 2; Format = RG32F; MipLevels = 9; };
+sampler sDLSS5_FlowEqC1 { Texture = DLSS5_FlowEqC1; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = LINEAR; };
+texture DLSS5_FlowEqC2 { Width = BUFFER_WIDTH / 4; Height = BUFFER_HEIGHT / 4; Format = RG32F; MipLevels = 8; };
+sampler sDLSS5_FlowEqC2 { Texture = DLSS5_FlowEqC2; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = LINEAR; };
+texture DLSS5_FlowEqC3 { Width = BUFFER_WIDTH / 8; Height = BUFFER_HEIGHT / 8; Format = RG32F; MipLevels = 7; };
+sampler sDLSS5_FlowEqC3 { Texture = DLSS5_FlowEqC3; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = LINEAR; };
+texture DLSS5_FlowEqC4 { Width = BUFFER_WIDTH / 16; Height = BUFFER_HEIGHT / 16; Format = RG32F; MipLevels = 6; };
+sampler sDLSS5_FlowEqC4 { Texture = DLSS5_FlowEqC4; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = LINEAR; };
+texture DLSS5_FlowEqC5 { Width = BUFFER_WIDTH / 32; Height = BUFFER_HEIGHT / 32; Format = RG32F; MipLevels = 5; };
+sampler sDLSS5_FlowEqC5 { Texture = DLSS5_FlowEqC5; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = LINEAR; };
+texture DLSS5_FlowEqC6 { Width = BUFFER_WIDTH / 64; Height = BUFFER_HEIGHT / 64; Format = RG32F; MipLevels = 4; };
+sampler sDLSS5_FlowEqC6 { Texture = DLSS5_FlowEqC6; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = LINEAR; };
+// Each level's SMOOTH field: what the pooled equations say, before any cell's own vector is put
+// back. The next finer level measures against it (see FlowEq).
+texture DLSS5_FlowS1 { Width = BUFFER_WIDTH / 2; Height = BUFFER_HEIGHT / 2; Format = RG16F; };
+sampler sDLSS5_FlowS1 { Texture = DLSS5_FlowS1; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
+texture DLSS5_FlowS2 { Width = BUFFER_WIDTH / 4; Height = BUFFER_HEIGHT / 4; Format = RG16F; };
+sampler sDLSS5_FlowS2 { Texture = DLSS5_FlowS2; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
+texture DLSS5_FlowS3 { Width = BUFFER_WIDTH / 8; Height = BUFFER_HEIGHT / 8; Format = RG16F; };
+sampler sDLSS5_FlowS3 { Texture = DLSS5_FlowS3; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
+texture DLSS5_FlowS4 { Width = BUFFER_WIDTH / 16; Height = BUFFER_HEIGHT / 16; Format = RG16F; };
+sampler sDLSS5_FlowS4 { Texture = DLSS5_FlowS4; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
+texture DLSS5_FlowS5 { Width = BUFFER_WIDTH / 32; Height = BUFFER_HEIGHT / 32; Format = RG16F; };
+sampler sDLSS5_FlowS5 { Texture = DLSS5_FlowS5; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
+texture DLSS5_FlowS6 { Width = BUFFER_WIDTH / 64; Height = BUFFER_HEIGHT / 64; Format = RG16F; };
+sampler sDLSS5_FlowS6 { Texture = DLSS5_FlowS6; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
 // Each coarser level as matched, before its cells are made to agree (FlowAgree).
 texture DLSS5_Flow2Raw { Width = BUFFER_WIDTH / 4; Height = BUFFER_HEIGHT / 4; Format = RGBA16F; };
 sampler sDLSS5_Flow2Raw { Texture = DLSS5_Flow2Raw; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
@@ -1037,6 +1065,9 @@ P9 Patch9Y(sampler2D s, float2 uv, float2 t)
     p.r2 = float3(tex2Dlod(s, float4(uv + float2(-t.x,  t.y), 0.0, 0.0)).y, tex2Dlod(s, float4(uv + float2(0.0,  t.y), 0.0, 0.0)).y, tex2Dlod(s, float4(uv + float2(t.x,  t.y), 0.0, 0.0)).y);
     return p;
 }
+#ifndef DPEN
+    #define DPEN 0.25
+#endif
 float P9CostL(P9 c, P9 p, P9 rs)
 {
     // (Only where standing still explains a sample nearly: a sample that changed a lot is
@@ -1050,7 +1081,7 @@ float P9CostL(P9 c, P9 p, P9 rs)
     const float3 g0 = step(abs(c.r0 - p.r0), r0.r0 + 1e-5), g1 = step(abs(c.r1 - p.r1), r0.r1 + 1e-5), g2 = step(abs(c.r2 - p.r2), r0.r2 + 1e-5);
     const float  n  = Sum3(g0) + Sum3(g1) + Sum3(g2);
     const float  d  = n > 0.5 ? (dot(c.r0 - p.r0, g0) + dot(c.r1 - p.r1, g1) + dot(c.r2 - p.r2, g2)) / n : 0.0;
-    return (Sum3(min(abs(c.r0 - p.r0 - d), r0.r0)) + Sum3(min(abs(c.r1 - p.r1 - d), r0.r1)) + Sum3(min(abs(c.r2 - p.r2 - d), r0.r2))) / 9.0 + 0.25 * abs(d) * n / 9.0;
+    return (Sum3(min(abs(c.r0 - p.r0 - d), r0.r0)) + Sum3(min(abs(c.r1 - p.r1 - d), r0.r1)) + Sum3(min(abs(c.r2 - p.r2 - d), r0.r2))) / 9.0 + DPEN * abs(d) * n / 9.0;
 }
 
 // One level of the pyramid from the one below it: four bilinear taps three quarters of a source
@@ -1061,11 +1092,14 @@ float PyrDown(sampler2D src, float2 uv, float2 st)
     return 0.25 * (tex2Dlod(src, float4(uv + float2(-o.x, -o.y), 0.0, 0.0)).x + tex2Dlod(src, float4(uv + float2(o.x, -o.y), 0.0, 0.0)).x
                  + tex2Dlod(src, float4(uv + float2(-o.x,  o.y), 0.0, 0.0)).x + tex2Dlod(src, float4(uv + float2(o.x,  o.y), 0.0, 0.0)).x);
 }
+#ifndef PYR_GAIN
+    #define PYR_GAIN 1.0
+#endif
 #define DLSS5_PYR(N, SRC_C, SRC_P, K) \
-    float  PS_PyrP##N(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return PyrDown(SRC_P, uv, BUFFER_PIXEL_SIZE * K); } \
+    float  PS_PyrP##N(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return PyrDown(SRC_P, uv, BUFFER_PIXEL_SIZE * K) * (K > 1.5 ? PYR_GAIN : 1.0); } \
     float2 PS_PyrC##N(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target \
     { \
-        const float c = PyrDown(SRC_C, uv, BUFFER_PIXEL_SIZE * K); \
+        const float c = PyrDown(SRC_C, uv, BUFFER_PIXEL_SIZE * K) * (K > 1.5 ? PYR_GAIN : 1.0); \
         return float2(c, abs(c - tex2Dlod(sDLSS5_PrevL##N, float4(uv, 0.0, 0.0)).x)); \
     }
 DLSS5_PYR(1, sDLSS5_CurLuma, sDLSS5_PrevLuma, 1.0)
@@ -1125,7 +1159,10 @@ float2 FlowTrack(sampler2D sC, sampler2D sP, float2 uv, float2 v, float cell, ou
         w[k9] = abs(b[k9] - a[k9]) <= w[k9] + FLOW_NOISE ? 1.0 : 0.0;
         cnt += w[k9];
     }
-    const bool all_in = cnt < 10.0;
+#ifndef LKMASK
+    #define LKMASK 1
+#endif
+    const bool all_in = cnt < 10.0 || LKMASK == 0 || (LKMASK == 2 && cell > 6.0);
     float sxx = 0.0, sxy = 0.0, syy = 0.0, sxt = 0.0, syt = 0.0, stt = 0.0;
     float sx = 0.0, sy = 0.0, st = 0.0, sa = 0.0, saa = 0.0, n = 0.0;
     [loop] for (int j = 1; j < 6; ++j)
@@ -1162,7 +1199,19 @@ float2 FlowTrack(sampler2D sC, sampler2D sP, float2 uv, float2 v, float cell, ou
 float2 FlowRefine(sampler2D sC, sampler2D sP, float2 uv, float2 v, float cell, inout float trust)
 {
     float lmin, res, dev;
-    const float2 v1 = FlowTrack(sC, sP, uv, v,  cell, lmin, res, dev);
+#ifndef LKIT
+    #define LKIT 2
+#endif
+#ifndef LKALL
+    #define LKALL 0
+#endif
+    float2 v1 = FlowTrack(sC, sP, uv, v,  cell, lmin, res, dev);
+    #if LKIT >= 3
+    v1 = FlowTrack(sC, sP, uv, v1, cell, lmin, res, dev);
+    #endif
+    #if LKIT >= 4
+    v1 = FlowTrack(sC, sP, uv, v1, cell, lmin, res, dev);
+    #endif
     const float2 v2 = FlowTrack(sC, sP, uv, v1, cell, lmin, res, dev);
     const float  g  = 2.0 * DLSS5_FLOW_FLOOR;
 #ifndef LKMAX
@@ -1171,7 +1220,13 @@ float2 FlowRefine(sampler2D sC, sampler2D sP, float2 uv, float2 v, float cell, i
     // (and it stayed within reach of where it started: the block match is right to half a cell
     // where it is right at all, so a step further than that is the gradients sliding along a
     // line of text or the rows of a list, not a correction)
+    #if LKALL == 1
+    const bool   ok = lmin >= g * g;
+    #elif LKALL == 2
+    const bool   ok = lmin >= g * g && all(abs(v2 - v1) <= 0.25 * cell);
+    #else
     const bool   ok = lmin >= g * g && all(abs(v2 - v1) <= 0.25 * cell) && all(abs(v2 - v) <= LKMAX * cell) && res <= 0.35 * dev + 2.0 * DLSS5_FLOW_FLOOR;
+    #endif
     // The window's weakest direction has the last word on trust either way: a block match on a
     // line is a perfect match, at any point along the line. (P9Corner, which is all the block
     // match has to go by, lets a line through that does not run along a row, a column or a
@@ -1217,7 +1272,10 @@ float4 FlowLevel(float2 uv, float lod, sampler2D coarse, bool has_coarse, sample
     // cell twice the size, and "did not move" from a level of 64 px cells says only that the
     // motion was under a few pixels.
     // -- unless the gradients of a wider window can follow it, which they often can.
-    if (has_coarse && contrast < 16.0 * DLSS5_FLOW_FLOOR)
+#ifndef FLATK
+    #define FLATK 16.0
+#endif
+    if (has_coarse && contrast < FLATK * DLSS5_FLOW_FLOOR)
     {
         float tr = 0.5 * ref_trust;
         // "Did not move", handed down to a patch that changed, is not believed at all: a HUD
@@ -1231,7 +1289,10 @@ float4 FlowLevel(float2 uv, float lod, sampler2D coarse, bool has_coarse, sample
     // The patch is where it was, to within the noise, and there was enough in it to have seen
     // it move. (This is most of a menu, and all of a still picture -- the estimator costs next
     // to nothing there.)
-    if (zero_raw <= DLSS5_FLOW_FLOOR) return float4(0.0, 0.0, FlowTrust(corner, contrast, zero_raw), changed);
+#ifndef CZ
+    #define CZ 99.0
+#endif
+    if (lod < CZ && zero_raw <= DLSS5_FLOW_FLOOR) return float4(0.0, 0.0, FlowTrust(corner, contrast, zero_raw), changed);
 
     // Zero first, with its head start: everything else has to beat it by a margin.
     const float n0 = length(ref) / cell;
@@ -1241,7 +1302,8 @@ float4 FlowLevel(float2 uv, float lod, sampler2D coarse, bool has_coarse, sample
     #define ZH 1
 #endif
 #if ZH == 1
-    float  best_cost = (zero_raw * (1.0 + 0.04 * n0) + 0.25 * DLSS5_FLOW_FLOOR * n0) * (1.0 - ZERO_BIAS) - DLSS5_FLOW_FLOOR;
+    float  best_cost = zero_raw * (1.0 + 0.04 * n0) + 0.25 * DLSS5_FLOW_FLOOR * n0;
+    if (lod < CZ) best_cost = best_cost * (1.0 - ZERO_BIAS) - DLSS5_FLOW_FLOOR;
 #elif ZH == 0
     float  best_cost = zero_raw * (1.0 + 0.04 * n0) + 0.25 * DLSS5_FLOW_FLOOR * n0;
 #else
@@ -1382,7 +1444,16 @@ float4 FlowAgree(sampler2D raw, float2 uv, float lod)
 // though neither knows it alone, and averaging their vectors -- each with nothing along its
 // own length -- gives half of it.
 // B holds the same sums over the cells that moved only: see FlowSolve.
-void FlowEq(sampler2D raw, sampler2D sC, sampler2D sP, float2 uv, float lod, out float4 A, out float4 B)
+//
+// The equations are written for the cell's motion RELATIVE TO THE COARSER LEVEL'S SMOOTH FIELD
+// at the cell (the right-hand side has G x that field taken off). What is pooled and solved is
+// then a correction to that field, the same for a neighbourhood -- not a motion, the same for a
+// neighbourhood. That matters wherever the motion itself varies across the neighbourhood, which
+// under a camera is everywhere but straight ahead: a floor under a pan runs from 55 px a frame
+// at the edge of the screen to 28 in the middle, under a dolly from -39 to +36, and one motion
+// solved for a 500 px stretch of it is 5 to 10 px wrong at either end. That was the tile
+// interiors of tools/fx-testbed's courtyard, where there is nothing else to go by.
+void FlowEq(sampler2D raw, sampler2D sC, sampler2D sP, sampler2D sS, bool has_prior, float2 uv, float lod, out float4 A, out float4 B, out float2 C)
 {
     const float  cell = exp2(lod);
     const float2 px = BUFFER_PIXEL_SIZE;
@@ -1429,12 +1500,15 @@ void FlowEq(sampler2D raw, sampler2D sC, sampler2D sP, float2 uv, float lod, out
     // it, a disocclusion -- has no say: what is left over, against the window's own contrast.
     const float dev = sqrt(max(saa - sa * sa / n, 0.0) / n);
     const float q   = 1.0 - smoothstep(0.35, 0.7, sqrt(max(stt, 0.0)) / max(dev, 1e-4));
-    const float2 v0c = v0 / cell;
+    float2 prior = 0.0;
+    if (has_prior) prior = tex2Dlod(sS, float4(uv, 0.0, 0.0)).xy;
+    const float2 v0c = (v0 - prior) / cell;
     const float2 r   = float2(sxx * v0c.x + sxy * v0c.y - sxt, sxy * v0c.x + syy * v0c.y - syt) * q;
     const float3 G   = float3(sxx, sxy, syy) * q;
     const float  mov = dot(v0, v0) > 1e-4 * cell * cell ? 1.0 : 0.0;
     A = float4(G, r.x);
-    B = float4(G * mov, r.y);
+    B = float4(G, r.x) * mov;
+    C = float2(r.y, r.y * mov);
 }
 
 // A level's field as the next level and the rest of the effect read it: for every cell, the
@@ -1449,7 +1523,7 @@ void FlowEq(sampler2D raw, sampler2D sC, sampler2D sP, float2 uv, float lod, out
 // cells that moved are pooled (B), or the still ones drag the surface next to them to a halt.
 // One that did not change at all takes everybody's word (A), which next to something still is
 // "still".
-float4 FlowSolve(sampler2D eqA, sampler2D eqB, sampler2D raw, sampler2D sC, float2 uv, float lod, int mips)
+void FlowSolve(sampler2D eqA, sampler2D eqB, sampler2D eqC, sampler2D raw, sampler2D sC, sampler2D sS, bool has_prior, float2 uv, float lod, int mips, out float4 F, out float2 S)
 {
     const float  cell  = exp2(lod);
     const float  moved = smoothstep(FLOW_NOISE, 2.0 * FLOW_NOISE, tex2Dlod(sC, float4(uv, 0.0, 0.0)).y);   // did this cell change?
@@ -1461,30 +1535,94 @@ float4 FlowSolve(sampler2D eqA, sampler2D eqB, sampler2D raw, sampler2D sC, floa
     {
         const float4 A = tex2Dlod(eqA, float4(uv, 0.0, l));
         const float4 B = tex2Dlod(eqB, float4(uv, 0.0, l));
+        const float2 C = tex2Dlod(eqC, float4(uv, 0.0, l)).xy;
         const float3 G = lerp(A.xyz, B.xyz, moved);
         const float  root = sqrt((G.x - G.z) * (G.x - G.z) + 4.0 * G.y * G.y);
         const float  lmin = 0.5 * (G.x + G.z - root), lmax = 0.5 * (G.x + G.z + root);
         if (lmin > 1e-9 && lmin > 0.01 * lmax)
         {
-            const float2 r   = float2(A.w, B.w);
+            const float2 r   = lerp(float2(A.w, C.x), float2(B.w, C.y), moved);
             const float2 sol = float2(G.z * r.x - G.y * r.y, G.x * r.y - G.y * r.x) / (G.x * G.z - G.y * G.y) * cell;   // cells -> px
             v = have ? lerp(v, sol, saturate(lmin * exp2(2.0 * l) / T)) : sol;
             have = true;
         }
     }
     const float4 own = FlowAgree(raw, uv, lod);
-    v = have ? lerp(v, own.xy, own.z) : own.xy;
-    return float4(v, own.zw);
+    // (v is the correction; the coarser level's smooth field goes back on)
+    if (has_prior) { v += tex2Dlod(sS, float4(uv, 0.0, 0.0)).xy; have = true; }
+    S = have ? v : own.xy;
+    F = float4(have ? lerp(v, own.xy, own.z) : own.xy, own.zw);
 }
-#define DLSS5_FLOW_LEVEL(N, LOD, MIPS) \
-    void   PS_FlowEq##N(float4 vpos : SV_Position, float2 uv : TEXCOORD, out float4 A : SV_Target0, out float4 B : SV_Target1) { FlowEq(sDLSS5_Flow##N##Raw, sDLSS5_CurL##N, sDLSS5_PrevL##N, uv, LOD, A, B); } \
-    float4 PS_FlowFill##N(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return FlowSolve(sDLSS5_FlowEqA##N, sDLSS5_FlowEqB##N, sDLSS5_Flow##N##Raw, sDLSS5_CurL##N, uv, LOD, MIPS); }
-DLSS5_FLOW_LEVEL(6, 6.0, 4)
-DLSS5_FLOW_LEVEL(5, 5.0, 5)
-DLSS5_FLOW_LEVEL(4, 4.0, 6)
-DLSS5_FLOW_LEVEL(3, 3.0, 7)
-DLSS5_FLOW_LEVEL(2, 2.0, 8)
-DLSS5_FLOW_LEVEL(1, 1.0, 9)
+#ifndef PRIOR
+    #define PRIOR 1
+#endif
+#define DLSS5_FLOW_LEVEL(N, LOD, MIPS, SPRIOR, HAS) \
+    void PS_FlowEq##N(float4 vpos : SV_Position, float2 uv : TEXCOORD, out float4 A : SV_Target0, out float4 B : SV_Target1, out float2 C : SV_Target2) { FlowEq(sDLSS5_Flow##N##Raw, sDLSS5_CurL##N, sDLSS5_PrevL##N, SPRIOR, HAS && PRIOR, uv, LOD, A, B, C); } \
+    void PS_FlowFill##N(float4 vpos : SV_Position, float2 uv : TEXCOORD, out float4 F : SV_Target0, out float2 S : SV_Target1) { FlowSolve(sDLSS5_FlowEqA##N, sDLSS5_FlowEqB##N, sDLSS5_FlowEqC##N, sDLSS5_Flow##N##Raw, sDLSS5_CurL##N, SPRIOR, HAS && PRIOR, uv, LOD, MIPS, F, S); }
+DLSS5_FLOW_LEVEL(6, 6.0, 4, sDLSS5_PrevMV, false)   // no coarser level: the sampler is never read
+DLSS5_FLOW_LEVEL(5, 5.0, 5, sDLSS5_FlowS6, true)
+DLSS5_FLOW_LEVEL(4, 4.0, 6, sDLSS5_FlowS5, true)
+DLSS5_FLOW_LEVEL(3, 3.0, 7, sDLSS5_FlowS4, true)
+DLSS5_FLOW_LEVEL(2, 2.0, 8, sDLSS5_FlowS3, true)
+DLSS5_FLOW_LEVEL(1, 1.0, 9, sDLSS5_FlowS2, true)
+
+// Development only: -Defines FLOWDBG=n puts another stage of the estimator where the rest of the
+// effect reads its result. n = 2..6: level n as handed down; 11..16: level n as matched;
+// 21..26: level n matched and agreed, before the pooled solve.
+#ifdef FLOWDBG
+float4 PS_FlowDbg(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+    #if FLOWDBG == 2
+    return tex2Dlod(sDLSS5_Flow2, float4(uv, 0.0, 0.0));
+    #elif FLOWDBG == 3
+    return tex2Dlod(sDLSS5_Flow3, float4(uv, 0.0, 0.0));
+    #elif FLOWDBG == 4
+    return tex2Dlod(sDLSS5_Flow4, float4(uv, 0.0, 0.0));
+    #elif FLOWDBG == 5
+    return tex2Dlod(sDLSS5_Flow5, float4(uv, 0.0, 0.0));
+    #elif FLOWDBG == 6
+    return tex2Dlod(sDLSS5_Flow6, float4(uv, 0.0, 0.0));
+    #elif FLOWDBG == 11
+    return tex2Dlod(sDLSS5_Flow1Raw, float4(uv, 0.0, 0.0));
+    #elif FLOWDBG == 12
+    return tex2Dlod(sDLSS5_Flow2Raw, float4(uv, 0.0, 0.0));
+    #elif FLOWDBG == 13
+    return tex2Dlod(sDLSS5_Flow3Raw, float4(uv, 0.0, 0.0));
+    #elif FLOWDBG == 14
+    return tex2Dlod(sDLSS5_Flow4Raw, float4(uv, 0.0, 0.0));
+    #elif FLOWDBG == 15
+    return tex2Dlod(sDLSS5_Flow5Raw, float4(uv, 0.0, 0.0));
+    #elif FLOWDBG == 16
+    return tex2Dlod(sDLSS5_Flow6Raw, float4(uv, 0.0, 0.0));
+    #elif FLOWDBG == 21
+    return FlowAgree(sDLSS5_Flow1Raw, uv, 1.0);
+    #elif FLOWDBG == 22
+    return FlowAgree(sDLSS5_Flow2Raw, uv, 2.0);
+    #elif FLOWDBG == 23
+    return FlowAgree(sDLSS5_Flow3Raw, uv, 3.0);
+    #elif FLOWDBG == 24
+    return FlowAgree(sDLSS5_Flow4Raw, uv, 4.0);
+    #elif FLOWDBG == 25
+    return FlowAgree(sDLSS5_Flow5Raw, uv, 5.0);
+    #elif FLOWDBG == 26
+    return FlowAgree(sDLSS5_Flow6Raw, uv, 6.0);
+    #elif FLOWDBG == 31
+    return float4(tex2Dlod(sDLSS5_FlowS1, float4(uv, 0.0, 0.0)).xy, 0.0, 0.0);
+    #elif FLOWDBG == 32
+    return float4(tex2Dlod(sDLSS5_FlowS2, float4(uv, 0.0, 0.0)).xy, 0.0, 0.0);
+    #elif FLOWDBG == 33
+    return float4(tex2Dlod(sDLSS5_FlowS3, float4(uv, 0.0, 0.0)).xy, 0.0, 0.0);
+    #elif FLOWDBG == 34
+    return float4(tex2Dlod(sDLSS5_FlowS4, float4(uv, 0.0, 0.0)).xy, 0.0, 0.0);
+    #elif FLOWDBG == 35
+    return float4(tex2Dlod(sDLSS5_FlowS5, float4(uv, 0.0, 0.0)).xy, 0.0, 0.0);
+    #elif FLOWDBG == 36
+    return float4(tex2Dlod(sDLSS5_FlowS6, float4(uv, 0.0, 0.0)).xy, 0.0, 0.0);
+    #else
+    return 0.0;
+    #endif
+}
+#endif
 
 #endif   // DLSS5_MV_BUILTIN
 
@@ -2599,23 +2737,26 @@ technique DLSS5_Feed
     pass PyrP6         { VertexShader = PostProcessVS; PixelShader = PS_PyrP6;         RenderTarget0 = DLSS5_PrevL6; }
     pass PyrC6         { VertexShader = PostProcessVS; PixelShader = PS_PyrC6;         RenderTarget0 = DLSS5_CurL6; }
     pass Flow6         { VertexShader = PostProcessVS; PixelShader = PS_Flow6;         RenderTarget0 = DLSS5_Flow6Raw; }
-    pass FlowEq6       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq6;       RenderTarget0 = DLSS5_FlowEqA6; RenderTarget1 = DLSS5_FlowEqB6; }
-    pass FlowFill6     { VertexShader = PostProcessVS; PixelShader = PS_FlowFill6;     RenderTarget0 = DLSS5_Flow6; }
+    pass FlowEq6       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq6;       RenderTarget0 = DLSS5_FlowEqA6; RenderTarget1 = DLSS5_FlowEqB6; RenderTarget2 = DLSS5_FlowEqC6; }
+    pass FlowFill6     { VertexShader = PostProcessVS; PixelShader = PS_FlowFill6;     RenderTarget0 = DLSS5_Flow6; RenderTarget1 = DLSS5_FlowS6; }
     pass Flow5         { VertexShader = PostProcessVS; PixelShader = PS_Flow5;         RenderTarget0 = DLSS5_Flow5Raw; }
-    pass FlowEq5       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq5;       RenderTarget0 = DLSS5_FlowEqA5; RenderTarget1 = DLSS5_FlowEqB5; }
-    pass FlowFill5     { VertexShader = PostProcessVS; PixelShader = PS_FlowFill5;     RenderTarget0 = DLSS5_Flow5; }
+    pass FlowEq5       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq5;       RenderTarget0 = DLSS5_FlowEqA5; RenderTarget1 = DLSS5_FlowEqB5; RenderTarget2 = DLSS5_FlowEqC5; }
+    pass FlowFill5     { VertexShader = PostProcessVS; PixelShader = PS_FlowFill5;     RenderTarget0 = DLSS5_Flow5; RenderTarget1 = DLSS5_FlowS5; }
     pass Flow4         { VertexShader = PostProcessVS; PixelShader = PS_Flow4;         RenderTarget0 = DLSS5_Flow4Raw; }
-    pass FlowEq4       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq4;       RenderTarget0 = DLSS5_FlowEqA4; RenderTarget1 = DLSS5_FlowEqB4; }
-    pass FlowFill4     { VertexShader = PostProcessVS; PixelShader = PS_FlowFill4;     RenderTarget0 = DLSS5_Flow4; }
+    pass FlowEq4       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq4;       RenderTarget0 = DLSS5_FlowEqA4; RenderTarget1 = DLSS5_FlowEqB4; RenderTarget2 = DLSS5_FlowEqC4; }
+    pass FlowFill4     { VertexShader = PostProcessVS; PixelShader = PS_FlowFill4;     RenderTarget0 = DLSS5_Flow4; RenderTarget1 = DLSS5_FlowS4; }
     pass Flow3         { VertexShader = PostProcessVS; PixelShader = PS_Flow3;         RenderTarget0 = DLSS5_Flow3Raw; }
-    pass FlowEq3       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq3;       RenderTarget0 = DLSS5_FlowEqA3; RenderTarget1 = DLSS5_FlowEqB3; }
-    pass FlowFill3     { VertexShader = PostProcessVS; PixelShader = PS_FlowFill3;     RenderTarget0 = DLSS5_Flow3; }
+    pass FlowEq3       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq3;       RenderTarget0 = DLSS5_FlowEqA3; RenderTarget1 = DLSS5_FlowEqB3; RenderTarget2 = DLSS5_FlowEqC3; }
+    pass FlowFill3     { VertexShader = PostProcessVS; PixelShader = PS_FlowFill3;     RenderTarget0 = DLSS5_Flow3; RenderTarget1 = DLSS5_FlowS3; }
     pass Flow2         { VertexShader = PostProcessVS; PixelShader = PS_Flow2;         RenderTarget0 = DLSS5_Flow2Raw; }
-    pass FlowEq2       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq2;       RenderTarget0 = DLSS5_FlowEqA2; RenderTarget1 = DLSS5_FlowEqB2; }
-    pass FlowFill2     { VertexShader = PostProcessVS; PixelShader = PS_FlowFill2;     RenderTarget0 = DLSS5_Flow2; }
+    pass FlowEq2       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq2;       RenderTarget0 = DLSS5_FlowEqA2; RenderTarget1 = DLSS5_FlowEqB2; RenderTarget2 = DLSS5_FlowEqC2; }
+    pass FlowFill2     { VertexShader = PostProcessVS; PixelShader = PS_FlowFill2;     RenderTarget0 = DLSS5_Flow2; RenderTarget1 = DLSS5_FlowS2; }
     pass Flow1         { VertexShader = PostProcessVS; PixelShader = PS_Flow1;         RenderTarget0 = DLSS5_Flow1Raw; }
-    pass FlowEq1       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq1;       RenderTarget0 = DLSS5_FlowEqA1; RenderTarget1 = DLSS5_FlowEqB1; }
-    pass FlowFill1     { VertexShader = PostProcessVS; PixelShader = PS_FlowFill1;     RenderTarget0 = DLSS5_Flow1; }
+    pass FlowEq1       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq1;       RenderTarget0 = DLSS5_FlowEqA1; RenderTarget1 = DLSS5_FlowEqB1; RenderTarget2 = DLSS5_FlowEqC1; }
+    pass FlowFill1     { VertexShader = PostProcessVS; PixelShader = PS_FlowFill1;     RenderTarget0 = DLSS5_Flow1; RenderTarget1 = DLSS5_FlowS1; }
+#ifdef FLOWDBG
+    pass FlowDbg       { VertexShader = PostProcessVS; PixelShader = PS_FlowDbg;       RenderTarget0 = DLSS5_Flow1; }
+#endif
 #endif
     pass FitSamples    { VertexShader = PostProcessVS; PixelShader = PS_FitSamples;    RenderTarget0 = DLSS5_FitA; RenderTarget1 = DLSS5_FitB; }
     pass FitSolve      { VertexShader = PostProcessVS; PixelShader = PS_FitSolve;      RenderTarget0 = DLSS5_Cam0; RenderTarget1 = DLSS5_Cam1; RenderTarget2 = DLSS5_Cam2; RenderTarget3 = DLSS5_Cam3; RenderTarget4 = DLSS5_Cam4; RenderTarget5 = DLSS5_Cam5; }
