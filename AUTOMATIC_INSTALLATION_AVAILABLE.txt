@@ -41,11 +41,12 @@ downloads (once, into a cache) and installs:
     Vulkan layer plus the ReShadeApps.ini entry, whichever your game needs
   - this feeder, from the latest release (addon32 + host64\ for a 32-bit game)
   - the ReShade framework headers
-  - LumeniteFX (motion vectors)
+  - nothing for motion vectors: the feeder's own shader estimates them
+    (LumeniteFX only if you ask for it with -MvProvider 3, or already use it)
   - your chosen neural consumer, and both NVIDIA runtimes
   - dgVoodoo2, for Direct3D 8/9 games
   - ReShade.ini and ReShadePreset.ini, with the motion-vector provider selected
-    and both techniques enabled in the right order
+    and the technique enabled
 
 Existing files are merged into and backed up, never replaced. It finishes with
 a read-only verification pass and prints [ OK ] / [WARN] / [FAIL] for every
