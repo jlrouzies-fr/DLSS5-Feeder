@@ -66,7 +66,7 @@ static void FeedOnVkDeviceGeneration();
 #include "feed_panel.h"     // the feeder's own in-game panel, the same in every build of the add-on
 #include "feed_depthsrc.h"  // which buffer Generic Depth binds, against the back buffer and any MSAA depth (#145)
 
-#define FEED_VERSION "1.19.1-beta.1"
+#define FEED_VERSION "2.0.0"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif
