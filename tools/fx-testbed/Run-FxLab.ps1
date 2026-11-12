@@ -125,7 +125,15 @@ Copy-Item (Join-Path $repo 'deploy\motion-vectors\lumenitefx\Shaders\*') $sh -Re
 Copy-Item (Join-Path $repo 'deploy\motion-vectors\lumenitefx\Textures\*') (Join-Path $rig 'reshade-shaders\Textures') -Force
 foreach ($d in $ExtraShaderDirs) { Copy-Item (Join-Path $d '*') $sh -Recurse -Force }
 Copy-Item $Shader (Join-Path $sh 'DLSS5_Feed.fx') -Force
-if ($Oracle) { Copy-Item (Join-Path $PSScriptRoot 'fxlab_Oracle.fx') $sh -Force }
+if ($Oracle)
+{
+    Copy-Item (Join-Path $PSScriptRoot 'fxlab_Oracle.fx') $sh -Force
+    # -Oracle means the exact vectors are USED: the technique that writes them runs first, and the
+    # feed reads texMotionVectors. (Without this the switch only copied the file; a run that did
+    # not also name the technique measured all-zero vectors and called them exact.)
+    if ($Techniques -notmatch 'fxlab_Oracle') { $Techniques = 'fxlab_Oracle@fxlab_Oracle.fx,' + (($Techniques -split ',' | ? { $_ -notmatch 'Lumenite_Kernel' }) -join ',') }
+    $Provider = 0
+}
 
 @"
 [ADDON]

@@ -322,7 +322,8 @@ uniform int MV_SNAP <
                  "that from; a finished picture has none, so the resampling only ever softens. A whole-pixel\n"
                  "vector fetches history pixel for pixel, and most 2D motion (menus, lists, tickers) IS in\n"
                  "whole pixels. The default takes the whole-pixel vector wherever last frame, fetched at\n"
-                 "it, IS this pixel; genuinely fractional motion keeps its fraction.";
+                 "it, IS this pixel and the vector found is within a quarter pixel of it already;\n"
+                 "genuinely fractional motion keeps its fraction.";
 > = 0;
 
 uniform int MOVING_HISTORY <
@@ -604,7 +605,8 @@ uniform int DEPTH_USE <
     ui_tooltip = "With a depth buffer the effect knows which pixels belong to the same surface. It then:\n"
                  " - does not let a cell's vector point at a different surface a frame ago;\n"
                  " - gives each pixel the vector of the cells on its own side of an outline;\n"
-                 " - drops the vector of a pixel that was hidden a frame ago (the depth test below);\n"
+                 " - gives a pixel that was hidden a frame ago the motion of its own surface, and flags\n"
+                 "   it (the depth test below);\n"
                  " - and, if the camera fit is enabled, fits it with the terms of a camera that travels.\n\n"
                  "Automatic checks the depth buffer every frame before believing it: it has to vary across\n"
                  "the screen (a capture, or a game ReShade finds no depth for, has none), and -- moved by\n"
@@ -995,6 +997,86 @@ float2 ProviderSurfaceMV(float2 uv)
 #else
     return ProviderMV(uv);
 #endif
+}
+
+// ---------------------------------------------------------------------------------------------
+// Camera model. Screen position x, y in -0.5..0.5, inverse-depth term w = s / (depth + s).
+// Basis (9 terms):  1, x, y, x^2, xy, y^2, w, xw, yw  -- the small-rotation flow field of a
+// pinhole camera is quadratic in the image position, and translation adds terms in 1/Z.
+// Both flow components share the basis; the fit solves them together (two right-hand sides).
+// ---------------------------------------------------------------------------------------------
+
+#define DLSS5_BASIS(B, x, y, w) \
+    B[0] = 1.0; B[1] = x; B[2] = y; B[3] = x * x; B[4] = x * y; B[5] = y * y; B[6] = w; B[7] = x * w; B[8] = y * w;
+
+// Without a depth buffer worth the name (a capture, a game ReShade cannot read depth from) the
+// three parallax terms are switched off and the model is what a camera that only turns and
+// zooms does to a picture.
+float RawDepth(float2 uv)
+{
+    // Raw hardware depth, exactly as the game wrote it -- the same orientation/offset
+    // corrections ReShade.fxh applies in GetLinearizedDepth(), minus the linearisation
+    // (DLSS must receive the raw values; the add-on tells it whether the range is reversed).
+    float2 t = uv;
+#if RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN
+    t.y = 1.0 - t.y;
+#endif
+    t.x /= RESHADE_DEPTH_INPUT_X_SCALE;
+    t.y /= RESHADE_DEPTH_INPUT_Y_SCALE;
+#if RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET
+    t.x -= RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET * BUFFER_RCP_WIDTH;
+#else
+    t.x -= RESHADE_DEPTH_INPUT_X_OFFSET / 2.000000001;
+#endif
+#if RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET
+    t.y += RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET * BUFFER_RCP_HEIGHT;
+#else
+    t.y += RESHADE_DEPTH_INPUT_Y_OFFSET / 2.000000001;
+#endif
+    return tex2Dlod(ReShade::DepthBuffer, float4(t, 0.0, 0.0)).x;
+}
+
+// The model's depth term: the RAW depth buffer value. A perspective projection writes
+// a + b / distance into it -- whatever its near and far planes, reversed or not -- and the
+// shift of a point under a travelling camera goes with 1 / distance, so with the constant and
+// the two position terms already in the basis the raw value spans exactly what is needed, with
+// nothing to configure. (It used to be s / (linear depth + s): bounded, but not proportional
+// to 1 / distance where it matters, close to the camera -- and dependent on the far plane
+// ReShade was told. Fitted with that, a travelling shot was no better than without depth.)
+// The sky, at the far plane, is then simply "infinitely far": the camera's turning and nothing else.
+// The value is brought to 0..1 over the fitted samples (PS_FitSolve keeps the range in Cam4.zw)
+// to keep the solve well conditioned; that is an affine change and alters nothing else.
+float ParallaxRaw(float2 uv) { return CamDepthOn() ? RawDepth(uv) : 0.0; }
+
+// The model's predicted delta-UV at uv for linear depth d.
+float2 PredictMV(float2 uv, float d)
+{
+    const float4 c = float4(0.5, 0.5, 0.0, 0.0);
+    const float4 p0 = tex2Dlod(sDLSS5_Cam0, c), p1 = tex2Dlod(sDLSS5_Cam1, c), p2 = tex2Dlod(sDLSS5_Cam2, c);
+    const float4 p3 = tex2Dlod(sDLSS5_Cam3, c), p4 = tex2Dlod(sDLSS5_Cam4, c);
+    const float x = uv.x - 0.5, y = uv.y - 0.5, w = (ParallaxRaw(uv) - p4.z) * p4.w;
+    float B[9]; DLSS5_BASIS(B, x, y, w)
+    // u: p0.xyzw p1.xyzw p2.x     v: p2.yzw p3.xyzw p4.xy
+    const float u = p0.x * B[0] + p0.y * B[1] + p0.z * B[2] + p0.w * B[3] + p1.x * B[4] + p1.y * B[5] + p1.z * B[6] + p1.w * B[7] + p2.x * B[8];
+    const float v = p2.y * B[0] + p2.z * B[1] + p2.w * B[2] + p3.x * B[3] + p3.y * B[4] + p3.z * B[5] + p3.w * B[6] + p4.x * B[7] + p4.y * B[8];
+    return float2(u, v);
+}
+
+bool FitIsUsable()
+{
+    // x = inlier share of the whole grid, y = rms px, z = samples used, w = samples offered
+    const float4 s = tex2Dlod(sDLSS5_Cam5, float4(0.5, 0.5, 0.0, 0.0));
+    // For the experimental geometry vectors: a quarter of the grid. For the per-pixel stage's
+    // camera vector, whose samples are only the trackable ones: two thirds of those -- one
+    // motion has to explain that much of what can be followed at all, or there is no "the
+    // camera". (It is a blunt test. With some hundred samples a pan scores 0.7-0.9 and a
+    // camera travelling past things at different distances 0.45-0.7. At 0.65 most of
+    // fx-testbed's travelling frames are refused and those shots come out 2-3% less steady
+    // than without the fit; at 0.5 it is 5-7%, with no test at all 9-10%.)
+#ifndef FITK
+    #define FITK 0.65
+#endif
+    return s.z >= 40.0 && s.z >= FITK * s.w;
 }
 
 // One whole vector of the provider -- the cell under uv, NOT an interpolation between cells --
@@ -1897,6 +1979,39 @@ DLSS5_FLOW_LEVEL(1, 1.0, sDLSS5_Flow2L, true)
 #ifndef BASE_FITS
     #define BASE_FITS 2
 #endif
+// BASE_VFIT: a V through the three costs instead of a parabola (the textbook cure for the
+// way a parabola on absolute differences pulls every fraction towards the whole texel).
+// Measured: a slow pan gains (0.30 -> 0.25 px) and things that move by themselves lose more
+// (0.41 -> 0.66: along the stripes of a rolling ball a V has no slope to stand on). Off.
+#ifndef BASE_VFIT
+    #define BASE_VFIT 0
+#endif
+// BASE_CAM: the camera fit inside the estimator (see BaseLevel). 1 = where a cell starts
+// from; 2 = and what it ends on wherever that fits about as well. OFF BY DEFAULT, for the same
+// reason as CAMERA_MODEL: on tools/fx-testbed it makes the vectors more exact (under a pan
+// 0.93 -> 0.78 px on textured surfaces, 4.0 -> 3.0 at outlines; with depth it also helps a
+// strafe) and the DLAA picture no better -- 0.57 from the input against 0.51 under the pan,
+// the turning point of the pan 1.37 times as restless as the input against 1.32. Something
+// that consumes the vectors AS vectors (frame generation, motion blur) would be better off
+// with it on. It costs the fit: about half a millisecond.
+#ifndef BASE_CAM
+    #define BASE_CAM 0
+#endif
+#ifndef BASE_CAM_K
+    #define BASE_CAM_K 1.1
+#endif
+#ifndef BASE_CAM_F
+    #define BASE_CAM_F 0.5
+#endif
+#ifndef BASE_CAM_CELL
+    #define BASE_CAM_CELL 64.0
+#endif
+#ifndef BASE_FITM
+    #define BASE_FITM 1.0
+#endif
+#ifndef BASE_FITF
+    #define BASE_FITF 0.0
+#endif
 // Two more uses of depth inside the estimator, measured and left off: weighing a patch's points
 // by whether they are on the middle's surface (BASE_DW) and letting only cells of the same
 // surface vote (BASE_DV). On tools/fx-testbed the first is a wash (better at the outlines under
@@ -1985,6 +2100,24 @@ float4 BaseLevel(float2 uv, float cell, sampler2D sM, sampler2D sMp, float tex, 
     }
     float2 best   = top ? float2(0.0, 0.0) : tex2Dlod(coarse, float4(uv, 0.0, 0.0)).xy;
     float  best_e = BaseCost(sM, sMp, uv, best, 0.0, tex, w, dc, dz);
+#if BASE_CAM
+    // What the camera did a frame ago, at this cell's depth (the fit of last frame's field: this
+    // frame's does not exist yet, and a camera does not change its mind in a frame -- what it
+    // changed by, the walk below makes up). Where that explains the cell about as well as what
+    // the level above found, it is where the cell starts from: of two answers the picture cannot
+    // tell apart -- this bar of a railing or the next one, anywhere along a plain edge -- the
+    // camera's is the right one far more often than not, and it knows about depth outlines,
+    // which a level of cells does not. A cell of something that moves by itself is not
+    // explained by it and starts where it always did.
+    float2 cv = 0.0;
+    float  ce = 1e9;
+    if (!top && cell <= BASE_CAM_CELL && FitIsUsable())
+    {
+        cv = PredictMV(uv, 0.0) * BUFFER_SCREEN_SIZE;
+        ce = BaseCost(sM, sMp, uv, cv, 0.0, tex, w, dc, dz);
+        if (ce <= best_e * BASE_CAM_K + BASE_CAM_F * DLSS5_FLOW_FLOOR) { best = cv; best_e = min(ce, best_e); }
+    }
+#endif
     if (top)
     {
         // Nothing above: none, or last frame's vector if that fits better, and from there three
@@ -2021,13 +2154,20 @@ float4 BaseLevel(float2 uv, float cell, sampler2D sM, sampler2D sMp, float tex, 
     // fractional vector looks a little worse than the whole one next to it.)
     [unroll] for (int fit = 0; fit < BASE_FITS; ++fit)
     {
-        const float h  = 0.5 * tex;
+        const float h  = (fit < 2 ? 0.5 : 0.25) * tex;
         const float el = BaseCost(sM, sMp, uv, best, float2(-h, 0.0), tex, w, dc, dz), er = BaseCost(sM, sMp, uv, best, float2(h, 0.0), tex, w, dc, dz);
         const float eu = BaseCost(sM, sMp, uv, best, float2(0.0, -h), tex, w, dc, dz), ed = BaseCost(sM, sMp, uv, best, float2(0.0, h), tex, w, dc, dz);
+#if BASE_VFIT
+        // A sum of absolute differences falls away from its minimum in two straight lines, not
+        // in a parabola: the minimum is where the two lines of equal and opposite slope
+        // through the three costs meet.
+        const float ax = max(el, er) - best_e, ay = max(eu, ed) - best_e;
+#else
         const float ax = el - 2.0 * best_e + er, ay = eu - 2.0 * best_e + ed;
+#endif
         const float2 f = h * float2(ax > 1e-9 ? clamp(0.5 * (el - er) / ax, -1.0, 1.0) : 0.0, ay > 1e-9 ? clamp(0.5 * (eu - ed) / ay, -1.0, 1.0) : 0.0);
         const float ef = BaseCost(sM, sMp, uv, best, f, tex, w, dc, dz);
-        if (ef < best_e) { best += f; best_e = ef; }
+        if (ef < best_e * BASE_FITM - BASE_FITF * DLSS5_FLOW_FLOOR) { best += f; best_e = ef; }
     }
     // "Did not move" is not one more candidate here: on anything that slides along its own
     // pattern (a striped ball rolling sideways) and under any motion of less than a texel it
@@ -2040,6 +2180,15 @@ float4 BaseLevel(float2 uv, float cell, sampler2D sM, sampler2D sMp, float tex, 
         const float e0 = BaseCost(sM, sMp, uv, float2(0.0, 0.0), 0.0, tex, w, dc, dz);
         if (e0 < BASE_ZK * best_e - 0.25 * DLSS5_FLOW_FLOOR) { best = 0.0; best_e = e0; }
     }
+#if BASE_CAM >= 2
+    // And last: whatever the search ended on, if the camera's answer explains the cell about as
+    // well, it IS the answer. The candidates above are taken on any improvement at all, and
+    // where the picture has nothing to say (the far end of a floor in haze, a sky, the inside
+    // of a plain wall) "any improvement" is noise -- such a cell ended on whichever candidate
+    // the noise liked, mostly "did not move". By construction this changes nothing the picture
+    // can tell: only cells where the two answers fit alike.
+    if (ce <= best_e * BASE_CAM_K + BASE_CAM_F * DLSS5_FLOW_FLOOR) { best = cv; best_e = ce; }
+#endif
     const float mad = BaseMad(sM, uv, tex);
     return float4(best, 1.0 - smoothstep(0.3, 0.7, best_e / (mad + DLSS5_FLOW_FLOOR)), 0.0);
 }
@@ -2077,6 +2226,74 @@ float4 PS_BaseMatch2(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Targe
 float4 PS_BaseMatch1(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseLevel(uv, 2.0,  sDLSS5_CurLuma, sDLSS5_PrevLuma, 1.0, sDLSS5_Flow2L, false); }
 float4 PS_BaseAgree2(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseAgree(sDLSS5_Flow2Raw, uv, 4.0); }
 float4 PS_BaseAgree1(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseAgree(sDLSS5_Flow1Raw, uv, 2.0); }
+// The finish. A cell's vector comes from thirteen points, and the last fraction of a pixel of
+// it is as noisy as thirteen points make it: under a slow pan, where a fraction of a pixel is
+// all there is, neighbouring cells of one wall disagree by a quarter of a pixel. The vote above
+// does not help there -- it picks one of the cells, noise and all. So, last of all, each cell
+// takes the mean of the cells around it that say THE SAME THING it does (within half a pixel
+// and a twentieth of its length): the noise averages out, and a neighbour that moves
+// differently -- the other side of an outline -- is not one of them, so nothing is blurred
+// across. A cell that stands still stays exactly still, and still cells have no say in a
+// moving one.
+// With a depth buffer (see DEPTH_USE) the cells also have to be on the cell's own surface, and
+// one thing more is possible: a cell that nothing explains (it was hidden a frame ago, or sits
+// astride an outline) takes what the explained cells of its surface say instead of its own
+// guess -- the wall that comes out from behind a moving thing moves with the wall.
+// BASE_FIN: how many times (0 = off). BASE_FIN_R: spacing of the 5x5, in cells.
+// MEASURED AND LEFT OFF. The vectors gain a few percent on every shot of tools/fx-testbed
+// (textured error under a pan 0.81 -> 0.77 px) and the DLAA picture loses: as far from the
+// input again as with the camera fit (0.61 against 0.51 under the pan), and no steadier. What
+// a temporal pass wants of a cell is the vector that lines its history up with the picture
+// THERE, and that is what the match found -- the mean of its neighbours is nearer the true
+// motion and further from that.
+#ifndef BASE_FIN
+    #define BASE_FIN 0
+#endif
+#ifndef BASE_FIN_R
+    #define BASE_FIN_R 1.0
+#endif
+#ifndef BASE_FIN_T
+    #define BASE_FIN_T 0.5
+#endif
+#ifndef BASE_FIN_FILL
+    #define BASE_FIN_FILL 1
+#endif
+float4 BaseFin(sampler2D src, float2 uv, float cell)
+{
+    const float2 t  = BUFFER_PIXEL_SIZE * cell * BASE_FIN_R;
+    const bool   dz = DepthUsable();
+    const float4 c  = tex2Dlod(src, float4(uv, 0.0, 0.0));
+    if (dot(c.xy, c.xy) == 0.0) return c;
+    const float  tol = BASE_FIN_T + 0.05 * length(c.xy);
+    float  d[25];
+    float4 v[25];
+    [unroll] for (int k = 0; k < 25; ++k)
+    {
+        const float2 at = uv + float2(k % 5 - 2, k / 5 - 2) * t;
+        v[k] = tex2Dlod(src, float4(at, 0.0, 0.0));
+        d[k] = dz ? ReShade::GetLinearizedDepth(at) : 0.0;
+    }
+    float2 sum = 0.0, fsum = 0.0;
+    float  ws = 0.0, fws = 0.0;
+    [unroll] for (int i = 0; i < 25; ++i)
+    {
+        const float moving = dot(v[i].xy, v[i].xy) > 0.0 ? 1.0 : 0.0;
+        const float surf   = dz && i != 12 ? OnSurface(d[12], d[i], d[24 - i]) : 1.0;
+        const float near   = 1.0 - smoothstep(tol, 2.0 * tol, max(abs(v[i].x - c.x), abs(v[i].y - c.y)));
+        const float w      = moving * surf * near * (0.1 + v[i].z);
+        sum  += w * v[i].xy; ws += w;
+        const float fw     = moving * surf * v[i].z;
+        fsum += fw * v[i].xy; fws += fw;
+    }
+    float2 o = sum / max(ws, 1e-6);
+#if BASE_FIN_FILL
+    if (dz && fws > 2.0) o = lerp(fsum / fws, o, smoothstep(0.0, 0.5, c.z));
+#endif
+    return float4(o, c.zw);
+}
+float4 PS_BaseFinA(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseFin(sDLSS5_ProviderMVPoint, uv, 2.0); }
+float4 PS_BaseFinB(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseFin(sDLSS5_Flow1Raw, uv, 2.0); }
+float4 PS_BaseFinC(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return tex2Dlod(sDLSS5_Flow1Raw, float4(uv, 0.0, 0.0)); }
 // The field the rest of the effect reads is at half resolution; a base that stops above that is
 // read up to it bilinearly.
 float4 PS_BaseOut3(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return tex2Dlod(sDLSS5_Flow3L, float4(uv, 0.0, 0.0)); }
@@ -2130,6 +2347,10 @@ float4 PS_FlowDbg(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     return float4(tex2Dlod(sDLSS5_Cam5, float4(0.5, 0.5, 0.0, 0.0)).zw / 16.0, 0.0, 0.0);
     #elif FLOWDBG == 43
     return float4(tex2Dlod(sDLSS5_Cam5, float4(0.5, 0.5, 0.0, 0.0)).y * 8.0, tex2Dlod(sDLSS5_Cam4, float4(0.5, 0.5, 0.0, 0.0)).w, 0.0, 0.0);
+    #elif FLOWDBG == 47
+    return FitIsUsable() ? float4(PredictMV(uv, 0.0) * BUFFER_SCREEN_SIZE, 1.0, 0.0) : float4(0.0, 0.0, 0.0, 0.0);
+    #elif FLOWDBG == 48
+    return FitIsUsable() ? float4(PredictMV(uv, 0.0) * BUFFER_SCREEN_SIZE, 1.0, 0.0) : tex2Dlod(sDLSS5_Flow1Raw, float4(uv, 0.0, 0.0));
     #elif FLOWDBG == 53
     return tex2Dlod(sDLSS5_Flow3L, float4(uv, 0.0, 0.0));
     #elif FLOWDBG == 44
@@ -2147,86 +2368,6 @@ float4 PS_FlowDbg(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 #endif
 
 #endif   // DLSS5_MV_BUILTIN
-
-// ---------------------------------------------------------------------------------------------
-// Camera model. Screen position x, y in -0.5..0.5, inverse-depth term w = s / (depth + s).
-// Basis (9 terms):  1, x, y, x^2, xy, y^2, w, xw, yw  -- the small-rotation flow field of a
-// pinhole camera is quadratic in the image position, and translation adds terms in 1/Z.
-// Both flow components share the basis; the fit solves them together (two right-hand sides).
-// ---------------------------------------------------------------------------------------------
-
-#define DLSS5_BASIS(B, x, y, w) \
-    B[0] = 1.0; B[1] = x; B[2] = y; B[3] = x * x; B[4] = x * y; B[5] = y * y; B[6] = w; B[7] = x * w; B[8] = y * w;
-
-// Without a depth buffer worth the name (a capture, a game ReShade cannot read depth from) the
-// three parallax terms are switched off and the model is what a camera that only turns and
-// zooms does to a picture.
-float RawDepth(float2 uv)
-{
-    // Raw hardware depth, exactly as the game wrote it -- the same orientation/offset
-    // corrections ReShade.fxh applies in GetLinearizedDepth(), minus the linearisation
-    // (DLSS must receive the raw values; the add-on tells it whether the range is reversed).
-    float2 t = uv;
-#if RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN
-    t.y = 1.0 - t.y;
-#endif
-    t.x /= RESHADE_DEPTH_INPUT_X_SCALE;
-    t.y /= RESHADE_DEPTH_INPUT_Y_SCALE;
-#if RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET
-    t.x -= RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET * BUFFER_RCP_WIDTH;
-#else
-    t.x -= RESHADE_DEPTH_INPUT_X_OFFSET / 2.000000001;
-#endif
-#if RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET
-    t.y += RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET * BUFFER_RCP_HEIGHT;
-#else
-    t.y += RESHADE_DEPTH_INPUT_Y_OFFSET / 2.000000001;
-#endif
-    return tex2Dlod(ReShade::DepthBuffer, float4(t, 0.0, 0.0)).x;
-}
-
-// The model's depth term: the RAW depth buffer value. A perspective projection writes
-// a + b / distance into it -- whatever its near and far planes, reversed or not -- and the
-// shift of a point under a travelling camera goes with 1 / distance, so with the constant and
-// the two position terms already in the basis the raw value spans exactly what is needed, with
-// nothing to configure. (It used to be s / (linear depth + s): bounded, but not proportional
-// to 1 / distance where it matters, close to the camera -- and dependent on the far plane
-// ReShade was told. Fitted with that, a travelling shot was no better than without depth.)
-// The sky, at the far plane, is then simply "infinitely far": the camera's turning and nothing else.
-// The value is brought to 0..1 over the fitted samples (PS_FitSolve keeps the range in Cam4.zw)
-// to keep the solve well conditioned; that is an affine change and alters nothing else.
-float ParallaxRaw(float2 uv) { return CamDepthOn() ? RawDepth(uv) : 0.0; }
-
-// The model's predicted delta-UV at uv for linear depth d.
-float2 PredictMV(float2 uv, float d)
-{
-    const float4 c = float4(0.5, 0.5, 0.0, 0.0);
-    const float4 p0 = tex2Dlod(sDLSS5_Cam0, c), p1 = tex2Dlod(sDLSS5_Cam1, c), p2 = tex2Dlod(sDLSS5_Cam2, c);
-    const float4 p3 = tex2Dlod(sDLSS5_Cam3, c), p4 = tex2Dlod(sDLSS5_Cam4, c);
-    const float x = uv.x - 0.5, y = uv.y - 0.5, w = (ParallaxRaw(uv) - p4.z) * p4.w;
-    float B[9]; DLSS5_BASIS(B, x, y, w)
-    // u: p0.xyzw p1.xyzw p2.x     v: p2.yzw p3.xyzw p4.xy
-    const float u = p0.x * B[0] + p0.y * B[1] + p0.z * B[2] + p0.w * B[3] + p1.x * B[4] + p1.y * B[5] + p1.z * B[6] + p1.w * B[7] + p2.x * B[8];
-    const float v = p2.y * B[0] + p2.z * B[1] + p2.w * B[2] + p3.x * B[3] + p3.y * B[4] + p3.z * B[5] + p3.w * B[6] + p4.x * B[7] + p4.y * B[8];
-    return float2(u, v);
-}
-
-bool FitIsUsable()
-{
-    // x = inlier share of the whole grid, y = rms px, z = samples used, w = samples offered
-    const float4 s = tex2Dlod(sDLSS5_Cam5, float4(0.5, 0.5, 0.0, 0.0));
-    // For the experimental geometry vectors: a quarter of the grid. For the per-pixel stage's
-    // camera vector, whose samples are only the trackable ones: two thirds of those -- one
-    // motion has to explain that much of what can be followed at all, or there is no "the
-    // camera". (It is a blunt test. With some hundred samples a pan scores 0.7-0.9 and a
-    // camera travelling past things at different distances 0.45-0.7. At 0.65 most of
-    // fx-testbed's travelling frames are refused and those shots come out 2-3% less steady
-    // than without the fit; at 0.5 it is 5-7%, with no test at all 9-10%.)
-#ifndef FITK
-    #define FITK 0.65
-#endif
-    return s.z >= 40.0 && s.z >= FITK * s.w;
-}
 
 // ---------------------------------------------------------------------------------------------
 // Per-pixel refinement (MV_PIPELINE = 0), for every provider. Returns the vector in PIXELS.
@@ -2252,8 +2393,14 @@ bool FitIsUsable()
 //      provider's whole cells around it and last frame's vector tried, and each has to be a
 //      clear improvement to be taken -- the pixel on the border between two motions;
 //   4. the result is polished to sub-pixel accuracy where that is a clear gain too, and the
-//      nearest whole-pixel vector is taken where it reproduces the pixel (history is then
-//      fetched pixel for pixel).
+//      nearest whole-pixel vector is taken where it reproduces the pixel and is where the
+//      vector all but was already (history is then fetched pixel for pixel).
+// What this stage costs when the provider is RIGHT is measured with exact vectors as the
+// provider (tools/fx-testbed, fxlab_Oracle.fx; they have to be enabled as a technique, or the
+// "exact" vectors are all zero and every conclusion drawn from them is wrong -- it happened):
+// they come out of it 0.1 px out where they went in, and the picture is 22% steadier than the
+// input under a pan where the same vectors untouched make it 31%. No one rule is to blame;
+// each of them takes a little.
 // code: 0 static lock, 1 zero, 2 the provider's vector, 3 a neighbouring cell, 4 last frame's
 // vector, 5 snapped to whole pixels, 6 the fitted camera motion.
 // ---------------------------------------------------------------------------------------------
@@ -2287,6 +2434,23 @@ bool PolishStep(P9 c0, float m0, float2 uv, inout float2 f, inout float ef)
     return any(abs(o) > 0.999);
 }
 
+// SNAP_NEAR: the whole-pixel vector is only taken where the vector in hand is already within
+// this much of it (pixels, per axis). LOCK_YIELD: the static lock stands back where the
+// provider's vector reproduces the pixel just as exactly. (Both: see where they are used.)
+#ifndef SNAP_NEAR
+    #define SNAP_NEAR 0.25
+#endif
+#ifndef LOCK_YIELD
+    #define LOCK_YIELD 1
+#endif
+#ifndef LOCK_TOL
+    #define LOCK_TOL 0.25
+#endif
+// RDBG (test rig): bits switch single rules of the per-pixel stage off.
+//   1 static lock   2 "did not move"   4 neighbouring cells / last frame   32 distrust
+#ifndef RDBG
+    #define RDBG 0
+#endif
 // A challenger is taken only if it explains the pixel a fifth better than what is in hand.
 #define DLSS5_PICK_TRY(V, CODE) \
     { const float2 v_ = (V); \
@@ -2320,7 +2484,38 @@ float2 RefineMV(float2 uv, out float distrust, out float code, out float detail,
     // sample, which makes it the sensitive one: a surface drifting a fraction of a pixel a
     // frame changes few of its pixels by a whole step, but every one of those averages a
     // little. It gets a quarter of the tolerance, so a slow pan does not lock.
-    if (P9MaxDiff(c0, p0) <= STATIC_NOISE && P9MaxDiff(c2, p2) <= 0.25 * STATIC_NOISE) return float2(0.0, 0.0);
+    if (!(RDBG & 1) && P9MaxDiff(c0, p0) <= STATIC_NOISE && P9MaxDiff(c2, p2) <= 0.25 * STATIC_NOISE)
+    {
+#if LOCK_YIELD
+        // Unless the provider's vector says the very same thing about this pixel: last frame,
+        // fetched at it, is this pixel too, as exactly. That is a plain surface in a picture
+        // that moves slowly -- the wall next to a doorway under a slow pan. Zero is not wrong
+        // there and neither is the wall's motion, but a wall whose plain parts stand still
+        // while its edges move is a field full of steps, and a temporal pass given that field
+        // was less steady than one given the provider's smooth one (fx-testbed, the turning
+        // point of a pan: 1.43 times the input's restlessness with the lock, 1.37 without).
+        // A caption or a HUD is not this: at the outline of a glyph the motion behind it
+        // reproduces nothing. Nor is a still picture in which the provider has found a
+        // fraction of a pixel of nothing here and there: the motion has to be what the
+        // provider says all around the pixel, not just at it.
+        const float2 lv = ProviderSurfaceMV(uv);
+        const float2 lr = px * 12.0;
+        const float2 l1 = ProviderMV(uv + float2(lr.x, 0.0)), l2 = ProviderMV(uv - float2(lr.x, 0.0));
+        const float2 l3 = ProviderMV(uv + float2(0.0, lr.y)), l4 = ProviderMV(uv - float2(0.0, lr.y));
+        const float  lt = LOCK_TOL + 0.1 * length(lv * BUFFER_SCREEN_SIZE);
+        const float  ld = max(max(length((l1 - lv) * BUFFER_SCREEN_SIZE), length((l2 - lv) * BUFFER_SCREEN_SIZE)),
+                              max(length((l3 - lv) * BUFFER_SCREEN_SIZE), length((l4 - lv) * BUFFER_SCREEN_SIZE)));
+        if (dot(lv, lv) > 0.0 && ld <= lt
+            && dot(l1, l1) > 0.0 && dot(l2, l2) > 0.0 && dot(l3, l3) > 0.0 && dot(l4, l4) > 0.0
+            && P9MaxDiff(c0, Patch9(sDLSS5_PrevLuma, uv + lv, px, 0.0)) <= STATIC_NOISE
+            && P9MaxDiff(c2, Patch9(sDLSS5_PrevLuma, uv + lv, px * 4.0, 2.0)) <= 0.25 * STATIC_NOISE)
+        {
+            code = 2.0; stale = 1.0;
+            return lv * BUFFER_SCREEN_SIZE;
+        }
+#endif
+        return float2(0.0, 0.0);
+    }
 
     // The provider's own answer for this pixel.
     float2 best = ProviderSurfaceMV(uv) * BUFFER_SCREEN_SIZE;
@@ -2382,7 +2577,7 @@ float2 RefineMV(float2 uv, out float distrust, out float code, out float detail,
     // scene's accuracy, and with LumeniteFX the picture was 2% steadier without it, while the
     // captions it was written for kept their zero by the rule above (98.6-100% of glyph pixels
     // either way). So it is gone.
-    if (t_zero < 0.5 * t_best - FLOW_NOISE)
+    if (!(RDBG & 2) && t_zero < 0.5 * t_best - FLOW_NOISE)
     {
         best = 0.0; t_best = t_zero; code = 1.0;
     }
@@ -2391,7 +2586,7 @@ float2 RefineMV(float2 uv, out float distrust, out float code, out float detail,
     // motions, or a provider that is simply off here. The provider's whole cells -- the one
     // under the pixel and the four around it, not interpolations of them -- and last frame's
     // vector get a hearing.
-    if (t_best > 0.3 * contrast + 2.0 * FLOW_NOISE)
+    if (!(RDBG & 4) && t_best > 0.3 * contrast + 2.0 * FLOW_NOISE)
     {
         const float2 cell = px * DLSS5_MV_CELL;
         DLSS5_PICK_TRY(ProviderCellPx(uv), 3.0)
@@ -2404,6 +2599,7 @@ float2 RefineMV(float2 uv, out float distrust, out float code, out float detail,
 
     // Nothing explains this pixel well (disocclusion, something translucent, a cut): say so.
     distrust = saturate((t_best - 2.0 * FLOW_NOISE) / (0.5 * contrast + 4.0 * FLOW_NOISE) - 0.5);
+    if (RDBG & 32) distrust = 0.0;
 
     // Sub-pixel polish: half a pixel either side on each axis (pixel scale only: this is about
     // the last fraction of a pixel) and the minimum of the curve through those three costs.
@@ -2465,7 +2661,14 @@ float2 RefineMV(float2 uv, out float distrust, out float code, out float detail,
     const float ring_range = ring_hi - ring_lo;
     const bool fits  = rw <= exact && ring <= 2.0 * FLOW_NOISE + 0.05 * ring_range;          // history can be reused as it is
     const bool tight = rw <= FLOW_NOISE + 0.03 * detail && ring <= FLOW_NOISE + 0.015 * ring_range;
-    if (MV_SNAP == 1 || (MV_SNAP == 0 && tight)) { best = whole; code = dot(whole, whole) > 0.0 ? 5.0 : 1.0; }
+    // And only where the vector in hand is all but whole already. Real whole-pixel motion is
+    // found to a fraction of a pixel before this point, so it loses nothing by that; what it
+    // shuts out is a vector of 0.6 px being "reproduced" at 1 on one pixel and at 0 on the
+    // next wherever the picture is too plain to tell. Those hops were the largest single cost
+    // of this stage on a 3D scene: without any snapping fx-testbed's courtyard was 3-7% steadier
+    // under every camera move than with it.
+    const bool near_whole = all(abs(best - whole) <= SNAP_NEAR);
+    if (MV_SNAP == 1 || (MV_SNAP == 0 && tight && near_whole)) { best = whole; code = dot(whole, whole) > 0.0 ? 5.0 : 1.0; }
     // A polish that left zero and did not at least halve the mismatch found no motion, only a
     // slope to slide down (fine repeating patterns have plenty), and a fraction of a pixel of
     // nothing in particular is worse than the zero it left.
@@ -2624,14 +2827,25 @@ float2 TrackStep(float2 uv, float2 v, float cell, float lod, out float lmin, out
 // stage's camera vector) with two fetches each and a 9x9 Gauss-Jordan solve every time -- a
 // long serial chain on a single lane, half a millisecond of it, every frame. Both consumers
 // (GEOM_ENABLE, CAMERA_MODEL) are off by default.
+// (The built-in estimator is a third consumer, and always on: it starts its cells from the fit,
+// see BASE_CAM.)
+#if DLSS5_MV_BUILTIN
+  #if BASE && BASE_CAM
+    #define DLSS5_FIT_ALWAYS 1
+  #endif
+#endif
+#ifndef DLSS5_FIT_ALWAYS
+    #define DLSS5_FIT_ALWAYS 0
+#endif
+bool FitWanted() { return DLSS5_FIT_ALWAYS || GEOM_ENABLE || (CamModelOn() && MV_PIPELINE == 0); }
 void PS_FitSamples(float4 vpos : SV_Position, float2 uv : TEXCOORD, out float4 A : SV_Target0, out float4 B : SV_Target1)
 {
-    if (!GEOM_ENABLE && !(CamModelOn() && MV_PIPELINE == 0)) { A = 0.0; B = 0.0; return; }
+    if (!FitWanted()) { A = 0.0; B = 0.0; return; }
     float2 suv = (floor(vpos.xy) + 0.5) / float2(DLSS5_FIT_W, DLSS5_FIT_H);
     float2 mv  = ProviderMV(suv);
     bool  valid  = true;
     float weight = 1.0;
-    if (CamModelOn() || GEOM_ENABLE)
+    if (FitWanted())
     {
         // For the per-pixel stage's camera vector the samples are made exact first. A provider's
         // errors are not noise that a fit averages away -- LumeniteFX reads a 0.64 px pan as
@@ -2722,7 +2936,7 @@ void PS_FitSolve(float4 vpos : SV_Position, float2 uv : TEXCOORD,
 {
     // See PS_FitSamples. P5.z is the sample count FitIsUsable() tests against 40, so a zeroed
     // P5 also reads as "no usable fit" for anything that looks at it anyway.
-    if (!GEOM_ENABLE && !(CamModelOn() && MV_PIPELINE == 0)) { P0 = 0.0; P1 = 0.0; P2 = 0.0; P3 = 0.0; P4 = 0.0; P5 = 0.0; return; }
+    if (!FitWanted()) { P0 = 0.0; P1 = 0.0; P2 = 0.0; P3 = 0.0; P4 = 0.0; P5 = 0.0; return; }
     float p[18];
     [unroll] for (int z = 0; z < 18; ++z) p[z] = 0.0;
     float inlier = 0.0, rms = 0.0, used = 0.0;
@@ -2996,6 +3210,36 @@ float4 PS_GlobalHistory(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Ta
 #ifndef VOL_HI
     #define VOL_HI 1.0
 #endif
+// A pixel that was hidden a frame ago (the depth test says so: where its vector points, last
+// frame had something nearer or further) has no history of its own. What it does have is a
+// surface, and that surface moved: the pixel is given the motion of the pixels around it that
+// are on its surface AND were visible a frame ago -- which is what a game engine hands a
+// temporal pass for such a pixel, and what the pass's own disocclusion handling expects.
+// REVEAL: 0 = no vector at all (zero), 1 = the vector as it is, 2 = its surface's.
+// (It used to be 0. On tools/fx-testbed that made a travelling camera's picture 1.15 times as
+// restless as the input where it is now 1.04, and with exact vectors as the provider it was
+// the largest single error at outlines: 3.3 px against 1.5.)
+#ifndef REVEAL
+    #define REVEAL 2
+#endif
+float2 RevealedMV(float2 uv, float d, float2 own)
+{
+    float2 sum = 0.0;
+    float  ws  = 0.0;
+    [unroll] for (int k = 0; k < 16; ++k)
+    {
+        const float  r  = k < 8 ? 6.0 : 16.0;
+        const float  a  = 0.7853982 * k + (k < 8 ? 0.0 : 0.3926991);
+        const float2 at = uv + float2(cos(a), sin(a)) * r * BUFFER_PIXEL_SIZE;
+        const float  da = ReShade::GetLinearizedDepth(at);
+        const float2 v  = ProviderMV(at);
+        const float  dp = tex2Dlod(sDLSS5_PrevDepth, float4(at + v, 0.0, 0.0)).x;
+        const float  w  = SameSurface(d, da) * SameSurface(da, dp);
+        sum += w * v; ws += w;
+    }
+    return ws > 0.5 ? sum / ws : own;
+}
+
 void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
                       out float2 mv_out : SV_Target0, out float mask : SV_Target1,
                       out float depth : SV_Target2, out float static_now : SV_Target3, out float2 vec_now : SV_Target4,
@@ -3047,7 +3291,11 @@ void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
                 const float tol = DEPTH_TOLERANCE * max(d, 1e-3);
                 const float bad_depth = saturate((abs(dp - d) - tol) / (tol + 1e-5));
                 distrust = max(distrust, bad_depth);
+#if REVEAL == 0
                 if (bad_depth > 0.5) mv = float2(0.0, 0.0);
+#elif REVEAL == 2
+                if (bad_depth > 0.5) mv = RevealedMV(uv, d, mv);
+#endif
             }
         }
         drop_history = MOVING_HISTORY > 0 && stale > 0.5 && (MOVING_HISTORY == 2 || detail >= DETAIL_CONTRAST);
@@ -3107,6 +3355,9 @@ void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
     if (MV_SNAP == 1) mv_px = round(mv_px);
     vec_now = mv_px * BUFFER_PIXEL_SIZE;   // the real vector, for next frame -- whatever is sent below
     if (drop_history) mv_px = float2(BUFFER_WIDTH, BUFFER_HEIGHT) * 4.0;   // off screen from anywhere
+#ifdef FITFLAG
+    if (FitIsUsable()) mv_px = float2(FITFLAG, 0.0);
+#endif
     mv_out = mv_px * MV_SIGN * MV_SCALE;
     mask   = saturate(distrust) * MASK_STRENGTH;
     depth  = RawDepth(uv);
@@ -3483,6 +3734,14 @@ technique DLSS5_Feed
     pass BaseAgree2    { VertexShader = PostProcessVS; PixelShader = PS_BaseAgree2;    RenderTarget0 = DLSS5_Flow2; }
     pass BaseMatch1    { VertexShader = PostProcessVS; PixelShader = PS_BaseMatch1;    RenderTarget0 = DLSS5_Flow1Raw; }
     pass BaseAgree1    { VertexShader = PostProcessVS; PixelShader = PS_BaseAgree1;    RenderTarget0 = DLSS5_Flow1; }
+#if BASE_FIN >= 1
+    pass BaseFinA      { VertexShader = PostProcessVS; PixelShader = PS_BaseFinA;      RenderTarget0 = DLSS5_Flow1Raw; }
+  #if BASE_FIN >= 2
+    pass BaseFinB      { VertexShader = PostProcessVS; PixelShader = PS_BaseFinB;      RenderTarget0 = DLSS5_Flow1; }
+  #else
+    pass BaseFinC      { VertexShader = PostProcessVS; PixelShader = PS_BaseFinC;      RenderTarget0 = DLSS5_Flow1; }
+  #endif
+#endif
 #else
     pass Flow2         { VertexShader = PostProcessVS; PixelShader = PS_Flow2;         RenderTarget0 = DLSS5_Flow2Raw; }
     pass FlowEq2       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq2;       RenderTarget0 = DLSS5_FlowEqA2; RenderTarget1 = DLSS5_FlowEqB2; RenderTarget2 = DLSS5_FlowStA2; }
