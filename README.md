@@ -125,21 +125,24 @@ renodx-dlss is not on GitHub. It comes from the RenoDX Discord, `#DLSS5` channel
 DLSS5-Feeder does not sharpen anything by itself. It builds the DLSS request your game never
 makes; a **second add-on** does the actual neural rendering. You install **exactly one** of them.
 
-**Recommended: Deep Fried Chicken**, by Alexander, from its Discord:
-<https://discord.gg/g2v2XGqvR> — take **1.4.8 or newer**.
+**Recommended: the OptiScaler DLSS-NR fork** this project maintains —
+<https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases> — an OptiScaler build with the neural pass
+built in. [The installer](#install-the-automated-way) downloads it and sets it up; to do it by
+hand, see [OptiScaler DLSS-NR](#optiscaler-dlss-nr-recommended).
 
-Copy its three files next to your game's `.exe` (or into `host64\` for a 32-bit game):
-`deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll` and `deep-fried-chicken.cfg`.
-Its settings file already arrives set up correctly, so leave it alone for your first run. You
-supply `nvngx_dlssnr.dll` and `nvngx_dlss.dll` yourself, as always.
+**The other option: the RenoDX add-on**, `renodx-dlss5.addon64` (Krish's `#DLSS5` build). The
+installer takes the newest one from the [RHI repository](https://github.com/RankFTW/rhi-repo/releases);
+by hand, see [The RenoDX add-on](#the-renodx-add-on).
 
-> **Never install two neural add-ons.** If Deep Fried Chicken finds RenoDX's add-on or Alex's
-> Toolkit loaded beside it, it does nothing at all for the whole session — silently, as far as
-> your eyes are concerned. Pick one. If something looks like it is not working, this is the first
-> thing to check.
+Either one is driven in game from [the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc) (**Alt+C**). Installed
+by hand, you also supply `nvngx_dlssnr.dll` and `nvngx_dlss.dll` yourself; the installer fetches both.
+
+> **Never install two neural tools.** Beside each other, one goes inert or the picture gets a
+> second neural pass — silently, as far as your eyes are concerned. Pick one. If something looks
+> like it is not working, this is the first thing to check.
 
 <details>
-<summary>Using Krish's RenoDX add-on instead (the older option, still fully supported)</summary>
+<summary>More on Krish's RenoDX add-on: where it comes from, and which builds</summary>
 
 `renodx-dlss5.addon64`, the `#DLSS5` build, from the RenoDX Discord, `#DLSS5` channel:
 <https://discord.com/invite/renodx>. It is what every release
@@ -153,8 +156,7 @@ found" and treated as the classic engine). Keep just one copy — ReShade loads 
 The feeder writes `EnableHooks=2`, `NeuralUplift=1` and `NREnableUpscaling=0` when they are unset,
 and in the `host64` helper it unbinds the global hotkeys so a gameplay keypress cannot silently
 toggle neural rendering in a background process. Every guard is keyed to a marker only the build
-that needs it carries. **None of this applies to Deep Fried Chicken**, which has its own config
-file and its own overlay tab.
+that needs it carries. None of this applies to OptiScaler, which has its own ini.
 
 | Build | Marker | What the feeder does about it |
 | --- | --- | --- |
@@ -173,8 +175,8 @@ generations were checked against the shipped binaries.
 <details>
 <summary>Careful: renodx-dlss and renodx-dlss5 are two different add-ons</summary>
 
-- **`renodx-dlss5`** (Krish) is a *neural add-on*. It works **with** this project, as the
-  alternative to Deep Fried Chicken above.
+- **`renodx-dlss5`** (Krish) is a *neural add-on*. It works **with** this project, as one of
+  the two neural tools above.
 - **`renodx-dlss`** (ShortFuse) *replaces* this project — it builds the DLSS request itself, so it
   neither needs nor tolerates the feeder. One or the other, never both.
 
@@ -184,10 +186,11 @@ generations were checked against the shipped binaries.
 
 - **OptiScaler** — a stock OptiScaler must be off. It takes over the very NGX calls this project
   makes, upscales them, and never runs a neural pass, so the picture never changes while every log
-  reads healthy. The exception is a **DLSS-NR fork** of it (wilsjo2's OptiScaler-DLSSNR-PreSR-Multipass
-  or Dagherbou's OptiScaler_DLSSNR), which *is* a supported neural consumer — see
-  [Alternative: OptiScaler DLSS-NR](#alternative-optiscaler-dlss-nr). With it installed there
-  must be no Deep Fried Chicken and no RenoDX add-on beside it.
+  reads healthy. The exception is a **DLSS-NR fork** of it (this project's, built on wilsjo2's
+  OptiScaler-DLSSNR-PreSR-Multipass; wilsjo2's own and Dagherbou's OptiScaler_DLSSNR are handled
+  too), which *is* a supported neural tool, and the recommended one — see
+  [OptiScaler DLSS-NR](#optiscaler-dlss-nr-recommended). With it installed there
+  must be no other neural add-on beside it.
 - **NVIDIA Smooth Motion** — turn it off **for Vulkan games only**. On Vulkan the two cannot work
   together, and no future release can fix that. You would see roughly half your frames
   unprocessed, which looks like heavy flickering or a picture stuck on an old frame. Nothing is
@@ -303,10 +306,11 @@ your antivirus.
 - [Before you install: four things](#before-you-install-four-things)
 - [Status](#status)
 - [Install: the automated way](#install-the-automated-way)
+- [The DLSS 5 Feeder menu (Alt+C)](#the-dlss-5-feeder-menu-altc)
 - [Install for a 64-bit game](#install-for-a-64-bit-game)
   - [Deep Fried Chicken: first run](#deep-fried-chicken-first-run)
-  - [Alternative: the RenoDX add-on](#alternative-the-renodx-add-on)
-  - [Alternative: OptiScaler DLSS-NR](#alternative-optiscaler-dlss-nr)
+  - [The RenoDX add-on](#the-renodx-add-on)
+  - [OptiScaler DLSS-NR](#optiscaler-dlss-nr-recommended)
 - [Install for a 32-bit game](#install-for-a-32-bit-game-beta)
 - [Install for a DirectX 10 game](#install-for-a-directx-10-game-beta)
 - [Install for a DirectX 9 game](#install-for-a-directx-9-game-beta)
@@ -420,26 +424,29 @@ It reads the architecture and render API out of the executable, then downloads (
 cache) and installs everything the manual sections below describe: ReShade 6.8+ with add-on
 support (a local DLL, or the machine-wide Vulkan layer plus the `ReShadeApps.ini` entry), the
 feeder from the latest release (`addon32` + `host64\` for a 32-bit game), the ReShade framework
-headers, LumeniteFX, Deep Fried Chicken, both NVIDIA runtimes, dgVoodoo2 for Direct3D 8/9 games
+headers, LumeniteFX, the neural tool, both NVIDIA runtimes, dgVoodoo2 for Direct3D 8/9 games
 (watermark off; `-DgVoodooWatermark` keeps it), and `ReShade.ini` / `ReShadePreset.ini` with the
 provider selected and both techniques enabled in the right order. Existing files are merged into
 and backed up, not replaced. It ends by running a read-only verification pass and prints the
 result — every line is `[ OK ]`, `[WARN]` or `[FAIL]`, with the fix for each failure.
 
+The last thing it prints is the one to remember: **once in game, press Alt+C to show
+[the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc)**.
+
 Things to know:
 
-- **Windows Defender flags Deep Fried Chicken** (it hooks NVIDIA's NGX runtime with Detours,
-  which heuristics dislike). The script tries the plain install first; only if Defender removes
-  the file does it explain, ask, and add an exclusion for the game folder through a UAC prompt.
-  Nothing is excluded without your yes.
+- **Windows Defender may flag the neural tool** (something that stands in for NVIDIA's NGX
+  runtime looks like a hooking tool to its heuristics). The script tries the plain install first;
+  only if Defender removes the file does it explain, ask, and add an exclusion for the game folder
+  through a UAC prompt. Nothing is excluded without your yes.
 - Vulkan games need one UAC prompt to register ReShade's layer and add the exe to
   `ReShadeApps.ini`. `-NoElevate` turns every such step into printed instructions instead.
-- **It asks which neural consumer you want** before downloading anything: Krish's RenoDX DLSS 5
-  add-on (the default), OptiScaler DLSS-NR, or Deep Fried Chicken. The first two are downloaded
-  for you; Chicken has no public download, so the script asks you to fetch it. Only one is ever
-  installed, and if another is already in the folder it offers to disable it. For OptiScaler it
-  also asks which fork: wilsjo2's (the default) or Dagherbou's. `-Consumer RenoDX|OptiScaler|DFC`
-  and `-OptiScalerFork wilsjo2|Dagherbou` answer both in advance for an unattended run.
+- **It asks which neural tool you want** before downloading anything: this project's OptiScaler
+  DLSS-NR fork (recommended, and what Enter gives you) or Krish's RenoDX DLSS5 add-on, taken from
+  the [RHI repository](https://github.com/RankFTW/rhi-repo/releases). Both are downloaded for you.
+  Only one is ever installed, and if another is already in the folder it offers to disable it.
+  `-Consumer OptiScaler|RenoDX` answers in advance for an unattended run; `-Yes` alone takes
+  OptiScaler. `-OptiScalerFork wilsjo2|Dagherbou` installs one of the other two forks instead.
 - **For a 64-bit game it asks whether to use the
   [64-bit helper mode](#64-bit-helper-mode-games-whose-own-process-cannot-run-ngx)**, which runs NGX
   in `host64\` as for a 32-bit game. Answer No (the default, and what Enter does) unless the game
@@ -452,6 +459,74 @@ Things to know:
   them, can run on either Direct3D 9 or 11; the script assumes 11 and says so).
 - The Discord download links inside the script expire; when one does, the script says so and
   tells you which parameter takes a fresh link or file.
+
+## The DLSS 5 Feeder menu (Alt+C)
+
+<!-- DRAFT for the release that ships the menu. Before publishing:
+     - retake the picture (this one is Fable Anniversary in a 1080p window, from the prototype);
+     - RenoDX: run in the lab against v6.1 and against 10.8.0 (RHI's newest on 2026-11-12); a newer
+       one the installer may fetch by then is untested;
+     - try it in an exclusive-fullscreen game before saying anything about fullscreen. -->
+
+Press **Alt+C** in the game. A panel slides in from the right edge with the settings of the neural
+tool that is doing the work, and **Alt+C** or **Esc** closes it again. It is the same panel in a
+32-bit game, in the 64-bit helper mode and in an ordinary 64-bit game, and it is drawn by the game's
+own ReShade, so there is no second window to find.
+
+![The DLSS 5 Feeder menu](docs/images/dlss5-feeder-menu.png)
+
+**What it drives.** Whichever of these two is installed; the line under the title names it and says
+whether it is running:
+
+- the **RenoDX add-on** (`renodx-dlss5*.addon64`), or
+- the **OptiScaler DLSS-NR** fork.
+
+ShortFuse's `renodx-dlss` is not supported next to this project at all (see
+[Before you install](#1-you-might-not-need-this-project-at-all)).
+
+**What is on it.** Two tabs. **Common** holds what both tools have under one name:
+
+| Group | Settings |
+| --- | --- |
+| Look | neural rendering on/off, preset, style, intensity |
+| Model | tone, structure, skin, character mask |
+| Passes and cost | number of passes, working resolution |
+| Final picture | detail strength, colour strength |
+| White point | paper white |
+
+The second tab is named after the tool and holds what only that tool has: for OptiScaler the
+highlight guard, the white point source and exposure trims, the unlock for up to 10 passes and the
+separate skin / environment controls; for the RenoDX add-on HUD correction, diffuse white and its
+stacking switches, and from RenoDX v8 on also its **look** controls (how much of the model's
+brightening, darkening and colour change is kept, by tonal range and by scale; halo suppression;
+Stabilize), **Detail stability**, the style highlight guard and the chroma clamp. RenoDX builds
+differ in what they have, so a row is shown only when the installed build has that setting. Its
+per-pass settings for passes 2 to 4, its model-weight sliders and its HDR codec choices stay on
+its own page.
+
+**When a change takes effect** depends on the tool and on where it runs:
+
+| Tool | Where it runs | A change takes effect |
+| --- | --- | --- |
+| OptiScaler DLSS-NR, [this project's fork](https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases) from **v0.8.93** (what the installer fetches) | anywhere | at once; the menu shows **LIVE** and has no Apply button |
+| OptiScaler DLSS-NR, an older build | the helper (`host64\`) | on **Apply**, which restarts the helper: a few seconds, the game keeps running |
+| OptiScaler DLSS-NR, an older build | the game's own process | on **Apply** it is saved, and used from the next start of the game |
+| RenoDX add-on | the helper (`host64\`) | on **Apply**, which restarts the helper |
+| RenoDX add-on | the game's own process | on **Apply** it is saved, and used from the next start of the game |
+
+Either tool reads its settings from its own file (`OptiScaler.ini`, or the `[RenoDX.DLSS5]` section
+of the ReShade.ini beside it), and that is where the menu writes them, so its own page and the menu
+always agree.
+
+**Size.** The **Panel size** row at the foot of the menu makes everything on it larger or smaller
+in steps of 10%. **Auto** follows the larger of two things: the height of the picture (a 4K picture
+gets 200%) and the Windows display scaling of the game's window (a 4K television at 200% gets 200%
+even when the game runs in a 1080p window). The choice is saved as `panel_scale`.
+
+**The shortcut** is `panel_key` and `panel_mods` in `dlss5-feed.cfg` (see
+[Configuration](#configuration)); **Show the DLSS 5 Feeder menu** on the overlay page (ReShade
+overlay → Add-ons → **DLSS 5 Feed**) opens it too. While the menu is up the mouse and keyboard
+belong to it and the game does not see them.
 
 ## Install for a 64-bit game
 
@@ -468,18 +543,20 @@ Things to know:
    its `Shaders\` folder (the `lumenite_*.fx` files and `include\`) into `reshade-shaders\Shaders\`,
    and `Textures\lumenite_bluenoise256.png` into `reshade-shaders\Textures\`.
    *(Other providers: see [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider).)*
-4. Get the neural consumer — **[Deep Fried Chicken](https://discord.gg/g2v2XGqvR)**
-   (see [Before you install](#2-you-need-one-neural-add-on-installed-next-to-this-one)) — and put its three files next to the game `.exe`:
-   `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll` and `deep-fried-chicken.cfg`.
-   Add **`nvngx_dlssnr.dll`** (from the RenoDX Discord — Chicken does not bundle it) and a
-   **`nvngx_dlss.dll`** (from any DLSS game, or
-   [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper)) in the same folder.
-   *(Using the RenoDX add-on instead? See [Alternative: the RenoDX add-on](#alternative-the-renodx-add-on).)*
+4. Get the neural tool (see [Before you install](#2-you-need-one-neural-add-on-installed-next-to-this-one)),
+   one of:
+   - the **OptiScaler DLSS-NR fork** (recommended): follow [OptiScaler DLSS-NR](#optiscaler-dlss-nr-recommended);
+   - the **RenoDX add-on**: put `renodx-dlss5.addon64` next to the game `.exe`, see
+     [The RenoDX add-on](#the-renodx-add-on).
+
+   Either way, add **`nvngx_dlssnr.dll`** (from the RenoDX Discord, or the
+   [RHI repository](https://github.com/RankFTW/rhi-repo/releases)) and a **`nvngx_dlss.dll`** (from
+   any DLSS game, or [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper)) in the same folder.
 5. Press **Home** for the ReShade overlay, select `DLSS5_Feed.fx`, set **`DLSS5_MV_PROVIDER` = `3`**
    in its Preprocessor definitions, and reload effects.
-6. In-game: enable **"LUMENITE: Kernel 2.0"**, then **DLSS 5 Feed** below it, then turn on neural
-   rendering in the consumer's own panel — the **Deep Fried Chicken** tab, or the **DLSS 5 Neural
-   Rendering** panel if you took the RenoDX route. Turn the game's MSAA/SSAA **off**.
+6. In-game: enable **"LUMENITE: Kernel 2.0"**, then **DLSS 5 Feed** below it, then press **Alt+C**
+   for [the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc) and check that **Neural rendering** is ticked.
+   Turn the game's MSAA/SSAA **off**.
 
 Check `dlss5-feed.log` (next to the game `.exe`) for `feature ready … DLAA`, `frame N delivered`,
 and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`. The overlay's
@@ -566,39 +643,43 @@ game-validated**.
 same run (plus `host64\dlss5-feed-host.log` for a 32-bit game), and the output of the
 [installer's verification output](#install-the-automated-way).
 
-### Alternative: the RenoDX add-on
+### The RenoDX add-on
 
-To use **Krish's `renodx-dlss5.addon64`** (the `#DLSS5` build) instead of Deep Fried Chicken —
+**Krish's `renodx-dlss5.addon64`** (the `#DLSS5` build) —
 [Before you install](#2-you-need-one-neural-add-on-installed-next-to-this-one) has the download and
 the list of build generations:
 
-- In step 4, put `renodx-dlss5.addon64` next to the game `.exe` in place of the three Chicken files.
-  `nvngx_dlssnr.dll` and `nvngx_dlss.dll` are needed either way. For a 32-bit game it goes into
-  `host64\`, again for the same reason Chicken does.
-- Its neural rendering is turned on in ReShade's **DLSS 5 Neural Rendering** panel, and on 32-bit
-  games mirrored onto our own overlay page — see [Configuration](#configuration).
+- In step 4, put `renodx-dlss5.addon64` next to the game `.exe`. `nvngx_dlssnr.dll` and
+  `nvngx_dlss.dll` go beside it. For a 32-bit game all three go into `host64\`, because the
+  neural work happens in the helper.
+- Its settings are in [the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc) (**Alt+C**), neural rendering on/off
+  included. Its own **DLSS 5 Neural Rendering** panel in ReShade is still there and shows the same
+  values; on 32-bit games a few of them are also mirrored onto our overlay page — see
+  [Configuration](#configuration).
 - The feeder writes `EnableHooks=2`, `NeuralUplift=1` and `NREnableUpscaling=0` when they are unset,
-  and unbinds the helper's global hotkeys. Both are RenoDX-specific and do nothing on the Chicken path.
+  and unbinds the helper's global hotkeys. Both are RenoDX-specific.
 - `warmup_rebuild` matters here: older builds latch STANDBY on their first create, and the warm-up
   re-create is what clears it.
 
-### Alternative: OptiScaler DLSS-NR
+### OptiScaler DLSS-NR (recommended)
 
-Two OptiScaler forks have the DLSS 5 neural-rendering model built in, as a pass on their
-upscaler's output, and both are supported here:
+OptiScaler forks with the DLSS 5 neural-rendering model built in, as a pass on their upscaler's
+output. The one to take is **[this project's fork](https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases)**:
+wilsjo2's fork plus the fixes this project needed, and the build
+[the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc) is tested with. Two others are handled too:
 **[OptiScaler-DLSSNR-PreSR-Multipass](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases)**
-(wilsjo2; actively maintained, pre-SR / multipass / finished-picture options, no forwarder DLL
+(wilsjo2; the one ours is built on: pre-SR / multipass / finished-picture options, no forwarder DLL
 since v0.8.1) and **[OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR/releases)**
 (Dagherbou; the original, ships its `nvngx.dll_dlssnr.dll` forwarder). Neither is a hook over
-NVIDIA's NGX like the two add-ons above: it *is* the NGX implementation the process talks to.
+NVIDIA's NGX like an add-on: it *is* the NGX implementation the process talks to.
 Installed the normal OptiScaler way, its loader hook hands its own module to the NGX SDK inside
 this feeder, so the feeder's DLAA request is upscaled by OptiScaler (`dlss` by default, so nothing
 changes there) and then given the neural pass, in place. The feeder detects it, tells the two
 generations apart (it logs `direct-runtime build` for wilsjo2 v0.8.1+ and `forwarder build` for
 Dagherbou), checks that its calls really went there, and skips the warm-up re-create the other two
 need. On the no-game rig the pass costs the same whether OptiScaler runs DLSS, XeSS or FSR
-underneath. The installer does all of the below with `-Consumer OptiScaler` and asks which fork
-(`-OptiScalerFork wilsjo2|Dagherbou` to skip the question; `-Yes` takes wilsjo2).
+underneath. The installer does all of the below, with this project's fork unless
+`-OptiScalerFork wilsjo2|Dagherbou` names another.
 
 - Get the release zip from the fork's releases page (`OptiScaler-NR-v<version>.zip` for wilsjo2,
   not the `-rtx40-mfg` variant; `OptiScaler-DLSSNR-<version>.zip` for Dagherbou; about 130 MB
@@ -617,19 +698,21 @@ underneath. The installer does all of the below with `-Consumer OptiScaler` and 
   folder carries that game's name and puts OptiScaler into pass-through (no hooks, no menu).
 - Switching from Dagherbou's build to wilsjo2's: delete the leftover `nvngx.dll_dlssnr.dll`
   (nothing loads it any more; the fork's own install notes say so). The installer renames it.
-- Remove Deep Fried Chicken's three files and any `renodx-dlss5*.addon64` from that folder.
-  OptiScaler captures every `nvngx` load in the process — Chicken's own bridge DLL ends in
-  `nvngx.dll` — so a second consumer either talks to OptiScaler or runs a second neural pass.
-- OptiScaler's menu opens with **Insert**; its neural-rendering section holds the pass controls.
-  For a 32-bit game the menu is in the helper: press **Show the DLSS 5 panel in-game** and then
-  Insert, or run with `host_window=1`.
+- Remove any `renodx-dlss5*.addon64` and any other neural add-on from that folder. OptiScaler
+  captures every `nvngx` load in the process, so a second one either talks to OptiScaler or runs
+  a second neural pass.
+- Its neural-rendering settings are in [the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc) (**Alt+C**), in a
+  32-bit game as well. OptiScaler's own menu still opens with **Insert**; for a 32-bit game that
+  menu is in the helper: press **Show the DLSS 5 panel in-game** and then Insert, or run with
+  `host_window=1`.
 - **Model resolution below 100% flickers on wilsjo2's builds up to v0.8.91** and keeps "settling"
   for a few frames after the camera stops, at every scale below 100%. The cause is in the fork's
   reduced path: the model was given a colour at the working size and depth / motion vectors at the
-  frame's size. A fixed build is on
-  [this project's fork, release v0.8.92](https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.8.92)
-  (v0.8.91 plus that one change, offered upstream as a pull request): same zip layout, same
-  install. `[DlssNr] MatchGuides=false` in its `OptiScaler.ini` brings the old behaviour back for
+  frame's size. It is fixed in
+  [this project's fork from release v0.8.92](https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.8.92)
+  (v0.8.91 plus that change, offered upstream as a pull request), and so in the newer
+  [v0.8.93](https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.8.93)
+  the installer fetches: same zip layout, same install. `[DlssNr] MatchGuides=false` in its `OptiScaler.ini` brings the old behaviour back for
   a comparison. The feeder's own **Work resolution** (`work_resolution`) is the other way to run
   the model below native, and was never affected: it shrinks the whole frame and makes the guides
   at that size.
@@ -659,18 +742,20 @@ work. Two folders to fill:
 **In a new `host64\` folder next to the game `.exe`** (64-bit side, nothing here can go beside the game)
 - `dlss5-feed-host64.exe` from the same release.
 - A 64-bit ReShade `dxgi.dll` (run the ReShade installer once against any 64-bit game and take it from there).
-- The neural consumer: Deep Fried Chicken's three files (`deep-fried-chicken.addon64`,
-  `deep-fried-chicken-nvngx.dll`, `deep-fried-chicken.cfg`), or `renodx-dlss5.addon64`
-  ([the RenoDX route](#alternative-the-renodx-add-on)), or the OptiScaler DLSS-NR set with
-  `OptiScaler.dll` renamed `winmm.dll` ([that route](#alternative-optiscaler-dlss-nr)).
+- The neural tool: the OptiScaler DLSS-NR set with `OptiScaler.dll` renamed `winmm.dll`
+  ([that route](#optiscaler-dlss-nr-recommended)), or `renodx-dlss5.addon64` ([the RenoDX route](#the-renodx-add-on)).
 - `nvngx_dlssnr.dll` and `nvngx_dlss.dll`.
 
 **Then, in-game**
 - Turn it on as for a 64-bit game. The first fed frame starts the helper by itself.
 - Day-to-day settings: ReShade overlay → Add-ons → **DLSS 5 Feed** (see [Configuration](#configuration)).
-- The neural consumer's own panel lives in the helper, not in the game's ReShade. No alt-tab needed:
-  press **Show the DLSS 5 panel in-game** on that page, or bind a key with **Set key**, and it is drawn
-  at the top right of the game window with your clicks forwarded to it. Changes apply live.
+- The neural tool's settings: press **Alt+C** for [the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc). It is
+  drawn by the game's own ReShade and reaches the tool in the helper for you (RenoDX add-on or
+  OptiScaler).
+- The neural consumer's **own** panel lives in the helper, not in the game's ReShade, and can be
+  cast into the game, for anything the menu does not carry. No alt-tab needed: press **Show the DLSS 5 panel in-game** on that page, or bind a key
+  with **Set key**, and it is drawn at the top right of the game window with your clicks forwarded
+  to it. Changes apply live.
   - That button uses the desktop compositor: windowed or borderless games only.
   - **Show as texture** draws it through the game's own ReShade instead and also works in exclusive
     fullscreen; it appears once the feed has built.
@@ -1330,12 +1415,15 @@ memory objects are import-only and a GL process cannot export one. Both directio
 | --- | --- |
 | D3D10, D3D11, D3D12, Vulkan or OpenGL game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); D3D10 is native, through a private D3D11 relay device the add-on creates for itself ([Install for a DirectX 10 game](#install-for-a-directx-10-game-beta)); Vulkan works out of the box at both bitnesses (the add-on adds the interop extensions itself; a small bundled layer is the fallback — [64-bit](#install-for-a-vulkan-game), [32-bit/DXVK](#32-bit-vulkan-dxvk)); OpenGL needs nothing extra at all, but the game must be rendering on the NVIDIA GPU (see [Install for an OpenGL game](#install-for-an-opengl-game)). |
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
-| A neural consumer + `nvngx_dlssnr.dll` | **Deep Fried Chicken** (recommended — `deep-fried-chicken.addon64`, `deep-fried-chicken-nvngx.dll`, `deep-fried-chicken.cfg`, from its Discord), or **Krish's `renodx-dlss5.addon64`** `#DLSS5` build as the alternative. Exactly one of them. Not ShortFuse's `renodx-dlss`, which is a different add-on that replaces this project rather than working with it (see [Before you install](#1-you-might-not-need-this-project-at-all)). Neither is included here, and neither bundles `nvngx_dlssnr.dll`. |
+| A neural tool + `nvngx_dlssnr.dll` | **The OptiScaler DLSS-NR fork** (recommended — [this project's](https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases), installed as `winmm.dll`), or **Krish's `renodx-dlss5.addon64`** `#DLSS5` build. Exactly one of them. Not ShortFuse's `renodx-dlss`, which is a different add-on that replaces this project rather than working with it (see [Before you install](#1-you-might-not-need-this-project-at-all)). Neither is included here, and neither bundles `nvngx_dlssnr.dll`. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
 | A motion vector provider | one of five, selected with the `DLSS5_MV_PROVIDER` definition — **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) Kernel is recommended** (`=3`); also iMMERSE Launchpad, VORT, LumeniteFX QuantMotion, or anything writing `texMotionVectors` (qUINT, `dh_uber_motion`). **Not DRME — it does not compile on ReShade 6.8.** See [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider). Install it yourself — nothing third-party is bundled, and our shader includes no third-party files. |
 | `dlss5-feed.addon64` (or `.addon32` + `host64\`, or `dlss5-feed-helper.addon64` + `host64\` in the [64-bit helper mode](#64-bit-helper-mode-games-whose-own-process-cannot-run-ngx)) + `DLSS5_Feed.fx` | this project. |
 
 ## Configuration
+
+The neural tool's own settings (style, intensity, passes, white point) are not here: they are in
+[the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc), on **Alt+C**. This section is about the feeder itself.
 
 The easiest way to change any of this is **ReShade's overlay → Add-ons tab → DLSS 5 Feed**: every
 setting below is a live control there (checkboxes, sliders, combos), reading from and saving straight
@@ -1386,6 +1474,10 @@ if you prefer editing the file directly:
 | `cast_scale` | 100 | **32-bit games only.** Size of the cast panel, 25..300 % of the largest size that fits the game window (above 100 % it may run past the window's edges). Also on the overlay as "Panel size". |
 | `cast_mode` | 0 | **32-bit games only.** How the cast panel is drawn: 0 = a desktop-compositor thumbnail of the helper's window (windowed / borderless games, any API); 1 = a shared copy of the helper's frame drawn by the game's ReShade or blitted onto its backbuffer (works in exclusive fullscreen; D3D11, OpenGL and Vulkan). The two overlay buttons set it. |
 | `cast_anchor` | 1 | **32-bit games only.** Which corner of the game window the cast panel sits in: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right. Before 0.14.0-beta.4 it was always the top-right and there was no way to move it. Also on the overlay as "Panel corner". |
+| `panel_key` | 67 | **Every build, not on the overlay page.** Virtual-key code that shows and hides [the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc); 67 is **C**. 0 = no shortcut (the button on the overlay page still opens it). |
+| `panel_mods` | 1 | Modifiers that must be held with `panel_key`: 1 = Alt, 2 = Ctrl, 4 = Shift, added together. The match is exact both ways, so Alt+C does not also answer to Ctrl+Alt+C (AltGr+C). |
+| `panel_side` | 1 | Which edge of the picture the menu slides in from: 0 left, 1 right. |
+| `panel_scale` | 0 | Size of the menu in percent, 50..400. 0 = automatic: the larger of the picture's height over 1080 and the Windows display scaling of the game's window, never below 100. Written by the menu's own **Panel size** row. |
 | `native_dlss_ok` | 0 | **D3D12 games (64-bit), parse-only.** Since 1.17.0-beta.2 the same-device D3D12 session refuses to open when the game has loaded a DLSS runtime of its own (`nvngx_dlss.dll` / `nvngx_dlssd.dll` from anywhere other than this add-on's folder or the driver, or Streamline's `sl.dlss.dll`). A second DLSS contract on the game's device is what crashed the neural consumer in #130; in such a game, turn DLSS on in its own settings and let the DLSS 5 add-on use that instead. `1` opens the session anyway. |
 | `hold_strength` | 0 | **Experimental output stabiliser, since 1.17.0-beta.2 (32-bit games) / beta.3 (64-bit, all four transports).** The neural consumer re-decides what a still region should look like from small frame-to-frame differences in its input: a slope under a tree is bright while the camera pans and darkens over the frames after the stop, although the game drew it the same way on every one of them (and a reset on every frame still darkens, so it is not history). The helper runs one compute pass after the evaluate: per output pixel it compares a 3x3 box of the game's frame with an anchor (that box as it was when the pixel last moved), relative to local brightness. Where the input moved, the model's answer shows as is and the anchor follows; where it did not, the shown pixel keeps this much of last frame's value and takes the rest from the model. 0 = off, 1 = a still region never moves until its input changes, 0.9 = the model's new opinion fades in over about ten frames. No reprojection, so nothing ghosts: a pixel whose input changed shows the current output that frame. A slider on the overlay page ("Output stabiliser"), applied live. On the 64-bit add-on it runs on the same device as the evaluate, so on the same-device D3D12 transport that is the game's device. |
 | `hold_tolerance` | 0.04 | How much a pixel's input (3x3 box, relative to its brightness) may differ from its anchor and still count as still: 0.04 = 4%. Below it the pixel is held; at twice it the model shows through fully. Raise it if a held region unlocks by itself (exposure drift, shimmer), lower it if slow animation lags behind. |
@@ -1647,7 +1739,7 @@ Common cases:
   (or `[ProcessFilter] TargetProcessName` names another exe); `NEURAL MODEL NOT CREATED` means it
   never built the pass and `OptiScaler.log` beside it says why; `not a DLSS-NR fork` means a stock
   OptiScaler, which can only upscale. Both forks (wilsjo2, Dagherbou) are recognised. See
-  [Alternative: OptiScaler DLSS-NR](#alternative-optiscaler-dlss-nr).
+  [OptiScaler DLSS-NR](#optiscaler-dlss-nr-recommended).
 * **Corruption or flicker with Smooth Motion on** — see [Before you install](#3-optiscaler-only-the-dlss-nr-fork-and-smooth-motion-off-on-vulkan) at the top of
   this README. The overlay says whether Smooth Motion was detected, and `dlss5-feed.log` records the feeding
   thread: `frame fed from thread N, not the usual M` means `Present` is arriving off-thread, and
@@ -1810,9 +1902,10 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
   [AlucardDH's dh-reshade-shaders](https://github.com/AlucardDH/dh-reshade-shaders) for the
   provider-switch pattern. **No provider's files are bundled or included by this project's shader**
   — install them from their own repositories, under their own licenses.
-* **DLSS 5 neural rendering:** **Deep Fried Chicken** by Alexander — the recommended consumer, and
+* **DLSS 5 neural rendering:** **Deep Fried Chicken** by Alexander —
   the author who built the ABI-1 interop this feeder negotiates over (`FEEDER-INTEROP-v1.md`) — and
-  the RenoDX community's `renodx-dlss5` add-on, the alternative. Neither is bundled here.
+  the RenoDX community's `renodx-dlss5` add-on, and the OptiScaler DLSS-NR forks by wilsjo2 and
+  Dagherbou. None is bundled here.
 * **ReShade** add-on API by Patrick Mours.
 * **dgVoodoo2** by Dege — the D3D9 translation layer that makes the DirectX 9 path possible.
 * **D3D12 stability findings** independently confirmed by the
