@@ -407,11 +407,14 @@ struct Cfg
                            // Far Cry 2 at 32 fps with the GPU 60% busy). The game shows the result from
                            // two frames back. 0 = the original drain of the current frame.
                            // Parse-only, not written back, not on the overlay.
+    int   preset;          // DLSS render-preset hint, as in the 64-bit add-on: 0 = the model's default,
+                           // 5 = E, 6 = F (legacy CNN), 10 = J, 11 = K, 12 = L, 13 = M. Sent to the host
+                           // in FeedBuild (v12); changing it rebuilds the feature.
 };
 
 //                                        host_window --v  v-- host_gpu_priority (off)          settle_evals --v  v-- hold_input
 static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 0, 100, 0, 1, 0, 0, 0, 0,
-                     /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f, /* d3d10_pipeline */ 1 };
+                     /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f, /* d3d10_pipeline */ 1, /* preset */ 0 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -621,6 +624,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "hold_strength")  == 0) next.hold_strength  = val < 0.0f ? 0.0f : val > 1.0f ? 1.0f : val;
         else if (_stricmp(key, "hold_tolerance") == 0) next.hold_tolerance = val < 0.005f ? 0.005f : val > 0.5f ? 0.5f : val;
         else if (_stricmp(key, "d3d10_pipeline") == 0) next.d3d10_pipeline = iv != 0 ? 1 : 0;
+        else if (_stricmp(key, "preset")         == 0) next.preset         = (iv >= 0 && iv <= 31) ? iv : 0;
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
@@ -628,7 +632,8 @@ static bool CfgReload()   // true when a build-affecting value changed
     if (next.work_sharpness < 0.0f || next.work_sharpness > 1.0f) next.work_sharpness = g_cfg.work_sharpness;
     const bool rebuild = next.mode != g_cfg.mode || next.hdr != g_cfg.hdr ||
                          next.depth_inverted != g_cfg.depth_inverted || next.flags != g_cfg.flags ||
-                         next.mv_scale_x != g_cfg.mv_scale_x || next.mv_scale_y != g_cfg.mv_scale_y;
+                         next.mv_scale_x != g_cfg.mv_scale_x || next.mv_scale_y != g_cfg.mv_scale_y ||
+                         next.preset != g_cfg.preset;
     const bool changed = memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
     if (changed)
     {
@@ -638,12 +643,12 @@ static bool CfgReload()   // true when a build-affecting value changed
         // what they had set (issue #15). The 64-bit side has always printed its full set.
         Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d log_frames=%d "
             "host_window=%d host_gpu_priority=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f async_home=%d "
-            "mv_scale=%.3f,%.3f cast_key=%d cast_mods=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d wine_fence_import=%d settle_evals=%d hold=%.2f/%.3f d3d10_pipeline=%d",
+            "mv_scale=%.3f,%.3f cast_key=%d cast_mods=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d wine_fence_import=%d settle_evals=%d hold=%.2f/%.3f d3d10_pipeline=%d preset=%d",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_mods, g_cfg.cast_scale,
             g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.host_creates, g_cfg.wine_fence_import, g_cfg.settle_evals,
-            g_cfg.hold_strength, g_cfg.hold_tolerance, g_cfg.d3d10_pipeline);
+            g_cfg.hold_strength, g_cfg.hold_tolerance, g_cfg.d3d10_pipeline, g_cfg.preset);
     }
     return rebuild;
 }
@@ -1138,12 +1143,26 @@ static void HostClose()
     g.sent_n    = 0;
     g.wait_n    = 0;
     g.out_valid = false;
+    // The pipe breaking is what tells the host to leave, so it is closed BEFORE the host is
+    // waited for -- when no worker can still be using it. (For two months it was closed after:
+    // a healthy host never saw the break, the wait below always ran its full four seconds on
+    // the game's render thread -- on every Apply, restart, device loss and exit -- and ended
+    // in TerminateProcess, so the host never got to release its swapchain and ReShade x64
+    // never saved its ini, which is what the four seconds are for. Max Payne 3's log: "game
+    // device destroyed" 16:08:20.261, "shut down cleanly" 16:08:24.297, and a host log that
+    // stops mid-session. With the order right a host is gone 7-27 ms after the break.)
+    if (g.pipe != nullptr && worker_done)
+    {
+        CloseHandle(g.pipe);
+        g.pipe = nullptr;
+    }
     if (g.hproc != nullptr)
     {
-        // Ending the host first is what unblocks an orphan worker parked on the pipe, and it
-        // is always safe: no worker ever touches g.hproc. 4 s, because the host releases its
-        // swapchain on the way out so ReShade x64 can save its ini (the overlay layout), and
-        // ReShade's own unhook takes about a second.
+        // With an orphan worker still parked on the pipe it cannot be closed (see below), and
+        // ending the host is then what unblocks the worker -- always safe: no worker ever
+        // touches g.hproc. 4 s, because the host releases its swapchain on the way out so
+        // ReShade x64 can save its ini (the overlay layout), and ReShade's own unhook takes
+        // about a second.
         if (WaitForSingleObject(g.hproc, 4000) != WAIT_OBJECT_0)
             TerminateProcess(g.hproc, 0);      // it did not exit on the pipe break
         CloseHandle(g.hproc);
@@ -1154,8 +1173,7 @@ static void HostClose()
         // Closing it under a live worker would let the value be reused and the orphan's next
         // write land in an unrelated handle. Leaking one pipe handle is the cheaper mistake;
         // the host it named is gone by now, so the orphan's I/O fails and it exits.
-        if (worker_done) CloseHandle(g.pipe);
-        else Log("[feed32] leaking the pipe handle: a host worker may still be using it");
+        Log("[feed32] leaking the pipe handle: a host worker may still be using it");
         g.pipe = nullptr;
     }
     // The fences belong to the host that just went away; a new host creates new ones.
@@ -3514,6 +3532,7 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
+    b.preset         = g_cfg.preset > 0 ? static_cast<uint32_t>(g_cfg.preset) : 0;
     if (want_sr) { b.target_width = g.output_width; b.target_height = g.output_height; }
     if (g_cfg.async_home) b.client_flags |= FEED_BUILD_ASYNC_HOME;
     if (g.host_creates)
@@ -3786,6 +3805,7 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
+    b.preset         = g_cfg.preset > 0 ? static_cast<uint32_t>(g_cfg.preset) : 0;
     if (g_cfg.async_home) b.client_flags |= FEED_BUILD_ASYNC_HOME;
     // b.tex stays zero: on this path the host creates, and answers with its handles.
 
@@ -4023,6 +4043,7 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
+    b.preset         = g_cfg.preset > 0 ? static_cast<uint32_t>(g_cfg.preset) : 0;
     // Under async_home the game copies home the PREVIOUS frame's result and is never
     // waiting on the evaluate the host is running, so the host may take its own time to
     // get a present slot rather than dropping the present. That drop is what starved the

@@ -905,6 +905,8 @@ struct Host
     UINT            out_width, out_height;  // the Output slot: == work (DLAA) or the native size (SR, v6)
     int             sr_quality;             // NVSDK_NGX_PerfQuality_Value in use when out != work
     const char     *sr_quality_name;
+    const char     *sr_quality_hint;        // the NGX render-preset hint key for that quality
+    unsigned        preset;                 // FeedBuild::preset (v12): the render-preset hint, 0 = default
     DXGI_FORMAT     color_fmt, output_fmt;
 
     HANDLE          latency_wait;  // the disguise swapchain's frame-latency waitable object.
@@ -2655,12 +2657,12 @@ static bool InitNgx()
 // the chosen preset. Fills h.sr_quality(_name); false when no preset covers the ratio.
 static bool PickSrQuality(UINT w, UINT h_, UINT out_w, UINT out_h)
 {
-    static const struct { NVSDK_NGX_PerfQuality_Value q; const char *name; } kOrder[] = {
-        { NVSDK_NGX_PerfQuality_Value_UltraQuality,     "Ultra Quality" },
-        { NVSDK_NGX_PerfQuality_Value_MaxQuality,       "Quality" },
-        { NVSDK_NGX_PerfQuality_Value_Balanced,         "Balanced" },
-        { NVSDK_NGX_PerfQuality_Value_MaxPerf,          "Performance" },
-        { NVSDK_NGX_PerfQuality_Value_UltraPerformance, "Ultra Performance" },
+    static const struct { NVSDK_NGX_PerfQuality_Value q; const char *name, *hint; } kOrder[] = {
+        { NVSDK_NGX_PerfQuality_Value_UltraQuality,     "Ultra Quality",     NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality },
+        { NVSDK_NGX_PerfQuality_Value_MaxQuality,       "Quality",           NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality },
+        { NVSDK_NGX_PerfQuality_Value_Balanced,         "Balanced",          NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced },
+        { NVSDK_NGX_PerfQuality_Value_MaxPerf,          "Performance",       NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance },
+        { NVSDK_NGX_PerfQuality_Value_UltraPerformance, "Ultra Performance", NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance },
     };
     // The optimal-settings callback lives on the CAPABILITY parameter object only; an
     // AllocateParameters object answers every preset with "no callback" (the first Fable
@@ -2682,6 +2684,7 @@ static bool PickSrQuality(UINT w, UINT h_, UINT out_w, UINT out_h)
         {
             h.sr_quality      = static_cast<int>(o.q);
             h.sr_quality_name = o.name;
+            h.sr_quality_hint = o.hint;
             return true;
         }
     }
@@ -2702,6 +2705,16 @@ static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r, U
     cp.Feature.InPerfQualityValue = sr ? static_cast<NVSDK_NGX_PerfQuality_Value>(h.sr_quality) : NVSDK_NGX_PerfQuality_Value_DLAA;
     cp.InFeatureCreateFlags       = flags;
     cp.InEnableOutputSubrects     = false;
+
+    // The render-preset hint the game's dlss5-feed.cfg asks for (FeedBuild::preset, v12), as the
+    // 64-bit add-on sets it. Written on every create, 0 included, so that going back to the
+    // default takes the last hint off again.
+    if (h.params != nullptr)
+    {
+        const char *key = sr && h.sr_quality_hint != nullptr ? h.sr_quality_hint : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA;
+        h.params->Set(key, h.preset);
+        if (h.preset != 0) Log("[host] DLSS render preset hint: %u", h.preset);
+    }
 
     if (!BeginCommands()) return false;
     DWORD ccode = 0;
@@ -3320,8 +3333,9 @@ static int Serve(DWORD game_pid)
         {
             FeedBuild b = {};
             if (!ReadFull(pipe, &b, sizeof(b))) break;
-            Log("[host] build: %ux%u color=%u output=%u hdr=%d inverted=%d", b.width, b.height,
-                b.color_fmt, b.output_fmt, b.hdr, b.depth_inverted);
+            Log("[host] build: %ux%u color=%u output=%u hdr=%d inverted=%d preset=%u", b.width, b.height,
+                b.color_fmt, b.output_fmt, b.hdr, b.depth_inverted, b.preset);
+            h.preset = b.preset;
 
             // Tear down the old set -- after the GPU is done with it. The last evaluate may
             // still be in flight, and a neural consumer (Deep Fried Chicken) keeps a graph

@@ -70,7 +70,11 @@
 #include <cstdint>
 
 #define FEED_IPC_MAGIC   0x35534C44u  // 'DLS5'
-#define FEED_IPC_VERSION 11u
+#define FEED_IPC_VERSION 12u
+
+// Version 12 added FeedBuild::preset: the DLSS render-preset hint (dlss5-feed.cfg `preset`), which
+// the 64-bit add-on has always applied and the host never heard of -- a 32-bit game ran on the
+// model's default whatever the file said.
 
 // Version 11 added FeedFrameMsg::settle_evals (experimentHold): how many extra evaluates of the
 // SAME frame the host runs after the real one, with zero motion and no reset, so the neural
@@ -182,6 +186,9 @@ struct FeedBuild        // game -> host, on every resolution/format change
     uint64_t panel_tex;          // v7+: D3D11 clients: NT-handle VALUE (game process) of the panel texture the
                                  // game created at FeedHelloAck::panel_* size; 0 = none. The host opens it and
                                  // copies its presented frame into it after every Present.
+    uint32_t preset;             // v12+: DLSS render-preset hint, 0 = the model's default (5 = E, 6 = F,
+                                 // 10 = J, 11 = K, 12 = L, 13 = M). Set before the feature is created.
+    uint32_t reserved;           // keeps the struct's size a multiple of 8 on both sides
 };
 
 struct FeedBuildAck     // host -> game
