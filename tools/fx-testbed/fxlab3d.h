@@ -601,6 +601,30 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
                    frame, names[k], a.n, a.tx / n, a.ty / n, a.sx / n, a.sy / n, a.err / n, 100 * a.q / n, 100 * a.o / n, 100 * a.z / n);
             emit(names[k], "vec", a.err / n, 100 * a.q / n, 100 * a.o / n, 100 * a.z / n);
         }
+        // Where the vectors are wrong, as a picture (a third of the size): the frame on top, and
+        // under it red = how far off (8 px and more is full red), green = a moving pixel that
+        // was given zero, blue = sky or HUD (not scored).
+        {
+            const int sw = W / 3, sh = H / 3;
+            std::vector<uint8_t> img(static_cast<size_t>(sw) * 3 * sh * 2);
+            for (int y = 0; y < sh; ++y)
+                for (int x = 0; x < sw; ++x)
+                {
+                    const size_t i = static_cast<size_t>(y * 3 + 1) * W + (x * 3 + 1);
+                    uint8_t *top = img.data() + (static_cast<size_t>(y) * sw + x) * 3, *bot = img.data() + (static_cast<size_t>(sh + y) * sw + x) * 3;
+                    top[0] = c.scene[i * 4 + 2]; top[1] = c.scene[i * 4 + 1]; top[2] = c.scene[i * 4];
+                    const float tx = XMConvertHalfToFloat(c.truth[i * 4]), ty = XMConvertHalfToFloat(c.truth[i * 4 + 1]);
+                    const float mx = (c.post[i * 3] * 1023.0f - 512.0f) / 8.0f, my = (c.post[i * 3 + 1] * 1023.0f - 512.0f) / 8.0f;
+                    const float e = cls[i] == 2 ? hypotf(mx, my) : hypotf(mx - tx, my - ty);
+                    const bool zero = fabsf(mx) < 0.01f && fabsf(my) < 0.01f && fabsf(tx) + fabsf(ty) > 0.25f;
+                    bot[2] = static_cast<uint8_t>(std::clamp(e / 8.0f, 0.0f, 1.0f) * 255.0f);
+                    bot[1] = cls[i] == 1 && zero ? 200 : 0;
+                    bot[0] = cls[i] != 1 ? 90 : 0;
+                }
+            char path[MAX_PATH];
+            sprintf_s(path, "%s\\%s_f%d_mverr.png", g.out.c_str(), g.tag.c_str(), frame);
+            SavePng(path, img, sw, sh * 2);
+        }
         return;
     }
 
