@@ -1144,6 +1144,28 @@ float FlowSym(P9 c, P9 m, float2 uv, float2 v, float cell, sampler2D sC, sampler
 //   lmin: the smaller eigenvalue of the window's gradient matrix, per cell and tap -- how well
 //         it pins motion down in its weakest direction (a line: not at all along itself);
 //   res, dev: what the corrected vector leaves unexplained, and the window's own contrast.
+// Motion, or a change of brightness? A window's sums can be solved either way: for a motion
+// alone, or for a motion and a brightness offset (the sums with their means taken off). The
+// second never explains less -- but it is blind to the commonest thing in a rendered picture, a
+// soft slope sliding along, which IS a change of brightness everywhere in the window. So the
+// offset is allowed in proportion to what it buys: nothing where motion alone already explains
+// the window (the slope), all of it where motion alone leaves several times more unexplained
+// than motion with an offset does (a lamp that flickers on a wall that stands still).
+// Returns the share of the means to take off, LKC..1. fl2: the noise floor squared, in the
+// units of the sums.
+#ifndef LKC
+    #define LKC 0.25
+#endif
+float FlowOffsetShare(float sxx, float sxy, float syy, float sxt, float syt, float stt, float sx, float sy, float st, float n, float fl2)
+{
+    const float e0  = 1e-3 * (sxx + syy) + n * fl2 * 1e-3;
+    const float eu  = stt - ((syy + e0) * sxt * sxt - 2.0 * sxy * sxt * syt + (sxx + e0) * syt * syt) / max((sxx + e0) * (syy + e0) - sxy * sxy, 1e-30);
+    const float cxx = sxx - sx * sx / n, cxy = sxy - sx * sy / n, cyy = syy - sy * sy / n;
+    const float cxt = sxt - sx * st / n, cyt = syt - sy * st / n, ctt = stt - st * st / n;
+    const float ec  = ctt - ((cyy + e0) * cxt * cxt - 2.0 * cxy * cxt * cyt + (cxx + e0) * cyt * cyt) / max((cxx + e0) * (cyy + e0) - cxy * cxy, 1e-30);
+    return lerp(LKC, 1.0, smoothstep(2.0, 6.0, max(eu, 0.0) / (max(ec, 0.0) + n * fl2)));
+}
+
 float2 FlowTrack(sampler2D sC, sampler2D sP, float2 uv, float2 v, float cell, out float lmin, out float lmax, out float res, out float dev, out float reach)
 {
     const float2 px = BUFFER_PIXEL_SIZE;
@@ -1188,16 +1210,14 @@ float2 FlowTrack(sampler2D sC, sampler2D sP, float2 uv, float2 v, float cell, ou
         }
     }
     n = max(n, 1e-3);
-#ifndef LKC
-    #define LKC 0.75
-#endif
     dev  = sqrt(max(saa - sa * sa / n, 0.0) / n);
     // How far the window's content reaches, in cells: its contrast over its mean gradient. A
     // gradient step is good for about that far -- a soft texture many cells across can be
     // followed over a cell or two, lettering two cells across cannot.
     reach = dev / sqrt(max((sxx + syy) / n, 1e-12));
-    sxx -= LKC * sx * sx / n; sxy -= LKC * sx * sy / n; syy -= LKC * sy * sy / n;
-    sxt -= LKC * sx * st / n; syt -= LKC * sy * st / n; stt -= LKC * st * st / n;
+    const float lkc = FlowOffsetShare(sxx, sxy, syy, sxt, syt, stt, sx, sy, st, n, DLSS5_FLOW_FLOOR * DLSS5_FLOW_FLOOR);
+    sxx -= lkc * sx * sx / n; sxy -= lkc * sx * sy / n; syy -= lkc * sy * sy / n;
+    sxt -= lkc * sx * st / n; syt -= lkc * sy * st / n; stt -= lkc * st * st / n;
     lmin = 0.5 * (sxx + syy - sqrt((sxx - syy) * (sxx - syy) + 4.0 * sxy * sxy)) / n;
     lmax = (sxx + syy) / n - lmin;
     // The step is damped in the direction the window says little about, against what it says in
@@ -1539,8 +1559,9 @@ void FlowEq(sampler2D raw, sampler2D sC, sampler2D sP, sampler2D sS, bool has_pr
         }
     }
     n = max(n, 1e-3);
-    sxx = (sxx - LKC * sx * sx / n) / n; sxy = (sxy - LKC * sx * sy / n) / n; syy = (syy - LKC * sy * sy / n) / n;
-    sxt = (sxt - LKC * sx * st / n) / n; syt = (syt - LKC * sy * st / n) / n; stt = (stt - LKC * st * st / n) / n;
+    const float lkc = FlowOffsetShare(sxx, sxy, syy, sxt, syt, stt, sx, sy, st, n, DLSS5_FLOW_FLOOR * DLSS5_FLOW_FLOOR * 4096.0);
+    sxx = (sxx - lkc * sx * sx / n) / n; sxy = (sxy - lkc * sx * sy / n) / n; syy = (syy - lkc * sy * sy / n) / n;
+    sxt = (sxt - lkc * sx * st / n) / n; syt = (syt - lkc * sy * st / n) / n; stt = (stt - lkc * st * st / n) / n;
     // A window that the agreed vector does not explain -- an outline with something else behind
     // it, a disocclusion -- has no say: what is left over, against the window's own contrast.
     const float dev = sqrt(max(saa - sa * sa / n, 0.0) / n);
