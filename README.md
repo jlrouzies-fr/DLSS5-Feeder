@@ -465,7 +465,8 @@ Things to know:
 <!-- DRAFT for the release that ships the menu. Before publishing:
      - retake the picture (this one is Fable Anniversary in a 1080p window, from the prototype);
      - name the OptiScaler fork release that carries live settings, once there is one;
-     - run the menu against the RenoDX build the installer fetches (tested with v6.1 only);
+     - RenoDX: run in the lab against v6.1 and against 10.8.0 (RHI's newest on 2026-11-12); a newer
+       one the installer may fetch by then is untested;
      - try it in an exclusive-fullscreen game before saying anything about fullscreen. -->
 
 Press **Alt+C** in the game. A panel slides in from the right edge with the settings of the neural
@@ -496,8 +497,13 @@ ShortFuse's `renodx-dlss` is not supported next to this project at all (see
 
 The second tab is named after the tool and holds what only that tool has: for OptiScaler the
 highlight guard, the white point source and exposure trims, the unlock for up to 10 passes and the
-separate skin / environment controls; for the RenoDX add-on global tone, HUD correction, diffuse
-white and its two stacking switches.
+separate skin / environment controls; for the RenoDX add-on HUD correction, diffuse white and its
+stacking switches, and from RenoDX v8 on also its **look** controls (how much of the model's
+brightening, darkening and colour change is kept, by tonal range and by scale; halo suppression;
+Stabilize), **Detail stability**, the style highlight guard and the chroma clamp. RenoDX builds
+differ in what they have, so a row is shown only when the installed build has that setting. Its
+per-pass settings for passes 2 to 4, its model-weight sliders and its HDR codec choices stay on
+its own page.
 
 **When a change takes effect** depends on the tool and on where it runs:
 

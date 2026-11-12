@@ -26,6 +26,7 @@ param(
     [string[]]$Actions = @(),
     [ValidateSet('renodx', 'optiscaler', 'none')][string]$Consumer = 'renodx',   # the neural tool (exactly one):
                                           # renodx = "RenoDX DLSS5 Generic" v6.1 (renodx-dlss5.addon64)
+    [string]$RenoDll = '',                # another renodx-dlss5 build to use (default: v6.1 from the deploy cache)
     [hashtable]$HostIni = @{},            # keys forced into the tool's ReShade.ini before the run, 'Section.Key' = value
     [hashtable]$Opti = @{},               # OptiScaler.ini overrides, 'Section.Key' = value
     [string]$OptiDll = '',                # another OptiScaler build to load as winmm.dll (default: deploy\optiscaler-fork\winmm.dll)
@@ -71,7 +72,7 @@ Remove-Item (Join-Path $tool 'renodx-dlss5.addon64'), (Join-Path $tool 'renodx-d
 if ($Consumer -ne 'optiscaler' -or -not $KeepHostIni) { Remove-Item (Join-Path $tool 'OptiScaler.ini') -ErrorAction SilentlyContinue }
 if ($Consumer -eq 'none') { Remove-Item (Join-Path $tool 'nvngx_dlssnr.dll') -ErrorAction SilentlyContinue }
 elseif (-not (Test-Path (Join-Path $tool 'nvngx_dlssnr.dll'))) { Copy-Item (Join-Path $dep 'shared\nvngx_dlssnr.dll') $tool -Force }   # 166 MB: once
-if ($Consumer -eq 'renodx')    { Copy-Item (Join-Path $dep 'renodx-dlss5-v61.addon64') (Join-Path $tool 'renodx-dlss5.addon64') -Force }
+if ($Consumer -eq 'renodx')    { Copy-Item $(if ($RenoDll -ne '') { $RenoDll } else { Join-Path $dep 'renodx-dlss5-v61.addon64' }) (Join-Path $tool 'renodx-dlss5.addon64') -Force }
 
 # Section-aware and tolerant of "Key = value": OptiScaler.ini repeats key names across sections
 # and the fork writes spaces round the equals sign.
@@ -150,7 +151,7 @@ ShowFrameTime=0
 }
 if ($HostIni.Count -gt 0) {
     if (-not ('OvLab.Ini' -as [type])) { Add-Type -Namespace OvLab -Name Ini -MemberDefinition '[DllImport("kernel32.dll", CharSet=CharSet.Ansi)] public static extern bool WritePrivateProfileString(string s, string k, string v, string f);' }
-    foreach ($k in $HostIni.Keys) { $q = $k.Split('.', 2); [OvLab.Ini]::WritePrivateProfileString($q[0], $q[1], [string]$HostIni[$k], (Join-Path $tool 'ReShade.ini')) | Out-Null }
+    foreach ($k in $HostIni.Keys) { $d = $k.LastIndexOf('.'); $q = @($k.Substring(0, $d), $k.Substring($d + 1)); [OvLab.Ini]::WritePrivateProfileString($q[0], $q[1], [string]$HostIni[$k], (Join-Path $tool 'ReShade.ini')) | Out-Null }
 }
 
 # --- dlss5-feed.cfg. F3 opens the feeder's panel (-Mode 3) or toggles the cast (-Mode 1 / 2), never both.

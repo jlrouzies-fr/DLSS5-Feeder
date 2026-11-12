@@ -196,6 +196,8 @@ struct BridgeItem
     int                need_item;
     BridgeSide         reno;       // "RenoDX DLSS5 Generic": [RenoDX.DLSS5] in its ReShade.ini
     BridgeSide         opti;       // OptiScaler DLSS-NR: [DlssNr] in OptiScaler.ini
+    BridgeSide         reno8;      // RenoDX from v8 on (it writes ConfigVersion), where it differs from `reno`:
+                                   // another range, or a setting older builds do not have (then reno is BR_NONE)
 };
 
 static const char *const kBrPresets[]   = { "Default", "Preset #1", "Preset #2", "Preset #3" };
@@ -203,6 +205,11 @@ static const char *const kBrStyles[]    = { "Default", "Natural", "Cinematic" };
 static const char *const kBrWhiteSource[]  = { "Manual", "Game exposure", "Automatic HDR exposure" };
 static const int         kBrWhiteSourceV[] = { 0, 1, 3 };   // OptiScaler's WhitePointSource values for those three
 enum { BR_ROW_WHITE_SOURCE = 16 };   // index of "White point source" below
+enum { BR_ROW_RENO_LOOK = 29 };     // index of "Adjust the model's result" below
+// RenoDX 10.8.0's choices, in the order of the numbers it takes. Detail stability really is
+// Auto / Off / Always: its log says "(Auto)" for 0, nothing for 1 and "(Always)" for 2.
+static const char *const kBrRenoStabilize[] = { "Off", "Static", "Motion" };
+static const char *const kBrRenoDetail[]    = { "Auto", "Off", "Always" };
 #define BR_NONE { nullptr, 0.0f, 0.0f, 0.0f }
 
 // Ranges. OptiScaler's are its own: Config.h defaults and the slider limits in
@@ -217,7 +224,8 @@ static const BridgeItem kBridge[] = {
     { "LOOK", "Style", BR_COMBO, nullptr, false, false, kBrStyles, 3, nullptr, -1, 0,
       { "NRStyle", 0.0f, 0.0f, 2.0f },             { "Style", 0.0f, 0.0f, 2.0f } },
     { "LOOK", "Intensity", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, -1, 0,
-      { "NRIntensity", 1.0f, 0.0f, 2.0f },         { "Intensity", 1.0f, 0.0f, 2.0f } },
+      { "NRIntensity", 1.0f, 0.0f, 2.0f },         { "Intensity", 1.0f, 0.0f, 2.0f },
+      { "NRIntensity", 1.0f, 0.0f, 1.0f } },                                          // 10.8.0 stops at 1
 
     // What the model is asked for.
     { "MODEL", "Tone", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, -1, 0,
@@ -237,7 +245,7 @@ static const BridgeItem kBridge[] = {
     { "PASSES AND COST", "Passes", BR_FLOAT, nullptr, true, false, nullptr, 0, nullptr, -1, 0,
       { "NRPasses", 1.0f, 1.0f, 4.0f },            { "Passes", 1.0f, 1.0f, 2.0f } },   // 2 = OptiScaler's limit without its "unlock up to 10"
     { "PASSES AND COST", "Working resolution", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, -1, 0,
-      { "NRResolutionScale", 1.0f, 0.25f, 1.0f },  { "WorkingScale", 1.0f, 0.25f, 1.0f } },   // OptiScaler itself goes to 2.0
+      { "NRResolutionScale", 1.0f, 0.33f, 1.0f },  { "WorkingScale", 1.0f, 0.25f, 1.0f } },   // OptiScaler itself goes to 2.0
 
     // How much of the model's picture is kept when it is put back over the game's.
     { "FINAL PICTURE", "Detail strength", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, -1, 0,
@@ -283,11 +291,64 @@ static const BridgeItem kBridge[] = {
       { "NRPreUpscale", 0.0f, 0.0f, 1.0f } },
     { "STACKING", "Chained temporal history", BR_BOOL, nullptr, false, false, nullptr, 0, nullptr, -1, 0,
       { "NRChainedHistory", 1.0f, 0.0f, 1.0f } },
+
+    // RenoDX DLSS5 from v8 on (read off 10.8.0: names from the ini it saves, limits from what it
+    // clamps an out-of-range value to, the order of each choice from what its log says it did).
+    // "Adjust NR's look" reshapes what the model returned; the rows under it apply while it is on.
+    { "LOOK OF THE RESULT", "Adjust the model's result", BR_BOOL, nullptr, false, false, nullptr, 0, nullptr, -1, 0,
+      BR_NONE, BR_NONE, { "NRLookMode", 0.0f, 0.0f, 1.0f } },
+    { "LOOK OF THE RESULT", "Edit strength", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookStrength", 1.0f, 0.0f, 2.0f } },
+    { "LOOK OF THE RESULT", "Brightening", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookBrighten", 1.0f, 0.0f, 2.0f } },
+    { "LOOK OF THE RESULT", "Darkening", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookDarken", 1.0f, 0.0f, 2.0f } },
+    { "LOOK OF THE RESULT", "Colour change", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookColour", 1.0f, 0.0f, 2.0f } },
+    { "LOOK OF THE RESULT", "Hue shift", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookHue", 1.0f, 0.0f, 2.0f } },
+    { "LOOK OF THE RESULT", "Shadows", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookShadows", 1.0f, 0.0f, 2.0f } },
+    { "LOOK OF THE RESULT", "Midtones", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookMidtones", 1.0f, 0.0f, 2.0f } },
+    { "LOOK OF THE RESULT", "Highlights", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookHighlights", 1.0f, 0.0f, 2.0f } },
+    { "LOOK OF THE RESULT", "Large-scale tone", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookTone", 1.0f, 0.0f, 2.0f } },
+    { "LOOK OF THE RESULT", "Fine detail", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookDetail", 1.0f, 0.0f, 2.0f } },
+    { "LOOK OF THE RESULT", "Detail radius", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookDetailRadius", 1.0f, 0.25f, 4.0f } },
+    { "LOOK OF THE RESULT", "Max brightening (stops, 0 = none)", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookMaxBrighten", 0.0f, 0.0f, 4.0f } },
+    { "LOOK OF THE RESULT", "Max darkening (stops, 0 = none)", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookMaxDarken", 0.0f, 0.0f, 4.0f } },
+    { "LOOK OF THE RESULT", "Max colour change (0 = none)", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookMaxColour", 0.0f, 0.0f, 2.0f } },
+    { "LOOK OF THE RESULT", "Halo suppression", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookHalo", 0.0f, 0.0f, 1.0f } },
+    { "LOOK OF THE RESULT", "Halo next to dark objects", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookHaloBrightSide", 0.0f, 0.0f, 1.0f } },
+    { "LOOK OF THE RESULT", "Stabilize", BR_COMBO, nullptr, false, false, kBrRenoStabilize, 3, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookStabilize", 0.0f, 0.0f, 2.0f } },
+    { "LOOK OF THE RESULT", "Stabilize time (ms)", BR_FLOAT, "%.0f", false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookStabilizeMs", 60.0f, 10.0f, 250.0f } },
+    { "LOOK OF THE RESULT", "Stabilize fine detail too", BR_BOOL, nullptr, false, false, nullptr, 0, nullptr, BR_ROW_RENO_LOOK, 1,
+      BR_NONE, BR_NONE, { "NRLookStabilizeDetail", 0.0f, 0.0f, 1.0f } },
+    { "STABILITY", "Detail stability", BR_COMBO, nullptr, false, false, kBrRenoDetail, 3, nullptr, -1, 0,
+      BR_NONE, BR_NONE, { "NRDetailStability", 0.0f, 0.0f, 2.0f } },
+    { "HIGHLIGHTS AND COLOUR", "Style highlight guard (stops)", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, -1, 1,
+      BR_NONE, BR_NONE, { "NRStyleHighlightGuard", 0.0f, 0.0f, 2.0f } },
+    { "HIGHLIGHTS AND COLOUR", "Chroma clamp (stops)", BR_FLOAT, "%.2f", false, false, nullptr, 0, nullptr, -1, 1,
+      BR_NONE, BR_NONE, { "NRChromaClamp", 1.0f, 0.25f, 2.0f } },
 };
 static const int kBridgeCount = static_cast<int>(sizeof(kBridge) / sizeof(kBridge[0]));
+static_assert(sizeof(kBridge) / sizeof(kBridge[0]) <= 64, "g_br and its companions hold 64 rows");
 
 static int       g_br_backend;
 static float     g_br[64], g_br_saved[64];
+static bool      g_br_reno8;          // the RenoDX build behind the panel is v8 or newer (see BridgeLoad)
+static bool      g_br_absent[64];     // this build of the tool has no such setting (see BridgeLoad)
 static bool      g_br_loaded;
 static int       g_br_tab;            // 0 = the settings tools share, 1 = the ones only this tool has
 static char      g_br_note[160];      // the last thing that happened, shown at the foot of the panel
@@ -317,16 +378,17 @@ static const char *BridgeBackendShort()
 }
 static const BridgeSide &BridgeSideOf(int i)
 {
-    return g_br_backend == BR_BACKEND_OPTI ? kBridge[i].opti : kBridge[i].reno;
+    if (g_br_backend == BR_BACKEND_OPTI) return kBridge[i].opti;
+    return g_br_reno8 && kBridge[i].reno8.key != nullptr ? kBridge[i].reno8 : kBridge[i].reno;
 }
-static const char *BridgeKey(int i) { return BridgeSideOf(i).key; }
+static const char *BridgeKey(int i) { return g_br_absent[i] ? nullptr : BridgeSideOf(i).key; }
 static const char *BridgeSection()  { return g_br_backend == BR_BACKEND_OPTI ? "DlssNr" : "RenoDX.DLSS5"; }
 
 // A setting only one of the tools has: it goes on the tool's own tab.
 static bool BridgeSpecific(int i)
 {
     const BridgeItem &it = kBridge[i];
-    return (it.reno.key != nullptr) + (it.opti.key != nullptr) < 2;
+    return (it.reno.key != nullptr || it.reno8.key != nullptr) + (it.opti.key != nullptr) < 2;
 }
 // A row is on show when the tool has the setting, it belongs to the tab in front, and the
 // choice it depends on is the one made.
@@ -385,13 +447,20 @@ static void BridgeLoad()
     g_br_backend = g_panel_env.opti_nr ? BR_BACKEND_OPTI : have_reno ? BR_BACKEND_RENODX : BR_BACKEND_NONE;
 
     char buf[64];
+    // A RenoDX build from v8 on writes ConfigVersion and its whole set of settings into its
+    // section. Once it has, a name that is not there is one this build does not have (10.8.0
+    // has neither NRGlobalTone nor NRPreUpscale): the row is left out, not shown doing nothing.
+    const bool full_set = g_br_backend == BR_BACKEND_RENODX && BridgeRead(BridgeSection(), "ConfigVersion", buf, sizeof(buf));
+    g_br_reno8 = full_set;
     for (int i = 0; i < kBridgeCount; ++i)
     {
         const BridgeItem &it = kBridge[i];
         const BridgeSide &side = BridgeSideOf(i);
         g_br[i] = side.def;
+        g_br_absent[i] = false;
         if (g_br_backend == BR_BACKEND_NONE || side.key == nullptr) { g_br_saved[i] = g_br[i]; continue; }
         const bool have = BridgeRead(BridgeSection(), side.key, buf, sizeof(buf));
+        if (!have && full_set) { g_br_absent[i] = true; g_br_saved[i] = g_br[i]; continue; }
         // OptiScaler writes "auto" for "my own default", and booleans as words.
         if (have && _stricmp(buf, "auto") != 0 && buf[0] != '\0')
         {

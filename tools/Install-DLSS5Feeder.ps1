@@ -209,7 +209,7 @@ $Sources = @{
     RenoDxDlss5Tag  = '^renodx-dlss5-\d'
     DlssNr          = 'https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.8.Lecram/nvngx_dlssnr_310.8.Lecram.zip'
     Dlss            = 'https://github.com/RankFTW/rhi-repo/releases/download/dlss-310.9.1/nvngx_dlss_310.9.1.zip'
-    RenoDxDlss5     = 'https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-7.0.0-rc8/renodx-dlss5_7.0.0-rc8.zip'
+    RenoDxDlss5     = 'https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-10.8.0/renodx-dlss5_10.8.0.zip'
     # The DLSS-NR forks; see -OptiScalerFork. Feeder is this project's own fork and the one that
     # is installed unless another is named. It and wilsjo2 name their release zip alike
     # (wilsjo2 also publishes an RTX 40 MFG variant that the pattern skips), so a download of
