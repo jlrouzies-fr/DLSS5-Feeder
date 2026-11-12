@@ -40,6 +40,7 @@ param(
     [string]$ReShadeDll = '',             # another ReShade build to load as dxgi.dll (default: deploy\reshade-dxgi\dxgi_x64.dll)
     [int]$Fade = 0,                       # the whole picture fades down and up, once every this many frames (nothing moves for it)
     [int]$Flash = 0,                      # lightning: 45% brightness, full for three frames every this many frames
+    [switch]$Logo,                        # 3D scene: a still logo on black whose brightness drifts a little (scored as 3d.logo)
     [switch]$Mesh,                        # 3D scene: add a perforated-metal floor panel (fine repeating dots), scored apart as 3d.mesh
     [switch]$Mv,                          # measure the VECTORS against the truth instead of the picture
     [switch]$NoReShade,
@@ -169,6 +170,7 @@ if ($Show -and -not $Interactive) { $args_ += '--show' }
 if ($Full) { $args_ += '--full' }
 if ($Mv) { $args_ += '--mv' }
 if ($Mesh) { $args_ += '--mesh' }
+if ($Logo) { $args_ += '--logo' }
 if ($Fade -gt 0) { $args_ += @('--fade', $Fade) }
 if ($Flash -gt 0) { $args_ += @('--flash', $Flash) }
 if ($Hdr) { $args_ += '--hdr' }

@@ -441,11 +441,32 @@ static void Render3D(int frame, int before)
 }
 
 // The HUD: everything on it is still, whatever the world behind it does.
-static void DrawHud3D()
+// The logo's rectangle on screen, in 4K units: x0, y0, x1, y1.
+static const float kLogo[4] = { 420, 560, 1560, 1700 };
+
+static void DrawHud3D(int frame)
 {
     auto dc = g.dc.Get();
     dc->BeginDraw();
     dc->SetTransform(D2D1::Matrix3x2F::Scale(g.S, g.S));
+    if (g.logo)
+    {
+        // A studio logo as an intro shows it: black, a grey plate with a black mark cut out of
+        // it, lettering underneath. Nothing moves; the grey breathes by a few percent.
+        const float k = 0.56f + 0.05f * sinf(6.2831853f * frame / 75.0f);
+        g.brush->SetColor(D2D1::ColorF(0, 0, 0, 1));
+        dc->FillRectangle(D2D1::RectF(kLogo[0], kLogo[1], kLogo[2], kLogo[3]), g.brush.Get());
+        g.brush->SetColor(D2D1::ColorF(k, k, k, 1));
+        dc->FillRectangle(D2D1::RectF(680, 640, 1300, 1260), g.brush.Get());
+        g.brush->SetColor(D2D1::ColorF(0, 0, 0, 1));
+        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(990, 1040), 230, 70), g.brush.Get());
+        dc->FillRectangle(D2D1::RectF(930, 740, 1010, 1100), g.brush.Get());
+        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(1040, 850), 110, 100), g.brush.Get());
+        g.brush->SetColor(D2D1::ColorF(k, k, k, 1));
+        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(1050, 850), 45, 55), g.brush.Get());
+        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(900, 1040), 90, 22), g.brush.Get());
+        Text(L"S T U D I O S", 96, 690, 1330, 800, k, true);
+    }
     g.brush->SetColor(D2D1::ColorF(0, 0, 0, 0.45f));
     dc->FillRectangle(D2D1::RectF(100, 90, 700, 150), g.brush.Get());
     g.brush->SetColor(D2D1::ColorF(0.25f, 0.85f, 0.35f, 1.0f));
@@ -662,4 +683,21 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
     Crop3("3d.fence", frame, c, 2300, 900, 3380, 1500);
     Crop3("3d.left", frame, c, 300, 700, 1380, 1300);
     if (g.mesh) Crop3("3d.mesh", frame, c, 1100, 1500, 2180, 2100);
+    if (g.logo)
+    {
+        // The logo apart: how far the output is from the input, and how many pixels are far off
+        // (more than 20 8-bit steps) -- speckle and blocks show there, not in a mean.
+        const int x0 = static_cast<int>(kLogo[0] * g.S), y0 = static_cast<int>(kLogo[1] * g.S), x1 = static_cast<int>(kLogo[2] * g.S), y1 = static_cast<int>(kLogo[3] * g.S);
+        double n = 0, sae = 0, far_ = 0, mx = 0;
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x)
+            {
+                const size_t i = static_cast<size_t>(y) * W + x;
+                const double d = 255.0 * fabs(static_cast<double>(lout[i]) - lin[i]);
+                sae += d; n += 1; if (d > 20.0) far_ += 1; if (d > mx) mx = d;
+            }
+        printf("  f%-4d 3d.logo         mae %6.2f  max %5.1f  far off %7.0f px (%.3f%%)\n", frame, sae / n, mx, far_, 100.0 * far_ / n);
+        emit("3d.logo", "static", sae / n, mx, far_, 100.0 * far_ / n);
+        Crop3("3d.logo", frame, c, 660, 880, 1200, 1180);
+    }
 }
