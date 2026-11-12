@@ -148,6 +148,78 @@ float4 ps_truth(VO i) : SV_Target
     return float4((p - c) * float2(0.5 * Misc.y, -0.5 * Misc.z), i.cur.w, i.prev.w);
 }
 float4 ps_sky(float4 pos : SV_Position) : SV_Target { return float4(sky(pos.y / Misc.z), 1.0); }
+
+// --fx: what a game draws that has no motion of its own to report -- a flame, smoke, mist, the
+// shimmer of hot air -- laid over the finished scene. Each is anchored in the world (it stays
+// where it is when the camera moves, and is hidden by what stands in front of it) and moves
+// within itself; the true vectors under it are still the background's, which is all a game
+// would hand over. A temporal pass that follows the wrong thing here smears.
+// Alpha says what a pixel is, for the scoring: 1 = scene, then steps of 5/255 down for flame,
+// smoke and haze.
+Texture2D<float4> fxColor : register(t0);
+Texture2D<float4> fxTruth : register(t1);
+float fbm(float2 p) { return 0.5 * vnoise(p) + 0.25 * vnoise(p * 2.03 + 7.1) + 0.125 * vnoise(p * 4.01 + 3.7) + 0.125 * vnoise(p * 8.07 + 1.3); }
+float3 fxLoad(float2 p)
+{
+    p = clamp(p - 0.5, 0.0, Misc.yz - 1.001);
+    const int2 i = int2(p); const float2 f = p - i;
+    return lerp(lerp(fxColor.Load(int3(i, 0)).rgb, fxColor.Load(int3(i + int2(1, 0), 0)).rgb, f.x),
+                lerp(fxColor.Load(int3(i + int2(0, 1), 0)).rgb, fxColor.Load(int3(i + int2(1, 1), 0)).rgb, f.x), f.y);
+}
+// A point of the world on the screen: xy pixels, z pixels per metre there, w view depth.
+float4 fxAnchor(float3 w)
+{
+    float4 c = mul(float4(w, 1.0), ViewProj);
+    return float4((c.x / c.w * 0.5 + 0.5) * Misc.y, (0.5 - c.y / c.w * 0.5) * Misc.z, 0.5 * Misc.z * 1.7320508 / max(c.w, 0.05), c.w);
+}
+float4 ps_fx(float4 pos : SV_Position) : SV_Target
+{
+    const float  t  = CamPos.w / 60.0;
+    const float  zs = fxTruth.Load(int3(pos.xy, 0)).z;           // the scene's view depth here (0 = sky)
+    const float  zscene = zs > 0.0 ? zs : 1e6;
+    const float3 fire = float3(-0.2, 0.0, 1.5);
+    float id = 0.0;
+
+    // Heat haze: the air above the fire bends what is seen through it.
+    const float4 ah = fxAnchor(fire + float3(0.0, 2.3, 0.0));
+    float2 q = (pos.xy - ah.xy) / ah.z; q.y = -q.y;                // metres, y up, around the anchor
+    float  hz = saturate(1.0 - length(q / float2(1.1, 1.5))) * step(0.3, ah.w) * step(ah.w, zscene + 0.3);
+    float2 d  = float2(fbm(float2(q.x * 4.0, q.y * 4.0 - t * 2.6)), fbm(float2(q.x * 4.0 + 17.0, q.y * 4.0 - t * 2.6))) - 0.5;
+    d *= 0.030 * ah.z * hz * hz * 4.0;
+    float3 col = fxLoad(pos.xy + d);
+    if (length(d) > 0.3) id = 3.0;
+
+    // Mist: a low bank drifting sideways over the ground.
+    const float4 am = fxAnchor(float3(2.6 + 1.6 * sin(t * 0.35), 0.7, -0.5));
+    q = (pos.xy - am.xy) / am.z; q.y = -q.y;
+    float mist = saturate(1.0 - length(q / float2(2.6, 0.8))) * step(0.3, am.w) * step(am.w, zscene + 0.3);
+    mist *= 0.25 + 0.75 * fbm(float2(q.x * 0.9 - t * 0.30, q.y * 1.6 + t * 0.07));
+    float a = 0.55 * smoothstep(0.05, 0.6, mist);
+    col = lerp(col, float3(0.74, 0.78, 0.84), a);
+    if (a > 0.04) id = 2.0;
+
+    // Smoke: a column rising from the fire, widening and swaying.
+    const float4 as = fxAnchor(fire + float3(0.0, 1.3, 0.0));
+    q = (pos.xy - as.xy) / as.z; q.y = -q.y;
+    float sway = 0.25 * sin(q.y * 0.9 - t * 0.8) * saturate(q.y * 0.4);
+    float sm = saturate(1.0 - abs(q.x - sway) / (0.30 + 0.26 * max(q.y, 0.0))) * smoothstep(0.0, 0.7, q.y) * (1.0 - smoothstep(3.0, 4.6, q.y));
+    sm *= step(0.3, as.w) * step(as.w, zscene + 0.3) * (0.30 + 0.70 * fbm(float2(q.x * 1.7, q.y * 1.2 - t * 1.0)));
+    a = 0.62 * smoothstep(0.05, 0.55, sm);
+    col = lerp(col, float3(0.30, 0.29, 0.30), a);
+    if (a > 0.04) id = 2.0;
+
+    // Flame: light added on top, licking upward.
+    const float4 af = fxAnchor(fire + float3(0.0, 0.25, 0.0));
+    q = (pos.xy - af.xy) / af.z; q.y = -q.y;
+    float y01 = saturate(q.y / 1.5);
+    float shape = saturate(1.0 - abs(q.x) / (0.40 * (1.0 - 0.6 * y01) + 0.02)) * (1.0 - y01) * step(0.0, q.y);
+    float fl = saturate((shape + (fbm(float2(q.x * 3.2, q.y * 2.4 - t * 3.4)) - 0.5) * 1.1 * sqrt(shape)) * 1.9);
+    fl *= step(0.3, af.w) * step(af.w, zscene + 0.3) * (0.9 + 0.1 * sin(t * 23.0));
+    col += fl * fl * float3(2.4, 1.15, 0.30) + pow(fl, 6.0) * float3(1.2, 1.2, 1.0);
+    if (fl > 0.05) id = 1.0;
+
+    return float4(col, 1.0 - id * 5.0 / 255.0);
+}
 )";
 
 struct Cb3
@@ -163,7 +235,8 @@ struct Scene3D
     ComPtr<ID3D11Texture2D> depth, sample, accum, truth, truth_staging;
     ComPtr<ID3D11DepthStencilView> dsv;
     ComPtr<ID3D11RenderTargetView> sample_rtv, accum_rtv, truth_rtv;
-    ComPtr<ID3D11ShaderResourceView> sample_srv, accum_srv;
+    ComPtr<ID3D11ShaderResourceView> sample_srv, accum_srv, truth_srv;
+    ComPtr<ID3D11PixelShader> ps_fx;
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps_color, ps_truth, ps_sky;
     ComPtr<ID3D11InputLayout> layout;
@@ -233,6 +306,7 @@ static void Init3D()
     CHECK(g.dev->CreateRenderTargetView(s3.truth.Get(), nullptr, &s3.truth_rtv), "RTV");
     CHECK(g.dev->CreateShaderResourceView(s3.sample.Get(), nullptr, &s3.sample_srv), "SRV");
     CHECK(g.dev->CreateShaderResourceView(s3.accum.Get(), nullptr, &s3.accum_srv), "SRV");
+    CHECK(g.dev->CreateShaderResourceView(s3.truth.Get(), nullptr, &s3.truth_srv), "SRV");
     td.BindFlags = 0; td.Usage = D3D11_USAGE_STAGING; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     CHECK(g.dev->CreateTexture2D(&td, nullptr, &s3.truth_staging), "truth staging");
 
@@ -244,6 +318,8 @@ static void Init3D()
     CHECK(g.dev->CreatePixelShader(c->GetBufferPointer(), c->GetBufferSize(), nullptr, &s3.ps_color), "3D PS");
     CHECK(g.dev->CreatePixelShader(t->GetBufferPointer(), t->GetBufferSize(), nullptr, &s3.ps_truth), "truth PS");
     CHECK(g.dev->CreatePixelShader(k->GetBufferPointer(), k->GetBufferSize(), nullptr, &s3.ps_sky), "sky PS");
+    auto fxp = Compile(k3dHlsl, "ps_fx", "ps_5_0");
+    CHECK(g.dev->CreatePixelShader(fxp->GetBufferPointer(), fxp->GetBufferSize(), nullptr, &s3.ps_fx), "effects PS");
     const D3D11_INPUT_ELEMENT_DESC il[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
@@ -324,6 +400,7 @@ static void Init3D()
     for (int i = 0; i < 12; ++i)                                                          // fence: thin bars, close
         add(0, 3, 0.13f, 0.13f, 0.15f, 0.05f, 1.4f, 0.05f, 1.4f + 0.35f * i, 0.7f, -3.6f);
     add(0, 3, 0.13f, 0.13f, 0.15f, 4.2f, 0.05f, 0.05f, 3.33f, 1.4f, -3.6f);
+    if (g.fx) add(0, 3, 0.10f, 0.09f, 0.09f, 0.7f, 0.3f, 0.7f, -0.2f, 0.15f, 1.5f);         // the brazier the fire burns in
     if (g.mesh) add(0, 5, 0.25f, 0.33f, 0.85f, kMesh[1] - kMesh[0], 0.02f, kMesh[3] - kMesh[2], 0.5f * (kMesh[0] + kMesh[1]), 0.01f, 0.5f * (kMesh[2] + kMesh[3]));
 }
 
@@ -425,15 +502,30 @@ static void Render3D(int frame, int before)
     g.ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     g.ctx->OMSetRenderTargets(1, s3.truth_rtv.GetAddressOf(), s3.dsv.Get());
     draw_objects(s3.ps_truth.Get());
+    // --no-depth: what ReShade finds at Present is an empty depth buffer, as on a capture.
+    if (g.nodepth) g.ctx->ClearDepthStencilView(s3.dsv.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
 
     g.ctx->OMSetRenderTargets(1, g.scene_rtv.GetAddressOf(), nullptr);
     g.ctx->OMSetDepthStencilState(s3.dss_off.Get(), 0);
     g.ctx->IASetInputLayout(nullptr);
     g.ctx->VSSetShader(g.vs.Get(), nullptr, 0);
-    g.ctx->PSSetShader(g.ps_blit.Get(), nullptr, 0);
-    g.ctx->PSSetShaderResources(0, 1, s3.accum_srv.GetAddressOf());
-    g.ctx->Draw(3, 0);
-    g.ctx->PSSetShaderResources(0, 1, &null_srv);
+    if (g.fx)
+    {
+        // (the constants the objects were drawn with are still in the buffer: ViewProj, the frame number, the size)
+        ID3D11ShaderResourceView *two[2] = { s3.accum_srv.Get(), s3.truth_srv.Get() };
+        g.ctx->PSSetShader(s3.ps_fx.Get(), nullptr, 0);
+        g.ctx->PSSetShaderResources(0, 2, two);
+        g.ctx->Draw(3, 0);
+        ID3D11ShaderResourceView *none[2] = { nullptr, nullptr };
+        g.ctx->PSSetShaderResources(0, 2, none);
+    }
+    else
+    {
+        g.ctx->PSSetShader(g.ps_blit.Get(), nullptr, 0);
+        g.ctx->PSSetShaderResources(0, 1, s3.accum_srv.GetAddressOf());
+        g.ctx->Draw(3, 0);
+        g.ctx->PSSetShaderResources(0, 1, &null_srv);
+    }
     g.ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
     g.ctx->OMSetDepthStencilState(nullptr, 0);
     g.ctx->PSSetConstantBuffers(0, 1, g.cb.GetAddressOf());
@@ -535,12 +627,14 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
     const size_t N = static_cast<size_t>(W) * H;
     std::vector<float> lin(N), lout(N);
     std::vector<uint8_t> cls(N);   // 0 sky, 1 scene, 2 HUD
+    std::vector<uint8_t> fxid(N);  // --fx: 0 none, 1 flame, 2 smoke or mist, 3 heat haze (from the scene's alpha, see ps_fx)
     for (size_t i = 0; i < N; ++i)
     {
         lin[i]  = 0.299f * c.pre[i * 3] + 0.587f * c.pre[i * 3 + 1] + 0.114f * c.pre[i * 3 + 2];
         lout[i] = 0.299f * c.post[i * 3] + 0.587f * c.post[i * 3 + 1] + 0.114f * c.post[i * 3 + 2];
         const bool hud = memcmp(&c.scene[i * 4], &c.nohud[i * 4], 3) != 0;
         cls[i] = hud ? 2 : (XMConvertHalfToFloat(c.truth[i * 4 + 2]) > 0.0f ? 1 : 0);
+        fxid[i] = g.fx && !hud ? static_cast<uint8_t>(std::min(3, (255 - c.nohud[i * 4 + 3] + 2) / 5)) : 0;
     }
     auto emit = [&](const char *probe, const char *kind, double a, double b, double cc, double d)
     {
@@ -607,6 +701,46 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
             printf("  f%-4d %-15s %9.0f px  truth (%6.2f,%6.2f) got (%6.2f,%6.2f)  err %5.2f px  <0.25: %5.1f%%  <1: %5.1f%%  zero %5.1f%%\n",
                    frame, names[k], a.n, a.tx / n, a.ty / n, a.sx / n, a.sy / n, a.err / n, 100 * a.q / n, 100 * a.o / n, 100 * a.z / n);
             emit(names[k], "vec", a.err / n, 100 * a.q / n, 100 * a.o / n, 100 * a.z / n);
+        }
+        if (g.fx)
+        {
+            // How much of each kind of pixel the shader marked as "no motion explains this" (the
+            // third channel of the vector view): all of an effect is right, any of the rest is not.
+            static const char *const mk[5] = { "scene", "flame", "smoke", "haze", "hud" };
+            double mn[5] = {}, mh[5] = {};
+            for (int y = 2; y < H - 2; ++y)
+                for (int x = 2; x < W - 2; ++x)
+                {
+                    const size_t i = static_cast<size_t>(y) * W + x;
+                    const int k = cls[i] == 2 ? 4 : fxid[i];
+                    mn[k] += 1; if (c.post[i * 3 + 2] > 0.35f) mh[k] += 1;
+                }
+            printf("  f%-4d 3d.fx.marked   ", frame);
+            for (int k = 0; k < 5; ++k) printf("  %s %5.1f%%", mk[k], 100 * mh[k] / (mn[k] > 0 ? mn[k] : 1));
+            printf("\n");
+        }
+        if (g.fx)
+        {
+            static const char *const fxn[4] = { "", "3d.fx.flame", "3d.fx.smoke", "3d.fx.haze" };
+            double fn[4] = {}, fe[4] = {}, fz[4] = {}, fo[4] = {};
+            for (int y = 2; y < H - 2; ++y)
+                for (int x = 2; x < W - 2; ++x)
+                {
+                    const size_t i = static_cast<size_t>(y) * W + x;
+                    const int k = fxid[i];
+                    if (k == 0) continue;
+                    const float tx = XMConvertHalfToFloat(c.truth[i * 4]), ty = XMConvertHalfToFloat(c.truth[i * 4 + 1]);
+                    const float mx = (c.post[i * 3] * 1023.0f - 512.0f) / 8.0f, my = (c.post[i * 3 + 1] * 1023.0f - 512.0f) / 8.0f;
+                    const float e = hypotf(mx - tx, my - ty);
+                    fn[k] += 1; fe[k] += e; if (e < 1.0f) fo[k] += 1;
+                    if (fabsf(mx) < 0.01f && fabsf(my) < 0.01f) fz[k] += 1;
+                }
+            for (int k = 1; k < 4; ++k)
+            {
+                const double n = fn[k] > 0 ? fn[k] : 1;
+                printf("  f%-4d %-15s %9.0f px  off the background's motion by %5.2f px  <1: %5.1f%%  zero %5.1f%%\n", frame, fxn[k], fn[k], fe[k] / n, 100 * fo[k] / n, 100 * fz[k] / n);
+                emit(fxn[k], "vec", fe[k] / n, 0, 100 * fo[k] / n, 100 * fz[k] / n);
+            }
         }
         for (int gy = 0; gy < GY; ++gy)
         {
@@ -686,6 +820,32 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
         const char *name = k == 2 ? "3d.hud" : "3d.scene";
         printf("  f%-4d %-15s mae %6.2f  psnr %5.1f  sharp %5.3f\n", frame, name, mae, psnr, sharp);
         emit(name, k == 2 ? "static" : "moving", mae, psnr, sharp, 0);
+    }
+
+    // 1b. --fx: the same under each effect. There is no right vector for a flame; the only
+    //     right picture is the one that went in, and what a temporal pass makes of it instead
+    //     (a smear, a ghost of last frame's flame, a mist that lags) is this number.
+    if (g.fx)
+    {
+        static const char *const fxn[4] = { "", "3d.fx.flame", "3d.fx.smoke", "3d.fx.haze" };
+        for (int k = 1; k < 4; ++k)
+        {
+            double sae = 0, sse = 0, gp = 0, gq = 0, n = 0;
+            for (int y = 1; y < H - 1; ++y)
+                for (int x = 1; x < W - 1; ++x)
+                {
+                    const size_t i = static_cast<size_t>(y) * W + x;
+                    if (fxid[i] != k) continue;
+                    const double d = fabs(static_cast<double>(lout[i]) - lin[i]);
+                    sae += d; sse += d * d; n += 1;
+                    gp += fabs(lin[i + 1] - lin[i]) + fabs(lin[i + W] - lin[i]);
+                    gq += fabs(lout[i + 1] - lout[i]) + fabs(lout[i + W] - lout[i]);
+                }
+            if (n < 1) n = 1;
+            const double mae = 255 * sae / n, mse = sse / n, psnr = mse > 1e-12 ? 10 * log10(1 / mse) : 99, sharp = gp > 1e-9 ? gq / gp : 1;
+            printf("  f%-4d %-15s mae %6.2f  psnr %5.1f  sharp %5.3f\n", frame, fxn[k], mae, psnr, sharp);
+            emit(fxn[k], "moving", mae, psnr, sharp, 0);
+        }
     }
 
     // 2. Stability along the true motion. For every scene pixel that was visible a frame ago:

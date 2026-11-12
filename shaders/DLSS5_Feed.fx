@@ -425,6 +425,20 @@ uniform float RESTORE_TEXTURE_CONTRAST <
                  "putting back. Below it -- film grain, noise, banding dither -- the model's smoothing stays.";
 > = 0.012;
 
+uniform int RESTORE_VOLATILE <
+    ui_category = "Restore (DLSS5_Feed_Restore technique)";
+    ui_type = "combo";
+    ui_items = "Off\0Flames, smoke, heat haze: what no motion explains\0";
+    ui_label = "Fire, smoke and haze";
+    ui_tooltip = "A flame, smoke, mist or the shimmer of hot air has no motion a vector could describe: it\n"
+                 "changes shape in place. A temporal model blends it with what it was a frame ago, which\n"
+                 "shows as smear and lag -- and no vector, right or wrong, changes that (tools/fx-testbed:\n"
+                 "the same error with exact, estimated and zero vectors).\n"
+                 "With this on, where the frame changed in a way the motion found does not account for --\n"
+                 "or where the motion itself is a jumble from one spot to the next, over an area and not\n"
+                 "just along an outline -- the pixel is shown as it came in.";
+> = 1;
+
 uniform bool RESTORE_BLACK <
     ui_category = "Restore (DLSS5_Feed_Restore technique)";
     ui_label = "Keep black black";
@@ -678,6 +692,10 @@ sampler sDLSS5_PrevGlobal { Texture = DLSS5_PrevGlobal; MinFilter = POINT; MagFi
 texture DLSS5_Changed  { Width = BUFFER_WIDTH / 8; Height = BUFFER_HEIGHT / 8; Format = R16F; MipLevels = 7; };
 sampler sDLSS5_Changed { Texture = DLSS5_Changed; AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
 texture DLSS5_Hud     { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R8; };
+// Where the picture is doing something no motion explains (a flame, smoke, the shimmer of hot
+// air): see PS_MotionVectors and PS_Restore.
+texture DLSS5_Vol     { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R8; };
+sampler sDLSS5_Vol     { Texture = DLSS5_Vol;     AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
 texture DLSS5_PrevHud { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R8; };
 sampler sDLSS5_Hud     { Texture = DLSS5_Hud;     AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
 sampler sDLSS5_PrevHud { Texture = DLSS5_PrevHud; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
@@ -2606,10 +2624,22 @@ float4 PS_GlobalHistory(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Ta
     return tex2Dlod(sDLSS5_Global, float4(0.5, 0.5, 0.0, 0.0));
 }
 
+#ifndef VOLR_LO
+    #define VOLR_LO 0.3
+#endif
+#ifndef VOLR_HI
+    #define VOLR_HI 1.0
+#endif
+#ifndef VOL_LO
+    #define VOL_LO 0.35
+#endif
+#ifndef VOL_HI
+    #define VOL_HI 1.0
+#endif
 void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
                       out float2 mv_out : SV_Target0, out float mask : SV_Target1,
                       out float depth : SV_Target2, out float static_now : SV_Target3, out float2 vec_now : SV_Target4,
-                      out float hud : SV_Target5)
+                      out float hud : SV_Target5, out float vol : SV_Target6)
 {
     bool drop_history = false;
     hud = 0.0;
@@ -2720,6 +2750,49 @@ void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
     mv_out = mv_px * MV_SIGN * MV_SCALE;
     mask   = saturate(distrust) * MASK_STRENGTH;
     depth  = RawDepth(uv);
+
+    // For DLSS5_Feed_Restore: is this something no motion explains? Two signs.
+    // One, the pixel changed and the best vector there is leaves a real part of that standing
+    // (distrust): a flame, the edge of drifting smoke, something that just appeared.
+    // Two, the motion found around here is a jumble -- neighbouring spots a few pixels apart
+    // disagree by more than a part of their own length: hot air bending what is behind it,
+    // smoke churning. Taken as the LEAST such disagreement at four places around the pixel,
+    // so that it has to hold over an area: the outline of a moving object is a line of
+    // disagreement too, and is none of this.
+    {
+        const float2 r1 = BUFFER_PIXEL_SIZE * 8.0, r2 = BUFFER_PIXEL_SIZE * 14.0;
+        float jumble = 1e9;
+        [unroll] for (int q = 0; q < 4; ++q)
+        {
+            const float2 at = uv + float2(q == 0 ? -r2.x : q == 1 ? r2.x : 0.0, q == 2 ? -r2.y : q == 3 ? r2.y : 0.0);
+            const float2 c  = ProviderMV(at);
+            const float2 a  = 0.25 * (ProviderMV(at + float2(r1.x, 0.0)) + ProviderMV(at - float2(r1.x, 0.0)) + ProviderMV(at + float2(0.0, r1.y)) + ProviderMV(at - float2(0.0, r1.y)));
+            jumble = min(jumble, length((c - a) * BUFFER_SCREEN_SIZE) / (0.6 + 0.1 * length(c * BUFFER_SCREEN_SIZE)));
+        }
+        vol = max(saturate(2.0 * distrust), smoothstep(VOL_LO, VOL_HI, jumble));
+        // Three, and the plainest: last frame, moved by the vector this pixel is given, does not
+        // have this frame's SHAPE here. A flame is followed quite happily by a motion estimator
+        // (it licks upward, and so do the vectors), and what it was a frame ago still is not
+        // what it is now; smoke thickens and thins in place.
+        // Shape, not level: the five samples are compared as ratios (logarithms), with the
+        // ratio they have in common taken off. A lamp that flickers on a still wall changes
+        // every sample by the same factor and is none of this -- a temporal pass may smooth
+        // that as it likes. And against the patch's own contrast, because on fine texture a
+        // vector a fraction of a pixel out leaves a difference too.
+        const float2 pv = mv_px * BUFFER_PIXEL_SIZE;
+        float lc[5], ld[5];
+        float lm = 0.0;
+        [unroll] for (int q2 = 0; q2 < 5; ++q2)
+        {
+            const float2 o = float2(q2 == 1 ? -3.0 : q2 == 2 ? 3.0 : 0.0, q2 == 3 ? -3.0 : q2 == 4 ? 3.0 : 0.0) * BUFFER_PIXEL_SIZE;
+            lc[q2] = log(max(tex2Dlod(sDLSS5_CurLuma, float4(uv + o, 0.0, 0.0)).x, 1e-3));
+            ld[q2] = lc[q2] - log(max(tex2Dlod(sDLSS5_PrevLuma, float4(uv + o + pv, 0.0, 0.0)).x, 1e-3));
+            lm += ld[q2] / 5.0;
+        }
+        float left = 0.0, own = 0.0;
+        [unroll] for (int q3 = 0; q3 < 5; ++q3) { left += abs(ld[q3] - lm) / 5.0; own += abs(lc[q3] - lc[0]) / 4.0; }
+        vol = max(vol, smoothstep(VOLR_LO, VOLR_HI, (left - 0.01) / (0.5 * own + 0.03)));
+    }
 }
 
 // End of the technique: this frame becomes next frame's history. The raw provider vector is
@@ -2820,7 +2893,7 @@ float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
         // Whole 10-bit codes, 1/8 px a step and +-63 px, so a zero vector reads back as exactly
         // 512. (It used to be 1/16 px and +-31 px, and a 38 px pan read back as 30 from every
         // provider, exact vectors included -- an "underestimate" that was only this clamp.)
-        return float3((round(clamp(v, -63.0, 63.0) * 8.0) + 512.0) / 1023.0, tex2Dlod(sDLSS5_Mask, float4(uv, 0.0, 0.0)).x);
+        return float3((round(clamp(v, -63.0, 63.0) * 8.0) + 512.0) / 1023.0, tex2Dlod(sDLSS5_Vol, float4(uv, 0.0, 0.0)).x);   // + the volatile mark, for tools/fx-testbed
     }
     if (DEBUG_VIEW == 11)
     {
@@ -2937,6 +3010,17 @@ float4 PS_Restore(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
         const float k = 1.0 - smoothstep(0.004, 0.012, max(was.r, max(was.g, was.b)));
         if (k > 0.0) now.rgb = lerp(now.rgb, was, k);
     }
+    // What no motion explains goes out as it came in (see RESTORE_VOLATILE). The mark is read
+    // smoothed over about ten pixels, so the hand-over is gradual.
+    if (RESTORE_VOLATILE == 1)
+    {
+        float v = 0.0;
+        [unroll] for (int vy = -1; vy <= 1; ++vy)
+        [unroll] for (int vx = -1; vx <= 1; ++vx)
+            v += tex2Dlod(sDLSS5_Vol, float4(uv + float2(vx, vy) * 4.0 * px, 0.0, 0.0)).x * (2.0 - abs(float(vx))) * (2.0 - abs(float(vy))) / 16.0;
+        const float w_vol = smoothstep(0.15, 0.55, v) * RESTORE_STRENGTH;
+        if (w_vol > 0.0) now.rgb = lerp(now.rgb, was, w_vol);
+    }
     if (RESTORE_WHAT == 1 && w_hud > 0.0) return float4(lerp(now.rgb, was, w_hud), now.a);
     // And texture the model has softened, marked or not (always fine detail only: the pixel
     // is moving, and what the model did to it at any broader scale is its to keep).
@@ -3036,7 +3120,7 @@ technique DLSS5_Feed
     pass FitSolve      { VertexShader = PostProcessVS; PixelShader = PS_FitSolve;      RenderTarget0 = DLSS5_Cam0; RenderTarget1 = DLSS5_Cam1; RenderTarget2 = DLSS5_Cam2; RenderTarget3 = DLSS5_Cam3; RenderTarget4 = DLSS5_Cam4; RenderTarget5 = DLSS5_Cam5; }
     pass Changed       { VertexShader = PostProcessVS; PixelShader = PS_Changed;       RenderTarget0 = DLSS5_Changed; }
     pass Global        { VertexShader = PostProcessVS; PixelShader = PS_Global;        RenderTarget0 = DLSS5_Global; }
-    pass Guides        { VertexShader = PostProcessVS; PixelShader = PS_MotionVectors; RenderTarget0 = DLSS5_MV; RenderTarget1 = DLSS5_Mask; RenderTarget2 = DLSS5_Depth; RenderTarget3 = DLSS5_StaticNow; RenderTarget4 = DLSS5_VecNow; RenderTarget5 = DLSS5_Hud; }
+    pass Guides        { VertexShader = PostProcessVS; PixelShader = PS_MotionVectors; RenderTarget0 = DLSS5_MV; RenderTarget1 = DLSS5_Mask; RenderTarget2 = DLSS5_Depth; RenderTarget3 = DLSS5_StaticNow; RenderTarget4 = DLSS5_VecNow; RenderTarget5 = DLSS5_Hud; RenderTarget6 = DLSS5_Vol; }
     pass History       { VertexShader = PostProcessVS; PixelShader = PS_StoreHistory;  RenderTarget0 = DLSS5_PrevLuma; RenderTarget1 = DLSS5_PrevDepth; RenderTarget2 = DLSS5_PrevMV; RenderTarget3 = DLSS5_PrevStatic; RenderTarget4 = DLSS5_PrevHud; RenderTarget5 = DLSS5_Before; }
     pass GlobalHistory { VertexShader = PostProcessVS; PixelShader = PS_GlobalHistory; RenderTarget0 = DLSS5_PrevGlobal; }
     DLSS5_MV_REQUEST_PASS   // Launchpad only: ask it to compute optical flow again next frame
