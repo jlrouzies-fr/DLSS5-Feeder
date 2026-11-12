@@ -624,7 +624,7 @@ static void Analyse3D(int frame, const Cap3 &c, const Cap3 *prev)
         {
             struct Line { const char *name; int x0, y0, dx, dy, n; };
             static const Line lines[6] = { { "up  ", 1920, 1850, 0, -40, 10 }, { "left", 1200, 1930, -60, 0, 10 }, { "ammo", 3380, 1980, -50, 0, 10 },
-                                           { "bot1", 150, 2080, 380, 0, 10 }, { "bot2", 150, 1800, 380, 0, 10 }, { "fenc", 2900, 1250, 95, 0, 10 } };
+                                           { "bot1", 150, 2080, 380, 0, 10 }, { "bot2", 150, 1800, 380, 0, 10 }, { "blob", 560, 2010, 50, 0, 10 } };
             for (const Line &l : lines)
             {
                 printf("  f%-4d probe %s", frame, l.name);
