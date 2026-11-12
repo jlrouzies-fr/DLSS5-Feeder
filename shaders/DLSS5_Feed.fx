@@ -185,7 +185,19 @@ sampler sDLSS5_ColorInput { Texture = DLSS5_ColorInput; AddressU = Clamp; Addres
     sampler sDLSS5_ProviderMVPoint { Texture = DLSS5_Flow1; AddressU = Clamp; AddressV = Clamp; MipFilter = Point; MinFilter = Point;  MagFilter = Point;  };
     #define DLSS5_MV_PROVIDER_NAME "Built in (DLSS5_Feed's own estimator)"
     #define DLSS5_MV_BUILTIN 1
-    #define DLSS5_MV_CELL 2.0
+    // How far down the estimator's base goes (see "The base field"):
+    //   1 = to 8 px cells, then the older fine levels (4 and 2 px) on top
+    //   2 = to 8 px cells and no further     3 = to 4 px cells     4 = to 2 px cells
+    #ifndef BASE
+        #define BASE 4
+    #endif
+    #if BASE == 2
+        #define DLSS5_MV_CELL 8.0
+    #elif BASE == 3
+        #define DLSS5_MV_CELL 4.0
+    #else
+        #define DLSS5_MV_CELL 2.0
+    #endif
 #else
     // The community-standard shared texture (ReshadeMotionEstimation, qUINT, dh_uber_motion, ...)
     texture texMotionVectors < pooled = false; > { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F; };
@@ -1758,6 +1770,199 @@ DLSS5_FLOW_LEVEL(3, 3.0, sDLSS5_Flow4L, true)
 DLSS5_FLOW_LEVEL(2, 2.0, sDLSS5_Flow3L, true)
 DLSS5_FLOW_LEVEL(1, 1.0, sDLSS5_Flow2L, true)
 
+// ---------------------------------------------------------------------------------------------
+// The base field: the four coarse levels (cells of 64, 32, 16 and 8 pixels).
+//
+// They used to be built like the fine ones -- a 3x3 patch of texels as large as the cell, a
+// search over whole cells, a head start for "did not move", trust by contrast -- and on
+// tools/fx-testbed's 3D scene, with and without a depth buffer, that was the weak part: soft
+// surfaces under a travelling camera a pixel out, a lone floor joint dragging the floor
+// beside it along itself. Each of those two failures names its own cure -- a patch as large
+// as its cell reaches into the next thing over, and a search that takes any improvement at
+// all slides along a line -- and the base is now built on them:
+//   - a small patch (thirteen points: a cross reaching three texels, and the four diagonals)
+//     on texels FOUR TIMES FINER than the cell. What a level can see is then not tied to how
+//     coarsely it places its vectors, and the patch stays inside its own cell: it does not
+//     reach across to a HUD panel or to the next bar of a railing;
+//   - no search to speak of. A cell tries what the coarser level found here and around here,
+//     what the scene did a frame ago, and "did not move"; then walks downhill a texel at a
+//     time, a few steps at most; then a parabola through the last three costs on each axis,
+//     kept only if the cost measured there really is lower. Nothing can jump, and where the
+//     picture cannot tell two candidates apart the first one stands -- which is the coarser
+//     level's, i.e. the smooth one;
+//   - every cell decides on what it sees, however little that is (no "too flat to say"),
+//     and then the cells VOTE, one cell one vote: of the 3x3 around it each takes the vector
+//     the others are closest to. A joint one cell wide is outvoted by the floor on both sides
+//     of it, instead of the floor being told by the joint because the joint has more contrast.
+// The fine levels (4 and 2 pixel cells) are as they were, started from this.
+// ---------------------------------------------------------------------------------------------
+#ifndef BASE_STEPS
+    #define BASE_STEPS 4
+#endif
+#ifndef BASE_ZK
+    #define BASE_ZK 0.5
+#endif
+#ifndef BASE_FITS
+    #define BASE_FITS 2
+#endif
+#ifndef BASE_DPEN
+    #define BASE_DPEN 0.25
+#endif
+float BaseCost(sampler2D sM, sampler2D sMp, float2 uv, float2 v, float tex)
+{
+    static const float2 o[13] = {
+        float2(0, 0), float2(-1, 0), float2(1, 0), float2(0, -1), float2(0, 1), float2(-3, 0), float2(3, 0), float2(0, -3), float2(0, 3),
+        float2(-2, -2), float2(2, -2), float2(-2, 2), float2(2, 2) };
+    const float2 t = BUFFER_PIXEL_SIZE * tex, pv = v * BUFFER_PIXEL_SIZE;
+    float a[13], b[13];
+    float ma = 0.0, mb = 0.0;
+    [unroll] for (int i = 0; i < 13; ++i)
+    {
+        a[i] = tex2Dlod(sM,  float4(uv + o[i] * t, 0.0, 0.0)).x;
+        b[i] = tex2Dlod(sMp, float4(uv + o[i] * t + pv, 0.0, 0.0)).x;
+        ma += a[i]; mb += b[i];
+    }
+    ma /= 13.0; mb /= 13.0;
+    float e = 0.0;
+    [unroll] for (int j = 0; j < 13; ++j) e += abs((a[j] - ma) - (b[j] - mb));
+    return e / 13.0 + BASE_DPEN * abs(ma - mb);
+}
+// The same with the vector's last fraction split between the two frames (this one read half of it
+// back, the last one half of it on): both are then interpolated alike, and a fraction of a texel
+// costs what it should. Read from one frame only, the interpolated side is the softer of the two
+// and every fractional vector looks a little worse than the whole one next to it.
+float BaseCostSym(sampler2D sM, sampler2D sMp, float2 uv, float2 v, float2 f, float tex)
+{
+    static const float2 o[13] = {
+        float2(0, 0), float2(-1, 0), float2(1, 0), float2(0, -1), float2(0, 1), float2(-3, 0), float2(3, 0), float2(0, -3), float2(0, 3),
+        float2(-2, -2), float2(2, -2), float2(-2, 2), float2(2, 2) };
+    const float2 t = BUFFER_PIXEL_SIZE * tex, pa = -0.5 * f * BUFFER_PIXEL_SIZE, pb = (v + 0.5 * f) * BUFFER_PIXEL_SIZE;
+    float a[13], b[13];
+    float ma = 0.0, mb = 0.0;
+    [unroll] for (int i = 0; i < 13; ++i)
+    {
+        a[i] = tex2Dlod(sM,  float4(uv + o[i] * t + pa, 0.0, 0.0)).x;
+        b[i] = tex2Dlod(sMp, float4(uv + o[i] * t + pb, 0.0, 0.0)).x;
+        ma += a[i]; mb += b[i];
+    }
+    ma /= 13.0; mb /= 13.0;
+    float e = 0.0;
+    [unroll] for (int j = 0; j < 13; ++j) e += abs((a[j] - ma) - (b[j] - mb));
+    return e / 13.0 + BASE_DPEN * abs(ma - mb);
+}
+float BaseMad(sampler2D sM, float2 uv, float tex)
+{
+    const float2 t = BUFFER_PIXEL_SIZE * tex;
+    const float c = tex2Dlod(sM, float4(uv, 0.0, 0.0)).x;
+    return 0.125 * (abs(tex2Dlod(sM, float4(uv + float2(-3, 0) * t, 0.0, 0.0)).x - c) + abs(tex2Dlod(sM, float4(uv + float2(3, 0) * t, 0.0, 0.0)).x - c)
+                  + abs(tex2Dlod(sM, float4(uv + float2(0, -3) * t, 0.0, 0.0)).x - c) + abs(tex2Dlod(sM, float4(uv + float2(0, 3) * t, 0.0, 0.0)).x - c)
+                  + abs(tex2Dlod(sM, float4(uv + float2(-2, -2) * t, 0.0, 0.0)).x - c) + abs(tex2Dlod(sM, float4(uv + float2(2, -2) * t, 0.0, 0.0)).x - c)
+                  + abs(tex2Dlod(sM, float4(uv + float2(-2, 2) * t, 0.0, 0.0)).x - c) + abs(tex2Dlod(sM, float4(uv + float2(2, 2) * t, 0.0, 0.0)).x - c));
+}
+#define DLSS5_BASE_TRY(V) { const float2 v_ = (V); const float e_ = BaseCost(sM, sMp, uv, v_, tex); if (e_ < best_e) { best_e = e_; best = v_; } }
+// A step of the search or of the walk downhill has to be worth taking: a tenth better, and by
+// more than rounding. Along a pattern that looks the same a texel further on -- planks, a
+// joint, stripes -- every step is a hair better or worse than the last by accident, and a walk
+// that took every hair slid thirty pixels along the planks of fx-testbed's turning crate.
+#ifndef BASE_MARGIN
+    #define BASE_MARGIN 0.9
+#endif
+#define DLSS5_BASE_STEP(V) { const float2 v_ = (V); const float e_ = BaseCost(sM, sMp, uv, v_, tex); if (e_ < best_e * BASE_MARGIN - 0.1 * DLSS5_FLOW_FLOOR) { best_e = e_; best = v_; } }
+// cell: this level's cell in pixels; tex: the texel matched on (a quarter of it); coarse: the
+// level above, read bilinearly (at the top: last frame's field).
+float4 BaseLevel(float2 uv, float cell, sampler2D sM, sampler2D sMp, float tex, sampler2D coarse, bool top)
+{
+    const float2 px = BUFFER_PIXEL_SIZE;
+    const float2 cc = px * cell * (top ? 1.0 : 2.0);
+    float2 best   = tex2Dlod(coarse, float4(uv, 0.0, 0.0)).xy;
+    float  best_e = BaseCost(sM, sMp, uv, best, tex);
+    if (top)
+    {
+        // Nothing above: last frame's vector or none, whichever fits, and from there three
+        // texels in every direction.
+        DLSS5_BASE_TRY(float2(0.0, 0.0))
+        const float2 seed = best;
+        [loop] for (int k = 0; k < 49; ++k)
+        {
+            const float2 o = float2(k % 7 - 3, k / 7 - 3);
+            if (o.x != 0.0 || o.y != 0.0) DLSS5_BASE_STEP(seed + o * tex)
+        }
+    }
+    else
+    {
+        [unroll] for (int y = -1; y <= 1; ++y)
+        [unroll] for (int x = -1; x <= 1; ++x)
+            if (x != 0 || y != 0) DLSS5_BASE_TRY(tex2Dlod(coarse, float4(uv + float2(x, y) * cc, 0.0, 0.0)).xy)
+        DLSS5_BASE_TRY(tex2Dlod(sDLSS5_FlowKeep, float4(uv, 0.0, 0.0)).xy)
+        // Downhill, a texel at a time.
+        [loop] for (int it = 0; it < BASE_STEPS; ++it)
+        {
+            const float2 c0 = best;
+            [loop] for (int k = 0; k < 9; ++k)
+                if (k != 4) DLSS5_BASE_STEP(c0 + float2(k % 3 - 1, k / 3 - 1) * tex)
+            if (all(best == c0)) break;
+        }
+    }
+    // The last fraction of a texel: half a texel either side on each axis, read symmetrically
+    // (see BaseCostSym), the minimum of the curve through the three costs, kept if the cost
+    // measured there really is lower. Twice: the second time from where the first one ended.
+    [unroll] for (int fit = 0; fit < BASE_FITS; ++fit)
+    {
+        const float h  = 0.5 * tex;
+        const float el = BaseCostSym(sM, sMp, uv, best, float2(-h, 0.0), tex), er = BaseCostSym(sM, sMp, uv, best, float2(h, 0.0), tex);
+        const float eu = BaseCostSym(sM, sMp, uv, best, float2(0.0, -h), tex), ed = BaseCostSym(sM, sMp, uv, best, float2(0.0, h), tex);
+        const float ax = el - 2.0 * best_e + er, ay = eu - 2.0 * best_e + ed;
+        const float2 f = h * float2(ax > 1e-9 ? clamp(0.5 * (el - er) / ax, -1.0, 1.0) : 0.0, ay > 1e-9 ? clamp(0.5 * (eu - ed) / ay, -1.0, 1.0) : 0.0);
+        const float ef = BaseCostSym(sM, sMp, uv, best, f, tex);
+        if (ef < best_e) { best += f; best_e = ef; }
+    }
+    // "Did not move" is not one more candidate here: on anything that slides along its own
+    // pattern (a striped ball rolling sideways) and under any motion of less than a texel it
+    // fits as well as the truth, and as a candidate it won those ties -- a fifth of a slowly
+    // panning frame standing still. It is taken only where it fits clearly BETTER than the best
+    // moving answer: a still element over a moving picture, which is what it is for. (The fine
+    // levels and the per-pixel stage decide the close calls.)
+    if (!top && dot(best, best) > 0.0)
+    {
+        const float e0 = BaseCost(sM, sMp, uv, float2(0.0, 0.0), tex);
+        if (e0 < BASE_ZK * best_e - 0.25 * DLSS5_FLOW_FLOOR) { best = 0.0; best_e = e0; }
+    }
+    const float mad = BaseMad(sM, uv, tex);
+    return float4(best, 1.0 - smoothstep(0.3, 0.7, best_e / (mad + DLSS5_FLOW_FLOOR)), 0.0);
+}
+// One cell, one vote: of the 3x3 around the cell, the vector the others are closest to.
+float4 BaseAgree(sampler2D raw, float2 uv, float cell)
+{
+    const float2 t = BUFFER_PIXEL_SIZE * cell;
+    float2 v[9];
+    [unroll] for (int k = 0; k < 9; ++k) v[k] = tex2Dlod(raw, float4(uv + float2(k % 3 - 1, k / 3 - 1) * t, 0.0, 0.0)).xy;
+    float  best = 1e30;
+    float2 pick = v[4];
+    [unroll] for (int i = 0; i < 9; ++i)
+    {
+        float sum = 0.0;
+        [unroll] for (int j = 0; j < 9; ++j) sum += abs(v[i].x - v[j].x) + abs(v[i].y - v[j].y);
+        if (sum < best - 1e-6 || (i == 4 && sum <= best + 1e-6)) { best = sum; pick = v[i]; }
+    }
+    return float4(pick, tex2Dlod(raw, float4(uv, 0.0, 0.0)).zw);
+}
+float4 PS_BaseMatch6(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseLevel(uv, 64.0, sDLSS5_CurL4, sDLSS5_PrevL4, 16.0, sDLSS5_FlowKeep, true); }
+float4 PS_BaseMatch5(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseLevel(uv, 32.0, sDLSS5_CurL3, sDLSS5_PrevL3, 8.0, sDLSS5_Flow6L, false); }
+float4 PS_BaseMatch4(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseLevel(uv, 16.0, sDLSS5_CurL2, sDLSS5_PrevL2, 4.0, sDLSS5_Flow5L, false); }
+float4 PS_BaseMatch3(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseLevel(uv, 8.0,  sDLSS5_CurL1, sDLSS5_PrevL1, 2.0, sDLSS5_Flow4L, false); }
+float4 PS_BaseMatch2(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseLevel(uv, 4.0,  sDLSS5_CurLuma, sDLSS5_PrevLuma, 1.0, sDLSS5_Flow3L, false); }
+float4 PS_BaseMatch1(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseLevel(uv, 2.0,  sDLSS5_CurLuma, sDLSS5_PrevLuma, 1.0, sDLSS5_Flow2L, false); }
+float4 PS_BaseAgree2(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseAgree(sDLSS5_Flow2Raw, uv, 4.0); }
+float4 PS_BaseAgree1(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseAgree(sDLSS5_Flow1Raw, uv, 2.0); }
+// The field the rest of the effect reads is at half resolution; a base that stops above that is
+// read up to it bilinearly.
+float4 PS_BaseOut3(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return tex2Dlod(sDLSS5_Flow3L, float4(uv, 0.0, 0.0)); }
+float4 PS_BaseOut2(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return tex2Dlod(sDLSS5_Flow2L, float4(uv, 0.0, 0.0)); }
+float4 PS_BaseAgree6(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseAgree(sDLSS5_Flow6Raw, uv, 64.0); }
+float4 PS_BaseAgree5(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseAgree(sDLSS5_Flow5Raw, uv, 32.0); }
+float4 PS_BaseAgree4(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseAgree(sDLSS5_Flow4Raw, uv, 16.0); }
+float4 PS_BaseAgree3(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return BaseAgree(sDLSS5_Flow3Raw, uv, 8.0); }
+
 // Development only: -Defines FLOWDBG=n puts another stage of the estimator where the rest of the
 // effect reads its result. n = 2..6: level n as handed down; 11..16: level n as matched;
 // 21..26: level n matched and agreed, before the pooled solve.
@@ -1802,6 +2007,8 @@ float4 PS_FlowDbg(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     return float4(tex2Dlod(sDLSS5_Cam5, float4(0.5, 0.5, 0.0, 0.0)).zw / 16.0, 0.0, 0.0);
     #elif FLOWDBG == 43
     return float4(tex2Dlod(sDLSS5_Cam5, float4(0.5, 0.5, 0.0, 0.0)).y * 8.0, tex2Dlod(sDLSS5_Cam4, float4(0.5, 0.5, 0.0, 0.0)).w, 0.0, 0.0);
+    #elif FLOWDBG == 53
+    return tex2Dlod(sDLSS5_Flow3L, float4(uv, 0.0, 0.0));
     #elif FLOWDBG == 41
     return float4(ReShade::GetLinearizedDepth(uv) * 60.0, tex2Dlod(ReShade::DepthBuffer, float4(uv, 0.0, 0.0)).x * 60.0, 0.0, 0.0);
     #else
@@ -3075,6 +3282,17 @@ technique DLSS5_Feed
     pass PyrC5         { VertexShader = PostProcessVS; PixelShader = PS_PyrC5;         RenderTarget0 = DLSS5_CurL5; }
     pass PyrP6         { VertexShader = PostProcessVS; PixelShader = PS_PyrP6;         RenderTarget0 = DLSS5_PrevL6; }
     pass PyrC6         { VertexShader = PostProcessVS; PixelShader = PS_PyrC6;         RenderTarget0 = DLSS5_CurL6; }
+#if BASE
+    pass BaseMatch6    { VertexShader = PostProcessVS; PixelShader = PS_BaseMatch6;    RenderTarget0 = DLSS5_Flow6Raw; }
+    pass BaseAgree6    { VertexShader = PostProcessVS; PixelShader = PS_BaseAgree6;    RenderTarget0 = DLSS5_Flow6; }
+    pass BaseMatch5    { VertexShader = PostProcessVS; PixelShader = PS_BaseMatch5;    RenderTarget0 = DLSS5_Flow5Raw; }
+    pass BaseAgree5    { VertexShader = PostProcessVS; PixelShader = PS_BaseAgree5;    RenderTarget0 = DLSS5_Flow5; }
+    pass BaseMatch4    { VertexShader = PostProcessVS; PixelShader = PS_BaseMatch4;    RenderTarget0 = DLSS5_Flow4Raw; }
+    pass BaseAgree4    { VertexShader = PostProcessVS; PixelShader = PS_BaseAgree4;    RenderTarget0 = DLSS5_Flow4; }
+    pass FlowKeep      { VertexShader = PostProcessVS; PixelShader = PS_FlowKeep;      RenderTarget0 = DLSS5_FlowKeep; }
+    pass BaseMatch3    { VertexShader = PostProcessVS; PixelShader = PS_BaseMatch3;    RenderTarget0 = DLSS5_Flow3Raw; }
+    pass BaseAgree3    { VertexShader = PostProcessVS; PixelShader = PS_BaseAgree3;    RenderTarget0 = DLSS5_Flow3; }
+#else
     pass Flow6         { VertexShader = PostProcessVS; PixelShader = PS_Flow6;         RenderTarget0 = DLSS5_Flow6Raw; }
     pass FlowEq6       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq6;       RenderTarget0 = DLSS5_FlowEqA6; RenderTarget1 = DLSS5_FlowEqB6; RenderTarget2 = DLSS5_FlowStA6; }
     pass FlowR1_6      { VertexShader = PostProcessVS; PixelShader = PS_FlowR16;       RenderTarget0 = DLSS5_FlowStB6; }
@@ -3100,6 +3318,19 @@ technique DLSS5_Feed
     pass FlowR2_3      { VertexShader = PostProcessVS; PixelShader = PS_FlowR23;       RenderTarget0 = DLSS5_FlowStA3; }
     pass FlowR3_3      { VertexShader = PostProcessVS; PixelShader = PS_FlowR33;       RenderTarget0 = DLSS5_FlowStB3; }
     pass FlowFill3     { VertexShader = PostProcessVS; PixelShader = PS_FlowFill3;     RenderTarget0 = DLSS5_Flow3; }
+#endif
+#if BASE == 2
+    pass BaseOut       { VertexShader = PostProcessVS; PixelShader = PS_BaseOut3;      RenderTarget0 = DLSS5_Flow1; }
+#elif BASE == 3
+    pass BaseMatch2    { VertexShader = PostProcessVS; PixelShader = PS_BaseMatch2;    RenderTarget0 = DLSS5_Flow2Raw; }
+    pass BaseAgree2    { VertexShader = PostProcessVS; PixelShader = PS_BaseAgree2;    RenderTarget0 = DLSS5_Flow2; }
+    pass BaseOut       { VertexShader = PostProcessVS; PixelShader = PS_BaseOut2;      RenderTarget0 = DLSS5_Flow1; }
+#elif BASE == 4
+    pass BaseMatch2    { VertexShader = PostProcessVS; PixelShader = PS_BaseMatch2;    RenderTarget0 = DLSS5_Flow2Raw; }
+    pass BaseAgree2    { VertexShader = PostProcessVS; PixelShader = PS_BaseAgree2;    RenderTarget0 = DLSS5_Flow2; }
+    pass BaseMatch1    { VertexShader = PostProcessVS; PixelShader = PS_BaseMatch1;    RenderTarget0 = DLSS5_Flow1Raw; }
+    pass BaseAgree1    { VertexShader = PostProcessVS; PixelShader = PS_BaseAgree1;    RenderTarget0 = DLSS5_Flow1; }
+#else
     pass Flow2         { VertexShader = PostProcessVS; PixelShader = PS_Flow2;         RenderTarget0 = DLSS5_Flow2Raw; }
     pass FlowEq2       { VertexShader = PostProcessVS; PixelShader = PS_FlowEq2;       RenderTarget0 = DLSS5_FlowEqA2; RenderTarget1 = DLSS5_FlowEqB2; RenderTarget2 = DLSS5_FlowStA2; }
     pass FlowR1_2      { VertexShader = PostProcessVS; PixelShader = PS_FlowR12;       RenderTarget0 = DLSS5_FlowStB2; }
@@ -3112,6 +3343,7 @@ technique DLSS5_Feed
     pass FlowR2_1      { VertexShader = PostProcessVS; PixelShader = PS_FlowR21;       RenderTarget0 = DLSS5_FlowStA1; }
     pass FlowR3_1      { VertexShader = PostProcessVS; PixelShader = PS_FlowR31;       RenderTarget0 = DLSS5_FlowStB1; }
     pass FlowFill1     { VertexShader = PostProcessVS; PixelShader = PS_FlowFill1;     RenderTarget0 = DLSS5_Flow1; }
+#endif
 #ifdef FLOWDBG
     pass FlowDbg       { VertexShader = PostProcessVS; PixelShader = PS_FlowDbg;       RenderTarget0 = DLSS5_Flow1; }
 #endif
