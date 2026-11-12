@@ -64,12 +64,14 @@
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
 #include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
 #include "feed_opti.h" // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
+#include "feed_renodx_api.h"   // RenoDX DLSS5's control interface (settings while it runs)
+#include "feed_panel.h" // the feeder's own in-game panel, the same in every build of the add-on
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 #include "feed_pq12.h" // the D3D12 PQ<->linear pass, for the transports with no shaders of their own
 #include "feed_hold12.h" // the output stabiliser: one compute pass after the evaluate, all four transports
 #include "feed_depthsrc.h" // which buffer Generic Depth binds, against the back buffer and any MSAA depth (#145)
 
-#define FEED_VERSION "1.19.0"
+#define FEED_VERSION "2.0.0"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif
@@ -269,6 +271,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 static char g_renodx_ver[48] = "not found";
 static char g_renodx_gen[16] = "";       // the add-on's own banner, e.g. "v4.7" (v4.6+ only)
 static bool g_renodx_present = false;
+static double g_pg_sum = 0.0; static unsigned g_pg_n = 0; static float g_pg_ms = 0.0f; static ULONGLONG g_pg_tick = 0;   // GPU cost for the menu
 static bool g_renodx_lazy    = false;
 static bool g_renodx_v46     = false;
 static bool g_renodx_v47     = false;
@@ -963,7 +966,9 @@ struct Cfg
     int   rebuild;         // any change of this number re-creates the feature once (manual trigger)
     int   log_frames;      // how many first frames get a full parameter dump in the log
     int   create_delay;    // frames to hold the FIRST feature create (the DLSS 5 add-on arms its NGX hooks asynchronously)
-    int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer)
+    int   preset;          // DLSS render preset hint: 0 = the add-on's default, which is L (kDefaultPreset);
+                           // 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer), 12=L, 13=M (second-generation
+                           // transformer). See PresetName().
     int   work_resolution; // 64-bit D3D11 only: 50..100 percent of each backbuffer axis
     int   work_upscale;    // how the work-size output is expanded back over the backbuffer:
                            // 0 = bilinear stretch, 1 = AMD FSR 1 (EASU + RCAS), 2 = DLSS
@@ -1054,6 +1059,32 @@ static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
 
+// The preset that is sent when the configuration says 0. It used to be no hint at all, which
+// leaves the choice to the DLSS DLL (K). It is L now, and it is always sent: on a real capture
+// (PS5 menus, 4K HDR10, the neural pass behind it) every preset but L and M left white text
+// and plain bright areas speckled once the neural pass had been over them -- single pixels
+// well above anything in the picture that went in. tools/fx-testbed, which measures plain DLAA
+// against the input, does not show that and prefers E for text; the picture people look at is
+// the one after the neural pass.
+static const int kDefaultPreset = 12;   // L
+
+// The letter NVIDIA gives a render-preset number, for the log and the overlay. The value is passed
+// to NGX as it is, so a number this table does not know still works if the DLSS DLL knows it.
+static const char *PresetName(int preset)
+{
+    switch (preset)
+    {
+    case 0:  return "default";
+    case 5:  return "E";
+    case 6:  return "F";
+    case 10: return "J";
+    case 11: return "K";
+    case 12: return "L";
+    case 13: return "M";
+    default: return "?";
+    }
+}
+
 static void CfgPath(char *out)
 {
     GetModuleFileNameA(g_self, out, MAX_PATH);
@@ -1130,6 +1161,7 @@ static bool CfgReload()
         else if (_stricmp(key, "warmup_rebuild") == 0) next.warmup_rebuild = iv;
         else if (_stricmp(key, "rebuild")        == 0) next.rebuild        = iv;
         else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
+        else if (FeedPanelCfg(key, iv)) {}   // panel_key / panel_mods / panel_side (feed_panel.h)
         else if (_stricmp(key, "create_delay")   == 0) next.create_delay   = iv;
         else if (_stricmp(key, "preset")         == 0) next.preset         = iv;
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
@@ -1311,7 +1343,10 @@ static const struct { int mode; const char *file, *tech; } kMvProviders[] = {
     { 3, "lumenite_Kernel.fx",      "Lumenite_Kernel" },
     { 4, "lumenite_QuantMotion.fx", "Lumenite_QuantMotion" },
 };
-static const char *kMvModeName[] = { "texMotionVectors", "Launchpad", "VORT", "LumeniteFX Kernel", "LumeniteFX QuantMotion" };
+// 5 is DLSS5_Feed.fx's own estimator: it lives in the effect itself, so there is no provider
+// technique to look for, nothing that can be missing or disabled, and nothing to warn about.
+static const char *kMvModeName[] = { "texMotionVectors", "Launchpad", "VORT", "LumeniteFX Kernel", "LumeniteFX QuantMotion", "built in" };
+static const int   kMvModeBuiltIn = 5;
 static const int   kMvModeCount  = static_cast<int>(sizeof(kMvModeName) / sizeof(kMvModeName[0]));
 
 // What the overlay shows under "Motion vectors": the resolved provider line, and the problem
@@ -1572,6 +1607,7 @@ struct Feed
     ID3D11Buffer       *pq_cb;          // the encode scale, for the copy-home pass
     bool   bridge_shaders_ok;
     bool   pq_bridge;                   // the bridge is active for the current build
+    bool   pq_wanted;                   // what BridgePqWanted() answered when that build was made (see BridgeStale)
     DXGI_FORMAT bb_view_fmt;            // the backbuffer's own typed format, for reading it.
                                         // Distinct from color_fmt once the bridge is on: that
                                         // becomes FP16 while this stays R10G10B10A2_UNORM.
@@ -1955,6 +1991,8 @@ static void TimingCollect(int slot)
     if (t[base + 1] > t[base])
     {
         g.ts_sum_ms += 1000.0 * double(t[base + 1] - t[base]) / double(g.ts_freq);
+        g_pg_sum += 1000.0 * double(t[base + 1] - t[base]) / double(g.ts_freq);   // the menu's readout: a 30-frame average
+        if (++g_pg_n >= 30) { g_pg_ms = static_cast<float>(g_pg_sum / g_pg_n); g_pg_tick = GetTickCount64(); g_pg_sum = 0.0; g_pg_n = 0; }
         ++g.ts_n;
     }
     const D3D12_RANGE wrote = { 0, 0 };   // read-only map
@@ -3867,6 +3905,23 @@ static bool BridgePqWanted(DXGI_FORMAT bb_fmt, const char **why)
     return true;
 }
 
+// Has the answer changed since the resources in hand were built? The bridge decides what format
+// DLSS's colour pair is made in, so a build made under one answer cannot serve the other -- and
+// two things change the answer without changing the backbuffer's size or format, which is all the
+// rebuild tests used to look at: the hdr_bridge key, and the swapchain's colour space (an app
+// that switches HDR on or off on the same 10-bit swap chain).
+// Measured the hard way in Elgato Studio: hdr_bridge 0 -> -1 in the cfg took the feature-only
+// shortcut, the shared pair stayed 10-bit, and the "HDR" picture went on being handed to DLSS
+// and the neural consumer as SDR until something else forced a full build.
+// Compared against what was WANTED at build time, not against pq_bridge: on a GPU where the
+// bridge cannot be set up, wanted stays true and active stays false, and that must not read as
+// a change on every frame.
+static bool BridgeStale(DXGI_FORMAT bb_fmt)
+{
+    const char *why = "";
+    return BridgePqWanted(bb_fmt, &why) != g.pq_wanted;
+}
+
 static bool BridgeWanted(DXGI_FORMAT bb_fmt, const char **why)
 {
     if (!BridgePqWanted(bb_fmt, why)) return false;
@@ -3946,7 +4001,8 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
     const bool want_sr = g_cfg.work_upscale == 2 && g_cfg.mode >= 2 && (w != backbuffer_w || h != backbuffer_h);   // mode 1 copies COLOR->OUTPUT, so sizes must match
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
         w == g.width && h == g.height && backbuffer_w == g.backbuffer_width &&
-        backbuffer_h == g.backbuffer_height && bb_fmt == g.bb_fmt && want_sr == g.sr_requested)
+        backbuffer_h == g.backbuffer_height && bb_fmt == g.bb_fmt && want_sr == g.sr_requested &&
+        !BridgeStale(bb_fmt))
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building shared textures");
@@ -3977,6 +4033,7 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
     if (!MakeBlitShaders()) { dev1->Release(); ReleaseFrameResources(); return false; }
 
     const char *bridge_why = "";
+    g.pq_wanted  = BridgePqWanted(bb_fmt, &bridge_why);
     g.pq_bridge  = BridgeWanted(bb_fmt, &bridge_why);
     // The bridge hands the consumer linear light in FP16 -- which is what it wants, and what
     // its own format test accepts. Without it, a PQ frame goes across described as SDR and
@@ -4256,12 +4313,19 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
     // Render-preset hint: presets differ in how aggressively history is clamped, which is
     // both a diagnostic and a partial mitigation for warping around transparents (dust,
     // flames) whose optical-flow vectors drag the background along. K=11 transformer is
-    // the modern default; E=5/F=6 are the legacy CNN presets with stronger clamping.
-    if (g_cfg.preset > 0)
+    // what DLSS picks by default; E=5/F=6 are the legacy CNN presets with stronger clamping,
+    // L=12/M=13 the second-generation transformer ones.
+    // What they do to a FINISHED picture, which is all this add-on ever feeds (tools/fx-testbed,
+    // DLSS 310.8, 4K DLAA; the table is in the README): E leaves text, a HUD and 2D content
+    // closest to what went in (static 14 px text keeps 0.99 of its edge energy against 0.84 on
+    // K); L and M leave a moving 3D scene most alone (error 0.37 / 0.35 against 0.72) and are
+    // the hardest on small still text (0.77). K is the best of them only on a still frame.
+    // The hint is always sent: 0 in the configuration means the add-on's default (kDefaultPreset,
+    // L), not "whatever the DLL picks".
     {
-        g.params->Set(sr ? g.sr_quality_hint : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, static_cast<unsigned int>(g_cfg.preset));
-        Log("[feed] DLSS render preset hint: %d (%s)", g_cfg.preset,
-            g_cfg.preset == 5 ? "E" : g_cfg.preset == 6 ? "F" : g_cfg.preset == 10 ? "J" : g_cfg.preset == 11 ? "K" : "?");
+        const int preset = g_cfg.preset > 0 ? g_cfg.preset : kDefaultPreset;
+        g.params->Set(sr ? g.sr_quality_hint : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, static_cast<unsigned int>(preset));
+        Log("[feed] DLSS render preset hint: %d (%s)%s", preset, PresetName(preset), g_cfg.preset > 0 ? "" : " -- the default");
     }
 
     if (!BeginCommands()) { Log("[feed] could not start a command list"); return false; }
@@ -4951,6 +5015,47 @@ static void ShutdownSession();   // defined below; every InitSession* unwinds th
 
 static ID3D12Device *g_dfc_device_proxy = nullptr;
 
+// GITC Uplift (#153) runs NR on a private D3D12 device of its own for D3D11 games. Where the
+// OS/driver cannot give it an independent device (its log: "device factory could not make an
+// independent device (0x80004002)"), D3D12CreateDevice hands out the adapter's one device per
+// process -- so the "private" device InitSession creates below is Uplift's. Uplift starts NGX
+// on the NATIVE device; starting it again on ReShade's proxy of that same device mixes the two
+// identities inside NGX: our list then fails Close() with E_INVALIDARG and the evaluate faults
+// in dxgi.dll through Uplift's _nvngx hooks. It only bit when Uplift came up first (its NR left
+// on from the previous session). With Uplift loaded we take the native device, the same
+// identity Uplift uses, exactly as for Deep Fried Chicken.
+static bool g_uplift_device_shared = false;   // this session's dev12 is the native device Uplift may share
+
+static bool FeedUpliftLoaded()
+{
+    if (GetModuleHandleW(L"gitc-uplift.addon64") != nullptr) return true;
+    wchar_t pat[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, pat, MAX_PATH);
+    wchar_t *s = wcsrchr(pat, L'\\');
+    if (s == nullptr) return false;
+    wcscpy_s(s + 1, MAX_PATH - (s + 1 - pat), L"gitc-uplift*.addon64");
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    FindClose(h);
+    return true;
+}
+
+// ShortFuse's renodx-dlss.addon64, loaded next to this add-on. Not a supported pairing (it is
+// built to run without the feeder, and the settings panel ignores it); this only keeps a user
+// who loads both from hanging the game. Its neural pass ("DLSS-NR direct") runs inside our NGX evaluate, on the NATIVE command list and
+// device behind ReShade's wrappers; with NGX started on the wrapper its feature creation read a
+// null in D3D12Core and the game hung seconds later (lab, 2026-11-12: 0xC0000005 at +0xC,
+// D3D12Core <- nvngx_dlssnr <- renodx-dlss.addon64). On the native device, as for Deep Fried
+// Chicken, nothing faults -- but its pass then never starts either (it finds our objects through
+// ReShade's wrappers), so this only makes the pair harmless; it works from the helper (host64).
+// Tried and worse: NGX on the native device with our list on the wrapper -> "command list would
+// not close" and a fault in nvngx_dlss, the mix the Uplift note above describes.
+static bool FeedShortFuseLoaded()
+{
+    return GetModuleHandleW(L"renodx-dlss.addon64") != nullptr;
+}
+
 static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
 {
     Breadcrumb("opening the D3D12 session");
@@ -5017,7 +5122,10 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         // native, otherwise NGX allocates ReShade-wrapped descriptor heaps and
         // passes them to native SetDescriptorHeaps (D3D12Core null dereference).
         // Keep the proxy alive until session teardown for observers holding it.
-        if (g_chicken_present)
+        const bool uplift = FeedUpliftLoaded();
+        g_uplift_device_shared = false;
+        const bool shortfuse = FeedShortFuseLoaded();
+        if (g_chicken_present || uplift || shortfuse)
         {
             // ReShade v6.8.0 source/com_utils.hpp: IID_UnwrappedObject (QueryInterface owns a reference).
             static constexpr GUID unwrapped = { 0x7f2c9a11, 0x3b4e, 0x4d6a,
@@ -5027,12 +5135,25 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
             {
                 g_dfc_device_proxy = g.dev12;
                 g.dev12 = native;
-                Log("[feed] DFC native D3D12 transport: proxy=%p native=%p; device, lists and descriptor heaps share native identity",
-                    g_dfc_device_proxy, g.dev12);
+                g_uplift_device_shared = uplift;
+                Log("[feed] %s native D3D12 transport: proxy=%p native=%p; device, lists and descriptor heaps share native identity",
+                    g_chicken_present ? "DFC" : uplift ? "GITC Uplift" : "RenoDX DLSS (ShortFuse)", g_dfc_device_proxy, g.dev12);
+                if (uplift)
+                    Log("[feed] GITC Uplift is loaded: it runs NGX on the native device, which D3D12 may hand this "
+                        "add-on too (one device per adapter when Uplift cannot get an independent one, #153). NGX "
+                        "is started on that same native identity, and is not shut down on it at teardown, because "
+                        "that would also end Uplift's NGX instance");
+            }
+            else if (uplift)
+            {
+                Log("[feed] GITC Uplift is loaded but ReShade gave no native device behind the proxy; continuing on "
+                    "the proxy (if this session then fails at 'command list would not close', use the 64-bit "
+                    "helper mode, #153)");
             }
         }
-    // Debug names make the DRED breadcrumb and page-fault output identify OUR objects.
-    g.dev12->SetName(L"dlss5-feed private device");
+    // Debug names make the DRED breadcrumb and page-fault output identify OUR objects. Not on a
+    // device Uplift may own: it would rename Uplift's device in its own DRED output.
+    if (!g_uplift_device_shared) g.dev12->SetName(L"dlss5-feed private device");
     FeedAttachInfoQueue();
 
         wchar_t data_path[MAX_PATH] = {};
@@ -5149,7 +5270,14 @@ static void ShutdownSession()
 {
     ReleaseFrameResources();
     if (g.params != nullptr) { if (!g_ngx_dying) NVSDK_NGX_D3D12_DestroyParameters(g.params); g.params = nullptr; }
-    if (g.ngx_inited && g.dev12 != nullptr) { if (!g_ngx_dying) NVSDK_NGX_D3D12_Shutdown1(g.dev12); g.ngx_inited = false; }
+    // On a device shared with GITC Uplift, Shutdown1 would end Uplift's NGX instance too (#153);
+    // our feature and parameters are released above, which is all that is ours.
+    if (g.ngx_inited && g.dev12 != nullptr)
+    {
+        if (!g_ngx_dying && !g_uplift_device_shared) NVSDK_NGX_D3D12_Shutdown1(g.dev12);
+        g.ngx_inited = false;
+    }
+    g_uplift_device_shared = false;
     SafeRelease(g.blit_vs);
     SafeRelease(g.blit_ps);
     SafeRelease(g.resample_ps);
@@ -5412,7 +5540,7 @@ static bool MakeTex12(int i, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, D3D12_RE
 static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
-        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt && !BridgeStale(bb_fmt))
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building same-device textures");
@@ -5438,7 +5566,8 @@ static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     // keeps the swapchain's own 10-bit format either way, so nothing the game copies changes.
     {
         const char *bridge_why = "";
-        g.pq_bridge = BridgePqWanted(bb_fmt, &bridge_why) &&
+        g.pq_wanted = BridgePqWanted(bb_fmt, &bridge_why);
+        g.pq_bridge = g.pq_wanted &&
                       SetupPq12Bridge(g.width, g.height, g.color_fmt, "same-device D3D12, on the GAME device");
         if (g.pq_bridge) g.hdr = true;
         else if (TypedColorFormat(bb_fmt) == DXGI_FORMAT_R10G10B10A2_UNORM)
@@ -5696,7 +5825,7 @@ static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
 static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
-        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt && !BridgeStale(bb_fmt))
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building the Vulkan-shared textures");
@@ -5725,7 +5854,8 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     // keeps the swapchain's own 10-bit format either way, so nothing the game copies changes.
     {
         const char *bridge_why = "";
-        g.pq_bridge = BridgePqWanted(bb_fmt, &bridge_why) &&
+        g.pq_wanted = BridgePqWanted(bb_fmt, &bridge_why);
+        g.pq_bridge = g.pq_wanted &&
                       SetupPq12Bridge(g.width, g.height, g.color_fmt, "Vulkan transport, on our private device");
         if (g.pq_bridge) g.hdr = true;
         else if (TypedColorFormat(bb_fmt) == DXGI_FORMAT_R10G10B10A2_UNORM)
@@ -6144,7 +6274,7 @@ static bool MakeSharedTexGl(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
 static bool BuildResourcesGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handle)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
-        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt && !BridgeStale(bb_fmt))
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building the OpenGL-shared textures");
@@ -6170,7 +6300,8 @@ static bool BuildResourcesGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_ha
     // keeps the swapchain's own 10-bit format either way, so nothing the game copies changes.
     {
         const char *bridge_why = "";
-        g.pq_bridge = BridgePqWanted(bb_fmt, &bridge_why) &&
+        g.pq_wanted = BridgePqWanted(bb_fmt, &bridge_why);
+        g.pq_bridge = g.pq_wanted &&
                       SetupPq12Bridge(g.width, g.height, g.color_fmt, "OpenGL transport, on our private device");
         if (g.pq_bridge) g.hdr = true;
         else if (TypedColorFormat(bb_fmt) == DXGI_FORMAT_R10G10B10A2_UNORM)
@@ -6725,7 +6856,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
     // add-on may still be patching its vtable (that has crashed the process at EXEC 0x0),
     // and it re-patches after every runtime recreation.
     const bool needs_build12 = !g.frame_ready || w != g.width || h != g.height || cd.Format != g.bb_fmt ||
-                               FeatureMissingForMode();
+                               BridgeStale(cd.Format) || FeatureMissingForMode();
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
@@ -7041,7 +7172,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
     const DXGI_FORMAT bbf = static_cast<DXGI_FORMAT>(cd.texture.format);
     const bool needs_build_vk = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt ||
-                                FeatureMissingForMode();
+                                BridgeStale(bbf) || FeatureMissingForMode();
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
@@ -7747,7 +7878,7 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
     const DXGI_FORMAT bbf = have_bb_desc ? static_cast<DXGI_FORMAT>(cd.texture.format)
                                          : DXGI_FORMAT_R8G8B8A8_UNORM;   // default FB: assume 8-bit; the blit converts anyway
     const bool needs_build_gl = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt ||
-                                FeatureMissingForMode();
+                                BridgeStale(bbf) || FeatureMissingForMode();
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
@@ -8028,7 +8159,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     const bool needs_build11 = !g.frame_ready || work_w != g.width || work_h != g.height ||
                                cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height ||
                                cd.Format != g.bb_fmt || want_sr != g.sr_requested ||
-                               FeatureMissingForMode();
+                               BridgeStale(cd.Format) || FeatureMissingForMode();
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
@@ -8513,9 +8644,14 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     last_signature = signature;
     last_rt = rt;
 
-    _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> %s (%s)",
-                mode, kMvModeName[mode], provider,
-                g.launchpad.handle ? (provider_broken ? "FAILED TO COMPILE" : provider_on ? "enabled" : "DISABLED") : "not installed");
+    const bool builtin = mode == kMvModeBuiltIn;
+    if (builtin)
+        _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> DLSS5_Feed.fx's own estimator (nothing to enable)",
+                    mode, kMvModeName[mode]);
+    else
+        _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> %s (%s)",
+                    mode, kMvModeName[mode], provider,
+                    g.launchpad.handle ? (provider_broken ? "FAILED TO COMPILE" : provider_on ? "enabled" : "DISABLED") : "not installed");
     g_mv_problem[0] = '\0';
 
     Log("[feed] effects: %s technique %s, ColorInput %s, DLSS5_MV %s, DLSS5_Depth %s, DLSS5_Mask %s, %s, depth reversed=%d",
@@ -8553,6 +8689,8 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
                 "before calling it missing", kEffectFile);
         }
     }
+    else if (builtin)
+        ;   // nothing can be missing: the estimator is part of the effect that just resolved
     else if (g.launchpad.handle == 0)
         _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
                     "DLSS5_Feed.fx is compiled for motion-vector provider %d (%s) but no known %s shader is installed: motion vectors will be zero (still images only). "
@@ -8683,9 +8821,61 @@ static void OnReloadedEffects(reshade::api::effect_runtime *rt)
 // where DLSS5_Feed.fx is genuinely absent (which is the whole point of the #81 warning) got no
 // warning either, because nothing was rendering to carry the timer forward. reshade_present
 // fires once per present per runtime regardless, which is what this needs.
-static void OnReShadePresent(reshade::api::effect_runtime * /*rt*/)
+// ---------------------------------------------------------------------------
+// The feeder's own panel (feed_panel.h), for a tool that runs in THIS process: its files are
+// beside this add-on, it shares this ReShade, and nothing has to be relayed. The panel itself
+// -- the settings, the drawing, the shortcut -- is the shared header's.
+// ---------------------------------------------------------------------------
+static void PanelRefresh()
+{
+    GetModuleFileNameA(g_self, g_panel_env.tool_dir, MAX_PATH);
+    if (char *s = strrchr(g_panel_env.tool_dir, '\\')) *(s + 1) = '\0';
+    // OptiScaler is found when it is loaded, which can be after this add-on attached (the
+    // feeder's own check runs once, at start): look again, without disturbing that record.
+    OptiInfo o = g_opti;
+    if (!o.present)
+    {
+        OptiInfo late = {};
+        if (OptiFindModule(&late)) { late.present = true; OptiClassify(late.path, &late.nr_fork, &late.direct); o = late; }
+    }
+    g_panel_env.opti_nr = o.present && o.nr_fork;
+    static char checked[MAX_PATH] = "";
+    static bool live = false;
+    if (g_panel_env.opti_nr && strcmp(checked, o.path) != 0) { strcpy_s(checked, o.path); live = OptiFileHasLiteral(o.path, OPTI_LIVE_LITERAL); }
+    g_panel_env.opti_live = g_panel_env.opti_nr && live;
+    _snprintf_s(g_panel_env.opti_ini, sizeof(g_panel_env.opti_ini), _TRUNCATE, "%s" OPTI_INI, o.dir);
+}
+#include "feed_panel_mv.h"   // the menu's motion-vector notice: what it asks ReShade and what its buttons do
+static void PanelSetup()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    g_panel_env.helper       = false;
+    PanelMvSetup();
+    g_panel_env.send_setting = [](const char *key, float value) { const int r = FeedRenoApiSet(key, value);
+                                                                 Log("[panel] %s=%g -> RenoDX control interface: %s", key, value, r == 1 ? "taken" : r == 0 ? "REFUSED" : "not available");
+                                                                 return r == 1; };
+    g_panel_env.live_keys    = [](char *out, size_t cb) { return FeedRenoApiKeys(out, cb); };
+    g_panel_env.gpu_ms       = []() { return GetTickCount64() - g_pg_tick < 3000 ? g_pg_ms : 0.0f; };
+    g_panel_env.refresh      = PanelRefresh;
+    g_panel_env.log          = Log;
+    CfgPath(g_panel_env.cfg_path);
+}
+// Drawn for the runtime the feed is bound to (any runtime while it is bound to none).
+static void OnPanelOverlay(reshade::api::effect_runtime *rt)
+{
+    if (g_cfg.enabled && (g.runtime == nullptr || rt == g.runtime)) FeedPanelDraw(rt);
+}
+
+static void OnReShadePresent(reshade::api::effect_runtime *rt)
 {
     FeedPollConfig();
+    if (g_cfg.enabled && rt != nullptr && (g.runtime == nullptr || rt == g.runtime))
+    {
+        PanelSetup();
+        FeedPanelTick(rt);
+    }
 }
 
 static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::effect_technique technique,
@@ -8852,6 +9042,17 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         if (enabled && rt != nullptr) { Log("[feed] enabled from the overlay; re-adopting the effect runtime"); OnInitEffectRuntime(rt); }
         else if (!enabled) Log("[feed] disabled from the overlay: no frames are fed and nothing is queried. "
                                "An already-installed Vulkan interop hook stays until the game exits.");
+    }
+
+    {
+        // The feeder's own panel (feed_panel.h): the settings of whichever neural tool is beside
+        // the feeder, under one set of names -- the same panel the 32-bit add-on has.
+        char key[96], label[160];
+        FeedPanelKeyName(key, sizeof(key));
+        sprintf_s(label, "%s the DLSS 5 Feeder menu", g_panel_wanted ? "Hide" : "Show");
+        if (ImGui::Button(label)) { PanelSetup(); FeedPanelShow(!g_panel_wanted); }
+        ImGui::SameLine();
+        ImGui::TextDisabled("shortcut: %s (panel_key / panel_mods in dlss5-feed.cfg)", key);
     }
 
     ImGui::Separator();
@@ -9032,13 +9233,18 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
 
     ImGui::Separator();
     ImGui::TextUnformatted("DLSS render preset");
-    static const char *kPresetNames[] = { "Default", "E (legacy CNN)", "F (legacy CNN)", "J (transformer)", "K (transformer)" };
-    static const int   kPresetValues[] = { 0, 5, 6, 10, 11 };
+    static const char *kPresetNames[] = { "Default (L)", "E (legacy CNN) - closest to the input without a neural pass", "F (legacy CNN)", "J (transformer)", "K (transformer)",
+                                          "L (transformer, 2nd gen) - clean text behind a neural pass", "M (transformer, 2nd gen) - clean text behind a neural pass" };
+    static const int   kPresetValues[] = { 0, 5, 6, 10, 11, 12, 13 };
+    const int preset_count = static_cast<int>(sizeof(kPresetValues) / sizeof(kPresetValues[0]));
     int preset_idx = 0;
-    for (int i = 0; i < 5; ++i) if (kPresetValues[i] == g_cfg.preset) preset_idx = i;
-    if (ImGui::Combo("Preset", &preset_idx, kPresetNames, 5)) { g_cfg.preset = kPresetValues[preset_idx]; dirty = true; rebuild = true; }
-    ImGui::TextWrapped("Presets differ in how hard DLSS clamps history against the current frame. "
-                       "If motion warps around transparents (dust, smoke, flames), try E or F.");
+    for (int i = 0; i < preset_count; ++i) if (kPresetValues[i] == g_cfg.preset) preset_idx = i;
+    if (ImGui::Combo("Preset", &preset_idx, kPresetNames, preset_count)) { g_cfg.preset = kPresetValues[preset_idx]; dirty = true; rebuild = true; }
+    ImGui::TextWrapped("The default is L. With a neural pass behind DLSS, L and M are the presets that leave "
+                       "white text and plain bright areas clean; the others speckle them (seen on a 4K HDR capture). "
+                       "Without a neural pass E is the one that leaves text, a HUD and 2D content closest to what "
+                       "went in, and L and M soften small still text a little (the 'restore text and HUD' technique "
+                       "gives it back). If motion warps around transparents (dust, smoke, flames), try E or F.");
 
     ImGui::Separator();
     ImGui::TextUnformatted("Motion vectors");
@@ -9049,7 +9255,8 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "provider matches the shader's DLSS5_MV_PROVIDER");
     ImGui::TextWrapped("%s", g_mv_probe);
     ImGui::TextWrapped("Change the provider with DLSS5_Feed.fx's DLSS5_MV_PROVIDER preprocessor definition: "
-                       "0 texMotionVectors (qUINT, dh_uber_motion), 1 Launchpad, 2 VORT, 3 LumeniteFX Kernel, 4 LumeniteFX QuantMotion.");
+                       "0 texMotionVectors (qUINT, dh_uber_motion), 1 Launchpad, 2 VORT, 3 LumeniteFX Kernel, 4 LumeniteFX QuantMotion, "
+                       "5 built in (DLSS5_Feed.fx's own estimator, nothing to enable).");
     if (ImGui::SliderFloat("MV scale X", &g_cfg.mv_scale_x, 0.0f, 4.0f)) dirty = true;
     if (ImGui::SliderFloat("MV scale Y", &g_cfg.mv_scale_y, 0.0f, 4.0f)) dirty = true;
 
@@ -9208,6 +9415,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::register_event<reshade::addon_event::reshade_present>(OnReShadePresent);
+        reshade::register_event<reshade::addon_event::reshade_overlay>(OnPanelOverlay);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         feed_depthsrc::Register();
         reshade::register_overlay(nullptr, DrawOverlay);
@@ -9237,6 +9445,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::unregister_event<reshade::addon_event::reshade_present>(OnReShadePresent);
+        reshade::unregister_event<reshade::addon_event::reshade_overlay>(OnPanelOverlay);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         feed_depthsrc::Unregister();
         FeedVkFramePresentRemove();

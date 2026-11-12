@@ -44,7 +44,31 @@
 #include "../src/feed_fmt.h"
 #include "../src/feed_dfc.h"   // Deep Fried Chicken interop ABI 1 (producer side, HostMode=1 here)
 #include "../src/feed_opti.h"  // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
+#include "../src/feed_renodx_api.h" // RenoDX DLSS5's control interface: its settings, set while it runs
 #include "../src/feed_hold12.h" // the output stabiliser (experimentHold): one compute pass after the evaluate
+
+// The GPU cost of a frame, for the game's menu (FeedStats in feed_ipc.h). Averaged over 30
+// timed frames so the number on screen is steady.
+static FeedStats *g_stats = nullptr;
+static double     g_stats_sum = 0.0;
+static unsigned   g_stats_n = 0;
+static void StatsOpen(DWORD game_pid)
+{
+    char name[64];
+    sprintf_s(name, FEED_STATS_FMT, static_cast<unsigned long>(game_pid));
+    HANDLE m = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(FeedStats), name);
+    if (m == nullptr) return;
+    g_stats = static_cast<FeedStats *>(MapViewOfFile(m, FILE_MAP_WRITE, 0, 0, sizeof(FeedStats)));
+    if (g_stats != nullptr) { g_stats->magic = FEED_STATS_MAGIC; g_stats->gpu_ms = 0.0f; g_stats->tick = GetTickCount(); }
+}
+static void StatsSample(double gpu_ms)
+{
+    g_stats_sum += gpu_ms;
+    if (++g_stats_n < 30) return;
+    if (g_stats != nullptr) { g_stats->gpu_ms = static_cast<float>(g_stats_sum / g_stats_n); g_stats->tick = GetTickCount(); }
+    g_stats_sum = 0.0;
+    g_stats_n = 0;
+}
 
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
@@ -62,6 +86,12 @@ static bool g_show_window = false;   // visible host window = the user's door to
 // the Z-order. The game's add-on positions it under the game window and forwards the
 // user's clicks to it. Banner and auto-Home run as for a visible window.
 static bool g_behind = false;
+// PROTOTYPE (side panel): "--side WxH". The window is sized for a full-height panel drawn 1:1
+// in the game (W includes the 96 px strip the add-on crops), ReShade's tab bar is hidden, the
+// banner is a plain fill, and the overlay is opened even though the window is never shown --
+// the game draws the panel from the shared texture, so nothing here has to reach the desktop.
+static bool g_side = false;
+static int  g_side_w = 0, g_side_h = 0;
 // Client area of the host window and its swapchain: TALL and narrow, not a 16:9 landscape
 // shape. The cast panel (dlss5-feed32's CastLayout) is right-aligned and fit to the game
 // window's height, so a tall source scales up to fill the game's vertical space and stays
@@ -181,6 +211,16 @@ static void FitWindowToWorkArea(const char *ini)
     }
     if (g_win_h < 540) g_win_h = 540;
 
+    if (g_side)
+    {
+        // The game named the size; the user's [DLSS5Host] keys are for the other modes and
+        // are neither read nor written here.
+        g_win_w = (g_side_w < 300 ? 300 : g_side_w > 4000 ? 4000 : g_side_w) & ~1;
+        g_win_h = (g_side_h < 300 ? 300 : g_side_h > 8000 ? 8000 : g_side_h) & ~1;
+        Log("[host] window size: %dx%d (side panel: named by the game on the command line)", g_win_w, g_win_h);
+        return;
+    }
+
     const int cfg_w = GetPrivateProfileIntA("DLSS5Host", "WindowWidth", 0, ini);
     const int cfg_h = GetPrivateProfileIntA("DLSS5Host", "WindowHeight", 0, ini);
     if (cfg_w > 0) g_win_w = cfg_w < 300 ? 300 : cfg_w > 4000 ? 4000 : cfg_w;
@@ -212,6 +252,31 @@ static void HostIniPath(char *out, size_t cb)
     sprintf_s(out, cb, "%sReShade.ini", dir);
 }
 
+// PROTOTYPE (side panel). ImGui names a docked window's tab by hashing "#TAB" seeded with the
+// hash of the window's name; since 1.91.6 the hash is CRC-32C (checked against this file's own
+// 0xCBCD3A85 = "###home" and 0xCC18005E = "Viewport"). A "###" restarts the hash, as in ImGui.
+static unsigned SideHash(const char *s, unsigned seed)
+{
+    static unsigned table[256];
+    if (table[1] == 0)
+        for (unsigned i = 0; i < 256; ++i)
+        {
+            unsigned c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1u) ? (c >> 1) ^ 0x82F63B78u : c >> 1;
+            table[i] = c;
+        }
+    seed = ~seed;
+    unsigned crc = seed;
+    for (; *s != 0; ++s)
+    {
+        if (s[0] == '#' && s[1] == '#' && s[2] == '#') crc = seed;
+        crc = (crc >> 8) ^ table[(crc & 0xFFu) ^ static_cast<unsigned char>(*s)];
+    }
+    return ~crc;
+}
+static unsigned SideTabId(const char *window_name) { return SideHash("#TAB", SideHash(window_name, 0)); }
+static std::string SideConsumerWindow(const char *ini);   // below, once the consumers are known
+
 // force=false is the startup rule: adopt an empty or stock layout, resize one this host
 // wrote itself, and never touch one the user dragged into shape.
 //
@@ -225,6 +290,36 @@ static void RefitHostOverlay(const char *ini, bool force)
     char dock[4096] = {};
     GetPrivateProfileStringA("OVERLAY", "Docking", "", dock, sizeof(dock), ini);
     const int tabs_w = g_win_w - 96;
+    if (g_side)
+    {
+        // Side panel: the same split, but the column holds ONE window -- the neural consumer's
+        // own when it has one, ReShade's Add-ons page when it has not -- with its tab bar
+        // switched off (ImGui reads NoTabBar between SizeRef and Selected), so that page fills
+        // the panel with no row of ReShade tabs above it. It has to be alone there: a node
+        // without a tab bar always shows its FIRST window, whatever Selected says, and
+        // ReShade's Home is always first. ReShade's own pages go to the 96 px strip instead,
+        // which the game crops away.
+        static const char *const own[] = { "###home", "###addons", "###settings", "###statistics", "###log", "###about", "###editor" };
+        const std::string consumer = SideConsumerWindow(ini);
+        const std::string page = consumer.empty() ? "###addons" : consumer;
+        char v[1024];
+        sprintf_s(v, "[Docking][Data],DockSpace   ID=0xB0DF600F Window=0xCC18005E Pos=8,,8 Size=%d,,%d Split=X,  "
+                     "DockNode  ID=0x00000001 Parent=0xB0DF600F SizeRef=%d,,%d NoTabBar=1 Selected=0x%08X,  "
+                     "DockNode  ID=0x00000002 Parent=0xB0DF600F SizeRef=96,,%d CentralNode=1 Selected=0xCBCD3A85",
+                  g_win_w - 16, g_win_h - 16, tabs_w, g_win_h, SideTabId(page.c_str()), g_win_h);
+        WritePrivateProfileStringA("OVERLAY", "Docking", v, ini);
+        sprintf_s(v, "[Window][%s],Pos=8,,8,Size=%d,,%d,Collapsed=0,DockId=0x00000001,,0,", page.c_str(), tabs_w, g_win_h - 16);
+        std::string w(v);
+        int order = 0;
+        for (const char *o : own)
+            if (page != o) { sprintf_s(v, "[Window][%s],Collapsed=0,DockId=0x00000002,,%d,", o, order++); w += v; }
+        sprintf_s(v, "[Window][Viewport],Pos=0,,0,Size=%d,,%d,Collapsed=0", g_win_w, g_win_h);
+        w += v;
+        WritePrivateProfileStringA("OVERLAY", "Window", w.c_str(), ini);
+        Log("[host] ReShade.ini: side panel layout, %d px wide; the page shown is %s%s%s", tabs_w,
+            consumer.empty() ? "ReShade's Add-ons tab" : "the consumer's own window '", consumer.c_str(), consumer.empty() ? "" : "'");
+        return;
+    }
     if (dock[0] == '\0' || force)
     {
         char v[4096];
@@ -312,6 +407,30 @@ static void PrepareHostOverlay()
     RefitHostOverlay(ini, false);
 }
 static bool g_renodx_present = false;   // renodx-dlss5.addon64 sits next to this exe
+
+// PROTOTYPE (side panel): the name of the neural consumer's own overlay window, "" when it
+// has none (its settings are then a section of ReShade's Add-ons page). ReShade saves every
+// ImGui window it has seen in [OVERLAY] Window=, so after one run the answer is on disk for
+// any consumer: the first window there that is not one of ReShade's own. Before that, the one
+// name this was built against.
+static std::string SideConsumerWindow(const char *ini)
+{
+    static const char *const own[] = { "###home", "###addons", "###settings", "###statistics", "###log", "###about",
+                                       "###editor", "Viewport", "Debug##Default" };
+    std::string all(8192, '\0');
+    all.resize(GetPrivateProfileStringA("OVERLAY", "Window", "", &all[0], static_cast<DWORD>(all.size()), ini));
+    for (size_t at = 0; (at = all.find("[Window][", at)) != std::string::npos;)
+    {
+        at += 9;
+        const size_t end = all.find("],", at);
+        if (end == std::string::npos) break;
+        const std::string name = all.substr(at, end - at);
+        bool mine = false;
+        for (const char *o : own) if (name == o) mine = true;
+        if (!mine && !name.empty()) return name;
+    }
+    return g_renodx_present ? "DLSS 5 Neural Rendering" : "";
+}
 // Its actual file name, which is not always the canonical one: a browser that downloaded the
 // file twice leaves "renodx-dlss5(2).addon64", and a real 616.86 log has exactly that. Needed
 // to recognise the consumer's own frames on a faulting stack (see NoteNgxFault).
@@ -905,6 +1024,8 @@ struct Host
     UINT            out_width, out_height;  // the Output slot: == work (DLAA) or the native size (SR, v6)
     int             sr_quality;             // NVSDK_NGX_PerfQuality_Value in use when out != work
     const char     *sr_quality_name;
+    const char     *sr_quality_hint;        // the NGX render-preset hint key for that quality
+    unsigned        preset;                 // FeedBuild::preset (v12): the render-preset hint, 0 = default
     DXGI_FORMAT     color_fmt, output_fmt;
 
     HANDLE          latency_wait;  // the disguise swapchain's frame-latency waitable object.
@@ -984,6 +1105,7 @@ static void TimingCollect(int slot)
     {
         h.ts_sum_ms += 1000.0 * double(t[base + 1] - t[base]) / double(h.ts_freq);
         ++h.ts_n;
+        StatsSample(1000.0 * double(t[base + 1] - t[base]) / double(h.ts_freq));
     }
     const D3D12_RANGE wrote = { 0, 0 };
     h.ts_read->Unmap(0, &wrote);
@@ -1652,6 +1774,10 @@ static void InitBanner()
     HFONT fnt_small = CreateFontW(S(26), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0,
                                   CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     HGDIOBJ old_font = SelectObject(dc, fnt_big);
+    // Side panel: the fill alone. The game shows this picture as the panel's own background,
+    // and lettering meant for a desktop window would sit behind the page.
+    if (!g_side)
+    {
     SetTextColor(dc, RGB(118, 185, 0));
     RECT r1 = { 0, S(150), W, S(240) };
     DrawTextW(dc, L"32-bit DLSS 5 Feeder", -1, &r1, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
@@ -1678,6 +1804,7 @@ static void InitBanner()
         RECT r4 = { 0, S(350), W, S(390) };
         DrawTextW(dc, L"If using OptiScaler, press  Insert  in this window for its menu.", -1, &r4,
                   DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
     }
     SelectObject(dc, old_font);
     DeleteObject(fnt_big);
@@ -1863,10 +1990,78 @@ static bool HostResize(int new_w, int new_h, const char *why)
     h.panel_host_owned = false;
     h.panel_size = 0;
 
+    if (g_side) return true;   // the game's size, not the user's: [DLSS5Host] keeps what it had
     char buf[16];
     sprintf_s(buf, "%d", g_win_w); WritePrivateProfileStringA("DLSS5Host", "WindowWidth", buf, ini);
     sprintf_s(buf, "%d", g_win_h); WritePrivateProfileStringA("DLSS5Host", "WindowHeight", buf, ini);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Settings a neural tool takes while it runs (RenoDX DLSS5 from v10: feed_renodx_api.h).
+// The add-on in the game cannot ask this process a question, so what the tool accepts is
+// written to a small file beside this exe, and the game's menu reads it: every name in it
+// can be changed with tag 'S' and no restart.
+// ---------------------------------------------------------------------------
+static char *g_live_probe = nullptr;   // lab only, see LiveTick
+
+static void LivePath(char *out)
+{
+    GetModuleFileNameA(nullptr, out, MAX_PATH);
+    if (char *s = strrchr(out, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - out), "dlss5-feed-live.txt");
+}
+
+static void LiveSet(const char *key, float value)
+{
+    char module[64] = "";
+    FeedRenoApi(module, sizeof(module));
+    float before = 0.0f;
+    const bool had = FeedRenoApiGet(key, &before);
+    const int  r = FeedRenoApiSet(key, value);
+    if (r < 0)
+        Log("[host] live setting %s=%g: no neural tool here takes settings while running; ignored", key, value);
+    else if (had)
+        Log("[host] live setting %s: %g -> %g, %s by %s", key, before, value, r == 1 ? "taken" : "REFUSED", module);
+    else
+        Log("[host] live setting %s=%g: %s by %s", key, value, r == 1 ? "taken" : "REFUSED", module);
+}
+
+// Once the tool is loaded (ReShade loads it after this process has a device), list what it
+// takes. Looked for on the first frames only; a tool without the interface leaves no file.
+static void LiveTick(uint64_t frame)
+{
+    static int state = 0;   // 0 looking, 1 done
+    if (state != 0) return;
+    if (frame > 900) { state = 1; return; }
+    if (frame % 30 != 1) return;
+    static char keys[8192];
+    char module[64] = "";
+    const int n = FeedRenoApiKeys(keys, sizeof(keys));
+    if (n <= 0) return;
+    FeedRenoApi(module, sizeof(module));
+    state = 1;
+    char path[MAX_PATH];
+    LivePath(path);
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "w") == 0 && f != nullptr)
+    {
+        fprintf(f, "; settings %s takes while it runs (written by dlss5-feed-host64 at start)\n%s", module, keys);
+        fclose(f);
+    }
+    Log("[host] %s takes %d settings while it runs (its control interface, version 1); listed in dlss5-feed-live.txt", module, n);
+
+    // LAB ONLY: DLSS5_FEED_LIVE_SET="Key=1.5;Other=2" -- each pair is set once, 600 frames in.
+    static char env[1024];
+    if (GetEnvironmentVariableA("DLSS5_FEED_LIVE_SET", env, sizeof(env)) != 0) g_live_probe = env;
+}
+
+static void LiveProbe(uint64_t frame)
+{
+    if (g_live_probe == nullptr || frame < 600) return;
+    char *ctx = nullptr;
+    for (char *tok = strtok_s(g_live_probe, ";", &ctx); tok != nullptr; tok = strtok_s(nullptr, ";", &ctx))
+        if (char *eq = strchr(tok, '=')) { *eq = '\0'; LiveSet(tok, static_cast<float>(atof(eq + 1))); }
+    g_live_probe = nullptr;
 }
 
 // After Present: copy the buffer that was just presented -- banner plus whatever ReShade
@@ -1957,7 +2152,7 @@ static bool PumpPresent(bool force = false)
     // Open ReShade's overlay for the user once the window is up: key down on one pump, key
     // up three pumps later, so ReShade sees a held key across a frame boundary (down and
     // up inside the same frame reads as never pressed). Only when the window is visible.
-    if (g_show_window && h.hwnd != nullptr)
+    if ((g_show_window || g_side) && h.hwnd != nullptr)   // side panel: the window is never shown, the overlay still is
     {
         // The count itself always runs: tag 'O' re-arms against it, and it is the only clock
         // the idle paths have. Only the posting is conditional on a key existing (issue #118).
@@ -2258,7 +2453,14 @@ static bool InitDisguise()
     Log("[host] window: %dx%d client (tall and narrow, fit to the work area height)%s", g_win_w, g_win_h,
         g_behind ? ", behind the game (tool window, no taskbar button)" : "");
     if (h.hwnd == nullptr) { Log("[host] window creation failed"); return false; }
-    if (g_show_window) ShowWindow(h.hwnd, SW_SHOWNOACTIVATE);   // never steal the game's focus
+    // Never the game's focus, and never in front of it either. A new window is shown at the TOP
+    // of the stack even when it is not activated, so the behind-the-game one covered the game
+    // for the seconds this process needs to start (and again after every restart from the
+    // menu's Apply) until it was pushed down further on. It is now shown at the bottom outright.
+    if (g_show_window && g_behind)
+        SetWindowPos(h.hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    else if (g_show_window)
+        ShowWindow(h.hwnd, SW_SHOWNOACTIVATE);
 
     {
         char ini[MAX_PATH];
@@ -2361,7 +2563,7 @@ static bool InitDisguise()
     h.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (h.list == nullptr || h.fence == nullptr) { Log("[host] list/fence creation failed"); return false; }
 
-    if (g_show_window) InitBanner();
+    if (g_show_window || g_side) InitBanner();   // side panel: the banner pair is also the panel copy's
     return true;
 }
 
@@ -2655,12 +2857,12 @@ static bool InitNgx()
 // the chosen preset. Fills h.sr_quality(_name); false when no preset covers the ratio.
 static bool PickSrQuality(UINT w, UINT h_, UINT out_w, UINT out_h)
 {
-    static const struct { NVSDK_NGX_PerfQuality_Value q; const char *name; } kOrder[] = {
-        { NVSDK_NGX_PerfQuality_Value_UltraQuality,     "Ultra Quality" },
-        { NVSDK_NGX_PerfQuality_Value_MaxQuality,       "Quality" },
-        { NVSDK_NGX_PerfQuality_Value_Balanced,         "Balanced" },
-        { NVSDK_NGX_PerfQuality_Value_MaxPerf,          "Performance" },
-        { NVSDK_NGX_PerfQuality_Value_UltraPerformance, "Ultra Performance" },
+    static const struct { NVSDK_NGX_PerfQuality_Value q; const char *name, *hint; } kOrder[] = {
+        { NVSDK_NGX_PerfQuality_Value_UltraQuality,     "Ultra Quality",     NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality },
+        { NVSDK_NGX_PerfQuality_Value_MaxQuality,       "Quality",           NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality },
+        { NVSDK_NGX_PerfQuality_Value_Balanced,         "Balanced",          NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced },
+        { NVSDK_NGX_PerfQuality_Value_MaxPerf,          "Performance",       NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance },
+        { NVSDK_NGX_PerfQuality_Value_UltraPerformance, "Ultra Performance", NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance },
     };
     // The optimal-settings callback lives on the CAPABILITY parameter object only; an
     // AllocateParameters object answers every preset with "no callback" (the first Fable
@@ -2682,6 +2884,7 @@ static bool PickSrQuality(UINT w, UINT h_, UINT out_w, UINT out_h)
         {
             h.sr_quality      = static_cast<int>(o.q);
             h.sr_quality_name = o.name;
+            h.sr_quality_hint = o.hint;
             return true;
         }
     }
@@ -2702,6 +2905,18 @@ static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r, U
     cp.Feature.InPerfQualityValue = sr ? static_cast<NVSDK_NGX_PerfQuality_Value>(h.sr_quality) : NVSDK_NGX_PerfQuality_Value_DLAA;
     cp.InFeatureCreateFlags       = flags;
     cp.InEnableOutputSubrects     = false;
+
+    // The render-preset hint the game's dlss5-feed.cfg asks for (FeedBuild::preset, v12), as the
+    // 64-bit add-on sets it. Written on every create. 0 is the default, and the default is L
+    // (12; see kDefaultPreset in the 64-bit add-on for why): a current add-on never sends 0, an
+    // older one that does gets the same answer here.
+    if (h.params != nullptr)
+    {
+        const char    *key    = sr && h.sr_quality_hint != nullptr ? h.sr_quality_hint : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA;
+        const unsigned preset = h.preset != 0 ? h.preset : 12u;
+        h.params->Set(key, preset);
+        Log("[host] DLSS render preset hint: %u%s", preset, h.preset != 0 ? "" : " (L, the default)");
+    }
 
     if (!BeginCommands()) return false;
     DWORD ccode = 0;
@@ -3137,6 +3352,7 @@ static bool WriteFull(HANDLE pipe, const void *buf, DWORD len)
 
 static int Serve(DWORD game_pid)
 {
+    StatsOpen(game_pid);
     char name[128];
     sprintf_s(name, FEED_PIPE_FMT, static_cast<unsigned long>(game_pid));
     // The IN buffer (game -> host) is the client's run-ahead reservoir, and it is the
@@ -3320,8 +3536,9 @@ static int Serve(DWORD game_pid)
         {
             FeedBuild b = {};
             if (!ReadFull(pipe, &b, sizeof(b))) break;
-            Log("[host] build: %ux%u color=%u output=%u hdr=%d inverted=%d", b.width, b.height,
-                b.color_fmt, b.output_fmt, b.hdr, b.depth_inverted);
+            Log("[host] build: %ux%u color=%u output=%u hdr=%d inverted=%d preset=%u", b.width, b.height,
+                b.color_fmt, b.output_fmt, b.hdr, b.depth_inverted, b.preset);
+            h.preset = b.preset;
 
             // Tear down the old set -- after the GPU is done with it. The last evaluate may
             // still be in flight, and a neural consumer (Deep Fried Chicken) keeps a graph
@@ -3658,10 +3875,22 @@ static int Serve(DWORD game_pid)
                     g_overlay_key);
             }
         }
+        else if (tag == 'S')
+        {
+            // One setting from the game's menu, for a tool that takes them while it runs. On
+            // this thread on purpose: it is the one that presents, which is where the tool's
+            // own page would have changed the value.
+            FeedSettingMsg sm = {};
+            if (!ReadFull(pipe, &sm, sizeof(sm))) break;
+            sm.key[sizeof(sm.key) - 1] = '\0';
+            LiveSet(sm.key, sm.value);
+        }
         else if (tag == 'F')
         {
             FeedFrameMsg fm = {};
             if (!ReadFull(pipe, &fm, sizeof(fm))) break;
+            LiveTick(fm.n);
+            LiveProbe(fm.n);
 
             // How far ahead of us the client has run. Under async_home=1 nothing bounds its
             // CPU: its GPU waits on the frame before, but the frame MESSAGES pile up in the
@@ -4071,6 +4300,8 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--hide") == 0) hide = true;
         else if (strcmp(argv[i], "--behind") == 0) behind = true;
         else if (strcmp(argv[i], "--gpu-priority") == 0) gpu_priority = true;
+        else if (strcmp(argv[i], "--side") == 0 && i + 1 < argc && sscanf_s(argv[i + 1], "%dx%d", &g_side_w, &g_side_h) == 2)
+        { g_side = true; ++i; }
         // First numeric token wins. This used to be a bare assignment, so ANY later token
         // the parser did not recognise ran through strtoul, came back 0, and silently
         // overwrote an already-parsed pid -- turning a good command line into the usage

@@ -90,8 +90,10 @@ recognized" line on stdout is harmless (it falls back fine); only trust the run 
 `nvngx_dlss.dll` alone (no NR) also ships inside any DLSS-enabled game, or via
 [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper).
 
-**Motion-vector provider** — default to **LumeniteFX Kernel** (`DLSS5_MV_PROVIDER=3`, the
-README's recommendation):
+**Motion-vector provider** — default to the estimator built into `DLSS5_Feed.fx`
+(`DLSS5_MV_PROVIDER=5`, the README's recommendation and what the installer writes): nothing
+to download and no second technique. To deploy with **LumeniteFX Kernel** (`=3`) instead, for
+a comparison or for a release whose shader predates the current estimator:
 
 ```
 curl -sL https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/mainline -o lumenitefx.zip
@@ -101,7 +103,8 @@ curl -sL https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/mainl
 its `Shaders\` (`lumenite_*.fx` + `include\*.fxh`) and `Textures\lumenite_bluenoise256.png`.
 Other providers are `#0` (whatever writes shared `texMotionVectors`), `#1` iMMERSE
 Launchpad, `#2` VORT, `#4` LumeniteFX QuantMotion — see README "Motion vectors: choosing a
-provider" for what each needs.
+provider" for what each needs. With any of 0-4 the provider's technique has to be enabled
+above `DLSS5_Feed`; with 5 there is none.
 
 **ReShade framework headers** (`ReShade.fxh`, `ReShadeUI.fxh`, `DrawText.fxh`) — every
 `.fx` file `#include`s these. Pull from any existing `reshade-shaders\Shaders\` on this

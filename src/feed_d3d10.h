@@ -29,7 +29,12 @@
 // CreateTexture2D carrying D3D10_RESOURCE_MISC_SHARED_KEYEDMUTEX comes back E_INVALIDARG
 // -- every bind-flag combination, every format, with or without MISC_SHARED alongside --
 // while the same call on a D3D11 device succeeds and plain legacy MISC_SHARED on the same
-// D3D10 device succeeds. Modern drivers simply do not implement that legacy path.
+// D3D10 device succeeds. The cause is narrower than "drivers dropped it" (re-measured for
+// #146, RTX 5090): a D3D10.1 device made on an adapter from a DXGI 1.0 factory -- which
+// is what pAdapter = NULL gives, and what Far Cry 2 passes -- can neither create nor OPEN
+// a keyed-mutex texture, and a D3D11 device made on that device's adapter cannot create
+// one either. On an IDXGIFactory1 adapter both work. The game picks its own factory, so
+// for the games that matter the route stays shut.
 //
 // So BOTH D3D10 versions take the event-query route, and this header has no fast path it
 // is quietly failing to use. The cost is honest and worth stating: an event query drains
@@ -37,7 +42,8 @@
 // device's outstanding GPU work to finish. That is one pipeline bubble per device per
 // frame, and it is the price of an API with no fence. It is also why the two crossings
 // are batched -- all three input copies share ONE FeedD3D10SyncGame, rather than paying
-// for a drain each.
+// for a drain each. The default since 1.19.1 avoids the bubbles altogether at the cost of
+// latency; see PIPELINED HANDOFF below.
 //
 // Ordering, which is subtler than it looks with no fence anywhere:
 //
@@ -99,6 +105,10 @@ struct FeedD3D10
     ID3D11DeviceContext *relay_ctx;   // owned
     ID3D10Query         *q10;         // the two drains, made once rather than per frame
     ID3D11Query         *q11;
+    ID3D10Query         *q10_ring[2]; // pipelined handoff: the game's end-of-frame mark per slot
+    bool                 ring_marked[2];
+    ID3D11Query         *q11_ring[2]; // ... and the relay's, after it drew that slot's Output
+    bool                 relay_marked[2];
     D3D_FEATURE_LEVEL    relay_fl;
     LUID                 luid;        // the adapter both devices are on
     HRESULT              hr;          // last failure ...
@@ -156,12 +166,22 @@ static bool FeedD3D10Open(FeedD3D10 *d, ID3D10Device *game_device)
     qd10.Query = D3D10_QUERY_EVENT;
     hr = d->game->CreateQuery(&qd10, &d->q10);
     if (FAILED(hr)) { FeedD3D10Fail(d, "D3D10 CreateQuery (event)", hr); return false; }
+    for (int i = 0; i < 2; ++i)
+    {
+        hr = d->game->CreateQuery(&qd10, &d->q10_ring[i]);
+        if (FAILED(hr)) { FeedD3D10Fail(d, "D3D10 CreateQuery (ring event)", hr); return false; }
+    }
 
     D3D11_QUERY_DESC qd11;
     memset(&qd11, 0, sizeof(qd11));
     qd11.Query = D3D11_QUERY_EVENT;
     hr = d->relay->CreateQuery(&qd11, &d->q11);
     if (FAILED(hr)) { FeedD3D10Fail(d, "D3D11 CreateQuery (event)", hr); return false; }
+    for (int i = 0; i < 2; ++i)
+    {
+        hr = d->relay->CreateQuery(&qd11, &d->q11_ring[i]);
+        if (FAILED(hr)) { FeedD3D10Fail(d, "D3D11 CreateQuery (ring event)", hr); return false; }
+    }
 
     d->ok = true;
     return true;
@@ -184,6 +204,13 @@ static void FeedD3D10Close(FeedD3D10 *d)
 {
     if (d->q11 != NULL) { d->q11->Release(); d->q11 = NULL; }
     if (d->q10 != NULL) { d->q10->Release(); d->q10 = NULL; }
+    for (int i = 0; i < 2; ++i)
+    {
+        if (d->q10_ring[i] != NULL) { d->q10_ring[i]->Release(); d->q10_ring[i] = NULL; }
+        if (d->q11_ring[i] != NULL) { d->q11_ring[i]->Release(); d->q11_ring[i] = NULL; }
+        d->ring_marked[i]  = false;
+        d->relay_marked[i] = false;
+    }
     if (d->relay_ctx != NULL)
     {
         d->relay_ctx->ClearState();
@@ -261,6 +288,70 @@ static bool FeedD3D10SyncGame(FeedD3D10 *d)
     while ((hr = d->q10->GetData(&done, sizeof(done), 0)) == S_FALSE)
         if (GetTickCount64() > deadline) return false;
     return SUCCEEDED(hr);
+}
+
+// PIPELINED HANDOFF (issue #146). The drains above stop a device dead in the frame it has
+// just queued, so the CPU and the GPU take turns and neither is busy while the other
+// works: Far Cry 2 at 4K sat at 32 fps with the GPU 60% used. Dropping only the game's
+// drain is not enough -- there is ONE GPU, and waiting on relay work submitted after the
+// game's frame still waits for that frame. So both crossings get two slots and a query
+// each, and every wait is on work submitted a whole frame earlier:
+//
+//   frame n, slot c = n & 1, p = the other one
+//   1. wait the relay's mark for p     (frame n-1's relay work: it read In[c], drew Out[p])
+//   2. game copies frame n into In[c], flush
+//   3. wait the game's mark for p      (frame n-1's game work: its copies into In[p] and
+//                                       its read of Out[c])
+//   4. relay reads In[p], the host evaluates it, the relay draws the result into Out[c],
+//      relay mark c, flush
+//   5. game copies Out[p] (step 4 of frame n-1, proven done by step 1) into its frame,
+//      game mark c, flush
+//
+// The game shows the frame from two frames back; the temporal history hides that much
+// less well than one frame, but a GPU that was idle 40% of the time is not idle any more.
+static void FeedD3D10Mark(FeedD3D10 *d, int slot)
+{
+    if (d->q10_ring[slot] == NULL || d->game == NULL) return;
+    d->q10_ring[slot]->End();
+    d->game->Flush();
+    d->ring_marked[slot] = true;
+}
+
+static void FeedD3D10MarkRelay(FeedD3D10 *d, int slot)
+{
+    if (d->q11_ring[slot] == NULL || d->relay_ctx == NULL) return;
+    d->relay_ctx->End(d->q11_ring[slot]);
+    d->relay_ctx->Flush();
+    d->relay_marked[slot] = true;
+}
+
+// Wait for a slot's mark. Both return true at once for a slot never marked.
+static bool FeedD3D10WaitMark(FeedD3D10 *d, int slot)
+{
+    if (!d->ring_marked[slot]) return true;
+    if (d->q10_ring[slot] == NULL) return false;
+    BOOL done = FALSE;
+    const ULONGLONG deadline = GetTickCount64() + FEED_D3D10_SYNC_MS;
+    HRESULT hr;
+    while ((hr = d->q10_ring[slot]->GetData(&done, sizeof(done), 0)) == S_FALSE)
+        if (GetTickCount64() > deadline) return false;
+    if (FAILED(hr)) return false;
+    d->ring_marked[slot] = false;
+    return true;
+}
+
+static bool FeedD3D10WaitRelayMark(FeedD3D10 *d, int slot)
+{
+    if (!d->relay_marked[slot]) return true;
+    if (d->q11_ring[slot] == NULL || d->relay_ctx == NULL) return false;
+    BOOL done = FALSE;
+    const ULONGLONG deadline = GetTickCount64() + FEED_D3D10_SYNC_MS;
+    HRESULT hr;
+    while ((hr = d->relay_ctx->GetData(d->q11_ring[slot], &done, sizeof(done), 0)) == S_FALSE)
+        if (GetTickCount64() > deadline) return false;
+    if (FAILED(hr)) return false;
+    d->relay_marked[slot] = false;
+    return true;
 }
 
 // The same for the relay.

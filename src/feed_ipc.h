@@ -70,7 +70,11 @@
 #include <cstdint>
 
 #define FEED_IPC_MAGIC   0x35534C44u  // 'DLS5'
-#define FEED_IPC_VERSION 11u
+#define FEED_IPC_VERSION 12u
+
+// Version 12 added FeedBuild::preset: the DLSS render-preset hint (dlss5-feed.cfg `preset`), which
+// the 64-bit add-on has always applied and the host never heard of -- a 32-bit game ran on the
+// model's default whatever the file said.
 
 // Version 11 added FeedFrameMsg::settle_evals (experimentHold): how many extra evaluates of the
 // SAME frame the host runs after the real one, with zero motion and no reset, so the neural
@@ -182,6 +186,9 @@ struct FeedBuild        // game -> host, on every resolution/format change
     uint64_t panel_tex;          // v7+: D3D11 clients: NT-handle VALUE (game process) of the panel texture the
                                  // game created at FeedHelloAck::panel_* size; 0 = none. The host opens it and
                                  // copies its presented frame into it after every Present.
+    uint32_t preset;             // v12+: DLSS render-preset hint, 0 = the model's default (5 = E, 6 = F,
+                                 // 10 = J, 11 = K, 12 = L, 13 = M). Set before the feature is created.
+    uint32_t reserved;           // keeps the struct's size a multiple of 8 on both sides
 };
 
 struct FeedBuildAck     // host -> game
@@ -217,6 +224,24 @@ struct FeedCastMsg      // game -> host ('C'), v10+: the cast panel's state, on 
     int32_t  left, top, right, bottom;   // where it is drawn, in the GAME window's client pixels
     float    scale;            // host client pixels -> game pixels; divide by it to map back
     uint32_t anchor;           // cast_anchor: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right
+};
+
+struct FeedSettingMsg   // game -> host ('S'): one setting for a neural tool that takes them while it
+{                       // runs. The host hands it to RenoDX DLSS5's control interface (feed_renodx_api.h).
+    char  key[64];      // Only sent for a name the host itself listed in host64\dlss5-feed-live.txt, so
+    float value;        // a host that does not know this tag is never sent it.
+};
+
+// What the helper measures and the game's menu shows: a small block of shared memory the helper
+// creates and keeps up to date, named after the game's process id. Read-only for the game.
+#define FEED_STATS_FMT   "Local\\DLSS5FeedStats-%lu"
+#define FEED_STATS_MAGIC 0x54533546u   // "F5ST"
+struct FeedStats
+{
+    uint32_t magic;
+    uint32_t tick;       // GetTickCount() of the last update: a reader ignores a block that stopped moving
+    float    gpu_ms;     // GPU time of the helper's work on one frame (DLSS and the neural pass), a short average
+    uint32_t reserved;
 };
 
 struct FeedFrameMsg     // game -> host, per frame

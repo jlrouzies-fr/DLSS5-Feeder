@@ -14,10 +14,13 @@
          bitness, the 64-bit host helper for 32-bit games (and for a 64-bit game in the
          64-bit helper mode, when asked for), the shader, the Vulkan fallback layer, and the
          verification script.
-      4. The ReShade framework headers and LumeniteFX (the recommended motion-vector provider).
+      4. The ReShade framework headers. Motion vectors come from DLSS5_Feed.fx's own estimator,
+         so there is no provider to install; LumeniteFX is fetched only for -MvProvider 3 or 4,
+         for an install that already uses it, or for a release whose shader predates the
+         current estimator.
       5. The neural consumer -- the RenoDX DLSS 5 add-on by default -- and the two NVIDIA
          NGX runtimes, in the folder where the 64-bit code runs (the game folder, or host64\).
-      6. ReShade.ini and ReShadePreset.ini with the provider selected and both techniques
+      6. ReShade.ini and ReShadePreset.ini with the provider selected and the technique(s)
          enabled in the right order (merged into existing files, which are backed up first).
       7. dgVoodoo2 for Direct3D 8/9 games, configured the way the README says.
       8. The d3dcompiler_47.dll trap and the "two neural consumers" trap, defused.
@@ -32,9 +35,9 @@
     exe to ReShadeApps.ini (Vulkan games only), and a Windows Defender exclusion. Each is
     run as a separate elevated step, with a UAC prompt, and only when actually needed. The
     Defender exclusion is never added without asking you first: the script tries the plain
-    download and extraction, and only if Defender removes Deep Fried Chicken (a known false
-    positive -- it hooks NVIDIA's NGX runtime with Detours, which heuristics dislike) does it
-    explain and ask.
+    download and extraction, and only if Defender removes the neural tool (a known false
+    positive -- something that stands in for NVIDIA's NGX runtime looks like a hooking tool
+    to its heuristics) does it explain and ask.
 
 .PARAMETER GameExe
     The game's real executable (not a launcher). A folder is accepted too, in which case the
@@ -47,23 +50,21 @@
     D3D8 (both via dgVoodoo2). Default: Auto.
 
 .PARAMETER Consumer
-    Which neural consumer does the DLSS 5 work: RenoDX (Krish's renodx-dlss5 add-on),
-    DFC (Deep Fried Chicken) or OptiScaler (an OptiScaler DLSS-NR fork, installed as
-    winmm.dll beside ReShade and set up to run its neural pass on the feed).
+    Which neural tool does the DLSS 5 work:
 
-    RenoDX and OptiScaler are downloaded automatically. Deep Fried Chicken is NOT: its
-    author does not publish the files, so choosing it prints its Discord invite, asks you
-    to drop Deep-Fried-Chicken-*.zip in the cache folder, and waits. Pass it non-
-    interactively with -DfcZip.
+      OptiScaler  the OptiScaler DLSS-NR fork (recommended): installed as winmm.dll beside
+                  ReShade and set up to run its neural pass on the feed.
+      RenoDX      the RenoDX DLSS5 add-on (Krish's renodx-dlss5), from the RHI repository.
 
-    Omitted, the script asks at the start; with -Yes and no choice given it takes RenoDX,
-    which is the only one it can fetch unattended.
+    Both are downloaded automatically. Omitted, the script asks at the start; with -Yes and
+    no choice given it takes OptiScaler.
 
 .PARAMETER OptiScalerFork
-    With -Consumer OptiScaler: which DLSS-NR fork. wilsjo2 (OptiScaler-DLSSNR-PreSR-Multipass:
-    actively maintained, no forwarder DLL, pre-SR and multipass options) or Dagherbou
-    (OptiScaler_DLSSNR, the original; ships nvngx.dll_dlssnr.dll, its forwarder). Both are
-    supported by the feeder. Omitted, the script asks; with -Yes it takes wilsjo2.
+    With -Consumer OptiScaler: which DLSS-NR fork. Feeder (the default, never asked) is this
+    project's own fork, jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass: wilsjo2's fork plus the
+    fixes this project needed, and the one the DLSS 5 Feeder menu is tested with. wilsjo2
+    (OptiScaler-DLSSNR-PreSR-Multipass, the upstream of ours) and Dagherbou (OptiScaler_DLSSNR,
+    the original; ships nvngx.dll_dlssnr.dll, its forwarder) are still handled when named.
 
 .PARAMETER HelperMode
     64-bit games only: run NGX in the host64\ helper process instead of inside the game (the
@@ -74,8 +75,13 @@
     Ask (default) asks, with No as the answer on Enter; with -Yes and Ask it is No.
 
 .PARAMETER MvProvider
-    DLSS5_MV_PROVIDER value: 3 (LumeniteFX Kernel, default) or 4 (LumeniteFX QuantMotion).
-    Both come from the same LumeniteFX download. Other providers are not automated.
+    DLSS5_MV_PROVIDER value. Default: 5, the estimator built into DLSS5_Feed.fx -- nothing else
+    to install or enable. 3 (LumeniteFX Kernel) and 4 (LumeniteFX QuantMotion) download and
+    install LumeniteFX as before. 0, 1 and 2 (texMotionVectors, Launchpad, VORT) only write the
+    definition: installing and enabling that provider is up to you.
+    Without this parameter two things override the default: an install that already has a
+    DLSS5_MV_PROVIDER in its preset keeps it (an update does not change what you chose), and a
+    release whose shader predates the current built-in estimator gets 3.
 
 .PARAMETER Downloads
     Cache folder for downloads. Default: %LOCALAPPDATA%\DLSS5-Feeder\downloads.
@@ -83,12 +89,12 @@
 .PARAMETER LocalFiles
     A folder holding any of the pieces you already have; each is used instead of a
     download when found there (matched by name): DLSS5-Feeder-*.zip,
-    ReShade_Setup_*_Addon.exe, Deep-Fried-Chicken*.zip, nvngx_dlssnr.dll, nvngx_dlss.dll,
+    ReShade_Setup_*_Addon.exe, nvngx_dlssnr.dll, nvngx_dlss.dll,
     renodx-dlss5*.addon64, OptiScaler-NR-*.zip / OptiScaler-DLSSNR*.zip, LumeniteFX*.zip, dgVoodoo2_*.zip,
     ReShade.fxh, ReShadeUI.fxh, DrawText.fxh. The NGX runtimes and the RenoDX add-on are
     also accepted as the .zip they are published in.
 
-.PARAMETER FeederZip, DfcZip, DlssNrDll, DlssDll, RenoDxAddon, OptiScalerZip, ReShadeSetup, LumeniteZip, DgVoodooZip
+.PARAMETER FeederZip, DlssNrDll, DlssDll, RenoDxAddon, OptiScalerZip, ReShadeSetup, LumeniteZip, DgVoodooZip
     Explicit path or URL for one piece, overriding both -LocalFiles and the defaults.
 
 .PARAMETER Prerelease
@@ -141,14 +147,14 @@ param(
     [ValidateSet('Ask', 'DFC', 'RenoDX', 'OptiScaler')]
     [string] $Consumer = 'Ask',
 
-    [ValidateSet('Ask', 'wilsjo2', 'Dagherbou')]
+    [ValidateSet('Ask', 'Feeder', 'wilsjo2', 'Dagherbou')]
     [string] $OptiScalerFork = 'Ask',
 
     [ValidateSet('Ask', 'No', 'Yes')]
     [string] $HelperMode = 'Ask',
 
-    [ValidateSet(3, 4)]
-    [int] $MvProvider = 3,
+    [ValidateSet(0, 1, 2, 3, 4, 5)]
+    [int] $MvProvider = 5,
 
     [string] $Downloads,
     [string] $LocalFiles,
@@ -211,15 +217,22 @@ $Sources = @{
     RenoDxDlss5Tag  = '^renodx-dlss5-\d'
     DlssNr          = 'https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.8.Lecram/nvngx_dlssnr_310.8.Lecram.zip'
     Dlss            = 'https://github.com/RankFTW/rhi-repo/releases/download/dlss-310.9.1/nvngx_dlss_310.9.1.zip'
-    RenoDxDlss5     = 'https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-7.0.0-rc8/renodx-dlss5_7.0.0-rc8.zip'
-    # Two DLSS-NR forks, both supported; see -OptiScalerFork. Each names its release zip
-    # differently, and wilsjo2 also publishes an RTX 40 MFG variant that the pattern skips.
-    OptiScalerReleases = @{ wilsjo2 = 'https://api.github.com/repos/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases'
+    RenoDxDlss5     = 'https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-10.8.0/renodx-dlss5_10.8.0.zip'
+    # The DLSS-NR forks; see -OptiScalerFork. Feeder is this project's own fork and the one that
+    # is installed unless another is named. It and wilsjo2 name their release zip alike
+    # (wilsjo2 also publishes an RTX 40 MFG variant that the pattern skips), so a download of
+    # ours is cached under a prefix: the same version number from the other fork must never be
+    # taken for it.
+    OptiScalerReleases = @{ Feeder = 'https://api.github.com/repos/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases'
+                            wilsjo2 = 'https://api.github.com/repos/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases'
                             Dagherbou = 'https://api.github.com/repos/Dagherbou/OptiScaler_DLSSNR/releases' }
-    OptiScalerHome     = @{ wilsjo2 = 'https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases'
+    OptiScalerHome     = @{ Feeder = 'https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases'
+                            wilsjo2 = 'https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases'
                             Dagherbou = 'https://github.com/Dagherbou/OptiScaler_DLSSNR/releases' }
-    OptiScalerAsset    = @{ wilsjo2 = '(?i)^OptiScaler-NR-v[\d.]+\.zip$'; Dagherbou = '(?i)^OptiScaler-DLSSNR-.*\.zip$' }
-    OptiScalerLocal    = @{ wilsjo2 = 'OptiScaler-NR-*.zip'; Dagherbou = 'OptiScaler-DLSSNR*.zip' }
+    OptiScalerAsset    = @{ Feeder = '(?i)^OptiScaler-NR-v[\d.]+\.zip$'; wilsjo2 = '(?i)^OptiScaler-NR-v[\d.]+\.zip$'; Dagherbou = '(?i)^OptiScaler-DLSSNR-.*\.zip$' }
+    OptiScalerLocal    = @{ Feeder = 'OptiScaler-NR-*.zip'; wilsjo2 = 'OptiScaler-NR-*.zip'; Dagherbou = 'OptiScaler-DLSSNR*.zip' }
+    OptiScalerCache    = @{ Feeder = 'DLSS5Feeder-'; wilsjo2 = ''; Dagherbou = '' }
+    OptiScalerName     = @{ Feeder = 'DLSS5-Feeder fork'; wilsjo2 = 'wilsjo2'; Dagherbou = 'Dagherbou' }
     DfcDiscord      = 'https://discord.gg/g2v2XGqvR'
     RenoDxDiscord   = 'https://discord.com/invite/renodx'
 }
@@ -233,6 +246,7 @@ $ReShadeMinVersion = '6.8'
 $script:CountDone = 0
 $script:CountWarn = 0
 $script:CountFail = 0
+$script:OptiLive  = $false   # the installed OptiScaler build takes settings while the game runs
 $script:Manual    = New-Object System.Collections.ArrayList   # steps the user must do
 $script:Changed   = New-Object System.Collections.ArrayList   # files written, for Unblock-File
 
@@ -286,6 +300,25 @@ function Write-Banner
 
     Write-Chunk ('  ' + [char]0x255A + ([string][char]0x2550) * $w + [char]0x255D) $box
     Write-Host ''
+}
+
+# The last thing on screen: a green box, each line its own colour. Used for the one sentence a
+# user must not miss -- how to open the DLSS 5 Feeder menu once the game is running.
+function Write-DoneBox
+{
+    param([object[]] $Lines)   # each: @{ Text = '...'; Colour = 'White' }
+    $box = 'Green'
+    $w   = 68
+    Write-Host ''
+    Write-Chunk ('  ' + [char]0x2554 + ([string][char]0x2550) * $w + [char]0x2557) $box
+    foreach ($l in @(@{ Text = ''; Colour = '' }) + $Lines + @(@{ Text = ''; Colour = '' })) {
+        $t = '   ' + $l.Text
+        if ($t.Length -gt $w) { $t = $t.Substring(0, $w) }
+        Write-Chunk ('  ' + [char]0x2551) $box -NoNewline
+        Write-Chunk $t.PadRight($w) $l.Colour -NoNewline
+        Write-Chunk ([string][char]0x2551) $box
+    }
+    Write-Chunk ('  ' + [char]0x255A + ([string][char]0x2550) * $w + [char]0x255D) $box
 }
 
 function Write-Section
@@ -1545,61 +1578,35 @@ New-DirSafe $script:Cache
 Write-Chunk '  Cache   ' 'DarkGray' -NoNewline
 Write-Host $script:Cache
 
-# Which neural consumer? Asked here, before anything is downloaded, because the answer
-# decides what gets fetched and what must never be installed beside it.
-# RenoDX is first and is the default: it is the only one of the three this installer can
-# actually fetch. Deep Fried Chicken is not published anywhere public -- its author does not
-# want the files mirrored -- so choosing it means a guided manual step rather than a download,
-# and making it the default meant every unattended run stopped to ask a human (#75).
+# Which neural tool? Asked here, before anything is downloaded, because the answer decides
+# what gets fetched and what must never be installed beside it. Two are offered, and both are
+# downloaded for you: this project's OptiScaler DLSS-NR fork, first and the default, and the
+# RenoDX DLSS5 add-on from the RHI repository.
 if ($Consumer -eq 'Ask') {
     if ($Yes) {
-        $Consumer = 'RenoDX'
+        $Consumer = 'OptiScaler'
     }
     else {
         Write-Host ''
-        Write-Chunk '  Neural consumer -- the add-on that turns the feed into neural rendering.' 'White'
-        Write-Chunk '   1. RenoDX DLSS 5       ' 'Gray' -NoNewline
-        Write-Chunk 'recommended; Krish''s renodx-dlss5 add-on, downloaded for you' 'DarkGray'
-        Write-Chunk '   2. Deep Fried Chicken  ' 'Gray' -NoNewline
-        Write-Chunk 'negotiates with the feeder over its own interop ABI -- you must fetch it by hand from its Discord' 'DarkGray'
-        Write-Chunk '   3. OptiScaler DLSS-NR  ' 'Gray' -NoNewline
-        Write-Chunk 'an OptiScaler fork with the neural pass built in: it takes the feed''s DLSS call, upscales, then runs the pass (menu on Insert)' 'DarkGray'
-        Write-Chunk '  Exactly one of them may be installed: each goes inert, or misbehaves, beside the others.' 'DarkGray'
-        Write-Chunk '  Which one? [1/2/3, Enter for 1] ' 'Cyan' -NoNewline
-        try { $a = Read-Host } catch { $a = '' }
-        switch ($a.Trim()) {
-            '2'          { $Consumer = 'DFC' }
-            'dfc'        { $Consumer = 'DFC' }
-            'chicken'    { $Consumer = 'DFC' }
-            '3'          { $Consumer = 'OptiScaler' }
-            'optiscaler' { $Consumer = 'OptiScaler' }
-            default      { $Consumer = 'RenoDX' }
-        }
-    }
-}
-# Which DLSS-NR fork (issue #126). wilsjo2's is the maintained one and needs no forwarder DLL;
-# Dagherbou's is the original the feeder was first measured against. The feeder handles both.
-if ($Consumer -eq 'OptiScaler' -and $OptiScalerFork -eq 'Ask') {
-    if ($Yes) {
-        $OptiScalerFork = 'wilsjo2'
-    }
-    else {
-        Write-Host ''
-        Write-Chunk '  Which OptiScaler DLSS-NR fork?' 'White'
-        Write-Chunk '   1. wilsjo2    ' 'Gray' -NoNewline
-        Write-Chunk 'OptiScaler-DLSSNR-PreSR-Multipass: actively maintained; no forwarder DLL; pre-SR, multipass and finished-picture options' 'DarkGray'
-        Write-Chunk '   2. Dagherbou  ' 'Gray' -NoNewline
-        Write-Chunk 'OptiScaler_DLSSNR: the original fork; ships its nvngx.dll_dlssnr.dll forwarder' 'DarkGray'
+        Write-Chunk '  Neural tool -- what turns the feed into neural rendering. Both are downloaded for you.' 'White'
+        Write-Chunk '   1. OptiScaler DLSS-NR  ' 'Gray' -NoNewline
+        Write-Chunk 'recommended; this project''s OptiScaler fork with the neural pass built in' 'DarkGray'
+        Write-Chunk '   2. RenoDX DLSS5        ' 'Gray' -NoNewline
+        Write-Chunk 'Krish''s renodx-dlss5 add-on, from the RHI repository' 'DarkGray'
+        Write-Chunk '  Only one of them is installed: each goes inert, or misbehaves, beside the other.' 'DarkGray'
         Write-Chunk '  Which one? [1/2, Enter for 1] ' 'Cyan' -NoNewline
         try { $a = Read-Host } catch { $a = '' }
         switch ($a.Trim()) {
-            '2'         { $OptiScalerFork = 'Dagherbou' }
-            'dagherbou' { $OptiScalerFork = 'Dagherbou' }
-            default     { $OptiScalerFork = 'wilsjo2' }
+            '2'      { $Consumer = 'RenoDX' }
+            'renodx' { $Consumer = 'RenoDX' }
+            default  { $Consumer = 'OptiScaler' }
         }
     }
 }
-$consumerLabel = switch ($Consumer) { 'DFC' { 'Deep Fried Chicken' } 'RenoDX' { 'RenoDX DLSS 5' } default { 'OptiScaler DLSS-NR (' + $OptiScalerFork + ')' } }
+# Which DLSS-NR fork: this project's own, unless -OptiScalerFork names another (issue #126:
+# wilsjo2's, which ours is built on, and Dagherbou's, the original, are both still handled).
+if ($Consumer -eq 'OptiScaler' -and $OptiScalerFork -eq 'Ask') { $OptiScalerFork = 'Feeder' }
+$consumerLabel = switch ($Consumer) { 'DFC' { 'Deep Fried Chicken' } 'RenoDX' { 'RenoDX DLSS 5' } default { 'OptiScaler DLSS-NR (' + $Sources.OptiScalerName[$OptiScalerFork] + ')' } }
 Write-Chunk '  Neural  ' 'DarkGray' -NoNewline
 Write-Host $consumerLabel
 if ($LocalFiles) {
@@ -1925,6 +1932,55 @@ else {
 }
 if (-not $feederPath) { Stop-Install -Text 'No feeder release to install.' }
 
+# 3a'. Which motion-vector provider. The default is the shader's own estimator (5), with two
+# exceptions when -MvProvider was not given: an install that has already chosen keeps its
+# choice, and a release whose DLSS5_Feed.fx predates the current estimator gets LumeniteFX
+# Kernel as before (the older built-in one was measured clearly behind it under 3D camera
+# motion; the new one is told apart by a function only it has).
+$mvWhy = ''
+if (-not $PSBoundParameters.ContainsKey('MvProvider')) {
+    $prevProvider = $null
+    if (-not $Force) {
+        try {
+            $ri0 = Read-TextSafe (Join-Safe $gameDir 'ReShade.ini')
+            $pp0 = Join-Safe $gameDir 'ReShadePreset.ini'
+            $ppIni0 = $(if ($ri0) { Get-IniKey -Text $ri0 -Section 'GENERAL' -Key 'PresetPath' } else { $null })
+            if ($ppIni0 -and -not [IO.Path]::IsPathRooted($ppIni0)) { $pp0 = [IO.Path]::GetFullPath((Join-Safe $gameDir $ppIni0)) }
+            elseif ($ppIni0) { $pp0 = $ppIni0 }
+            $pt0 = Read-TextSafe $pp0
+            if ($pt0) {
+                $d0 = Get-IniKey -Text $pt0 -Section 'DLSS5_Feed.fx' -Key 'PreprocessorDefinitions'
+                if ($d0 -and $d0 -match '(?i)(^|,)\s*DLSS5_MV_PROVIDER\s*=\s*([0-5])\s*(,|$)') { $prevProvider = [int] $Matches[2] }
+            }
+        }
+        catch { }
+    }
+    if ($null -ne $prevProvider) {
+        $MvProvider = $prevProvider
+        $mvWhy = 'kept from the existing ReShadePreset.ini (pass -MvProvider to change it)'
+    }
+    else {
+        $hasEstimator = $false
+        try {
+            $z0 = Open-Zip $feederPath
+            try {
+                $fx0 = Find-ZipEntry $z0 '(?i)(^|/)DLSS5_Feed\.fx$'
+                if ($fx0) { $hasEstimator = (Read-ZipText $fx0) -match 'float4\s+BaseLevel\s*\(' }
+            }
+            finally { $z0.Dispose() }
+        }
+        catch { }
+        if (-not $hasEstimator) {
+            $MvProvider = 3
+            $mvWhy = 'the shader in this release predates the current built-in estimator'
+        }
+    }
+}
+$providerFx = $null
+$providerTechnique = $null
+if ($MvProvider -eq 3) { $providerFx = 'lumenite_Kernel.fx'; $providerTechnique = 'Lumenite_Kernel@lumenite_Kernel.fx' }
+elseif ($MvProvider -eq 4) { $providerFx = 'lumenite_QuantMotion.fx'; $providerTechnique = 'Lumenite_QuantMotion@lumenite_QuantMotion.fx' }
+
 # 3b. ReShade setup (only needed if ReShade is missing or too old somewhere; cheap, always fetch)
 $reshadePath = $null
 if ($ReShadeSetup) {
@@ -1958,8 +2014,11 @@ foreach ($h in @('ReShade.fxh', 'ReShadeUI.fxh', 'DrawText.fxh')) {
     $headerPaths[$h] = $p
 }
 
-# 3d. LumeniteFX
-$lumenitePath = Resolve-Piece -Label 'LumeniteFX' -Explicit $LumeniteZip -LocalPattern 'LumeniteFX*.zip' -DefaultUrl $Sources.Lumenite -CacheName 'LumeniteFX-mainline.zip'
+# 3d. LumeniteFX (only when it is the provider)
+$lumenitePath = $null
+if ($providerTechnique) {
+    $lumenitePath = Resolve-Piece -Label 'LumeniteFX' -Explicit $LumeniteZip -LocalPattern 'LumeniteFX*.zip' -DefaultUrl $Sources.Lumenite -CacheName 'LumeniteFX-mainline.zip'
+}
 
 # 3e. Consumer
 $dfcPath = $null
@@ -2000,7 +2059,8 @@ else {
     # Each fork ships as a GitHub release (about 130 MB; nvngx_dlssnr.dll is not in either).
     # Newest release the maintainer marks as such (or the newest of all with -Prerelease, the
     # way the feeder's own release is found above); offline, the newest cached copy.
-    $optiLabel = 'OptiScaler DLSS-NR (' + $OptiScalerFork + ')'
+    $optiLabel = 'OptiScaler DLSS-NR (' + $Sources.OptiScalerName[$OptiScalerFork] + ')'
+    $optiCache = $Sources.OptiScalerCache[$OptiScalerFork]
     $optiLocal = $Sources.OptiScalerLocal[$OptiScalerFork]
     if ($OptiScalerZip) {
         $optiPath = Resolve-Piece -Label $optiLabel -Explicit $OptiScalerZip -CacheName 'OptiScaler-DLSSNR-explicit.zip'
@@ -2026,11 +2086,11 @@ else {
                 catch { }
             }
             if ($assetUrl) {
-                $dest = Join-Safe $script:Cache $assetName
+                $dest = Join-Safe $script:Cache ($optiCache + $assetName)
                 if (Get-Download -Url $assetUrl -Dest $dest -Label $optiLabel) { $optiPath = $dest }
             }
             else {
-                $hit = Get-ChildItem -LiteralPath $script:Cache -File -Filter $optiLocal -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                $hit = Get-ChildItem -LiteralPath $script:Cache -File -Filter ($optiCache + $optiLocal) -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
                 if ($hit) { $optiPath = $hit.FullName; Report -Status 'Warn' -Text ('GitHub unreachable; using the cached OptiScaler release ' + $hit.Name) }
             }
         }
@@ -2455,37 +2515,44 @@ if ($missing.Count -eq 0) { Report -Status 'Ok' -Text 'ReShade framework headers
 else { Report -Status 'Fail' -Text ('Missing framework header(s): ' + ($missing -join ', ')) -Detail 'Copy them from https://github.com/crosire/reshade-shaders/tree/slim/Shaders into reshade-shaders\Shaders\.' }
 
 # ---------------------------------------------------------------------------------------
-# 7. Motion vectors: LumeniteFX
+# 7. Motion vectors
 # ---------------------------------------------------------------------------------------
 
-Write-Section 'Motion vectors (LumeniteFX)'
+Write-Section 'Motion vectors'
 
-$providerFx = if ($MvProvider -eq 4) { 'lumenite_QuantMotion.fx' } else { 'lumenite_Kernel.fx' }
-$providerTechnique = if ($MvProvider -eq 4) { 'Lumenite_QuantMotion@lumenite_QuantMotion.fx' } else { 'Lumenite_Kernel@lumenite_Kernel.fx' }
-
-if ($lumenitePath) {
-    try {
-        $z = Open-Zip $lumenitePath
-        try {
-            $n = 0
-            foreach ($e in $z.Entries) {
-                $en = $e.FullName -replace '\\', '/'
-                if ($en.EndsWith('/')) { continue }
-                if ($en -match '(?i)(^|/)Shaders/(lumenite_[^/]+\.fx)$') { Expand-ZipEntry -Entry $e -To (Join-Safe $shaderDir $Matches[2]); $n++ }
-                elseif ($en -match '(?i)(^|/)Shaders/include/([^/]+\.fxh)$') { Expand-ZipEntry -Entry $e -To (Join-Safe $shaderDir ('include\' + $Matches[2])); $n++ }
-                elseif ($en -match '(?i)(^|/)Textures/([^/]+)$') { Expand-ZipEntry -Entry $e -To (Join-Safe $textureDir $Matches[2]); $n++ }
-            }
-            if ($n -eq 0) { throw 'no Shaders\ or Textures\ entries found in the LumeniteFX zip' }
-            Report -Status 'Done' -Text ('LumeniteFX installed (' + $n + ' files into reshade-shaders\Shaders\ and Textures\).')
-        }
-        finally { $z.Dispose() }
-    }
-    catch { Report -Status 'Fail' -Text 'LumeniteFX could not be installed.' -Detail $_.Exception.Message }
+if ($MvProvider -eq 5) {
+    Report -Status 'Ok' -Text 'Motion vectors: the estimator built into DLSS5_Feed.fx (DLSS5_MV_PROVIDER=5). Nothing to install or enable.' -Detail $mvWhy
+}
+elseif (-not $providerTechnique) {
+    Report -Status 'Info' -Text ('DLSS5_MV_PROVIDER=' + $MvProvider + ': this provider is not installed by this script.') `
+           -Detail ($(if ($mvWhy) { $mvWhy + '. ' } else { '' }) + 'Its effect has to be in reshade-shaders\Shaders\ and enabled ABOVE DLSS 5 Feed. -MvProvider 5 uses the built-in estimator instead and needs neither.')
 }
 else {
-    Report -Status 'Fail' -Text 'LumeniteFX is not available.' -Detail 'https://github.com/umar-afzaal/LumeniteFX (Code > Download ZIP), then -LumeniteZip <file>.'
+    if ($mvWhy) { Report -Status 'Info' -Text ('Motion vectors: DLSS5_MV_PROVIDER=' + $MvProvider + ' -- ' + $mvWhy + '.') }
+    if ($lumenitePath) {
+        try {
+            $z = Open-Zip $lumenitePath
+            try {
+                $n = 0
+                foreach ($e in $z.Entries) {
+                    $en = $e.FullName -replace '\\', '/'
+                    if ($en.EndsWith('/')) { continue }
+                    if ($en -match '(?i)(^|/)Shaders/(lumenite_[^/]+\.fx)$') { Expand-ZipEntry -Entry $e -To (Join-Safe $shaderDir $Matches[2]); $n++ }
+                    elseif ($en -match '(?i)(^|/)Shaders/include/([^/]+\.fxh)$') { Expand-ZipEntry -Entry $e -To (Join-Safe $shaderDir ('include\' + $Matches[2])); $n++ }
+                    elseif ($en -match '(?i)(^|/)Textures/([^/]+)$') { Expand-ZipEntry -Entry $e -To (Join-Safe $textureDir $Matches[2]); $n++ }
+                }
+                if ($n -eq 0) { throw 'no Shaders\ or Textures\ entries found in the LumeniteFX zip' }
+                Report -Status 'Done' -Text ('LumeniteFX installed (' + $n + ' files into reshade-shaders\Shaders\ and Textures\).')
+            }
+            finally { $z.Dispose() }
+        }
+        catch { Report -Status 'Fail' -Text 'LumeniteFX could not be installed.' -Detail $_.Exception.Message }
+    }
+    else {
+        Report -Status 'Fail' -Text 'LumeniteFX is not available.' -Detail 'https://github.com/umar-afzaal/LumeniteFX (Code > Download ZIP), then -LumeniteZip <file>.'
+    }
+    if (-not (Find-FileUnder $shaderDir $providerFx)) { Report -Status 'Fail' -Text ($providerFx + ' is not installed; DLSS5_MV_PROVIDER=' + $MvProvider + ' has nothing to read.') }
 }
-if (-not (Find-FileUnder $shaderDir $providerFx)) { Report -Status 'Fail' -Text ($providerFx + ' is not installed; DLSS5_MV_PROVIDER=' + $MvProvider + ' has nothing to read.') }
 
 # ---------------------------------------------------------------------------------------
 # 8. Neural consumer and NVIDIA runtimes
@@ -2735,11 +2802,21 @@ else {
                 Start-Sleep -Milliseconds 1000
                 $dll = Join-Safe $consumerDir $optiName
                 if (-not (Test-FileHere $dll)) { throw ($optiName + ' vanished right after extraction -- Defender? Check Windows Security > Protection history.') }
-                $t = 'OptiScaler DLSS-NR (' + $OptiScalerFork + ') installed as ' + $optiName
+                $t = 'OptiScaler DLSS-NR (' + $Sources.OptiScalerName[$OptiScalerFork] + ') installed as ' + $optiName
                 if ($iniKept) { $t += ' (existing OptiScaler.ini kept)' }
                 $beside = if ($zipForwarder) { 'the neural forwarder nvngx.dll_dlssnr.dll and the OptiScaler\ runtime folder beside it' }
                           else { 'the OptiScaler\ runtime folder beside it; this build needs no forwarder DLL (feature 18 goes through the driver''s NGX core)' }
                 Report -Status 'Done' -Text ($t + '.') -Detail ('in ' + $consumerWhere + '; ' + $beside)
+                # Does this build take settings while the game runs? This project's fork does from
+                # v0.8.93 on, and says so in the DLL -- the same text the add-on looks for before
+                # its menu shows LIVE. An older build (a cached zip, another fork) reads its ini at
+                # start only, and the closing steps say which of the two the user has.
+                $script:OptiLive = [bool](Get-BinaryMarker -Path $dll -Pattern 'DLSS-NR live settings' -MaxBytes 67108864)
+                if ($script:OptiLive) { Report -Status 'Ok' -Text 'This OptiScaler build takes changes from the DLSS 5 Feeder menu while the game runs.' }
+                else {
+                    Report -Status 'Info' -Text 'This OptiScaler build reads its settings at start only.' `
+                           -Detail ('A change made in the DLSS 5 Feeder menu is used after its Apply button (helper) or at the next start of the game. This project''s fork applies changes at once from v0.8.93: ' + $Sources.OptiScalerHome['Feeder'])
+                }
                 if (-not $zipForwarder) {
                     # Left over from the other generation: nothing loads it, and the fork's own install
                     # notes say to remove it on upgrade.
@@ -2894,8 +2971,12 @@ else {
     Report -Status 'Done' -Text 'ReShade.ini written from the template.' -Detail $(if ($bak) { 'previous file backed up: ' + $bak } else { '' })
 }
 
-# ReShadePreset.ini: the provider must be enabled and run BEFORE DLSS5_Feed, and the
-# provider choice lives in the effect's own section (not in ReShade.ini).
+# ReShadePreset.ini: a provider that is an effect of its own (LumeniteFX) must be enabled and
+# run BEFORE DLSS5_Feed; the built-in estimator (5) is part of DLSS5_Feed and needs nothing.
+# The provider choice lives in the effect's own section (not in ReShade.ini).
+$lead = @()
+if ($providerTechnique) { $lead += $providerTechnique }
+$orderText = $(if ($providerTechnique) { $providerTechnique.Split('@')[0] + ' and DLSS5_Feed enabled in that order' } else { 'DLSS5_Feed enabled' })
 $presetPath = Join-Safe $gameDir 'ReShadePreset.ini'
 $presetPathFromIni = Get-IniKey -Text (Read-TextSafe $iniPath) -Section 'GENERAL' -Key 'PresetPath'
 if ($presetPathFromIni -and -not [IO.Path]::IsPathRooted($presetPathFromIni)) { $presetPath = [IO.Path]::GetFullPath((Join-Safe $gameDir $presetPathFromIni)) }
@@ -2910,7 +2991,13 @@ if ($existingPreset -and -not $Force) {
         $list = @()
         if ($cur) { $list = @($cur -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
         $list = @($list | Where-Object { $_ -ine $providerTechnique -and $_ -ine $feedTechnique -and $_ -notmatch '(?i)^DLSS5_Feed_Debug@' })
-        $list += $providerTechnique
+        # Built in: the LumeniteFX flow effect is switched off again if it was only there for
+        # the feed -- that is, unless another LumeniteFX effect that reads its flow is enabled.
+        if ($MvProvider -eq 5 -and $key -eq 'Techniques') {
+            $otherLumenite = @($list | Where-Object { $_ -match '(?i)@lumenite_' -and $_ -notmatch '(?i)@lumenite_(Kernel|QuantMotion)\.fx$' })
+            if ($otherLumenite.Count -eq 0) { $list = @($list | Where-Object { $_ -notmatch '(?i)@lumenite_(Kernel|QuantMotion)\.fx$' }) }
+        }
+        $list += $lead
         $list += $feedTechnique
         if ($key -eq 'TechniqueSorting') { $list += 'DLSS5_Feed_Debug@DLSS5_Feed.fx' }
         $new = Set-IniKey -Text $new -Section '' -Key $key -Value ($list -join ',')
@@ -2926,19 +3013,19 @@ if ($existingPreset -and -not $Force) {
     if ($new.TrimEnd() -ne $existingPreset.TrimEnd()) {
         $bak = Backup-File $presetPath
         Write-TextTracked -Path $presetPath -Text $new
-        Report -Status 'Done' -Text ('ReShadePreset.ini: existing preset kept; ' + $providerTechnique.Split('@')[0] + ' and DLSS5_Feed enabled in that order, DLSS5_MV_PROVIDER=' + $MvProvider + '.') -Detail ('backup: ' + $bak)
+        Report -Status 'Done' -Text ('ReShadePreset.ini: existing preset kept; ' + $orderText + ', DLSS5_MV_PROVIDER=' + $MvProvider + '.') -Detail ('backup: ' + $bak)
     }
     else { Report -Status 'Ok' -Text 'ReShadePreset.ini already correct.' }
 }
 else {
     $bak = $null
     if ($existingPreset) { $bak = Backup-File $presetPath }
-    $preset = 'Techniques=' + $providerTechnique + ',' + $feedTechnique + "`r`n" +
-              'TechniqueSorting=' + $providerTechnique + ',' + $feedTechnique + ',DLSS5_Feed_Debug@DLSS5_Feed.fx' + "`r`n`r`n" +
+    $preset = 'Techniques=' + ((@($lead) + $feedTechnique) -join ',') + "`r`n" +
+              'TechniqueSorting=' + ((@($lead) + $feedTechnique) -join ',') + ',DLSS5_Feed_Debug@DLSS5_Feed.fx' + "`r`n`r`n" +
               '[DLSS5_Feed.fx]' + "`r`n" + 'DEBUG_VIEW=0' + "`r`n" + 'MV_SCALE=1.000000' + "`r`n" + 'MV_SIGN=1.000000,1.000000' + "`r`n" +
               'PreprocessorDefinitions=DLSS5_MV_PROVIDER=' + $MvProvider + "`r`n"
     Write-TextTracked -Path $presetPath -Text $preset
-    Report -Status 'Done' -Text ('ReShadePreset.ini written: ' + $providerTechnique.Split('@')[0] + ' then DLSS5_Feed, DLSS5_MV_PROVIDER=' + $MvProvider + '.') -Detail $(if ($bak) { 'previous file backed up: ' + $bak } else { '' })
+    Report -Status 'Done' -Text ('ReShadePreset.ini written: ' + $orderText + ', DLSS5_MV_PROVIDER=' + $MvProvider + '.') -Detail $(if ($bak) { 'previous file backed up: ' + $bak } else { '' })
 }
 
 # A DLSS5_MV_PROVIDER in ReShade.ini does nothing and only confuses; say so.
@@ -3009,18 +3096,26 @@ Write-Host ''
 Write-Chunk '  Next, in the game:' 'White'
 $steps = @()
 $steps += 'Launch it. Press Home for the ReShade overlay and check there are no compile errors.'
-$steps += ('Both techniques should already be ticked, in this order: ' + $providerTechnique.Split('@')[0] + ' above DLSS 5 Feed.')
+if ($providerTechnique) { $steps += ('Both techniques should already be ticked, in this order: ' + $providerTechnique.Split('@')[0] + ' above DLSS 5 Feed.') }
+elseif ($MvProvider -eq 5) { $steps += 'DLSS 5 Feed should already be ticked. Its motion vectors are its own: there is no second technique to enable.' }
+else { $steps += ('DLSS 5 Feed should already be ticked. Enable your motion-vector effect (DLSS5_MV_PROVIDER=' + $MvProvider + ') ABOVE it.') }
 if ($Consumer -eq 'DFC') {
     if ($useHost) { $steps += 'Open the ReShade overlay > Add-ons > DLSS 5 Feed and press "Show the DLSS 5 panel in-game" to reach the Deep Fried Chicken tab (it lives in the host64 helper).' }
     else { $steps += 'Turn on neural rendering in the Deep Fried Chicken tab of the overlay.' }
     $steps += 'On its first armed run Chicken registers itself for early load in ReShade.ini and asks for one more full restart. Do that restart.'
 }
 elseif ($Consumer -eq 'RenoDX') {
-    $steps += 'Turn on neural rendering in the DLSS 5 Neural Rendering add-on panel.'
+    $steps += 'Press Alt+C for the DLSS 5 Feeder menu and check that "Neural rendering" is ticked. The look, the passes and the white point are all there.'
+    if ($useHost) { $steps += 'A change in that menu is applied with its Apply button, which restarts the host64 helper (a few seconds; the game keeps running).' }
+    else { $steps += 'A change in that menu is saved with its Apply button and used from the next start of the game (RenoDX reads its settings at start).' }
 }
 else {
-    if ($useHost) { $steps += 'OptiScaler''s menu lives in the host64 helper: open the ReShade overlay > Add-ons > DLSS 5 Feed, press "Show the DLSS 5 panel in-game", then press Insert. Its neural-rendering section holds the pass controls; the pass is already switched on.' }
-    else { $steps += 'Press Insert for OptiScaler''s menu; its neural-rendering section holds the pass controls, and the pass is already switched on.' }
+    $steps += 'Press Alt+C for the DLSS 5 Feeder menu: OptiScaler''s neural-rendering settings are there, and the pass is already switched on.'
+    if ($script:OptiLive) { $steps += 'Changes in that menu apply at once, while the game runs (the menu shows LIVE).' }
+    elseif ($useHost) { $steps += 'A change in that menu is applied with its Apply button, which restarts the host64 helper (a few seconds; the game keeps running).' }
+    else { $steps += 'A change in that menu is saved with its Apply button and used from the next start of the game.' }
+    if ($useHost) { $steps += 'OptiScaler''s own menu is still there if you want it, in the host64 helper: ReShade overlay > Add-ons > DLSS 5 Feed > "Show the DLSS 5 panel in-game", then Insert.' }
+    else { $steps += 'OptiScaler''s own menu is still on Insert if you want it.' }
     $steps += 'dlss5-feed.log (host64\dlss5-feed-host.log for a 32-bit game or the helper mode) should say "NGX calls are routed through OptiScaler DLSS-NR" and, after the first frames, "neural model (feature 18) loaded".'
 }
 $steps += 'Turn the game''s MSAA/SSAA off.'
@@ -3030,6 +3125,21 @@ if ($isVulkan) { $steps += 'If dlss5-feed.log says the Vulkan interop entry poin
 $steps += 'Then check dlss5-feed.log next to the exe for "feature ready", "frame N delivered", and re-run Verify-DLSS5Feeder.ps1 for a runtime verdict.'
 $i = 1
 foreach ($s in $steps) { Write-Chunk ('   ' + $i + '. ' + $s) 'Gray'; $i++ }
+
+# Said last and in a box, so it is still on screen when the window is read: the menu's shortcut.
+# Deep Fried Chicken keeps its own tab and is not driven by the menu, so it gets no such line.
+if ($script:CountFail -gt 0) {
+    Write-DoneBox @(@{ Text = 'Install finished with ' + $script:CountFail + ' problem(s). See the lines marked above.'; Colour = 'Yellow' })
+}
+elseif ($Consumer -eq 'DFC') {
+    Write-DoneBox @(@{ Text = 'Install done.'; Colour = 'White' },
+                    @{ Text = 'Once in game: Deep Fried Chicken''s settings are in its own tab.'; Colour = 'Gray' })
+}
+else {
+    Write-DoneBox @(@{ Text = 'Install done.'; Colour = 'White' },
+                    @{ Text = ''; Colour = '' },
+                    @{ Text = 'Once in game, press  ALT + C  to show the DLSS 5 Feeder menu.'; Colour = 'Green' })
+}
 
 Write-Host ''
 if ($script:CountFail -gt 0) { Exit-Installer 1 }

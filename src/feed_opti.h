@@ -83,6 +83,7 @@
 #define OPTI_INI        "OptiScaler.ini"
 #define OPTI_NR_LITERAL "nvngx_dlssnr.dll"       // the model's file name: in every DLSS-NR build, in no upstream OptiScaler
 #define OPTI_FORWARDER  "nvngx.dll_dlssnr.dll"   // the forwarder build's caller-gate shim; a build that names it loads it
+#define OPTI_LIVE_LITERAL "DLSS-NR live settings" // in a build that re-reads [DlssNr] from its ini while running (fork branch feat/nr-live-settings)
 #define OPTI_MIN_OS     "10.0.10240.16384"       // what OptiScaler answers as MinOSVersion for SuperSampling
 #define OPTI_MAX_SCAN   (96u * 1024u * 1024u)    // OptiScaler.dll is ~26 MB
 #define OPTI_MODEL_WAIT 120u                     // evaluates to keep looking for the model before calling it never created

@@ -63,9 +63,10 @@ static void FeedOnVkDeviceGeneration();
 #include "feed_ldr.h"       // loader notifications: vulkan-1.dll or ReShade unloading under us (#135)
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 #include "feed_opti.h"      // OptiScaler DLSS-NR: only the file scan and the ini reader are used here (it lives in host64 too)
+#include "feed_panel.h"     // the feeder's own in-game panel, the same in every build of the add-on
 #include "feed_depthsrc.h"  // which buffer Generic Depth binds, against the back buffer and any MSAA depth (#145)
 
-#define FEED_VERSION "1.19.0"
+#define FEED_VERSION "2.0.0"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif
@@ -402,11 +403,21 @@ struct Cfg
                            // model's new answer; where it changed, the model's answer shows as is.
     float hold_tolerance;  // relative input change (0.04 = 4 percent of local brightness) below which a
                            // pixel counts as still; the gate opens fully at twice this.
+    int   d3d10_pipeline;  // Direct3D 10 games: 1 = two sets of bridges, and every wait is on work
+                           // queued a frame earlier, so neither device is drained mid-frame (issue #146,
+                           // Far Cry 2 at 32 fps with the GPU 60% busy). The game shows the result from
+                           // two frames back. 0 = the original drain of the current frame.
+                           // Parse-only, not written back, not on the overlay.
+    int   preset;          // DLSS render-preset hint, as in the 64-bit add-on: 0 = the add-on's default,
+                           // which is L (kDefaultPreset; see the 64-bit add-on for why), 5 = E, 6 = F
+                           // (legacy CNN), 10 = J, 11 = K, 12 = L, 13 = M. Sent to the host in FeedBuild
+                           // (v12), always as a number the host can pass on; changing it rebuilds the feature.
 };
 
 //                                        host_window --v  v-- host_gpu_priority (off)          settle_evals --v  v-- hold_input
+static const uint32_t kDefaultPreset = 12;   // L
 static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 0, 100, 0, 1, 0, 0, 0, 0,
-                     /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f };
+                     /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f, /* d3d10_pipeline */ 1, /* preset */ 0 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -608,13 +619,16 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "cast_key")       == 0) next.cast_key       = (iv > 0 && iv < 256) ? iv : 0;
         else if (_stricmp(key, "cast_mods")      == 0) next.cast_mods      = iv < 0 ? 0 : iv & 7;
         else if (_stricmp(key, "cast_scale")     == 0) next.cast_scale     = iv < 25 ? 25 : iv > 300 ? 300 : iv;
-        else if (_stricmp(key, "cast_mode")      == 0) next.cast_mode      = iv == 1 ? 1 : 0;
+        else if (_stricmp(key, "cast_mode")      == 0) next.cast_mode      = (iv >= 0 && iv <= 2) ? iv : 0;   // 2 = side panel cast (prototype)
+        else if (FeedPanelCfg(key, iv)) {}                     // panel_key / panel_mods / panel_side (feed_panel.h)
         else if (_stricmp(key, "cast_anchor")    == 0) next.cast_anchor    = iv < 0 ? 0 : iv > 3 ? 3 : iv;
         else if (_stricmp(key, "host_creates")   == 0) next.host_creates   = iv == 1 ? 1 : 0;
         else if (_stricmp(key, "wine_fence_import") == 0) next.wine_fence_import = iv == 1 ? 1 : 0;
         else if (_stricmp(key, "settle_evals")   == 0) next.settle_evals   = iv < 0 ? 0 : iv > 8 ? 8 : iv;
         else if (_stricmp(key, "hold_strength")  == 0) next.hold_strength  = val < 0.0f ? 0.0f : val > 1.0f ? 1.0f : val;
         else if (_stricmp(key, "hold_tolerance") == 0) next.hold_tolerance = val < 0.005f ? 0.005f : val > 0.5f ? 0.5f : val;
+        else if (_stricmp(key, "d3d10_pipeline") == 0) next.d3d10_pipeline = iv != 0 ? 1 : 0;
+        else if (_stricmp(key, "preset")         == 0) next.preset         = (iv >= 0 && iv <= 31) ? iv : 0;
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
@@ -622,7 +636,8 @@ static bool CfgReload()   // true when a build-affecting value changed
     if (next.work_sharpness < 0.0f || next.work_sharpness > 1.0f) next.work_sharpness = g_cfg.work_sharpness;
     const bool rebuild = next.mode != g_cfg.mode || next.hdr != g_cfg.hdr ||
                          next.depth_inverted != g_cfg.depth_inverted || next.flags != g_cfg.flags ||
-                         next.mv_scale_x != g_cfg.mv_scale_x || next.mv_scale_y != g_cfg.mv_scale_y;
+                         next.mv_scale_x != g_cfg.mv_scale_x || next.mv_scale_y != g_cfg.mv_scale_y ||
+                         next.preset != g_cfg.preset;
     const bool changed = memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
     if (changed)
     {
@@ -632,12 +647,12 @@ static bool CfgReload()   // true when a build-affecting value changed
         // what they had set (issue #15). The 64-bit side has always printed its full set.
         Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d log_frames=%d "
             "host_window=%d host_gpu_priority=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f async_home=%d "
-            "mv_scale=%.3f,%.3f cast_key=%d cast_mods=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d wine_fence_import=%d settle_evals=%d hold=%.2f/%.3f",
+            "mv_scale=%.3f,%.3f cast_key=%d cast_mods=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d wine_fence_import=%d settle_evals=%d hold=%.2f/%.3f d3d10_pipeline=%d preset=%d",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_mods, g_cfg.cast_scale,
             g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.host_creates, g_cfg.wine_fence_import, g_cfg.settle_evals,
-            g_cfg.hold_strength, g_cfg.hold_tolerance);
+            g_cfg.hold_strength, g_cfg.hold_tolerance, g_cfg.d3d10_pipeline, g_cfg.preset);
     }
     return rebuild;
 }
@@ -660,7 +675,10 @@ static const struct { int mode; const char *file, *tech; } kMvProviders[] = {
     { 3, "lumenite_Kernel.fx",      "Lumenite_Kernel" },
     { 4, "lumenite_QuantMotion.fx", "Lumenite_QuantMotion" },
 };
-static const char *kMvModeName[] = { "texMotionVectors", "Launchpad", "VORT", "LumeniteFX Kernel", "LumeniteFX QuantMotion" };
+// 5 is DLSS5_Feed.fx's own estimator: it lives in the effect itself, so there is no provider
+// technique to look for, nothing that can be missing or disabled, and nothing to warn about.
+static const char *kMvModeName[] = { "texMotionVectors", "Launchpad", "VORT", "LumeniteFX Kernel", "LumeniteFX QuantMotion", "built in" };
+static const int   kMvModeBuiltIn = 5;
 static const int   kMvModeCount  = static_cast<int>(sizeof(kMvModeName) / sizeof(kMvModeName[0]));
 
 static char g_mv_status[192]  = "not checked yet";
@@ -804,6 +822,14 @@ struct Feed32
     bool            is_d3d10;
     FeedD3D10       d10;
     FeedD3D10Bridge d10_bridge[FEED_SLOTS];   // native-sized; FEED_OUTPUT is the one with an RTV
+    // d3d10_pipeline: the second set of bridges, Output included. Ring slot 0 is d10_bridge,
+    // slot 1 is this. See PIPELINED HANDOFF in feed_d3d10.h.
+    FeedD3D10Bridge d10_in1[FEED_SLOTS];
+    bool            d10_pipelined;            // what the current build made: one slot or two
+    int             d10_pipeline_asked;       // g_cfg.d3d10_pipeline at that build; a change rebuilds
+    UINT64          d10_ring_n;               // deposits since the build; this frame's slot = n & 1
+    bool            d10_in_full[2];           // In[slot] holds a frame the game copied
+    bool            d10_out_full[2];          // Out[slot] has a result queued into it
     ID3D10Device1  *d10_dev;                  // not owned, and only for the log line
 
     bool        built;
@@ -1121,12 +1147,26 @@ static void HostClose()
     g.sent_n    = 0;
     g.wait_n    = 0;
     g.out_valid = false;
+    // The pipe breaking is what tells the host to leave, so it is closed BEFORE the host is
+    // waited for -- when no worker can still be using it. (For two months it was closed after:
+    // a healthy host never saw the break, the wait below always ran its full four seconds on
+    // the game's render thread -- on every Apply, restart, device loss and exit -- and ended
+    // in TerminateProcess, so the host never got to release its swapchain and ReShade x64
+    // never saved its ini, which is what the four seconds are for. Max Payne 3's log: "game
+    // device destroyed" 16:08:20.261, "shut down cleanly" 16:08:24.297, and a host log that
+    // stops mid-session. With the order right a host is gone 7-27 ms after the break.)
+    if (g.pipe != nullptr && worker_done)
+    {
+        CloseHandle(g.pipe);
+        g.pipe = nullptr;
+    }
     if (g.hproc != nullptr)
     {
-        // Ending the host first is what unblocks an orphan worker parked on the pipe, and it
-        // is always safe: no worker ever touches g.hproc. 4 s, because the host releases its
-        // swapchain on the way out so ReShade x64 can save its ini (the overlay layout), and
-        // ReShade's own unhook takes about a second.
+        // With an orphan worker still parked on the pipe it cannot be closed (see below), and
+        // ending the host is then what unblocks the worker -- always safe: no worker ever
+        // touches g.hproc. 4 s, because the host releases its swapchain on the way out so
+        // ReShade x64 can save its ini (the overlay layout), and ReShade's own unhook takes
+        // about a second.
         if (WaitForSingleObject(g.hproc, 4000) != WAIT_OBJECT_0)
             TerminateProcess(g.hproc, 0);      // it did not exit on the pipe break
         CloseHandle(g.hproc);
@@ -1137,8 +1177,7 @@ static void HostClose()
         // Closing it under a live worker would let the value be reused and the orphan's next
         // write land in an unrelated handle. Leaking one pipe handle is the cheaper mistake;
         // the host it named is gone by now, so the orphan's I/O fails and it exits.
-        if (worker_done) CloseHandle(g.pipe);
-        else Log("[feed32] leaking the pipe handle: a host worker may still be using it");
+        Log("[feed32] leaking the pipe handle: a host worker may still be using it");
         g.pipe = nullptr;
     }
     // The fences belong to the host that just went away; a new host creates new ones.
@@ -1258,6 +1297,41 @@ static bool       g_cast_placed;          // the host window was moved under the
 static bool       g_cast_fullscreen;      // the game's swapchain went exclusive fullscreen
 static bool       g_host_hidden;          // the host was started with --hide (host_window=2, or exclusive
                                           // fullscreen at start): there is no window to cast from
+// PROTOTYPE -- the side panel (cast_mode=2). The same shared panel texture as cast_mode=1,
+// laid out as an overlay of its own instead of a picture in a corner: the full height of the
+// game window at one edge, drawn 1:1 (the host is started at exactly that size), under a
+// header this add-on draws, over a dimmed game, sliding in and out. The host is started with
+// NO window on screen (--hide --side WxH): nothing of it goes through the desktop compositor,
+// so there is nothing for an exclusive-fullscreen swapchain to object to (#109, #99, #77).
+static bool       g_host_side;            // the host was started with --side
+static float      g_side_t;               // the slide: 0 = out of sight, 1 = fully in
+static ULONGLONG  g_side_tick;            // when g_side_t was last stepped; 0 = not animating
+static const int  kSideHeader = 34;       // the header strip above the panel, game pixels
+
+// The host window size a side panel needs in a game client area of this size: the panel
+// (38% of the width, within 480..640) plus the 96 px strip CastLayout crops, by the height
+// left under the header. Clamped as the host clamps, so the two never disagree.
+static SIZE CastSideWant(const RECT &gc)
+{
+    int pw = static_cast<int>(gc.right * 0.38f);
+    if (pw < 480) pw = 480; else if (pw > 640) pw = 640;
+    int ph = gc.bottom - kSideHeader;
+    if (ph < 300) ph = 300; else if (ph > 8000) ph = 8000;
+    return { (pw + 96) & ~1, ph & ~1 };
+}
+static void CastSideResize(int w, int h);   // below, with the other pipe writers
+static void PanelSetup();   // below: the feeder panel's hooks into this build
+
+static void CastSideStep(bool in)
+{
+    const ULONGLONG now = GetTickCount64();
+    float dt = g_side_tick == 0 ? 0.0f : static_cast<float>(now - g_side_tick) / 180.0f;   // 180 ms end to end
+    if (dt > 0.34f) dt = 0.34f;   // a hitch must not swallow the whole slide
+    g_side_tick = now;
+    g_side_t += in ? dt : -dt;
+    if (g_side_t < 0.0f) g_side_t = 0.0f; else if (g_side_t > 1.0f) g_side_t = 1.0f;
+}
+
 static POINT      g_cast_last = { -1, -1 };
 static POINT      g_cast_cursor = { -1, -1 };   // the mouse position this frame, game client coordinates
 // Castlevania: Lords of Shadow 2 reads the mouse in a way ReShade x86 never sees, so the
@@ -1296,6 +1370,9 @@ static bool       g_cast_close_hover;     // the cursor is over the panel's own 
 static const int kCastCloseSize = 28;
 static RECT CastCloseRect()
 {
+    // Side panel: the right end of the header strip, which sits above the panel rect.
+    if (g_host_side && g_cfg.cast_mode == 2)
+        return { g_cast_rect.right - kSideHeader, g_cast_rect.top - kSideHeader, g_cast_rect.right, g_cast_rect.top - 2 };
     const int s = static_cast<int>(kCastCloseSize * (g_cast_scale > 1.0f ? g_cast_scale : 1.0f));
     return { g_cast_rect.right - s, g_cast_rect.top, g_cast_rect.right, g_cast_rect.top + s };
 }
@@ -1650,6 +1727,34 @@ static void CastFlushInput()
         Log("[feed32] cast: released %d key(s) and %d button(s) still held in the host", keys, buttons);
 }
 
+// PROTOTYPE (side panel). The host's ReShade does not read the coordinates this add-on puts in
+// a forwarded mouse message: it takes the position of EVERY input message from MSG.pt, the
+// real cursor at the moment the message was posted, and turns that into its own client
+// coordinates (ReShade input_windows.cpp, handle_window_message). So the host's window --
+// which is never shown -- is kept where the real cursor is over the same point of its client
+// area as it is over the panel in the game: its client origin sits on the panel's top-left
+// corner on screen. The panel is 1:1, so one placement is right for every message.
+static void CastSidePlaceHost(HWND game, const RECT &panel)
+{
+    static const bool off = GetEnvironmentVariableA("DLSS5_FEED_SIDE_NOPLACE", nullptr, 0) != 0;   // lab A/B only
+    if (off || g_cast_hwnd == nullptr) return;
+    POINT want = { panel.left, panel.top }, have = { 0, 0 };
+    RECT  wr = {};
+    if (!ClientToScreen(game, &want) || !ClientToScreen(g_cast_hwnd, &have) || !GetWindowRect(g_cast_hwnd, &wr)) return;
+    if (have.x == want.x && have.y == want.y) return;
+    // Asynchronous: the host's thread applies it at its next pump, ahead of the messages
+    // posted after it, and this thread never waits on another process.
+    SetWindowPos(g_cast_hwnd, nullptr, wr.left + (want.x - have.x), wr.top + (want.y - have.y), 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    static int said = 0;
+    if (said < 2)
+    {
+        ++said;
+        Log("[feed32] cast: side panel: the host's unseen window is placed with its client origin at screen %ld,%ld "
+            "(the panel's corner), so the real cursor maps onto the panel 1:1", want.x, want.y);
+    }
+}
+
 // Finds the host window, registers the thumbnail on the game window and lays the panel
 // out: right-aligned at the top, the host's tab column at 1:1 or shrunk to fit the game
 // client area. Returns false when there is nothing on screen (status says why).
@@ -1657,7 +1762,19 @@ static bool CastLayout()
 {
     HWND game = g.runtime != nullptr ? static_cast<HWND>(g.runtime->get_hwnd()) : nullptr;
     if (game == nullptr || !IsWindow(game)) { strcpy_s(g_cast_status, "no game window"); return false; }
-    if (g_host_hidden)
+    const bool side = g_host_side && g_cfg.cast_mode == 2;
+    if (g_cfg.cast_mode == 2 && !g_host_side)
+    {
+        strcpy_s(g_cast_status, g.is_d3d10 ? "the side panel is not available on Direct3D 10"
+                                           : "the side panel needs the host started for it: restart the host");
+        return false;
+    }
+    if (g_host_side && !side)
+    {
+        strcpy_s(g_cast_status, "the host was started for the side panel (no window): restart the host for this mode");
+        return false;
+    }
+    if (g_host_hidden && !side)
     {
         strcpy_s(g_cast_status, g_cfg.host_window == 2
             ? "the host runs without a window (host_window=2); nothing to cast"
@@ -1694,7 +1811,7 @@ static bool CastLayout()
             }
         }
     }
-    if (!g_cast_placed)
+    if (!g_cast_placed && !side)   // the side panel's host has no window on screen to place
     {
         // Under the game window, at its position: on a second monitor the parked host
         // window would otherwise be in plain view. Never activated, never resized.
@@ -1706,7 +1823,7 @@ static bool CastLayout()
 
     // D3D10 has no texture mode -- the panel view cannot cross into the game's ImGui --
     // so the cast is always the compositor thumbnail there.
-    const bool texture = g_cfg.cast_mode == 1 && !g.is_d3d10;
+    const bool texture = g_cfg.cast_mode >= 1 && !g.is_d3d10;
     if (texture != g_cast_texture)   // the mode changed while shown: start over in the other one
     {
         CastRelease();
@@ -1745,8 +1862,37 @@ static bool CastLayout()
     const bool  bottom = g_cfg.cast_anchor >= 2;
     const LONG  dx = right  ? gc.right  - dw : 0;
     const LONG  dy = bottom ? gc.bottom - dh : 0;
-    const RECT dest = { dx, dy, dx + dw, dy + dh };
+    RECT dest = { dx, dy, dx + dw, dy + dh };
 
+    if (side)
+    {
+        // The game window changed size since the host was started for it: have the host
+        // follow (its window, swapchain and the panel texture), exactly as the sliders do.
+        const SIZE want = CastSideWant(gc);
+        if ((static_cast<LONG>(g.panel_w) != want.cx || static_cast<LONG>(g.panel_h) != want.cy) &&
+            GetTickCount64() >= g_panel_poll_quiet_until)
+        {
+            CastSideResize(want.cx, want.cy);
+            strcpy_s(g_cast_status, "resizing the side panel to the game window");
+            return false;
+        }
+        // 1:1, never scaled: under the header, the full height, at the left or right edge.
+        // A panel taller than the room (a resize still on its way) is cropped, not squeezed.
+        const LONG pw = src.cx, ph = src.cy < gc.bottom - kSideHeader ? src.cy : gc.bottom - kSideHeader;
+        const LONG px = right ? gc.right - pw : 0;
+        dest = { px, kSideHeader, px + pw, kSideHeader + ph };
+        if (g_cast_dest != game) { g_cast_dest = game; Log("[feed32] cast: side panel on game window %p", (void *)game); }
+        if (!EqualRect(&dest, &g_cast_rect))
+            Log("[feed32] cast: side panel %ldx%ld at the %s edge, 1:1 from the host's %ux%u frame",
+                pw, ph, right ? "right" : "left", g.panel_w, g.panel_h);
+        CastSidePlaceHost(game, dest);
+        g_cast_rect  = dest;
+        g_cast_src   = { pw, ph };
+        g_cast_scale = 1.0f;
+        g_cast_shown = true;
+        sprintf_s(g_cast_status, "side panel shown at %ldx%ld%s", pw, ph, g_cast_hover ? " (cursor over it)" : "");
+        return true;
+    }
     if (texture)
     {
         // Nothing to register: OnOverlay draws the texture at g_cast_rect every frame.
@@ -2053,7 +2199,7 @@ static void CastTick(reshade::api::effect_runtime *rt)
         // With the host started --hide there is no window to cast. The key used to toggle
         // anyway and log "cast: shown (key)" over nothing at all, which reads as a panel that
         // should have appeared (#118). Say why, once, and leave the state alone.
-        if (g_host_hidden && HostAlive())
+        if (g_host_hidden && !g_host_side && HostAlive())
         {
             static bool said = false;
             if (!said)
@@ -2071,8 +2217,31 @@ static void CastTick(reshade::api::effect_runtime *rt)
         }
     }
 
+    // The feeder's own panel (feed_panel.h) has its own shortcut. While it is up it owns the
+    // input, and the cast -- the other way to reach a tool's settings -- stands down.
+    PanelSetup();
+    FeedPanelTick(rt);
+    if (FeedPanelVisible())
+    {
+        if (g_cast_thumb != nullptr || g_cast_shown) CastRelease();
+        return;
+    }
+    const bool side = g_host_side && g_cfg.cast_mode == 2;
     if (!g_cast_wanted)
     {
+        // The side panel slides out before it goes: it stays drawn, takes no input and gives
+        // the game its mouse and keyboard back at once.
+        if (side && g_cast_shown && g_side_t > 0.0f && HostAlive())
+        {
+            CastSideStep(false);
+            CastFlushInput();
+            g_cast_hover    = false;
+            g_cast_captured = false;
+            g_cast_cursor   = { -1, -1 };
+            if (g_side_t > 0.0f) { strcpy_s(g_cast_status, "side panel closing"); return; }
+        }
+        g_side_t    = 0.0f;
+        g_side_tick = 0;
         if (g_cast_thumb != nullptr || g_cast_shown) CastRelease();
         strcpy_s(g_cast_status, "hidden");
         return;
@@ -2080,10 +2249,13 @@ static void CastTick(reshade::api::effect_runtime *rt)
     if (!HostAlive())
     {
         CastHostLost();
+        g_side_t    = 0.0f;
+        g_side_tick = 0;
         strcpy_s(g_cast_status, "the host is not running");
         return;
     }
     if (!CastLayout()) return;
+    if (side) CastSideStep(true);
     CastInput(rt);
 }
 
@@ -2155,6 +2327,7 @@ static void OnOverlay(reshade::api::effect_runtime *rt)
         rt->get_mouse_cursor_position(&wx, &wy, &w);
         if (w != 0) g_cast_wheel_pending = w;
     }
+    if (FeedPanelVisible()) { FeedPanelDraw(rt); return; }
     if (!g_cast_shown)
     {
         if (g_cast_hid_cursor) { ImGui::GetIO().MouseDrawCursor = true; g_cast_hid_cursor = false; }
@@ -2162,12 +2335,43 @@ static void OnOverlay(reshade::api::effect_runtime *rt)
     }
     ImDrawList *dl = ImGui::GetForegroundDrawList(nullptr);
     if (dl == nullptr) return;
+    // Side panel: the game dims behind it and a header strip of our own sits above the cast
+    // picture; all of it, the picture included, rides the slide offset. g_cast_rect stays
+    // the settled rectangle -- it is what input is mapped against and what the host is told.
+    const bool side = g_cast_texture && g_host_side && g_cfg.cast_mode == 2;
+    float side_dx = 0.0f;
+    if (side)
+    {
+        const bool  right = g_cfg.cast_anchor == 1 || g_cfg.cast_anchor == 3;
+        const float u = 1.0f - g_side_t, ease = 1.0f - u * u * u;
+        const float w = static_cast<float>(g_cast_rect.right - g_cast_rect.left);
+        side_dx = (right ? w : -w) * (1.0f - ease);
+        const ImVec2 disp = ImGui::GetIO().DisplaySize;
+        dl->AddRectFilled(ImVec2(0.0f, 0.0f), disp, IM_COL32(0, 0, 0, static_cast<int>(120.0f * ease)));
+        const ImVec2 ha(g_cast_rect.left + side_dx, 0.0f), hb(g_cast_rect.right + side_dx, static_cast<float>(kSideHeader));
+        dl->AddRectFilled(ha, hb, IM_COL32(18, 18, 22, 255));
+        dl->AddRectFilled(ImVec2(ha.x, hb.y - 2.0f), hb, IM_COL32(118, 185, 0, 255));
+        const float fs = ImGui::GetFontSize(), ty = (kSideHeader - 2.0f - fs) * 0.5f;
+        dl->AddText(ImVec2(ha.x + 12.0f, ty), IM_COL32(235, 235, 240, 255), "DLSS 5 neural rendering");
+        char hint[112] = "", key[96];
+        if (g_cfg.cast_key > 0)
+        {
+            CastKeyCombo(g_cfg.cast_key, g_cfg.cast_mods, key, sizeof(key));
+            sprintf_s(hint, "%s or Esc closes", key);
+        }
+        else strcpy_s(hint, "Esc closes");
+        const ImVec2 hs = ImGui::CalcTextSize(hint, nullptr, false, -1.0f);
+        dl->AddText(ImVec2(hb.x - kSideHeader - 10.0f - hs.x, ty), IM_COL32(150, 150, 158, 255), hint);
+        // The inner edge, so the panel reads as a sheet over the game rather than a cut-out.
+        const float ex = right ? ha.x : hb.x;
+        dl->AddLine(ImVec2(ex, 0.0f), ImVec2(ex, disp.y), IM_COL32(118, 185, 0, 160), 1.0f);
+    }
     if (g_cast_texture && !g.is_d3d10 && g.panel_srv != nullptr && g.panel_w != 0)
     {
         // ReShade's D3D11 ImGui backend takes the view pointer itself as the texture id
         // (the same convention as the rtv.handle casts in FeedFrame11).
-        const ImVec2 pmin(static_cast<float>(g_cast_rect.left), static_cast<float>(g_cast_rect.top));
-        const ImVec2 pmax(static_cast<float>(g_cast_rect.right), static_cast<float>(g_cast_rect.bottom));
+        const ImVec2 pmin(static_cast<float>(g_cast_rect.left) + side_dx, static_cast<float>(g_cast_rect.top));
+        const ImVec2 pmax(static_cast<float>(g_cast_rect.right) + side_dx, static_cast<float>(g_cast_rect.bottom));
         const ImVec2 uv1(static_cast<float>(g_cast_src.cx) / static_cast<float>(g.panel_w),
                          static_cast<float>(g_cast_src.cy) / static_cast<float>(g.panel_h));
         dl->AddImage(static_cast<ImTextureID>(reinterpret_cast<uintptr_t>(g.panel_srv)), pmin, pmax, ImVec2(0.0f, 0.0f), uv1);
@@ -2175,7 +2379,7 @@ static void OnOverlay(reshade::api::effect_runtime *rt)
     // The close button, on top of everything.
     {
         const RECT c = CastCloseRect();
-        const ImVec2 a(static_cast<float>(c.left), static_cast<float>(c.top)), b(static_cast<float>(c.right), static_cast<float>(c.bottom));
+        const ImVec2 a(static_cast<float>(c.left) + side_dx, static_cast<float>(c.top)), b(static_cast<float>(c.right) + side_dx, static_cast<float>(c.bottom));
         dl->AddRectFilled(a, b, g_cast_close_hover ? IM_COL32(200, 40, 40, 230) : IM_COL32(30, 30, 30, 200));
         dl->AddRect(a, b, IM_COL32(255, 255, 255, 160));
         const float pad = (b.x - a.x) * 0.3f;
@@ -2341,6 +2545,7 @@ static void DetectChickenHost()
 static bool   g_opti_host            = false;
 static bool   g_opti_host_nr         = false;   // a DLSS-NR fork, not upstream OptiScaler
 static bool   g_opti_host_direct     = false;   // ... the direct-runtime generation (no forwarder; see feed_opti.h)
+static bool   g_opti_host_live       = false;   // ... a build that re-reads [DlssNr] while it runs (the bridge panel then needs no restart)
 static char   g_opti_host_module[64] = "";
 static char   g_opti_ini_path[MAX_PATH];
 static UINT64 g_opti_ini_read_at     = 0;
@@ -2365,6 +2570,7 @@ static void DetectOptiHost()
         if (!OptiIsBuild(path)) continue;
         g_opti_host = true;
         OptiClassify(path, &g_opti_host_nr, &g_opti_host_direct);
+        g_opti_host_live = g_opti_host_nr && OptiFileHasLiteral(path, OPTI_LIVE_LITERAL);
         strcpy_s(g_opti_host_module, name);
         break;
     }
@@ -2504,9 +2710,29 @@ static bool HostWorkerConnect(HANDLE ev)
     // host_window=3 is the way out of that for a swapchain that only CLAIMS fullscreen: a
     // wrapper presenting into a borderless window (dgVoodoo, #118). The add-on cannot tell
     // the two apart from the fullscreen state alone, so the user says so.
-    const bool hide = g_cfg.host_window == 2 || (g_cfg.host_window == 0 && g_cast_fullscreen);
+    // PROTOTYPE, cast_mode=2: the side panel's host never has a window on screen, fullscreen
+    // or not, and is told the size the panel will be drawn at so its frame is 1:1 with it.
+    char side_arg[48] = "";
+    bool side = false;
+    if (g_cfg.cast_mode == 2 && !g.is_d3d10 && g.runtime != nullptr)
+    {
+        RECT gc = {};
+        HWND game = static_cast<HWND>(g.runtime->get_hwnd());
+        if (game != nullptr && GetClientRect(game, &gc) && gc.right >= 640 && gc.bottom >= 360)
+        {
+            const SIZE want = CastSideWant(gc);
+            sprintf_s(side_arg, " --side %ldx%ld", want.cx, want.cy);
+            side = true;
+        }
+    }
+    g_host_side = side;
+    const bool hide = side || g_cfg.host_window == 2 || (g_cfg.host_window == 0 && g_cast_fullscreen);
     g_host_hidden = hide;
-    if (hide)
+    if (side)
+        Log("[feed32] side panel: starting the host with no window on screen (%s); its panel reaches the game "
+            "through the shared texture only%s", side_arg + 1,
+            g_cast_fullscreen ? " -- the game's swapchain is exclusive fullscreen" : "");
+    else if (hide)
         Log("[feed32] starting the host without a window (%s): the in-game panel is unavailable this session%s",
             g_cfg.host_window == 2 ? "host_window=2" : "the game's swapchain is exclusive fullscreen",
             g_cfg.host_window == 2 ? "" : " -- switch the game to borderless/windowed to get it back (#109). If it "
@@ -2515,9 +2741,9 @@ static bool HostWorkerConnect(HANDLE ev)
     else if (g_cfg.host_window == 3 && g_cast_fullscreen)
         Log("[feed32] host_window=3: the game's swapchain reports exclusive fullscreen and the host gets its window "
             "anyway. If the game stops presenting right after this line, that fullscreen is real: go back to host_window=0");
-    sprintf_s(cmd, "\"%s\" %lu%s%s", exe, GetCurrentProcessId(),
+    sprintf_s(cmd, "\"%s\" %lu%s%s%s", exe, GetCurrentProcessId(),
               hide ? " --hide" : g_cfg.host_window == 1 ? "" : " --behind",
-              g_cfg.host_gpu_priority ? " --gpu-priority" : "");
+              g_cfg.host_gpu_priority ? " --gpu-priority" : "", side_arg);
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
@@ -3024,7 +3250,7 @@ static void HostClose();   // below
 // fences, tears down shared state and stops the worker -- none of which may happen beside a
 // frame that is using them. So the buttons only record what they want; FeedFrame consumes
 // it at the top of the next frame, inside the lock.
-enum { HOST_REQ_NONE = 0, HOST_REQ_RESTART, HOST_REQ_APPLY, HOST_REQ_WINSIZE, HOST_REQ_OVERLAY };
+enum { HOST_REQ_NONE = 0, HOST_REQ_RESTART, HOST_REQ_APPLY, HOST_REQ_WINSIZE, HOST_REQ_OVERLAY, HOST_REQ_BRIDGE };
 static volatile LONG g_host_request;
 static char          g_host_request_why[160];
 
@@ -3078,6 +3304,81 @@ static void HostApplySettings()
     g.consecutive_fails = 0;
     g_retry_at = 0;
     Warn("DLSS 5 settings applied -- the replacement host starts in the background");
+}
+
+// ---------------------------------------------------------------------------
+// The feeder's own panel (feed_panel.h), for a tool that runs in host64's helper: where the
+// tool's files are, whether the helper is up, and how to reach it. The panel itself -- the
+// settings, the drawing, the shortcut -- is the shared header's, the same in every build.
+// ---------------------------------------------------------------------------
+static void PanelRefresh()
+{
+    GetModuleFileNameA(g_self, g_panel_env.tool_dir, MAX_PATH);
+    if (char *s = strrchr(g_panel_env.tool_dir, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - g_panel_env.tool_dir), "host64\\");
+    HostIniPath(g_panel_env.reshade_ini);
+    g_panel_env.opti_nr   = g_opti_host && g_opti_host_nr;
+    g_panel_env.opti_live = g_opti_host_live;
+    strcpy_s(g_panel_env.opti_ini, g_opti_ini_path);
+}
+static void PanelScheduleApply() { HostRequest(HOST_REQ_BRIDGE, nullptr); }   // consumed inside the feed lock
+static void PanelRestartTool()
+{
+    g.built = false;
+    g.disabled = false;
+    g.consecutive_fails = 0;
+    g_retry_at = 0;
+}
+#include "feed_panel_mv.h"   // the menu's motion-vector notice: what it asks ReShade and what its buttons do
+// One setting for a tool that takes them while it runs: pipe tag 'S'; the helper hands it to the
+// tool's own control interface. Called from FeedPanelApply, inside the feed lock.
+static bool PanelSendSetting(const char *key, float value)
+{
+#pragma pack(push, 1)
+    struct { BYTE tag; FeedSettingMsg sm; } msg = { 'S', {} };
+#pragma pack(pop)
+    strcpy_s(msg.sm.key, key);
+    msg.sm.value = value;
+    if (PipeWrite(&msg, sizeof(msg))) return true;
+    HostLost("a setting could not be sent");
+    return false;
+}
+// The helper's GPU time per frame, from the block it shares (FeedStats). 0 = not known.
+static float PanelGpuMs()
+{
+    static const FeedStats *st = nullptr;
+    static ULONGLONG        tried = 0;
+    if (st == nullptr)
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (now - tried < 1000) return 0.0f;
+        tried = now;
+        char name[64];
+        sprintf_s(name, FEED_STATS_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
+        HANDLE m = OpenFileMappingA(FILE_MAP_READ, FALSE, name);
+        if (m == nullptr) return 0.0f;
+        st = static_cast<const FeedStats *>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, sizeof(FeedStats)));
+        if (st == nullptr) return 0.0f;
+    }
+    if (st->magic != FEED_STATS_MAGIC || GetTickCount() - st->tick > 3000) return 0.0f;   // the helper stopped
+    return st->gpu_ms;
+}
+static void PanelSetup()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    g_panel_env.helper         = true;
+    PanelMvSetup();
+    g_panel_env.send_setting   = PanelSendSetting;
+    g_panel_env.gpu_ms         = PanelGpuMs;
+    g_panel_env.refresh        = PanelRefresh;
+    g_panel_env.running        = HostAlive;
+    g_panel_env.starting       = HostStarting;
+    g_panel_env.schedule_apply = PanelScheduleApply;
+    g_panel_env.stop_tool      = HostClose;
+    g_panel_env.restart_tool   = PanelRestartTool;
+    g_panel_env.log            = Log;
+    CfgPath(g_panel_env.cfg_path);
 }
 
 // v8: resize the running host's window, without restarting it.
@@ -3152,6 +3453,26 @@ static void HostToggleOverlay()
 // Sent from OnPresent, after CastTick has settled the layout for this frame. Under the feed
 // lock like every other write on this side; a re-entrant frame simply skips it, and the
 // comparison below sends it again next frame because the published snapshot is unchanged.
+// PROTOTYPE (side panel): the game window changed size, so the host's frame must too. The same
+// 'W' the sliders send, with the size computed from the game window instead of read from them.
+static void CastSideResize(int w, int h)
+{
+    if (g.pipe == nullptr || !FeedEnter()) return;
+    if (g.pipe != nullptr)
+    {
+#pragma pack(push, 1)
+        struct { BYTE tag; FeedWindowMsg wm; } msg = { 'W', { static_cast<uint32_t>(w), static_cast<uint32_t>(h) } };
+#pragma pack(pop)
+        if (!PipeWrite(&msg, sizeof(msg))) HostLost("the side panel resize could not be sent");
+        else
+        {
+            CastAdoptPanelSize(static_cast<unsigned>(w), static_cast<unsigned>(h), "side panel: the game window changed size");
+            g_panel_poll_quiet_until = GetTickCount64() + 2500;
+        }
+    }
+    FeedLeave();
+}
+
 static bool  g_cast_pub_shown  = false;
 static RECT  g_cast_pub_rect   = {};
 static float g_cast_pub_scale  = 0.0f;
@@ -3206,6 +3527,7 @@ static void HostConsumeRequest()
     else if (req == HOST_REQ_APPLY) HostApplySettings();
     else if (req == HOST_REQ_WINSIZE) HostApplyWindowSize();
     else if (req == HOST_REQ_OVERLAY) HostToggleOverlay();
+    else if (req == HOST_REQ_BRIDGE) FeedPanelApply();
 }
 
 // ---------------------------------------------------------------------------
@@ -3264,6 +3586,7 @@ static void ReleaseShared()
     {
         if (g.d10.relay_ctx != nullptr) { g.d10.relay_ctx->ClearState(); g.d10.relay_ctx->Flush(); }
         for (int i = 0; i < FEED_SLOTS; ++i) FeedD3D10ReleaseBridge(&g.d10_bridge[i]);
+        for (int i = 0; i < FEED_SLOTS; ++i) FeedD3D10ReleaseBridge(&g.d10_in1[i]);
     }
     SafeRelease(g.output_srv);
     g.sr_active = false;              // the next build decides again
@@ -3496,6 +3819,7 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
+    b.preset         = g_cfg.preset > 0 ? static_cast<uint32_t>(g_cfg.preset) : kDefaultPreset;
     if (want_sr) { b.target_width = g.output_width; b.target_height = g.output_height; }
     if (g_cfg.async_home) b.client_flags |= FEED_BUILD_ASYNC_HOME;
     if (g.host_creates)
@@ -3768,6 +4092,7 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
+    b.preset         = g_cfg.preset > 0 ? static_cast<uint32_t>(g_cfg.preset) : kDefaultPreset;
     if (g_cfg.async_home) b.client_flags |= FEED_BUILD_ASYNC_HOME;
     // b.tex stays zero: on this path the host creates, and answers with its handles.
 
@@ -4005,6 +4330,7 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
     b.mv_scale_x     = g_cfg.mv_scale_x;
     b.mv_scale_y     = g_cfg.mv_scale_y;
+    b.preset         = g_cfg.preset > 0 ? static_cast<uint32_t>(g_cfg.preset) : kDefaultPreset;
     // Under async_home the game copies home the PREVIOUS frame's result and is never
     // waiting on the evaluate the host is running, so the host may take its own time to
     // get a present slot rather than dropping the present. That drop is what starved the
@@ -4933,6 +5259,15 @@ static ID3D10Texture2D *AsTexture2D10(ID3D10Resource *res, D3D10_TEXTURE2D_DESC 
 static bool BuildD3D10Bridges(UINT native_w, UINT native_h)
 {
     for (int i = 0; i < FEED_SLOTS; ++i) FeedD3D10ReleaseBridge(&g.d10_bridge[i]);
+    for (int i = 0; i < FEED_SLOTS; ++i) FeedD3D10ReleaseBridge(&g.d10_in1[i]);
+    // Whatever the ring held belongs to the old bridges.
+    g.d10_pipelined        = false;
+    g.d10_pipeline_asked   = g_cfg.d3d10_pipeline;
+    g.d10_ring_n           = 0;
+    g.d10_in_full[0]       = g.d10_in_full[1]  = false;
+    g.d10_out_full[0]      = g.d10_out_full[1] = false;
+    g.d10.ring_marked[0]   = g.d10.ring_marked[1]  = false;
+    g.d10.relay_marked[0]  = g.d10.relay_marked[1] = false;
 
     const struct { int slot; DXGI_FORMAT fmt; bool rtv; } want[FEED_SLOTS] = {
         { FEED_COLOR,  g.color_fmt,              false },
@@ -4950,7 +5285,23 @@ static bool BuildD3D10Bridges(UINT native_w, UINT native_h)
         }
     }
 
-    Log("[feed32] D3D10 bridges built: %ux%u, colour %s", native_w, native_h, FeedFmtName(g.color_fmt));
+    // The second set. A failure here is not fatal: the single-slot drain still works.
+    bool pipelined = g_cfg.d3d10_pipeline != 0;
+    for (int i = 0; pipelined && i < FEED_SLOTS; ++i)
+    {
+        if (!FeedD3D10MakeBridge(&g.d10, &g.d10_in1[want[i].slot], native_w, native_h, want[i].fmt, want[i].rtv))
+        {
+            Log("[feed32] D3D10 second %s bridge failed at %s: 0x%08X -- staying with the per-frame drain",
+                FeedSlotName(want[i].slot), g.d10.where != nullptr ? g.d10.where : "?", g.d10.hr);
+            for (int j = 0; j < FEED_SLOTS; ++j) FeedD3D10ReleaseBridge(&g.d10_in1[j]);
+            pipelined = false;
+        }
+    }
+    g.d10_pipelined = pipelined;
+
+    Log("[feed32] D3D10 bridges built: %ux%u, colour %s, %s", native_w, native_h, FeedFmtName(g.color_fmt),
+        pipelined ? "pipelined (d3d10_pipeline=1: two slots each way, no device is drained; the game shows the result from two frames back)"
+                  : "per-frame drain (d3d10_pipeline=0)");
     return true;
 }
 
@@ -4971,6 +5322,99 @@ static bool BlitHome10(ID3D10Resource *dst)
 // The Direct3D 10 sibling of FeedFrameDispatch's D3D11 branch. Everything from
 // CopyOrResampleInputs onwards is that same client running on the private relay device;
 // what is new is only the two API crossings at either end. See src/feed_d3d10.h.
+// d3d10_pipeline=1: the two-slot handoff described in feed_d3d10.h (PIPELINED HANDOFF).
+// Every wait below is on work submitted a whole frame earlier, so neither the game's GPU
+// nor the CPU sits idle while the other finishes; the game shows the result from two
+// frames back. async_home does not apply: the Output ring already keeps the host's round
+// trip out of the frame.
+static void FeedHandoff10Pipelined(ID3D10Resource *color_res, ID3D10Resource *mv_res,
+                                   ID3D10Resource *depth_res, UINT native_w, UINT native_h)
+{
+    ID3D11DeviceContext *ctx = g.d10.relay_ctx;
+    const int cur  = static_cast<int>(g.d10_ring_n & 1);
+    const int prev = cur ^ 1;
+    FeedD3D10Bridge *b_cur  = cur  == 0 ? g.d10_bridge : g.d10_in1;
+    FeedD3D10Bridge *b_prev = prev == 0 ? g.d10_bridge : g.d10_in1;
+
+    // 1. The relay's work from last frame: it read In[cur] and drew Out[prev].
+    Breadcrumb("waiting for the relay's previous frame");
+    if (!FeedD3D10WaitRelayMark(&g.d10, prev)) { FeedFail("D3D10 relay sync"); return; }
+
+    // 2. This frame into In[cur], and on its way to the GPU.
+    Breadcrumb("handing the frame to the relay device");
+    FeedD3D10Deposit(&g.d10, &b_cur[FEED_COLOR], color_res);
+    FeedD3D10Deposit(&g.d10, &b_cur[FEED_MV],    mv_res);
+    FeedD3D10Deposit(&g.d10, &b_cur[FEED_DEPTH], depth_res);
+    g.d10.game->Flush();
+    ++g.d10_ring_n;
+    g.d10_in_full[cur] = true;
+
+    // The first frame after a build has no previous one to hand on.
+    if (g.d10_in_full[prev])
+    {
+        // 3. The game's work from last frame: its copies into In[prev], its read of Out[cur].
+        Breadcrumb("waiting for the previous frame's copies");
+        if (!FeedD3D10WaitMark(&g.d10, prev)) { FeedFail("D3D10 input sync"); FeedD3D10Mark(&g.d10, cur); return; }
+
+        if (g.sr_active)
+        {
+            if (g.need_reset || g_cfg.reset_every) g.jitter_index = 0;
+            HaltonJitter(g.jitter_index, g.jitter_phases, &g.jitter_x, &g.jitter_y);
+        }
+
+        Breadcrumb("preparing work-resolution inputs");
+        if (!CopyOrResampleInputs(ctx,
+                                  b_prev[FEED_COLOR].tex11,
+                                  b_prev[FEED_MV].tex11,
+                                  b_prev[FEED_DEPTH].tex11,
+                                  b_prev[FEED_MV].srv11,
+                                  b_prev[FEED_DEPTH].srv11,
+                                  native_w, native_h))
+        { FeedFail("work-resolution resample"); FeedD3D10Mark(&g.d10, cur); return; }
+
+        const UINT64 n = ++g.frame_n;
+        const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+        g.need_reset = false;
+
+        g.ctx4->Signal(g.fence_in, n);
+        ctx->Flush();
+
+        const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset),
+                                  g.sr_active ? g.jitter_x : 0.0f, g.sr_active ? g.jitter_y : 0.0f,
+                                  static_cast<uint32_t>(g_cfg.settle_evals),
+                                  g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u,
+                                  g_cfg.hold_strength, g_cfg.hold_tolerance };
+        const bool sent = PipeWriteFrame(fm);
+        if (sent && g.sr_active) ++g.jitter_index;
+        if (!sent) { HostLost("frame message failed"); FeedD3D10Mark(&g.d10, cur); return; }
+
+        // 4. The host's answer, drawn into Out[cur] -- queued on the relay behind the
+        // host's fence, and nobody waits for it this frame.
+        Breadcrumb("queueing the host's result");
+        g.ctx4->Wait(g.fence_out, n);
+        g.fence_wait_queued = true;
+        g.wait_n            = n;
+        g.sent_n            = n;
+        BlitOutputToBackbuffer(ctx, b_cur[FEED_OUTPUT].rtv11);
+        FeedD3D10MarkRelay(&g.d10, cur);
+        g.d10_out_full[cur] = true;
+
+        // 5. Last frame's answer home. Step 1 proved the relay has drawn it.
+        if (g.d10_out_full[prev])
+        {
+            g.d10.game->CopyResource(color_res, b_prev[FEED_OUTPUT].tex10);
+            g.out_valid = true;
+            const UINT64 done = ++g.frames_done;
+            g.consecutive_fails = 0;
+            if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                Log("[feed32] frame %llu delivered (%ux%u, reset=%d, D3D10, pipelined)", done, g.width, g.height, reset);
+        }
+    }
+
+    // Last of the game's work for this frame, after its read of Out[prev].
+    FeedD3D10Mark(&g.d10, cur);
+}
+
 static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource_view rtv)
 {
     LARGE_INTEGER t0, t1;
@@ -5058,7 +5502,8 @@ static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource
                               cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height;
     if (size_changed) g.sr_unavailable = false;
     const bool want_sr = sr_wanted && !g.sr_unavailable && (work_w != cd.Width || work_h != cd.Height);
-    if (ok && (!g.built || size_changed || cd.Format != g.bb_fmt || want_sr != g.sr_requested))
+    if (ok && (!g.built || size_changed || cd.Format != g.bb_fmt || want_sr != g.sr_requested ||
+               g.d10_pipeline_asked != g_cfg.d3d10_pipeline))
     {
         if (GetTickCount64() < g_retry_at)
             ok = false;
@@ -5076,6 +5521,8 @@ static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource
     if (ok && g.built && g.d10_bridge[FEED_COLOR].tex11 != nullptr && g.d10_bridge[FEED_OUTPUT].rtv11 != nullptr)
     {
         if (!HostAlive()) { HostLost("process died"); }
+        else if (g.d10_pipelined)
+            FeedHandoff10Pipelined(color_res, mv_res, depth_res, cd.Width, cd.Height);
         else
         {
             const bool async_home = g_cfg.async_home != 0;
@@ -5468,14 +5915,21 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     if (signature == last_signature) return;
     last_signature = signature;
 
-    _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> %s (%s)",
-                mode, kMvModeName[mode], provider,
-                g.launchpad.handle ? (provider_broken ? "FAILED TO COMPILE" : provider_on ? "enabled" : "DISABLED") : "not installed");
+    const bool builtin = mode == kMvModeBuiltIn;
+    if (builtin)
+        _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> DLSS5_Feed.fx's own estimator (nothing to enable)",
+                    mode, kMvModeName[mode]);
+    else
+        _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> %s (%s)",
+                    mode, kMvModeName[mode], provider,
+                    g.launchpad.handle ? (provider_broken ? "FAILED TO COMPILE" : provider_on ? "enabled" : "DISABLED") : "not installed");
     g_mv_problem[0] = '\0';
     Log("[feed32] effects: technique %s, DLSS5_MV %s, DLSS5_Depth %s, %s, depth reversed=%d",
         g.technique.handle ? "found" : "MISSING", g.mv_var.handle ? "found" : "MISSING",
         g.depth_var.handle ? "found" : "MISSING", g_mv_status, g.depth_reversed ? 1 : 0);
-    if (g.handles_ok && g.launchpad.handle == 0)
+    if (builtin)
+        ;   // nothing can be missing: the estimator is part of the effect itself
+    else if (g.handles_ok && g.launchpad.handle == 0)
         _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
                     "DLSS5_Feed.fx is compiled for motion-vector provider %d (%s) but no known %s shader is installed: motion vectors will be zero. "
                     "Install one, or change the DLSS5_MV_PROVIDER preprocessor definition.", mode, kMvModeName[mode], kMvModeName[mode]);
@@ -6015,6 +6469,17 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     if (ImGui::SliderFloat("MV scale Y", &g_cfg.mv_scale_y, 0.0f, 4.0f)) dirty = true;
 
     ImGui::Separator();
+    {
+        // The feeder's own panel (feed_panel.h): the settings of whichever neural tool is in
+        // host64, under one set of names, with no host window and nothing cast.
+        char key[96], label[160];
+        FeedPanelKeyName(key, sizeof(key));
+        sprintf_s(label, "%s the DLSS 5 Feeder menu", g_panel_wanted ? "Hide" : "Show");
+        if (ImGui::Button(label)) { PanelSetup(); FeedPanelShow(!g_panel_wanted); }
+        ImGui::SameLine();
+        ImGui::TextDisabled("shortcut: %s (panel_key / panel_mods in dlss5-feed.cfg)", key);
+    }
+    ImGui::Separator();
     ImGui::TextUnformatted("DLSS 5 panel in-game");
     ImGui::SameLine();
     HelpMarker("Shows the helper process's own tuning panel (the neural consumer's tab column) inside this "
@@ -6052,6 +6517,26 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                   : "Drawn by this game's ReShade from a copy of the host's frame: works in exclusive "
                                     "fullscreen and on any monitor. The panel appears once the feed has built (its "
                                     "texture is set up with the first build).");
+    // PROTOTYPE: the side panel. Needs a host started for it (no window, sized to this game
+    // window), so choosing it while another kind of host runs restarts the host.
+    ImGui::SameLine();
+    if (g.is_d3d10) ImGui::BeginDisabled();
+    {
+        const bool shown_side = g_cast_wanted && g_cfg.cast_mode == 2;
+        if (ImGui::Button(shown_side ? "Hide the side panel" : "Side panel (prototype)"))
+        {
+            g_cast_wanted = !shown_side;
+            if (g_cfg.cast_mode != 2)
+            {
+                g_cfg.cast_mode = 2;
+                dirty = true;
+                if (HostAlive() && !g_host_side)
+                    HostRequest(HOST_REQ_RESTART, "side panel: the host restarts with no window, sized for the panel");
+            }
+            Log("[feed32] cast: %s (overlay, side panel)", g_cast_wanted ? "shown" : "hidden");
+        }
+    }
+    if (g.is_d3d10) ImGui::EndDisabled();
     // What the two buttons above cast is the host's ReShade overlay. The host opens it once
     // when it starts; close it and there was no way back, because the overlay key does not
     // survive the trip through the cast (see HostToggleOverlay).
@@ -6435,6 +6920,47 @@ static VOID CALLBACK OnLdrNotify(ULONG reason, const FeedLdrDllNotificationData 
     else Log("[feed32] could not start the release thread (%lu); the add-on stays loaded and unregistered", GetLastError());
 }
 
+// dpi_aware=1 in dlss5-feed.cfg: make the game process DPI aware before it creates its window.
+// A DPI-unaware 32-bit game on a scaled desktop (4K at 200%) is told the screen is 1920x1080:
+// Max Payne 3 then sizes its window, and with it the swap chain, to 1940x1100 and rolls a 4K
+// setting back to 1080p (or shows a grey picture), and RenoDX's fake fullscreen sizes against
+// the same wrong screen. The AppCompat "~ HIGHDPIAWARE" layer did not reach it when started by
+// Steam through PlayMaxPayne3.exe. Read straight from the file at attach -- CfgReload's Cfg has no
+// slot for it, and CfgSave carries unknown keys over -- because it only means anything here,
+// before the first window. Off by default: some games lay their UI out for a 96-DPI screen.
+static void ApplyDpiAwareFromCfg()
+{
+    char path[MAX_PATH];
+    CfgPath(path);
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "r") != 0 || f == nullptr) return;
+    int want = 0;
+    char line[160];
+    while (fgets(line, sizeof(line), f) != nullptr)
+    {
+        int v = 0;
+        if (sscanf_s(line, " dpi_aware = %d", &v) == 1) want = v;
+    }
+    fclose(f);
+    if (want != 1) return;
+
+    const HMODULE user32 = GetModuleHandleA("user32.dll");
+    using SetCtxFn = BOOL(WINAPI *)(HANDLE);
+    using SetAwareFn = BOOL(WINAPI *)();
+    const auto set_ctx = user32 ? reinterpret_cast<SetCtxFn>(GetProcAddress(user32, "SetProcessDpiAwarenessContext")) : nullptr;
+    const auto set_aware = user32 ? reinterpret_cast<SetAwareFn>(GetProcAddress(user32, "SetProcessDPIAware")) : nullptr;
+    // -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, -3 = PER_MONITOR_AWARE (older Windows 10)
+    if (set_ctx != nullptr && (set_ctx(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-4))) ||
+                               set_ctx(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-3)))))
+        Log("[feed32] dpi_aware=1: the game process is now per-monitor DPI aware (it sees the real screen size).");
+    else if (set_ctx != nullptr && GetLastError() == ERROR_ACCESS_DENIED)
+        Log("[feed32] dpi_aware=1: the process already had its DPI awareness set (manifest or compatibility setting); left as it is.");
+    else if (set_aware != nullptr && set_aware())
+        Log("[feed32] dpi_aware=1: the game process is now system DPI aware.");
+    else
+        Log("[feed32] dpi_aware=1: Windows refused to change the DPI awareness (error %lu).", GetLastError());
+}
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
@@ -6464,6 +6990,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         }
         CfgWriteDefault();
         CfgReload();
+        ApplyDpiAwareFromCfg();
         // Said once, plainly, because "enabled=0 but it still crashed" is only evidence if
         // the reader knows what enabled=0 actually leaves behind (issue #44).
         if (!g_cfg.enabled)

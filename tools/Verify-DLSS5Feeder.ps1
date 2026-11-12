@@ -1837,6 +1837,7 @@ $providerNames = @{
     '2' = 'VORT (MotVectTexVort)'
     '3' = 'LumeniteFX Kernel (Kernel::tFlow)'
     '4' = 'LumeniteFX QuantMotion (QuantMotion::tFlow)'
+    '5' = 'built in (DLSS5_Feed.fx''s own estimator; no other effect needed)'
 }
 $providerFx = @{
     '1' = 'MartysMods_LAUNCHPAD.fx'
@@ -1967,7 +1968,7 @@ else {
                 else {
                     Report -Status 'Fail' -Text 'Provider 0 is selected but no known texMotionVectors writer is enabled.' `
                            -Detail ('Techniques=' + $techniques + "`nProvider 0 only reads the shared texture -- something has to fill it.") `
-                           -Action 'Enable a motion-vector effect (DRME/MotionEstimation.fx, qUINT, dh_uber_motion), or switch to DLSS5_MV_PROVIDER=3 with lumenite_Kernel.fx.'
+                           -Action 'Enable a motion-vector effect (DRME/MotionEstimation.fx, qUINT, dh_uber_motion), or switch to DLSS5_MV_PROVIDER=5, the estimator built into DLSS5_Feed.fx, which needs no other effect.'
                 }
             }
         }
