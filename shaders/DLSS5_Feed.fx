@@ -425,6 +425,15 @@ uniform float RESTORE_TEXTURE_CONTRAST <
                  "putting back. Below it -- film grain, noise, banding dither -- the model's smoothing stays.";
 > = 0.012;
 
+uniform bool RESTORE_BLACK <
+    ui_category = "Restore (DLSS5_Feed_Restore technique)";
+    ui_label = "Keep black black";
+    ui_tooltip = "A neural pass lifts pure black to a mottled dark grey (measured: 12 8-bit steps on the black\n"
+                 "of a logo screen, from the neural pass alone -- DLAA leaves it at 0.1). With this on, a pixel\n"
+                 "that came in black goes out black: letterbox bars, a logo's background, a fade to black.\n"
+                 "Anything brighter than about one 8-bit step is left to the model.";
+> = true;
+
 uniform float RESTORE_STRENGTH <
     ui_category = "Restore (DLSS5_Feed_Restore technique)";
     ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.05;
@@ -2056,7 +2065,7 @@ float4 PS_Restore(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     // more than three in a row -- that is a picture standing still, and it should settle.
     const float repeats = tex2Dlod(sDLSS5_Global, float4(0.5, 0.5, 0.0, 0.0)).y;
     if (RESTORE_HOLD_REPEATS && repeats > 0.5 && repeats < 3.5) return tex2Dfetch(sDLSS5_LastOut, int2(vpos.xy));
-    const float4 now = tex2Dlod(ReShade::BackBuffer, float4(uv, 0.0, 0.0));
+    float4 now = tex2Dlod(ReShade::BackBuffer, float4(uv, 0.0, 0.0));
     // The mark, grown by a pixel (the antialiased rim of a glyph belongs to it) and then
     // SMOOTHED over a 5x5: the mark is decided pixel by pixel, on contrast, so inside a fat
     // stroke or on a textured still picture it comes out as a mosaic of marked and unmarked
@@ -2080,6 +2089,12 @@ float4 PS_Restore(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     h /= wsum;
     const float w_hud = smoothstep(0.35, 0.85, h) * RESTORE_STRENGTH;
     const float3 was  = tex2Dlod(sDLSS5_Before, float4(uv, 0.0, 0.0)).rgb;
+    // What came in black goes out black (the whole pixel: there is no detail in black to keep).
+    if (RESTORE_BLACK)
+    {
+        const float k = 1.0 - smoothstep(0.004, 0.012, max(was.r, max(was.g, was.b)));
+        if (k > 0.0) now.rgb = lerp(now.rgb, was, k);
+    }
     if (RESTORE_WHAT == 1 && w_hud > 0.0) return float4(lerp(now.rgb, was, w_hud), now.a);
     // And texture the model has softened, marked or not (always fine detail only: the pixel
     // is moving, and what the model did to it at any broader scale is its to keep).

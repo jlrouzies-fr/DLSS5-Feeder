@@ -453,16 +453,18 @@ static void DrawHud3D(int frame)
     {
         // A studio logo as an intro shows it: black, a grey plate with a black mark cut out of
         // it, lettering underneath. Nothing moves; the grey breathes by a few percent.
-        const float k = 0.56f + 0.05f * sinf(6.2831853f * frame / 75.0f);
+        const bool  white = g.logo == 2;
+        const float k  = white ? 0.93f + 0.06f * sinf(6.2831853f * frame / 75.0f) : 0.56f + 0.05f * sinf(6.2831853f * frame / 75.0f);
+        const float bg = white ? 0.0f : k, fg = white ? k : 0.0f;   // plate / mark
         g.brush->SetColor(D2D1::ColorF(0, 0, 0, 1));
         dc->FillRectangle(D2D1::RectF(kLogo[0], kLogo[1], kLogo[2], kLogo[3]), g.brush.Get());
-        g.brush->SetColor(D2D1::ColorF(k, k, k, 1));
+        g.brush->SetColor(D2D1::ColorF(bg, bg, bg, 1));
         dc->FillRectangle(D2D1::RectF(680, 640, 1300, 1260), g.brush.Get());
-        g.brush->SetColor(D2D1::ColorF(0, 0, 0, 1));
+        g.brush->SetColor(D2D1::ColorF(fg, fg, fg, 1));
         dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(990, 1040), 230, 70), g.brush.Get());
         dc->FillRectangle(D2D1::RectF(930, 740, 1010, 1100), g.brush.Get());
         dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(1040, 850), 110, 100), g.brush.Get());
-        g.brush->SetColor(D2D1::ColorF(k, k, k, 1));
+        g.brush->SetColor(D2D1::ColorF(bg, bg, bg, 1));
         dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(1050, 850), 45, 55), g.brush.Get());
         dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(900, 1040), 90, 22), g.brush.Get());
         Text(L"S T U D I O S", 96, 690, 1330, 800, k, true);

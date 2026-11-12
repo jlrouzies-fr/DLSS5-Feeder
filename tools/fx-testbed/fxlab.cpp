@@ -275,7 +275,7 @@ struct App
     bool paused = false;    // Space, in --loop: the frame number stands still
     int  fade = 0;          // the whole picture fades down and up again, once every this many frames (a logo fading in, a scene change)
     int  flash = 0;         // the picture is at 45% and jumps to full for three frames, every this many frames (lightning)
-    bool logo = false;      // 3D scene: a still studio logo (grey plate, black mark, lettering) whose brightness drifts a little
+    int  logo = 0;          // 3D scene: a still studio logo (grey plate, black mark, lettering) whose brightness drifts a little
     bool mesh = false;      // 3D scene: a perforated-metal floor panel in front of the camera (fine repeating dots)
     bool mvdump = false;    // the read-back is DLSS5_Feed_Debug view 10 (vectors), not a picture
     double preroll = 0.0;   // seconds of frame 0 before the clock starts (ReShade compiles its effects meanwhile)
@@ -694,7 +694,7 @@ int main(int argc, char **argv)
         else if (a == "--full")    g.full = true;
         else if (a == "--mv")      g.mvdump = true;
         else if (a == "--mesh")    g.mesh = true;
-        else if (a == "--logo")    g.logo = true;
+        else if (a == "--logo")    { g.logo = atoi(v); ++i; }
         else if (a == "--fade")    { g.fade = atoi(v); ++i; }
         else if (a == "--flash")   { g.flash = atoi(v); ++i; }
         else if (a == "--capture") { for (const char *s = v; *s; ) { g.captures.push_back(atoi(s)); while (*s && *s != ',') ++s; if (*s) ++s; } ++i; }
