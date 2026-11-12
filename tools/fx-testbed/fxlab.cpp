@@ -281,6 +281,7 @@ struct App
     int  flash = 0;         // the picture is at 45% and jumps to full for three frames, every this many frames (lightning)
     int  logo = 0;          // 3D scene: a still studio logo (grey plate, black mark, lettering) whose brightness drifts a little
     bool fx = false;        // 3D scene: a flame, smoke, mist and heat haze (scored apart as 3d.fx.*)
+    int  depth_flicker = 0; // 3D scene: the depth buffer is empty every Nth frame (a buffer that does not hold)
     bool nodepth = false;   // 3D scene: leave ReShade no depth buffer to read (what a capture is like)
     bool mesh = false;      // 3D scene: a perforated-metal floor panel in front of the camera (fine repeating dots)
     bool mvdump = false;    // the read-back is DLSS5_Feed_Debug view 10 (vectors), not a picture
@@ -702,6 +703,7 @@ int main(int argc, char **argv)
         else if (a == "--mv")      g.mvdump = true;
         else if (a == "--mesh")    g.mesh = true;
         else if (a == "--no-depth") g.nodepth = true;
+        else if (a == "--depth-flicker") { g.depth_flicker = atoi(v); ++i; }
         else if (a == "--fx")      g.fx = true;
         else if (a == "--logo")    { g.logo = atoi(v); ++i; }
         else if (a == "--logo-nits") { g.logo_nits = static_cast<float>(atof(v)); ++i; }

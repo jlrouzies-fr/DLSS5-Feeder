@@ -503,7 +503,7 @@ static void Render3D(int frame, int before)
     g.ctx->OMSetRenderTargets(1, s3.truth_rtv.GetAddressOf(), s3.dsv.Get());
     draw_objects(s3.ps_truth.Get());
     // --no-depth: what ReShade finds at Present is an empty depth buffer, as on a capture.
-    if (g.nodepth) g.ctx->ClearDepthStencilView(s3.dsv.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
+    if (g.nodepth || (g.depth_flicker > 0 && frame % g.depth_flicker == 0)) g.ctx->ClearDepthStencilView(s3.dsv.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
 
     g.ctx->OMSetRenderTargets(1, g.scene_rtv.GetAddressOf(), nullptr);
     g.ctx->OMSetDepthStencilState(s3.dss_off.Get(), 0);

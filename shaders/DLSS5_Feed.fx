@@ -596,6 +596,30 @@ uniform float LUMA_TOLERANCE <
                  "may fall (relative to that range's maximum). Lower = stricter.";
 > = 0.25;
 
+uniform int DEPTH_USE <
+    ui_category = "Depth buffer";
+    ui_type = "combo";
+    ui_items = "Automatic: when there is one and it holds\0Never\0Always (trust ReShade's depth as it is)\0";
+    ui_label = "Use the game's depth buffer";
+    ui_tooltip = "With a depth buffer the effect knows which pixels belong to the same surface. It then:\n"
+                 " - does not let a cell's vector point at a different surface a frame ago;\n"
+                 " - gives each pixel the vector of the cells on its own side of an outline;\n"
+                 " - drops the vector of a pixel that was hidden a frame ago (the depth test below);\n"
+                 " - and, if the camera fit is enabled, fits it with the terms of a camera that travels.\n\n"
+                 "Automatic checks the depth buffer every frame before believing it: it has to vary across\n"
+                 "the screen (a capture, or a game ReShade finds no depth for, has none), and -- moved by\n"
+                 "the vectors found from the picture alone -- it has to be last frame's depth on four\n"
+                 "fifths of the screen (a buffer that flickers, lags a frame or belongs to something else\n"
+                 "is not). After half a second of that it is used; when it stops holding, within a few\n"
+                 "frames it is not, and the effect works from the picture alone. ReShade's own depth\n"
+                 "settings (reversed, upside down) must be right for the game, as for any depth effect.\n\n"
+                 "Measured on tools/fx-testbed: a depth buffer that is empty every other frame, or every\n"
+                 "seventh, is never used; with a good one the vectors gain a little and the picture is\n"
+                 "unchanged. The camera fit is NOT switched on by this: its vectors are more exact but\n"
+                 "never whole pixels, and DLSS resamples its history more with them (the picture came out\n"
+                 "further from the input, 0.82 against 0.52 on a pan).";
+> = 0;
+
 uniform bool VALIDATE_DEPTH <
     ui_category = "Validation (flicker / flames / disocclusion)";
     ui_label = "Depth test (zeroes the vector)";
@@ -688,6 +712,34 @@ texture DLSS5_PrevMV    { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format =
 // across an object edge mixes two surfaces' values and fails the test on every edge in motion.
 sampler sDLSS5_PrevLuma  { Texture = DLSS5_PrevLuma;  AddressU = Clamp; AddressV = Clamp; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
 sampler sDLSS5_PrevDepth { Texture = DLSS5_PrevDepth; AddressU = Clamp; AddressV = Clamp; MinFilter = POINT;  MagFilter = POINT;  MipFilter = POINT; };
+// Is the depth buffer usable? x = for how many frames it has held (see PS_DepthCheck), y = the
+// share of the screen where it agreed with last frame's this frame, z = its range.
+texture DLSS5_DepthOK     { Width = 1; Height = 1; Format = RGBA16F; };
+texture DLSS5_PrevDepthOK { Width = 1; Height = 1; Format = RGBA16F; };
+sampler sDLSS5_DepthOK     { Texture = DLSS5_DepthOK;     MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+sampler sDLSS5_PrevDepthOK { Texture = DLSS5_PrevDepthOK; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+// (As of last frame: the estimator runs before this frame's check, which needs its vectors.)
+bool DepthUsable()  { return DEPTH_USE == 2 || (DEPTH_USE == 0 && tex2Dlod(sDLSS5_PrevDepthOK, float4(0.5, 0.5, 0.0, 0.0)).x >= 30.0); }
+// The camera fit is on when asked for (CAM_AUTO=1 would switch it on with the depth buffer: see
+// DEPTH_USE for why that is not the default); its depth terms are on by themselves once the
+// depth buffer holds.
+#ifndef CAM_AUTO
+    #define CAM_AUTO 0
+#endif
+bool CamModelOn()   { return CAMERA_MODEL || (CAM_AUTO && DepthUsable()); }
+bool CamDepthOn()   { return CAMERA_DEPTH || GEOM_ENABLE || DepthUsable(); }
+// Two depths (linear) of the same surface? 1 = yes, 0 = no, by how far apart they are in proportion.
+float SameSurface(float a, float b) { return 1.0 - smoothstep(0.08, 0.25, abs(a - b) / max(min(a, b), 1e-5)); }
+// The same for a point and the one opposite it across the middle: on one flat surface, however
+// steeply it runs away from the camera, 1 / depth changes by the same amount on either side.
+// (A floor seen at a shallow angle doubles its depth within a few cells; judged by depth alone
+// it was a staircase of "different surfaces", and its cells stopped agreeing with each other.)
+// dc, da, db: linear depth at the middle, at the point, at the point opposite.
+float OnSurface(float dc, float da, float db)
+{
+    const float zc = 1.0 / max(dc, 1e-6), za = 1.0 / max(da, 1e-6), zb = 1.0 / max(db, 1e-6);
+    return max(1.0 - smoothstep(0.04, 0.12, abs(za + zb - 2.0 * zc) / zc), SameSurface(dc, da));
+}
 sampler sDLSS5_PrevMV    { Texture = DLSS5_PrevMV;    AddressU = Clamp; AddressV = Clamp; MinFilter = POINT;  MagFilter = POINT;  MipFilter = POINT; };
 // For DLSS5_Feed_Restore. Hud: how sure it is that a pixel is a still element over a moving
 // picture (0..1, built up over frames, see the feed pass); PrevHud: last frame's. Before: the
@@ -902,6 +954,46 @@ float2 ProviderMV(float2 uv)
     return MV_LOWRES_FILTER == 0 ? tex2Dlod(sDLSS5_ProviderMV, c).xy : tex2Dlod(sDLSS5_ProviderMVPoint, c).xy;
 #else
     return tex2Dlod(sDLSS5_ProviderMV, c).xy;
+#endif
+}
+
+// The same for a PIXEL, with a depth buffer (see DEPTH_USE): from the cells around it that are
+// on its own surface. Read plainly, a field of cells is a blend of the two motions for a cell's
+// width either side of every outline -- and the pixels just inside the outline of something
+// that moves, or of a railing in front of a floor, are exactly where a temporal pass shows a
+// wrong vector as a trail. With depth each pixel knows which side it is on.
+// (Fields that are coarser than the picture only: the built-in estimator's, LumeniteFX's.)
+#ifndef SURF_MV
+    #define SURF_MV 1
+#endif
+float2 ProviderSurfaceMV(float2 uv)
+{
+#if (DLSS5_MV_BUILTIN || DLSS5_MV_LOWRES) && SURF_MV
+    if (!DepthUsable()) return ProviderMV(uv);
+  #if DLSS5_MV_BUILTIN
+    const float2 gs = BUFFER_SCREEN_SIZE / 2.0;
+  #else
+    const float2 gs = BUFFER_SCREEN_SIZE / 8.0;
+  #endif
+    const float2 g = uv * gs - 0.5, i0 = floor(g), f = g - i0;
+    const float  dc = ReShade::GetLinearizedDepth(uv);
+    float2 sum = 0.0;
+    float  ws  = 0.0;
+    [unroll] for (int k = 0; k < 4; ++k)
+    {
+        const float2 o   = float2(k % 2, k / 2);
+        const float2 cuv = (i0 + o + 0.5) / gs;
+        const float  w   = (o.x > 0.5 ? f.x : 1.0 - f.x) * (o.y > 0.5 ? f.y : 1.0 - f.y) * (SameSurface(dc, ReShade::GetLinearizedDepth(cuv)) + 1e-3);
+        sum += w * tex2Dlod(sDLSS5_ProviderMVPoint, float4(cuv, 0.0, 0.0)).xy;
+        ws  += w;
+    }
+  #if DLSS5_MV_BUILTIN
+    return sum / ws * BUFFER_PIXEL_SIZE;
+  #else
+    return sum / ws;
+  #endif
+#else
+    return ProviderMV(uv);
 #endif
 }
 
@@ -1805,50 +1897,50 @@ DLSS5_FLOW_LEVEL(1, 1.0, sDLSS5_Flow2L, true)
 #ifndef BASE_FITS
     #define BASE_FITS 2
 #endif
+// Two more uses of depth inside the estimator, measured and left off: weighing a patch's points
+// by whether they are on the middle's surface (BASE_DW) and letting only cells of the same
+// surface vote (BASE_DV). On tools/fx-testbed the first is a wash (better at the outlines under
+// a dolly and a strafe, worse under a pan, a hair worse on plain surfaces) and the second costs
+// accuracy on plain surfaces and at outlines alike: the picture-only base is good enough there
+// that taking evidence away from it does more harm than taking the wrong evidence does.
+#ifndef BASE_DW
+    #define BASE_DW 0
+#endif
+#ifndef BASE_DV
+    #define BASE_DV 0
+#endif
+#ifndef BASE_DEPTH_W
+    #define BASE_DEPTH_W 0.02
+#endif
 #ifndef BASE_DPEN
     #define BASE_DPEN 0.25
 #endif
-float BaseCost(sampler2D sM, sampler2D sMp, float2 uv, float2 v, float tex)
+static const float2 kBaseTap[13] = {
+    float2(0, 0), float2(-1, 0), float2(1, 0), float2(0, -1), float2(0, 1), float2(-3, 0), float2(3, 0), float2(0, -3), float2(0, 3),
+    float2(-2, -2), float2(2, -2), float2(-2, 2), float2(2, 2) };
+// With a depth buffer (see DEPTH_USE) a candidate that would take the patch's middle to a
+// different surface a frame ago pays for it (dc: the middle's depth now; a step in depth, not
+// a slope -- a floor coming closer is the same floor). w weighs the patch's points; it is 1
+// everywhere unless BASE_DW is on (see there).
+float BaseCost(sampler2D sM, sampler2D sMp, float2 uv, float2 v, float2 f, float tex, float w[13], float dc, bool dz)
 {
-    static const float2 o[13] = {
-        float2(0, 0), float2(-1, 0), float2(1, 0), float2(0, -1), float2(0, 1), float2(-3, 0), float2(3, 0), float2(0, -3), float2(0, 3),
-        float2(-2, -2), float2(2, -2), float2(-2, 2), float2(2, 2) };
-    const float2 t = BUFFER_PIXEL_SIZE * tex, pv = v * BUFFER_PIXEL_SIZE;
-    float a[13], b[13];
-    float ma = 0.0, mb = 0.0;
-    [unroll] for (int i = 0; i < 13; ++i)
-    {
-        a[i] = tex2Dlod(sM,  float4(uv + o[i] * t, 0.0, 0.0)).x;
-        b[i] = tex2Dlod(sMp, float4(uv + o[i] * t + pv, 0.0, 0.0)).x;
-        ma += a[i]; mb += b[i];
-    }
-    ma /= 13.0; mb /= 13.0;
-    float e = 0.0;
-    [unroll] for (int j = 0; j < 13; ++j) e += abs((a[j] - ma) - (b[j] - mb));
-    return e / 13.0 + BASE_DPEN * abs(ma - mb);
-}
-// The same with the vector's last fraction split between the two frames (this one read half of it
-// back, the last one half of it on): both are then interpolated alike, and a fraction of a texel
-// costs what it should. Read from one frame only, the interpolated side is the softer of the two
-// and every fractional vector looks a little worse than the whole one next to it.
-float BaseCostSym(sampler2D sM, sampler2D sMp, float2 uv, float2 v, float2 f, float tex)
-{
-    static const float2 o[13] = {
-        float2(0, 0), float2(-1, 0), float2(1, 0), float2(0, -1), float2(0, 1), float2(-3, 0), float2(3, 0), float2(0, -3), float2(0, 3),
-        float2(-2, -2), float2(2, -2), float2(-2, 2), float2(2, 2) };
+    // f: the last fraction of the vector, split between the two frames (this one read half of
+    // it back, the last one half of it on) so that both are interpolated alike; 0 = read as is.
     const float2 t = BUFFER_PIXEL_SIZE * tex, pa = -0.5 * f * BUFFER_PIXEL_SIZE, pb = (v + 0.5 * f) * BUFFER_PIXEL_SIZE;
     float a[13], b[13];
-    float ma = 0.0, mb = 0.0;
+    float ma = 0.0, mb = 0.0, ws = 0.0;
     [unroll] for (int i = 0; i < 13; ++i)
     {
-        a[i] = tex2Dlod(sM,  float4(uv + o[i] * t + pa, 0.0, 0.0)).x;
-        b[i] = tex2Dlod(sMp, float4(uv + o[i] * t + pb, 0.0, 0.0)).x;
-        ma += a[i]; mb += b[i];
+        a[i] = tex2Dlod(sM,  float4(uv + kBaseTap[i] * t + pa, 0.0, 0.0)).x;
+        b[i] = tex2Dlod(sMp, float4(uv + kBaseTap[i] * t + pb, 0.0, 0.0)).x;
+        ma += w[i] * a[i]; mb += w[i] * b[i]; ws += w[i];
     }
-    ma /= 13.0; mb /= 13.0;
+    ma /= ws; mb /= ws;
     float e = 0.0;
-    [unroll] for (int j = 0; j < 13; ++j) e += abs((a[j] - ma) - (b[j] - mb));
-    return e / 13.0 + BASE_DPEN * abs(ma - mb);
+    [unroll] for (int j = 0; j < 13; ++j) e += w[j] * abs((a[j] - ma) - (b[j] - mb));
+    e = e / ws + BASE_DPEN * abs(ma - mb);
+    if (dz) e += BASE_DEPTH_W * (1.0 - SameSurface(dc, tex2Dlod(sDLSS5_PrevDepth, float4(uv + pb, 0.0, 0.0)).x));
+    return e;
 }
 float BaseMad(sampler2D sM, float2 uv, float tex)
 {
@@ -1859,7 +1951,7 @@ float BaseMad(sampler2D sM, float2 uv, float tex)
                   + abs(tex2Dlod(sM, float4(uv + float2(-2, -2) * t, 0.0, 0.0)).x - c) + abs(tex2Dlod(sM, float4(uv + float2(2, -2) * t, 0.0, 0.0)).x - c)
                   + abs(tex2Dlod(sM, float4(uv + float2(-2, 2) * t, 0.0, 0.0)).x - c) + abs(tex2Dlod(sM, float4(uv + float2(2, 2) * t, 0.0, 0.0)).x - c));
 }
-#define DLSS5_BASE_TRY(V) { const float2 v_ = (V); const float e_ = BaseCost(sM, sMp, uv, v_, tex); if (e_ < best_e) { best_e = e_; best = v_; } }
+#define DLSS5_BASE_TRY(V) { const float2 v_ = (V); const float e_ = BaseCost(sM, sMp, uv, v_, 0.0, tex, w, dc, dz); if (e_ < best_e) { best_e = e_; best = v_; } }
 // A step of the search or of the walk downhill has to be worth taking: a tenth better, and by
 // more than rounding. Along a pattern that looks the same a texel further on -- planks, a
 // joint, stripes -- every step is a hair better or worse than the last by accident, and a walk
@@ -1867,20 +1959,39 @@ float BaseMad(sampler2D sM, float2 uv, float tex)
 #ifndef BASE_MARGIN
     #define BASE_MARGIN 0.9
 #endif
-#define DLSS5_BASE_STEP(V) { const float2 v_ = (V); const float e_ = BaseCost(sM, sMp, uv, v_, tex); if (e_ < best_e * BASE_MARGIN - 0.1 * DLSS5_FLOW_FLOOR) { best_e = e_; best = v_; } }
+#define DLSS5_BASE_STEP(V) { const float2 v_ = (V); const float e_ = BaseCost(sM, sMp, uv, v_, 0.0, tex, w, dc, dz); if (e_ < best_e * BASE_MARGIN - 0.1 * DLSS5_FLOW_FLOOR) { best_e = e_; best = v_; } }
 // cell: this level's cell in pixels; tex: the texel matched on (a quarter of it); coarse: the
 // level above, read bilinearly (at the top: last frame's field).
 float4 BaseLevel(float2 uv, float cell, sampler2D sM, sampler2D sMp, float tex, sampler2D coarse, bool top)
 {
     const float2 px = BUFFER_PIXEL_SIZE;
     const float2 cc = px * cell * (top ? 1.0 : 2.0);
-    float2 best   = tex2Dlod(coarse, float4(uv, 0.0, 0.0)).xy;
-    float  best_e = BaseCost(sM, sMp, uv, best, tex);
+    const bool   dz = DepthUsable();
+    float w[13];
+    float dc = 0.0;
+    [unroll] for (int q = 0; q < 13; ++q) w[q] = 1.0;
+    if (dz) dc = ReShade::GetLinearizedDepth(uv);
+    if (dz && BASE_DW)
+    {
+        float dt[13];
+        [unroll] for (int q1 = 1; q1 < 13; ++q1) dt[q1] = ReShade::GetLinearizedDepth(uv + kBaseTap[q1] * px * tex);
+        // (the points come in opposite pairs: 1-2, 3-4, 5-6, 7-8, 9-12, 10-11)
+        w[1] = OnSurface(dc, dt[1], dt[2]);   w[2]  = OnSurface(dc, dt[2], dt[1]);
+        w[3] = OnSurface(dc, dt[3], dt[4]);   w[4]  = OnSurface(dc, dt[4], dt[3]);
+        w[5] = OnSurface(dc, dt[5], dt[6]);   w[6]  = OnSurface(dc, dt[6], dt[5]);
+        w[7] = OnSurface(dc, dt[7], dt[8]);   w[8]  = OnSurface(dc, dt[8], dt[7]);
+        w[9] = OnSurface(dc, dt[9], dt[12]);  w[12] = OnSurface(dc, dt[12], dt[9]);
+        w[10] = OnSurface(dc, dt[10], dt[11]); w[11] = OnSurface(dc, dt[11], dt[10]);
+    }
+    float2 best   = top ? float2(0.0, 0.0) : tex2Dlod(coarse, float4(uv, 0.0, 0.0)).xy;
+    float  best_e = BaseCost(sM, sMp, uv, best, 0.0, tex, w, dc, dz);
     if (top)
     {
-        // Nothing above: last frame's vector or none, whichever fits, and from there three
-        // texels in every direction.
-        DLSS5_BASE_TRY(float2(0.0, 0.0))
+        // Nothing above: none, or last frame's vector if that fits better, and from there three
+        // texels in every direction. (None first: on a sky or a blank wall everything fits
+        // alike, and what stood there was whatever vector had last been true of something else
+        // -- kept for good, since nothing could ever beat it.)
+        DLSS5_BASE_TRY(tex2Dlod(coarse, float4(uv, 0.0, 0.0)).xy)
         const float2 seed = best;
         [loop] for (int k = 0; k < 49; ++k)
         {
@@ -1904,44 +2015,56 @@ float4 BaseLevel(float2 uv, float cell, sampler2D sM, sampler2D sMp, float tex, 
         }
     }
     // The last fraction of a texel: half a texel either side on each axis, read symmetrically
-    // (see BaseCostSym), the minimum of the curve through the three costs, kept if the cost
+    // (see BaseCost), the minimum of the curve through the three costs, kept if the cost
     // measured there really is lower. Twice: the second time from where the first one ended.
+    // (Read from one frame only, the interpolated side is the softer of the two and every
+    // fractional vector looks a little worse than the whole one next to it.)
     [unroll] for (int fit = 0; fit < BASE_FITS; ++fit)
     {
         const float h  = 0.5 * tex;
-        const float el = BaseCostSym(sM, sMp, uv, best, float2(-h, 0.0), tex), er = BaseCostSym(sM, sMp, uv, best, float2(h, 0.0), tex);
-        const float eu = BaseCostSym(sM, sMp, uv, best, float2(0.0, -h), tex), ed = BaseCostSym(sM, sMp, uv, best, float2(0.0, h), tex);
+        const float el = BaseCost(sM, sMp, uv, best, float2(-h, 0.0), tex, w, dc, dz), er = BaseCost(sM, sMp, uv, best, float2(h, 0.0), tex, w, dc, dz);
+        const float eu = BaseCost(sM, sMp, uv, best, float2(0.0, -h), tex, w, dc, dz), ed = BaseCost(sM, sMp, uv, best, float2(0.0, h), tex, w, dc, dz);
         const float ax = el - 2.0 * best_e + er, ay = eu - 2.0 * best_e + ed;
         const float2 f = h * float2(ax > 1e-9 ? clamp(0.5 * (el - er) / ax, -1.0, 1.0) : 0.0, ay > 1e-9 ? clamp(0.5 * (eu - ed) / ay, -1.0, 1.0) : 0.0);
-        const float ef = BaseCostSym(sM, sMp, uv, best, f, tex);
+        const float ef = BaseCost(sM, sMp, uv, best, f, tex, w, dc, dz);
         if (ef < best_e) { best += f; best_e = ef; }
     }
     // "Did not move" is not one more candidate here: on anything that slides along its own
     // pattern (a striped ball rolling sideways) and under any motion of less than a texel it
     // fits as well as the truth, and as a candidate it won those ties -- a fifth of a slowly
     // panning frame standing still. It is taken only where it fits clearly BETTER than the best
-    // moving answer: a still element over a moving picture, which is what it is for. (The fine
-    // levels and the per-pixel stage decide the close calls.)
+    // moving answer: a still element over a moving picture, which is what it is for. (The
+    // per-pixel stage decides the close calls.)
     if (!top && dot(best, best) > 0.0)
     {
-        const float e0 = BaseCost(sM, sMp, uv, float2(0.0, 0.0), tex);
+        const float e0 = BaseCost(sM, sMp, uv, float2(0.0, 0.0), 0.0, tex, w, dc, dz);
         if (e0 < BASE_ZK * best_e - 0.25 * DLSS5_FLOW_FLOOR) { best = 0.0; best_e = e0; }
     }
     const float mad = BaseMad(sM, uv, tex);
     return float4(best, 1.0 - smoothstep(0.3, 0.7, best_e / (mad + DLSS5_FLOW_FLOOR)), 0.0);
 }
 // One cell, one vote: of the 3x3 around the cell, the vector the others are closest to.
+// (BASE_DV: only the cells of this cell's own surface vote. Off: see there.)
 float4 BaseAgree(sampler2D raw, float2 uv, float cell)
 {
     const float2 t = BUFFER_PIXEL_SIZE * cell;
+    const bool   dz = DepthUsable();
+    const float  dc = dz ? ReShade::GetLinearizedDepth(uv) : 0.0;
     float2 v[9];
-    [unroll] for (int k = 0; k < 9; ++k) v[k] = tex2Dlod(raw, float4(uv + float2(k % 3 - 1, k / 3 - 1) * t, 0.0, 0.0)).xy;
+    float  w[9], dn[9];
+    [unroll] for (int k = 0; k < 9; ++k)
+    {
+        const float2 at = uv + float2(k % 3 - 1, k / 3 - 1) * t;
+        v[k]  = tex2Dlod(raw, float4(at, 0.0, 0.0)).xy;
+        dn[k] = dz ? ReShade::GetLinearizedDepth(at) : 0.0;
+    }
+    [unroll] for (int k1 = 0; k1 < 9; ++k1) w[k1] = dz && BASE_DV && k1 != 4 ? OnSurface(dc, dn[k1], dn[8 - k1]) : 1.0;
     float  best = 1e30;
     float2 pick = v[4];
     [unroll] for (int i = 0; i < 9; ++i)
     {
-        float sum = 0.0;
-        [unroll] for (int j = 0; j < 9; ++j) sum += abs(v[i].x - v[j].x) + abs(v[i].y - v[j].y);
+        float sum = w[i] < 0.5 ? 1e30 : 0.0;
+        [unroll] for (int j = 0; j < 9; ++j) sum += w[j] * (abs(v[i].x - v[j].x) + abs(v[i].y - v[j].y));
         if (sum < best - 1e-6 || (i == 4 && sum <= best + 1e-6)) { best = sum; pick = v[i]; }
     }
     return float4(pick, tex2Dlod(raw, float4(uv, 0.0, 0.0)).zw);
@@ -2009,6 +2132,12 @@ float4 PS_FlowDbg(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     return float4(tex2Dlod(sDLSS5_Cam5, float4(0.5, 0.5, 0.0, 0.0)).y * 8.0, tex2Dlod(sDLSS5_Cam4, float4(0.5, 0.5, 0.0, 0.0)).w, 0.0, 0.0);
     #elif FLOWDBG == 53
     return tex2Dlod(sDLSS5_Flow3L, float4(uv, 0.0, 0.0));
+    #elif FLOWDBG == 44
+    return float4(tex2Dlod(sDLSS5_PrevDepthOK, float4(0.5, 0.5, 0.0, 0.0)).x * 0.5, tex2Dlod(sDLSS5_PrevDepthOK, float4(0.5, 0.5, 0.0, 0.0)).y * 60.0, 0.0, 0.0);
+    #elif FLOWDBG == 45
+    return float4(tex2Dlod(sDLSS5_PrevDepthOK, float4(0.5, 0.5, 0.0, 0.0)).w * 0.25, tex2Dlod(sDLSS5_PrevDepthOK, float4(0.5, 0.5, 0.0, 0.0)).z * 60.0, 0.0, 0.0);
+    #elif FLOWDBG == 46
+    return float4(ReShade::GetLinearizedDepth(uv) * 60.0, tex2Dlod(sDLSS5_PrevDepth, float4(uv, 0.0, 0.0)).x * 60.0, 0.0, 0.0);
     #elif FLOWDBG == 41
     return float4(ReShade::GetLinearizedDepth(uv) * 60.0, tex2Dlod(ReShade::DepthBuffer, float4(uv, 0.0, 0.0)).x * 60.0, 0.0, 0.0);
     #else
@@ -2066,7 +2195,7 @@ float RawDepth(float2 uv)
 // The sky, at the far plane, is then simply "infinitely far": the camera's turning and nothing else.
 // The value is brought to 0..1 over the fitted samples (PS_FitSolve keeps the range in Cam4.zw)
 // to keep the solve well conditioned; that is an affine change and alters nothing else.
-float ParallaxRaw(float2 uv) { return (CAMERA_DEPTH || GEOM_ENABLE) ? RawDepth(uv) : 0.0; }
+float ParallaxRaw(float2 uv) { return CamDepthOn() ? RawDepth(uv) : 0.0; }
 
 // The model's predicted delta-UV at uv for linear depth d.
 float2 PredictMV(float2 uv, float d)
@@ -2194,12 +2323,12 @@ float2 RefineMV(float2 uv, out float distrust, out float code, out float detail,
     if (P9MaxDiff(c0, p0) <= STATIC_NOISE && P9MaxDiff(c2, p2) <= 0.25 * STATIC_NOISE) return float2(0.0, 0.0);
 
     // The provider's own answer for this pixel.
-    float2 best = ProviderMV(uv) * BUFFER_SCREEN_SIZE;
+    float2 best = ProviderSurfaceMV(uv) * BUFFER_SCREEN_SIZE;
     code = 2.0;
     // And the camera's: what the motion fitted to the whole frame says this pixel did.
     float2 cam = best;
     bool   has_cam = false;
-    if (CAMERA_MODEL && FitIsUsable())
+    if (CamModelOn() && FitIsUsable())
     {
         cam = PredictMV(uv, ReShade::GetLinearizedDepth(uv)) * BUFFER_SCREEN_SIZE;
         has_cam = true;
@@ -2421,7 +2550,7 @@ float4 ValidateTests(float2 uv, float2 mv)
 
     // 2. Depth: previous linear depth at the reprojected spot vs the current one (sky exempt).
     const float dc = ReShade::GetLinearizedDepth(uv);
-    if (VALIDATE_DEPTH && dc < 0.999)
+    if (VALIDATE_DEPTH && DepthUsable() && dc < 0.999)
     {
         const float dp  = tex2Dlod(sDLSS5_PrevDepth, float4(puv, 0.0, 0.0)).x;
         const float tol = DEPTH_TOLERANCE * max(dc, 1e-3);
@@ -2497,12 +2626,12 @@ float2 TrackStep(float2 uv, float2 v, float cell, float lod, out float lmin, out
 // (GEOM_ENABLE, CAMERA_MODEL) are off by default.
 void PS_FitSamples(float4 vpos : SV_Position, float2 uv : TEXCOORD, out float4 A : SV_Target0, out float4 B : SV_Target1)
 {
-    if (!GEOM_ENABLE && !(CAMERA_MODEL && MV_PIPELINE == 0)) { A = 0.0; B = 0.0; return; }
+    if (!GEOM_ENABLE && !(CamModelOn() && MV_PIPELINE == 0)) { A = 0.0; B = 0.0; return; }
     float2 suv = (floor(vpos.xy) + 0.5) / float2(DLSS5_FIT_W, DLSS5_FIT_H);
     float2 mv  = ProviderMV(suv);
     bool  valid  = true;
     float weight = 1.0;
-    if (CAMERA_MODEL || GEOM_ENABLE)
+    if (CamModelOn() || GEOM_ENABLE)
     {
         // For the per-pixel stage's camera vector the samples are made exact first. A provider's
         // errors are not noise that a fit averages away -- LumeniteFX reads a 0.64 px pan as
@@ -2593,7 +2722,7 @@ void PS_FitSolve(float4 vpos : SV_Position, float2 uv : TEXCOORD,
 {
     // See PS_FitSamples. P5.z is the sample count FitIsUsable() tests against 40, so a zeroed
     // P5 also reads as "no usable fit" for anything that looks at it anyway.
-    if (!GEOM_ENABLE && !(CAMERA_MODEL && MV_PIPELINE == 0)) { P0 = 0.0; P1 = 0.0; P2 = 0.0; P3 = 0.0; P4 = 0.0; P5 = 0.0; return; }
+    if (!GEOM_ENABLE && !(CamModelOn() && MV_PIPELINE == 0)) { P0 = 0.0; P1 = 0.0; P2 = 0.0; P3 = 0.0; P4 = 0.0; P5 = 0.0; return; }
     float p[18];
     [unroll] for (int z = 0; z < 18; ++z) p[z] = 0.0;
     float inlier = 0.0, rms = 0.0, used = 0.0;
@@ -2715,7 +2844,7 @@ void PS_FitSolve(float4 vpos : SV_Position, float2 uv : TEXCOORD,
 #ifndef FITPHYS
     #define FITPHYS 1
 #endif
-        if (FITPHYS && (CAMERA_DEPTH || GEOM_ENABLE) && wk > 0.0)
+        if (FITPHYS && CamDepthOn() && wk > 0.0)
         {
             // packed upper triangle: (i, j), i <= j  ->  i * 9 - i * (i - 1) / 2 + j - i
             const float su = M[42], sv = M[44];                       // (7,7), (8,8)
@@ -2826,6 +2955,30 @@ float4 PS_Global(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     return float4(n / 144.0, changed > 0.0 ? 0.0 : min(before + 1.0, 1000.0), changed, 0.0);
 }
 
+// Is there a depth buffer, and is it this picture's? One pixel, every frame (see DEPTH_USE).
+// It has to vary across the screen, and -- carried back along the vectors found from the
+// picture alone -- it has to be what last frame's depth was there, on four fifths of a 16x9
+// grid. A frame that passes counts one up; one that fails takes fifteen off, so a cut or a
+// loading screen costs a quarter of a second and a buffer that flickers never gets there.
+float4 PS_DepthCheck(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+    float lo = 1e9, hi = -1e9, ok = 0.0, n = 0.0;
+    [loop] for (int k = 0; k < 144; ++k)
+    {
+        const float2 at = (float2(k % 16, k / 16) + 0.5) / float2(16.0, 9.0);
+        const float  d  = ReShade::GetLinearizedDepth(at);
+        lo = min(lo, d); hi = max(hi, d);
+        const float2 was = at + ProviderMV(at);
+        const float  in_ = all(was >= 0.0) && all(was <= 1.0) ? 1.0 : 0.0;
+        n  += in_;
+        ok += in_ * (SameSurface(d, tex2Dlod(sDLSS5_PrevDepth, float4(saturate(was), 0.0, 0.0)).x) > 0.5 ? 1.0 : 0.0);
+    }
+    const bool   good = hi - lo > 0.004 && n >= 40.0 && ok >= 0.8 * n;
+    const float  held = tex2Dlod(sDLSS5_PrevDepthOK, float4(0.5, 0.5, 0.0, 0.0)).x;
+    return float4(good ? min(held + 1.0, 120.0) : max(held - 15.0, 0.0), ok / max(n, 1.0), hi - lo, n);
+}
+float4 PS_DepthKeep(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target { return tex2Dlod(sDLSS5_DepthOK, float4(0.5, 0.5, 0.0, 0.0)); }
+
 float4 PS_GlobalHistory(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
     return tex2Dlod(sDLSS5_Global, float4(0.5, 0.5, 0.0, 0.0));
@@ -2852,7 +3005,7 @@ void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
     hud = 0.0;
     // Providers hand out "delta UV": previous position = uv + mv. DLSS wants the same
     // direction, in pixels.
-    const float2 flow = ProviderMV(uv);
+    const float2 flow = ProviderSurfaceMV(uv);
     float2 mv = flow;
     float  distrust = 0.0;
     static_now = 0.0;   // the geometry path does not run the static test
@@ -2865,7 +3018,7 @@ void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
         distrust = g.w;
         // Disocclusion: the geometric vector on a newly revealed pixel points into the
         // occluder's old position; the depth test catches that and asks for the current frame.
-        if (VALIDATE_DEPTH && d < 0.999)
+        if (VALIDATE_DEPTH && DepthUsable() && d < 0.999)
         {
             const float2 puv = uv + mv;
             if (all(puv >= 0.0) && all(puv <= 1.0))
@@ -2885,7 +3038,7 @@ void PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD,
         // Disocclusion, where there is a depth buffer to see it with: the vector points at a
         // different surface, so it is dropped and the pixel flagged.
         const float d = ReShade::GetLinearizedDepth(uv);
-        if (VALIDATE_DEPTH && d < 0.999 && code > 1.5)
+        if (VALIDATE_DEPTH && DepthUsable() && d < 0.999 && code > 1.5)
         {
             const float2 puv = uv + mv;
             if (all(puv >= 0.0) && all(puv <= 1.0))
@@ -3348,6 +3501,7 @@ technique DLSS5_Feed
     pass FlowDbg       { VertexShader = PostProcessVS; PixelShader = PS_FlowDbg;       RenderTarget0 = DLSS5_Flow1; }
 #endif
 #endif
+    pass DepthCheck    { VertexShader = PostProcessVS; PixelShader = PS_DepthCheck;    RenderTarget0 = DLSS5_DepthOK; }
     pass FitSamples    { VertexShader = PostProcessVS; PixelShader = PS_FitSamples;    RenderTarget0 = DLSS5_FitA; RenderTarget1 = DLSS5_FitB; }
     pass FitSolve      { VertexShader = PostProcessVS; PixelShader = PS_FitSolve;      RenderTarget0 = DLSS5_Cam0; RenderTarget1 = DLSS5_Cam1; RenderTarget2 = DLSS5_Cam2; RenderTarget3 = DLSS5_Cam3; RenderTarget4 = DLSS5_Cam4; RenderTarget5 = DLSS5_Cam5; }
     pass Changed       { VertexShader = PostProcessVS; PixelShader = PS_Changed;       RenderTarget0 = DLSS5_Changed; }
@@ -3355,6 +3509,7 @@ technique DLSS5_Feed
     pass Guides        { VertexShader = PostProcessVS; PixelShader = PS_MotionVectors; RenderTarget0 = DLSS5_MV; RenderTarget1 = DLSS5_Mask; RenderTarget2 = DLSS5_Depth; RenderTarget3 = DLSS5_StaticNow; RenderTarget4 = DLSS5_VecNow; RenderTarget5 = DLSS5_Hud; RenderTarget6 = DLSS5_Vol; }
     pass History       { VertexShader = PostProcessVS; PixelShader = PS_StoreHistory;  RenderTarget0 = DLSS5_PrevLuma; RenderTarget1 = DLSS5_PrevDepth; RenderTarget2 = DLSS5_PrevMV; RenderTarget3 = DLSS5_PrevStatic; RenderTarget4 = DLSS5_PrevHud; RenderTarget5 = DLSS5_Before; }
     pass GlobalHistory { VertexShader = PostProcessVS; PixelShader = PS_GlobalHistory; RenderTarget0 = DLSS5_PrevGlobal; }
+    pass DepthKeep     { VertexShader = PostProcessVS; PixelShader = PS_DepthKeep;     RenderTarget0 = DLSS5_PrevDepthOK; }
     DLSS5_MV_REQUEST_PASS   // Launchpad only: ask it to compute optical flow again next frame
 }
 

@@ -44,6 +44,7 @@ param(
     [double]$LogoNits = 1000,             # with -Hdr: the logo's white in nits (0 = the normal SDR-to-HDR mapping, ~600 at most)
     [int]$Logo = 0,                          # 3D scene: a still logo on black whose brightness drifts a little (scored as 3d.logo)
     [switch]$Effects,                     # 3D scene: a flame, smoke, mist and heat haze (scored apart as 3d.fx.flame / smoke / haze)
+    [int]$DepthFlicker = 0,               # 3D scene: the depth buffer is empty every Nth frame (2 = every other one)
     [switch]$NoDepth,                     # 3D scene: clear the depth buffer before Present, so ReShade has none to read (a capture)
     [switch]$Mesh,                        # 3D scene: add a perforated-metal floor panel (fine repeating dots), scored apart as 3d.mesh
     [switch]$Mv,                          # measure the VECTORS against the truth instead of the picture
@@ -176,6 +177,7 @@ if ($Full) { $args_ += '--full' }
 if ($Mv) { $args_ += '--mv' }
 if ($Mesh) { $args_ += '--mesh' }
 if ($NoDepth) { $args_ += '--no-depth' }
+if ($DepthFlicker -gt 0) { $args_ += @('--depth-flicker', $DepthFlicker) }
 if ($Effects) { $args_ += '--fx' }
 if ($Logo -gt 0) { $args_ += @('--logo', $Logo, '--logo-nits', $LogoNits) }   # 1 = grey plate with a black mark, 2 = white mark and lettering on black
 if ($Fade -gt 0) { $args_ += @('--fade', $Fade) }
