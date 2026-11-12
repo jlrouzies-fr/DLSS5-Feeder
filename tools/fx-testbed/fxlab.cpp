@@ -273,6 +273,8 @@ struct App
     int  hold_run = 0, hold_still = 0;   // --hold A,B: the scene moves for A presents, then stands still for B, over and over
     bool loop = false;      // run until Esc instead of for g.frames
     bool paused = false;    // Space, in --loop: the frame number stands still
+    int  fade = 0;          // the whole picture fades down and up again, once every this many frames (a logo fading in, a scene change)
+    int  flash = 0;         // the picture is at 45% and jumps to full for three frames, every this many frames (lightning)
     bool mesh = false;      // 3D scene: a perforated-metal floor panel in front of the camera (fine repeating dots)
     bool mvdump = false;    // the read-back is DLSS5_Feed_Debug view 10 (vectors), not a picture
     double preroll = 0.0;   // seconds of frame 0 before the clock starts (ReShade compiles its effects meanwhile)
@@ -691,6 +693,8 @@ int main(int argc, char **argv)
         else if (a == "--full")    g.full = true;
         else if (a == "--mv")      g.mvdump = true;
         else if (a == "--mesh")    g.mesh = true;
+        else if (a == "--fade")    { g.fade = atoi(v); ++i; }
+        else if (a == "--flash")   { g.flash = atoi(v); ++i; }
         else if (a == "--capture") { for (const char *s = v; *s; ) { g.captures.push_back(atoi(s)); while (*s && *s != ',') ++s; if (*s) ++s; } ++i; }
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
@@ -904,6 +908,38 @@ int main(int argc, char **argv)
             g.ctx->Draw(3, 0);
             g.ctx->OMSetBlendState(g.bs_sub.Get(), nullptr, 0xFFFFFFFF);
             g.ctx->PSSetShader(g.ps_noise_sub.Get(), nullptr, 0);
+            g.ctx->Draw(3, 0);
+            g.ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+            g.ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+        }
+
+        if (g.fade > 0 || g.flash > 0)
+        {
+            // Brightness alone changes, nothing moves: scene *= k.
+            float k = 1.0f;
+            if (g.fade > 0)  k *= 0.15f + 0.85f * (0.5f - 0.5f * cosf(6.2831853f * (shown % g.fade) / g.fade));
+            if (g.flash > 0) k *= (shown % g.flash) < 3 ? 1.0f : 0.45f;
+            static ComPtr<ID3D11BlendState> bs_mul;
+            if (!bs_mul)
+            {
+                D3D11_BLEND_DESC bl = {};
+                bl.RenderTarget[0].BlendEnable = TRUE; bl.RenderTarget[0].SrcBlend = D3D11_BLEND_ZERO; bl.RenderTarget[0].DestBlend = D3D11_BLEND_BLEND_FACTOR;
+                bl.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD; bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO; bl.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+                bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD; bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+                CHECK(g.dev->CreateBlendState(&bl, &bs_mul), "multiply blend");
+            }
+            const float kk[4] = { k, k, k, 1.0f };
+            g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g.ctx->IASetInputLayout(nullptr);
+            g.ctx->RSSetState(g.rs.Get());
+            g.ctx->RSSetViewports(1, &vp);
+            g.ctx->OMSetDepthStencilState(nullptr, 0);
+            g.ctx->VSSetShader(g.vs.Get(), nullptr, 0);
+            g.ctx->PSSetShader(g.ps_noise_sub.Get(), nullptr, 0);
+            g.ctx->PSSetConstantBuffers(0, 1, g.cb.GetAddressOf());
+            g.ctx->PSSetShaderResources(0, 1, &null_srv);
+            g.ctx->OMSetRenderTargets(1, g.scene_rtv.GetAddressOf(), nullptr);
+            g.ctx->OMSetBlendState(bs_mul.Get(), kk, 0xFFFFFFFF);
             g.ctx->Draw(3, 0);
             g.ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
             g.ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
