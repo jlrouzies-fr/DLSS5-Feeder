@@ -32,9 +32,9 @@
     exe to ReShadeApps.ini (Vulkan games only), and a Windows Defender exclusion. Each is
     run as a separate elevated step, with a UAC prompt, and only when actually needed. The
     Defender exclusion is never added without asking you first: the script tries the plain
-    download and extraction, and only if Defender removes Deep Fried Chicken (a known false
-    positive -- it hooks NVIDIA's NGX runtime with Detours, which heuristics dislike) does it
-    explain and ask.
+    download and extraction, and only if Defender removes the neural tool (a known false
+    positive -- something that stands in for NVIDIA's NGX runtime looks like a hooking tool
+    to its heuristics) does it explain and ask.
 
 .PARAMETER GameExe
     The game's real executable (not a launcher). A folder is accepted too, in which case the
@@ -47,23 +47,21 @@
     D3D8 (both via dgVoodoo2). Default: Auto.
 
 .PARAMETER Consumer
-    Which neural consumer does the DLSS 5 work: RenoDX (Krish's renodx-dlss5 add-on),
-    DFC (Deep Fried Chicken) or OptiScaler (an OptiScaler DLSS-NR fork, installed as
-    winmm.dll beside ReShade and set up to run its neural pass on the feed).
+    Which neural tool does the DLSS 5 work:
 
-    RenoDX and OptiScaler are downloaded automatically. Deep Fried Chicken is NOT: its
-    author does not publish the files, so choosing it prints its Discord invite, asks you
-    to drop Deep-Fried-Chicken-*.zip in the cache folder, and waits. Pass it non-
-    interactively with -DfcZip.
+      OptiScaler  the OptiScaler DLSS-NR fork (recommended): installed as winmm.dll beside
+                  ReShade and set up to run its neural pass on the feed.
+      RenoDX      the RenoDX DLSS5 add-on (Krish's renodx-dlss5), from the RHI repository.
 
-    Omitted, the script asks at the start; with -Yes and no choice given it takes RenoDX,
-    which is the only one it can fetch unattended.
+    Both are downloaded automatically. Omitted, the script asks at the start; with -Yes and
+    no choice given it takes OptiScaler.
 
 .PARAMETER OptiScalerFork
-    With -Consumer OptiScaler: which DLSS-NR fork. wilsjo2 (OptiScaler-DLSSNR-PreSR-Multipass:
-    actively maintained, no forwarder DLL, pre-SR and multipass options) or Dagherbou
-    (OptiScaler_DLSSNR, the original; ships nvngx.dll_dlssnr.dll, its forwarder). Both are
-    supported by the feeder. Omitted, the script asks; with -Yes it takes wilsjo2.
+    With -Consumer OptiScaler: which DLSS-NR fork. Feeder (the default, never asked) is this
+    project's own fork, jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass: wilsjo2's fork plus the
+    fixes this project needed, and the one the DLSS 5 Feeder menu is tested with. wilsjo2
+    (OptiScaler-DLSSNR-PreSR-Multipass, the upstream of ours) and Dagherbou (OptiScaler_DLSSNR,
+    the original; ships nvngx.dll_dlssnr.dll, its forwarder) are still handled when named.
 
 .PARAMETER HelperMode
     64-bit games only: run NGX in the host64\ helper process instead of inside the game (the
@@ -83,12 +81,12 @@
 .PARAMETER LocalFiles
     A folder holding any of the pieces you already have; each is used instead of a
     download when found there (matched by name): DLSS5-Feeder-*.zip,
-    ReShade_Setup_*_Addon.exe, Deep-Fried-Chicken*.zip, nvngx_dlssnr.dll, nvngx_dlss.dll,
+    ReShade_Setup_*_Addon.exe, nvngx_dlssnr.dll, nvngx_dlss.dll,
     renodx-dlss5*.addon64, OptiScaler-NR-*.zip / OptiScaler-DLSSNR*.zip, LumeniteFX*.zip, dgVoodoo2_*.zip,
     ReShade.fxh, ReShadeUI.fxh, DrawText.fxh. The NGX runtimes and the RenoDX add-on are
     also accepted as the .zip they are published in.
 
-.PARAMETER FeederZip, DfcZip, DlssNrDll, DlssDll, RenoDxAddon, OptiScalerZip, ReShadeSetup, LumeniteZip, DgVoodooZip
+.PARAMETER FeederZip, DlssNrDll, DlssDll, RenoDxAddon, OptiScalerZip, ReShadeSetup, LumeniteZip, DgVoodooZip
     Explicit path or URL for one piece, overriding both -LocalFiles and the defaults.
 
 .PARAMETER Prerelease
@@ -141,7 +139,7 @@ param(
     [ValidateSet('Ask', 'DFC', 'RenoDX', 'OptiScaler')]
     [string] $Consumer = 'Ask',
 
-    [ValidateSet('Ask', 'wilsjo2', 'Dagherbou')]
+    [ValidateSet('Ask', 'Feeder', 'wilsjo2', 'Dagherbou')]
     [string] $OptiScalerFork = 'Ask',
 
     [ValidateSet('Ask', 'No', 'Yes')]
@@ -212,14 +210,21 @@ $Sources = @{
     DlssNr          = 'https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.8.Lecram/nvngx_dlssnr_310.8.Lecram.zip'
     Dlss            = 'https://github.com/RankFTW/rhi-repo/releases/download/dlss-310.9.1/nvngx_dlss_310.9.1.zip'
     RenoDxDlss5     = 'https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-7.0.0-rc8/renodx-dlss5_7.0.0-rc8.zip'
-    # Two DLSS-NR forks, both supported; see -OptiScalerFork. Each names its release zip
-    # differently, and wilsjo2 also publishes an RTX 40 MFG variant that the pattern skips.
-    OptiScalerReleases = @{ wilsjo2 = 'https://api.github.com/repos/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases'
+    # The DLSS-NR forks; see -OptiScalerFork. Feeder is this project's own fork and the one that
+    # is installed unless another is named. It and wilsjo2 name their release zip alike
+    # (wilsjo2 also publishes an RTX 40 MFG variant that the pattern skips), so a download of
+    # ours is cached under a prefix: the same version number from the other fork must never be
+    # taken for it.
+    OptiScalerReleases = @{ Feeder = 'https://api.github.com/repos/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases'
+                            wilsjo2 = 'https://api.github.com/repos/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases'
                             Dagherbou = 'https://api.github.com/repos/Dagherbou/OptiScaler_DLSSNR/releases' }
-    OptiScalerHome     = @{ wilsjo2 = 'https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases'
+    OptiScalerHome     = @{ Feeder = 'https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases'
+                            wilsjo2 = 'https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases'
                             Dagherbou = 'https://github.com/Dagherbou/OptiScaler_DLSSNR/releases' }
-    OptiScalerAsset    = @{ wilsjo2 = '(?i)^OptiScaler-NR-v[\d.]+\.zip$'; Dagherbou = '(?i)^OptiScaler-DLSSNR-.*\.zip$' }
-    OptiScalerLocal    = @{ wilsjo2 = 'OptiScaler-NR-*.zip'; Dagherbou = 'OptiScaler-DLSSNR*.zip' }
+    OptiScalerAsset    = @{ Feeder = '(?i)^OptiScaler-NR-v[\d.]+\.zip$'; wilsjo2 = '(?i)^OptiScaler-NR-v[\d.]+\.zip$'; Dagherbou = '(?i)^OptiScaler-DLSSNR-.*\.zip$' }
+    OptiScalerLocal    = @{ Feeder = 'OptiScaler-NR-*.zip'; wilsjo2 = 'OptiScaler-NR-*.zip'; Dagherbou = 'OptiScaler-DLSSNR*.zip' }
+    OptiScalerCache    = @{ Feeder = 'DLSS5Feeder-'; wilsjo2 = ''; Dagherbou = '' }
+    OptiScalerName     = @{ Feeder = 'DLSS5-Feeder fork'; wilsjo2 = 'wilsjo2'; Dagherbou = 'Dagherbou' }
     DfcDiscord      = 'https://discord.gg/g2v2XGqvR'
     RenoDxDiscord   = 'https://discord.com/invite/renodx'
 }
@@ -1564,61 +1569,35 @@ New-DirSafe $script:Cache
 Write-Chunk '  Cache   ' 'DarkGray' -NoNewline
 Write-Host $script:Cache
 
-# Which neural consumer? Asked here, before anything is downloaded, because the answer
-# decides what gets fetched and what must never be installed beside it.
-# RenoDX is first and is the default: it is the only one of the three this installer can
-# actually fetch. Deep Fried Chicken is not published anywhere public -- its author does not
-# want the files mirrored -- so choosing it means a guided manual step rather than a download,
-# and making it the default meant every unattended run stopped to ask a human (#75).
+# Which neural tool? Asked here, before anything is downloaded, because the answer decides
+# what gets fetched and what must never be installed beside it. Two are offered, and both are
+# downloaded for you: this project's OptiScaler DLSS-NR fork, first and the default, and the
+# RenoDX DLSS5 add-on from the RHI repository.
 if ($Consumer -eq 'Ask') {
     if ($Yes) {
-        $Consumer = 'RenoDX'
+        $Consumer = 'OptiScaler'
     }
     else {
         Write-Host ''
-        Write-Chunk '  Neural consumer -- the add-on that turns the feed into neural rendering.' 'White'
-        Write-Chunk '   1. RenoDX DLSS 5       ' 'Gray' -NoNewline
-        Write-Chunk 'recommended; Krish''s renodx-dlss5 add-on, downloaded for you' 'DarkGray'
-        Write-Chunk '   2. Deep Fried Chicken  ' 'Gray' -NoNewline
-        Write-Chunk 'negotiates with the feeder over its own interop ABI -- you must fetch it by hand from its Discord' 'DarkGray'
-        Write-Chunk '   3. OptiScaler DLSS-NR  ' 'Gray' -NoNewline
-        Write-Chunk 'an OptiScaler fork with the neural pass built in: it takes the feed''s DLSS call, upscales, then runs the pass (menu on Insert)' 'DarkGray'
-        Write-Chunk '  Exactly one of them may be installed: each goes inert, or misbehaves, beside the others.' 'DarkGray'
-        Write-Chunk '  Which one? [1/2/3, Enter for 1] ' 'Cyan' -NoNewline
-        try { $a = Read-Host } catch { $a = '' }
-        switch ($a.Trim()) {
-            '2'          { $Consumer = 'DFC' }
-            'dfc'        { $Consumer = 'DFC' }
-            'chicken'    { $Consumer = 'DFC' }
-            '3'          { $Consumer = 'OptiScaler' }
-            'optiscaler' { $Consumer = 'OptiScaler' }
-            default      { $Consumer = 'RenoDX' }
-        }
-    }
-}
-# Which DLSS-NR fork (issue #126). wilsjo2's is the maintained one and needs no forwarder DLL;
-# Dagherbou's is the original the feeder was first measured against. The feeder handles both.
-if ($Consumer -eq 'OptiScaler' -and $OptiScalerFork -eq 'Ask') {
-    if ($Yes) {
-        $OptiScalerFork = 'wilsjo2'
-    }
-    else {
-        Write-Host ''
-        Write-Chunk '  Which OptiScaler DLSS-NR fork?' 'White'
-        Write-Chunk '   1. wilsjo2    ' 'Gray' -NoNewline
-        Write-Chunk 'OptiScaler-DLSSNR-PreSR-Multipass: actively maintained; no forwarder DLL; pre-SR, multipass and finished-picture options' 'DarkGray'
-        Write-Chunk '   2. Dagherbou  ' 'Gray' -NoNewline
-        Write-Chunk 'OptiScaler_DLSSNR: the original fork; ships its nvngx.dll_dlssnr.dll forwarder' 'DarkGray'
+        Write-Chunk '  Neural tool -- what turns the feed into neural rendering. Both are downloaded for you.' 'White'
+        Write-Chunk '   1. OptiScaler DLSS-NR  ' 'Gray' -NoNewline
+        Write-Chunk 'recommended; this project''s OptiScaler fork with the neural pass built in' 'DarkGray'
+        Write-Chunk '   2. RenoDX DLSS5        ' 'Gray' -NoNewline
+        Write-Chunk 'Krish''s renodx-dlss5 add-on, from the RHI repository' 'DarkGray'
+        Write-Chunk '  Only one of them is installed: each goes inert, or misbehaves, beside the other.' 'DarkGray'
         Write-Chunk '  Which one? [1/2, Enter for 1] ' 'Cyan' -NoNewline
         try { $a = Read-Host } catch { $a = '' }
         switch ($a.Trim()) {
-            '2'         { $OptiScalerFork = 'Dagherbou' }
-            'dagherbou' { $OptiScalerFork = 'Dagherbou' }
-            default     { $OptiScalerFork = 'wilsjo2' }
+            '2'      { $Consumer = 'RenoDX' }
+            'renodx' { $Consumer = 'RenoDX' }
+            default  { $Consumer = 'OptiScaler' }
         }
     }
 }
-$consumerLabel = switch ($Consumer) { 'DFC' { 'Deep Fried Chicken' } 'RenoDX' { 'RenoDX DLSS 5' } default { 'OptiScaler DLSS-NR (' + $OptiScalerFork + ')' } }
+# Which DLSS-NR fork: this project's own, unless -OptiScalerFork names another (issue #126:
+# wilsjo2's, which ours is built on, and Dagherbou's, the original, are both still handled).
+if ($Consumer -eq 'OptiScaler' -and $OptiScalerFork -eq 'Ask') { $OptiScalerFork = 'Feeder' }
+$consumerLabel = switch ($Consumer) { 'DFC' { 'Deep Fried Chicken' } 'RenoDX' { 'RenoDX DLSS 5' } default { 'OptiScaler DLSS-NR (' + $Sources.OptiScalerName[$OptiScalerFork] + ')' } }
 Write-Chunk '  Neural  ' 'DarkGray' -NoNewline
 Write-Host $consumerLabel
 if ($LocalFiles) {
@@ -2019,7 +1998,8 @@ else {
     # Each fork ships as a GitHub release (about 130 MB; nvngx_dlssnr.dll is not in either).
     # Newest release the maintainer marks as such (or the newest of all with -Prerelease, the
     # way the feeder's own release is found above); offline, the newest cached copy.
-    $optiLabel = 'OptiScaler DLSS-NR (' + $OptiScalerFork + ')'
+    $optiLabel = 'OptiScaler DLSS-NR (' + $Sources.OptiScalerName[$OptiScalerFork] + ')'
+    $optiCache = $Sources.OptiScalerCache[$OptiScalerFork]
     $optiLocal = $Sources.OptiScalerLocal[$OptiScalerFork]
     if ($OptiScalerZip) {
         $optiPath = Resolve-Piece -Label $optiLabel -Explicit $OptiScalerZip -CacheName 'OptiScaler-DLSSNR-explicit.zip'
@@ -2045,11 +2025,11 @@ else {
                 catch { }
             }
             if ($assetUrl) {
-                $dest = Join-Safe $script:Cache $assetName
+                $dest = Join-Safe $script:Cache ($optiCache + $assetName)
                 if (Get-Download -Url $assetUrl -Dest $dest -Label $optiLabel) { $optiPath = $dest }
             }
             else {
-                $hit = Get-ChildItem -LiteralPath $script:Cache -File -Filter $optiLocal -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                $hit = Get-ChildItem -LiteralPath $script:Cache -File -Filter ($optiCache + $optiLocal) -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
                 if ($hit) { $optiPath = $hit.FullName; Report -Status 'Warn' -Text ('GitHub unreachable; using the cached OptiScaler release ' + $hit.Name) }
             }
         }
@@ -2754,7 +2734,7 @@ else {
                 Start-Sleep -Milliseconds 1000
                 $dll = Join-Safe $consumerDir $optiName
                 if (-not (Test-FileHere $dll)) { throw ($optiName + ' vanished right after extraction -- Defender? Check Windows Security > Protection history.') }
-                $t = 'OptiScaler DLSS-NR (' + $OptiScalerFork + ') installed as ' + $optiName
+                $t = 'OptiScaler DLSS-NR (' + $Sources.OptiScalerName[$OptiScalerFork] + ') installed as ' + $optiName
                 if ($iniKept) { $t += ' (existing OptiScaler.ini kept)' }
                 $beside = if ($zipForwarder) { 'the neural forwarder nvngx.dll_dlssnr.dll and the OptiScaler\ runtime folder beside it' }
                           else { 'the OptiScaler\ runtime folder beside it; this build needs no forwarder DLL (feature 18 goes through the driver''s NGX core)' }
