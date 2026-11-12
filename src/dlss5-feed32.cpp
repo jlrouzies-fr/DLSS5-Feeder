@@ -63,6 +63,7 @@ static void FeedOnVkDeviceGeneration();
 #include "feed_ldr.h"       // loader notifications: vulkan-1.dll or ReShade unloading under us (#135)
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 #include "feed_opti.h"      // OptiScaler DLSS-NR: only the file scan and the ini reader are used here (it lives in host64 too)
+#include "feed_panel.h"     // the feeder's own in-game panel, the same in every build of the add-on
 #include "feed_depthsrc.h"  // which buffer Generic Depth binds, against the back buffer and any MSAA depth (#145)
 
 #define FEED_VERSION "1.19.1-beta.1"
@@ -616,7 +617,8 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "cast_key")       == 0) next.cast_key       = (iv > 0 && iv < 256) ? iv : 0;
         else if (_stricmp(key, "cast_mods")      == 0) next.cast_mods      = iv < 0 ? 0 : iv & 7;
         else if (_stricmp(key, "cast_scale")     == 0) next.cast_scale     = iv < 25 ? 25 : iv > 300 ? 300 : iv;
-        else if (_stricmp(key, "cast_mode")      == 0) next.cast_mode      = iv == 1 ? 1 : 0;
+        else if (_stricmp(key, "cast_mode")      == 0) next.cast_mode      = (iv >= 0 && iv <= 2) ? iv : 0;   // 2 = side panel cast (prototype)
+        else if (FeedPanelCfg(key, iv)) {}                     // panel_key / panel_mods / panel_side (feed_panel.h)
         else if (_stricmp(key, "cast_anchor")    == 0) next.cast_anchor    = iv < 0 ? 0 : iv > 3 ? 3 : iv;
         else if (_stricmp(key, "host_creates")   == 0) next.host_creates   = iv == 1 ? 1 : 0;
         else if (_stricmp(key, "wine_fence_import") == 0) next.wine_fence_import = iv == 1 ? 1 : 0;
@@ -1293,6 +1295,41 @@ static bool       g_cast_placed;          // the host window was moved under the
 static bool       g_cast_fullscreen;      // the game's swapchain went exclusive fullscreen
 static bool       g_host_hidden;          // the host was started with --hide (host_window=2, or exclusive
                                           // fullscreen at start): there is no window to cast from
+// PROTOTYPE -- the side panel (cast_mode=2). The same shared panel texture as cast_mode=1,
+// laid out as an overlay of its own instead of a picture in a corner: the full height of the
+// game window at one edge, drawn 1:1 (the host is started at exactly that size), under a
+// header this add-on draws, over a dimmed game, sliding in and out. The host is started with
+// NO window on screen (--hide --side WxH): nothing of it goes through the desktop compositor,
+// so there is nothing for an exclusive-fullscreen swapchain to object to (#109, #99, #77).
+static bool       g_host_side;            // the host was started with --side
+static float      g_side_t;               // the slide: 0 = out of sight, 1 = fully in
+static ULONGLONG  g_side_tick;            // when g_side_t was last stepped; 0 = not animating
+static const int  kSideHeader = 34;       // the header strip above the panel, game pixels
+
+// The host window size a side panel needs in a game client area of this size: the panel
+// (38% of the width, within 480..640) plus the 96 px strip CastLayout crops, by the height
+// left under the header. Clamped as the host clamps, so the two never disagree.
+static SIZE CastSideWant(const RECT &gc)
+{
+    int pw = static_cast<int>(gc.right * 0.38f);
+    if (pw < 480) pw = 480; else if (pw > 640) pw = 640;
+    int ph = gc.bottom - kSideHeader;
+    if (ph < 300) ph = 300; else if (ph > 8000) ph = 8000;
+    return { (pw + 96) & ~1, ph & ~1 };
+}
+static void CastSideResize(int w, int h);   // below, with the other pipe writers
+static void PanelSetup();   // below: the feeder panel's hooks into this build
+
+static void CastSideStep(bool in)
+{
+    const ULONGLONG now = GetTickCount64();
+    float dt = g_side_tick == 0 ? 0.0f : static_cast<float>(now - g_side_tick) / 180.0f;   // 180 ms end to end
+    if (dt > 0.34f) dt = 0.34f;   // a hitch must not swallow the whole slide
+    g_side_tick = now;
+    g_side_t += in ? dt : -dt;
+    if (g_side_t < 0.0f) g_side_t = 0.0f; else if (g_side_t > 1.0f) g_side_t = 1.0f;
+}
+
 static POINT      g_cast_last = { -1, -1 };
 static POINT      g_cast_cursor = { -1, -1 };   // the mouse position this frame, game client coordinates
 // Castlevania: Lords of Shadow 2 reads the mouse in a way ReShade x86 never sees, so the
@@ -1331,6 +1368,9 @@ static bool       g_cast_close_hover;     // the cursor is over the panel's own 
 static const int kCastCloseSize = 28;
 static RECT CastCloseRect()
 {
+    // Side panel: the right end of the header strip, which sits above the panel rect.
+    if (g_host_side && g_cfg.cast_mode == 2)
+        return { g_cast_rect.right - kSideHeader, g_cast_rect.top - kSideHeader, g_cast_rect.right, g_cast_rect.top - 2 };
     const int s = static_cast<int>(kCastCloseSize * (g_cast_scale > 1.0f ? g_cast_scale : 1.0f));
     return { g_cast_rect.right - s, g_cast_rect.top, g_cast_rect.right, g_cast_rect.top + s };
 }
@@ -1685,6 +1725,34 @@ static void CastFlushInput()
         Log("[feed32] cast: released %d key(s) and %d button(s) still held in the host", keys, buttons);
 }
 
+// PROTOTYPE (side panel). The host's ReShade does not read the coordinates this add-on puts in
+// a forwarded mouse message: it takes the position of EVERY input message from MSG.pt, the
+// real cursor at the moment the message was posted, and turns that into its own client
+// coordinates (ReShade input_windows.cpp, handle_window_message). So the host's window --
+// which is never shown -- is kept where the real cursor is over the same point of its client
+// area as it is over the panel in the game: its client origin sits on the panel's top-left
+// corner on screen. The panel is 1:1, so one placement is right for every message.
+static void CastSidePlaceHost(HWND game, const RECT &panel)
+{
+    static const bool off = GetEnvironmentVariableA("DLSS5_FEED_SIDE_NOPLACE", nullptr, 0) != 0;   // lab A/B only
+    if (off || g_cast_hwnd == nullptr) return;
+    POINT want = { panel.left, panel.top }, have = { 0, 0 };
+    RECT  wr = {};
+    if (!ClientToScreen(game, &want) || !ClientToScreen(g_cast_hwnd, &have) || !GetWindowRect(g_cast_hwnd, &wr)) return;
+    if (have.x == want.x && have.y == want.y) return;
+    // Asynchronous: the host's thread applies it at its next pump, ahead of the messages
+    // posted after it, and this thread never waits on another process.
+    SetWindowPos(g_cast_hwnd, nullptr, wr.left + (want.x - have.x), wr.top + (want.y - have.y), 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    static int said = 0;
+    if (said < 2)
+    {
+        ++said;
+        Log("[feed32] cast: side panel: the host's unseen window is placed with its client origin at screen %ld,%ld "
+            "(the panel's corner), so the real cursor maps onto the panel 1:1", want.x, want.y);
+    }
+}
+
 // Finds the host window, registers the thumbnail on the game window and lays the panel
 // out: right-aligned at the top, the host's tab column at 1:1 or shrunk to fit the game
 // client area. Returns false when there is nothing on screen (status says why).
@@ -1692,7 +1760,19 @@ static bool CastLayout()
 {
     HWND game = g.runtime != nullptr ? static_cast<HWND>(g.runtime->get_hwnd()) : nullptr;
     if (game == nullptr || !IsWindow(game)) { strcpy_s(g_cast_status, "no game window"); return false; }
-    if (g_host_hidden)
+    const bool side = g_host_side && g_cfg.cast_mode == 2;
+    if (g_cfg.cast_mode == 2 && !g_host_side)
+    {
+        strcpy_s(g_cast_status, g.is_d3d10 ? "the side panel is not available on Direct3D 10"
+                                           : "the side panel needs the host started for it: restart the host");
+        return false;
+    }
+    if (g_host_side && !side)
+    {
+        strcpy_s(g_cast_status, "the host was started for the side panel (no window): restart the host for this mode");
+        return false;
+    }
+    if (g_host_hidden && !side)
     {
         strcpy_s(g_cast_status, g_cfg.host_window == 2
             ? "the host runs without a window (host_window=2); nothing to cast"
@@ -1729,7 +1809,7 @@ static bool CastLayout()
             }
         }
     }
-    if (!g_cast_placed)
+    if (!g_cast_placed && !side)   // the side panel's host has no window on screen to place
     {
         // Under the game window, at its position: on a second monitor the parked host
         // window would otherwise be in plain view. Never activated, never resized.
@@ -1741,7 +1821,7 @@ static bool CastLayout()
 
     // D3D10 has no texture mode -- the panel view cannot cross into the game's ImGui --
     // so the cast is always the compositor thumbnail there.
-    const bool texture = g_cfg.cast_mode == 1 && !g.is_d3d10;
+    const bool texture = g_cfg.cast_mode >= 1 && !g.is_d3d10;
     if (texture != g_cast_texture)   // the mode changed while shown: start over in the other one
     {
         CastRelease();
@@ -1780,8 +1860,37 @@ static bool CastLayout()
     const bool  bottom = g_cfg.cast_anchor >= 2;
     const LONG  dx = right  ? gc.right  - dw : 0;
     const LONG  dy = bottom ? gc.bottom - dh : 0;
-    const RECT dest = { dx, dy, dx + dw, dy + dh };
+    RECT dest = { dx, dy, dx + dw, dy + dh };
 
+    if (side)
+    {
+        // The game window changed size since the host was started for it: have the host
+        // follow (its window, swapchain and the panel texture), exactly as the sliders do.
+        const SIZE want = CastSideWant(gc);
+        if ((static_cast<LONG>(g.panel_w) != want.cx || static_cast<LONG>(g.panel_h) != want.cy) &&
+            GetTickCount64() >= g_panel_poll_quiet_until)
+        {
+            CastSideResize(want.cx, want.cy);
+            strcpy_s(g_cast_status, "resizing the side panel to the game window");
+            return false;
+        }
+        // 1:1, never scaled: under the header, the full height, at the left or right edge.
+        // A panel taller than the room (a resize still on its way) is cropped, not squeezed.
+        const LONG pw = src.cx, ph = src.cy < gc.bottom - kSideHeader ? src.cy : gc.bottom - kSideHeader;
+        const LONG px = right ? gc.right - pw : 0;
+        dest = { px, kSideHeader, px + pw, kSideHeader + ph };
+        if (g_cast_dest != game) { g_cast_dest = game; Log("[feed32] cast: side panel on game window %p", (void *)game); }
+        if (!EqualRect(&dest, &g_cast_rect))
+            Log("[feed32] cast: side panel %ldx%ld at the %s edge, 1:1 from the host's %ux%u frame",
+                pw, ph, right ? "right" : "left", g.panel_w, g.panel_h);
+        CastSidePlaceHost(game, dest);
+        g_cast_rect  = dest;
+        g_cast_src   = { pw, ph };
+        g_cast_scale = 1.0f;
+        g_cast_shown = true;
+        sprintf_s(g_cast_status, "side panel shown at %ldx%ld%s", pw, ph, g_cast_hover ? " (cursor over it)" : "");
+        return true;
+    }
     if (texture)
     {
         // Nothing to register: OnOverlay draws the texture at g_cast_rect every frame.
@@ -2088,7 +2197,7 @@ static void CastTick(reshade::api::effect_runtime *rt)
         // With the host started --hide there is no window to cast. The key used to toggle
         // anyway and log "cast: shown (key)" over nothing at all, which reads as a panel that
         // should have appeared (#118). Say why, once, and leave the state alone.
-        if (g_host_hidden && HostAlive())
+        if (g_host_hidden && !g_host_side && HostAlive())
         {
             static bool said = false;
             if (!said)
@@ -2106,8 +2215,31 @@ static void CastTick(reshade::api::effect_runtime *rt)
         }
     }
 
+    // The feeder's own panel (feed_panel.h) has its own shortcut. While it is up it owns the
+    // input, and the cast -- the other way to reach a tool's settings -- stands down.
+    PanelSetup();
+    FeedPanelTick(rt);
+    if (FeedPanelVisible())
+    {
+        if (g_cast_thumb != nullptr || g_cast_shown) CastRelease();
+        return;
+    }
+    const bool side = g_host_side && g_cfg.cast_mode == 2;
     if (!g_cast_wanted)
     {
+        // The side panel slides out before it goes: it stays drawn, takes no input and gives
+        // the game its mouse and keyboard back at once.
+        if (side && g_cast_shown && g_side_t > 0.0f && HostAlive())
+        {
+            CastSideStep(false);
+            CastFlushInput();
+            g_cast_hover    = false;
+            g_cast_captured = false;
+            g_cast_cursor   = { -1, -1 };
+            if (g_side_t > 0.0f) { strcpy_s(g_cast_status, "side panel closing"); return; }
+        }
+        g_side_t    = 0.0f;
+        g_side_tick = 0;
         if (g_cast_thumb != nullptr || g_cast_shown) CastRelease();
         strcpy_s(g_cast_status, "hidden");
         return;
@@ -2115,10 +2247,13 @@ static void CastTick(reshade::api::effect_runtime *rt)
     if (!HostAlive())
     {
         CastHostLost();
+        g_side_t    = 0.0f;
+        g_side_tick = 0;
         strcpy_s(g_cast_status, "the host is not running");
         return;
     }
     if (!CastLayout()) return;
+    if (side) CastSideStep(true);
     CastInput(rt);
 }
 
@@ -2190,6 +2325,7 @@ static void OnOverlay(reshade::api::effect_runtime *rt)
         rt->get_mouse_cursor_position(&wx, &wy, &w);
         if (w != 0) g_cast_wheel_pending = w;
     }
+    if (FeedPanelVisible()) { FeedPanelDraw(rt); return; }
     if (!g_cast_shown)
     {
         if (g_cast_hid_cursor) { ImGui::GetIO().MouseDrawCursor = true; g_cast_hid_cursor = false; }
@@ -2197,12 +2333,43 @@ static void OnOverlay(reshade::api::effect_runtime *rt)
     }
     ImDrawList *dl = ImGui::GetForegroundDrawList(nullptr);
     if (dl == nullptr) return;
+    // Side panel: the game dims behind it and a header strip of our own sits above the cast
+    // picture; all of it, the picture included, rides the slide offset. g_cast_rect stays
+    // the settled rectangle -- it is what input is mapped against and what the host is told.
+    const bool side = g_cast_texture && g_host_side && g_cfg.cast_mode == 2;
+    float side_dx = 0.0f;
+    if (side)
+    {
+        const bool  right = g_cfg.cast_anchor == 1 || g_cfg.cast_anchor == 3;
+        const float u = 1.0f - g_side_t, ease = 1.0f - u * u * u;
+        const float w = static_cast<float>(g_cast_rect.right - g_cast_rect.left);
+        side_dx = (right ? w : -w) * (1.0f - ease);
+        const ImVec2 disp = ImGui::GetIO().DisplaySize;
+        dl->AddRectFilled(ImVec2(0.0f, 0.0f), disp, IM_COL32(0, 0, 0, static_cast<int>(120.0f * ease)));
+        const ImVec2 ha(g_cast_rect.left + side_dx, 0.0f), hb(g_cast_rect.right + side_dx, static_cast<float>(kSideHeader));
+        dl->AddRectFilled(ha, hb, IM_COL32(18, 18, 22, 255));
+        dl->AddRectFilled(ImVec2(ha.x, hb.y - 2.0f), hb, IM_COL32(118, 185, 0, 255));
+        const float fs = ImGui::GetFontSize(), ty = (kSideHeader - 2.0f - fs) * 0.5f;
+        dl->AddText(ImVec2(ha.x + 12.0f, ty), IM_COL32(235, 235, 240, 255), "DLSS 5 neural rendering");
+        char hint[112] = "", key[96];
+        if (g_cfg.cast_key > 0)
+        {
+            CastKeyCombo(g_cfg.cast_key, g_cfg.cast_mods, key, sizeof(key));
+            sprintf_s(hint, "%s or Esc closes", key);
+        }
+        else strcpy_s(hint, "Esc closes");
+        const ImVec2 hs = ImGui::CalcTextSize(hint, nullptr, false, -1.0f);
+        dl->AddText(ImVec2(hb.x - kSideHeader - 10.0f - hs.x, ty), IM_COL32(150, 150, 158, 255), hint);
+        // The inner edge, so the panel reads as a sheet over the game rather than a cut-out.
+        const float ex = right ? ha.x : hb.x;
+        dl->AddLine(ImVec2(ex, 0.0f), ImVec2(ex, disp.y), IM_COL32(118, 185, 0, 160), 1.0f);
+    }
     if (g_cast_texture && !g.is_d3d10 && g.panel_srv != nullptr && g.panel_w != 0)
     {
         // ReShade's D3D11 ImGui backend takes the view pointer itself as the texture id
         // (the same convention as the rtv.handle casts in FeedFrame11).
-        const ImVec2 pmin(static_cast<float>(g_cast_rect.left), static_cast<float>(g_cast_rect.top));
-        const ImVec2 pmax(static_cast<float>(g_cast_rect.right), static_cast<float>(g_cast_rect.bottom));
+        const ImVec2 pmin(static_cast<float>(g_cast_rect.left) + side_dx, static_cast<float>(g_cast_rect.top));
+        const ImVec2 pmax(static_cast<float>(g_cast_rect.right) + side_dx, static_cast<float>(g_cast_rect.bottom));
         const ImVec2 uv1(static_cast<float>(g_cast_src.cx) / static_cast<float>(g.panel_w),
                          static_cast<float>(g_cast_src.cy) / static_cast<float>(g.panel_h));
         dl->AddImage(static_cast<ImTextureID>(reinterpret_cast<uintptr_t>(g.panel_srv)), pmin, pmax, ImVec2(0.0f, 0.0f), uv1);
@@ -2210,7 +2377,7 @@ static void OnOverlay(reshade::api::effect_runtime *rt)
     // The close button, on top of everything.
     {
         const RECT c = CastCloseRect();
-        const ImVec2 a(static_cast<float>(c.left), static_cast<float>(c.top)), b(static_cast<float>(c.right), static_cast<float>(c.bottom));
+        const ImVec2 a(static_cast<float>(c.left) + side_dx, static_cast<float>(c.top)), b(static_cast<float>(c.right) + side_dx, static_cast<float>(c.bottom));
         dl->AddRectFilled(a, b, g_cast_close_hover ? IM_COL32(200, 40, 40, 230) : IM_COL32(30, 30, 30, 200));
         dl->AddRect(a, b, IM_COL32(255, 255, 255, 160));
         const float pad = (b.x - a.x) * 0.3f;
@@ -2376,6 +2543,7 @@ static void DetectChickenHost()
 static bool   g_opti_host            = false;
 static bool   g_opti_host_nr         = false;   // a DLSS-NR fork, not upstream OptiScaler
 static bool   g_opti_host_direct     = false;   // ... the direct-runtime generation (no forwarder; see feed_opti.h)
+static bool   g_opti_host_live       = false;   // ... a build that re-reads [DlssNr] while it runs (the bridge panel then needs no restart)
 static char   g_opti_host_module[64] = "";
 static char   g_opti_ini_path[MAX_PATH];
 static UINT64 g_opti_ini_read_at     = 0;
@@ -2400,6 +2568,7 @@ static void DetectOptiHost()
         if (!OptiIsBuild(path)) continue;
         g_opti_host = true;
         OptiClassify(path, &g_opti_host_nr, &g_opti_host_direct);
+        g_opti_host_live = g_opti_host_nr && OptiFileHasLiteral(path, OPTI_LIVE_LITERAL);
         strcpy_s(g_opti_host_module, name);
         break;
     }
@@ -2539,9 +2708,29 @@ static bool HostWorkerConnect(HANDLE ev)
     // host_window=3 is the way out of that for a swapchain that only CLAIMS fullscreen: a
     // wrapper presenting into a borderless window (dgVoodoo, #118). The add-on cannot tell
     // the two apart from the fullscreen state alone, so the user says so.
-    const bool hide = g_cfg.host_window == 2 || (g_cfg.host_window == 0 && g_cast_fullscreen);
+    // PROTOTYPE, cast_mode=2: the side panel's host never has a window on screen, fullscreen
+    // or not, and is told the size the panel will be drawn at so its frame is 1:1 with it.
+    char side_arg[48] = "";
+    bool side = false;
+    if (g_cfg.cast_mode == 2 && !g.is_d3d10 && g.runtime != nullptr)
+    {
+        RECT gc = {};
+        HWND game = static_cast<HWND>(g.runtime->get_hwnd());
+        if (game != nullptr && GetClientRect(game, &gc) && gc.right >= 640 && gc.bottom >= 360)
+        {
+            const SIZE want = CastSideWant(gc);
+            sprintf_s(side_arg, " --side %ldx%ld", want.cx, want.cy);
+            side = true;
+        }
+    }
+    g_host_side = side;
+    const bool hide = side || g_cfg.host_window == 2 || (g_cfg.host_window == 0 && g_cast_fullscreen);
     g_host_hidden = hide;
-    if (hide)
+    if (side)
+        Log("[feed32] side panel: starting the host with no window on screen (%s); its panel reaches the game "
+            "through the shared texture only%s", side_arg + 1,
+            g_cast_fullscreen ? " -- the game's swapchain is exclusive fullscreen" : "");
+    else if (hide)
         Log("[feed32] starting the host without a window (%s): the in-game panel is unavailable this session%s",
             g_cfg.host_window == 2 ? "host_window=2" : "the game's swapchain is exclusive fullscreen",
             g_cfg.host_window == 2 ? "" : " -- switch the game to borderless/windowed to get it back (#109). If it "
@@ -2550,9 +2739,9 @@ static bool HostWorkerConnect(HANDLE ev)
     else if (g_cfg.host_window == 3 && g_cast_fullscreen)
         Log("[feed32] host_window=3: the game's swapchain reports exclusive fullscreen and the host gets its window "
             "anyway. If the game stops presenting right after this line, that fullscreen is real: go back to host_window=0");
-    sprintf_s(cmd, "\"%s\" %lu%s%s", exe, GetCurrentProcessId(),
+    sprintf_s(cmd, "\"%s\" %lu%s%s%s", exe, GetCurrentProcessId(),
               hide ? " --hide" : g_cfg.host_window == 1 ? "" : " --behind",
-              g_cfg.host_gpu_priority ? " --gpu-priority" : "");
+              g_cfg.host_gpu_priority ? " --gpu-priority" : "", side_arg);
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
@@ -3059,7 +3248,7 @@ static void HostClose();   // below
 // fences, tears down shared state and stops the worker -- none of which may happen beside a
 // frame that is using them. So the buttons only record what they want; FeedFrame consumes
 // it at the top of the next frame, inside the lock.
-enum { HOST_REQ_NONE = 0, HOST_REQ_RESTART, HOST_REQ_APPLY, HOST_REQ_WINSIZE, HOST_REQ_OVERLAY };
+enum { HOST_REQ_NONE = 0, HOST_REQ_RESTART, HOST_REQ_APPLY, HOST_REQ_WINSIZE, HOST_REQ_OVERLAY, HOST_REQ_BRIDGE };
 static volatile LONG g_host_request;
 static char          g_host_request_why[160];
 
@@ -3113,6 +3302,44 @@ static void HostApplySettings()
     g.consecutive_fails = 0;
     g_retry_at = 0;
     Warn("DLSS 5 settings applied -- the replacement host starts in the background");
+}
+
+// ---------------------------------------------------------------------------
+// The feeder's own panel (feed_panel.h), for a tool that runs in host64's helper: where the
+// tool's files are, whether the helper is up, and how to reach it. The panel itself -- the
+// settings, the drawing, the shortcut -- is the shared header's, the same in every build.
+// ---------------------------------------------------------------------------
+static void PanelRefresh()
+{
+    GetModuleFileNameA(g_self, g_panel_env.tool_dir, MAX_PATH);
+    if (char *s = strrchr(g_panel_env.tool_dir, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - g_panel_env.tool_dir), "host64\\");
+    HostIniPath(g_panel_env.reshade_ini);
+    g_panel_env.opti_nr   = g_opti_host && g_opti_host_nr;
+    g_panel_env.opti_live = g_opti_host_live;
+    strcpy_s(g_panel_env.opti_ini, g_opti_ini_path);
+}
+static void PanelScheduleApply() { HostRequest(HOST_REQ_BRIDGE, nullptr); }   // consumed inside the feed lock
+static void PanelRestartTool()
+{
+    g.built = false;
+    g.disabled = false;
+    g.consecutive_fails = 0;
+    g_retry_at = 0;
+}
+static void PanelSetup()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    g_panel_env.helper         = true;
+    g_panel_env.refresh        = PanelRefresh;
+    g_panel_env.running        = HostAlive;
+    g_panel_env.starting       = HostStarting;
+    g_panel_env.schedule_apply = PanelScheduleApply;
+    g_panel_env.stop_tool      = HostClose;
+    g_panel_env.restart_tool   = PanelRestartTool;
+    g_panel_env.log            = Log;
+    CfgPath(g_panel_env.cfg_path);
 }
 
 // v8: resize the running host's window, without restarting it.
@@ -3187,6 +3414,26 @@ static void HostToggleOverlay()
 // Sent from OnPresent, after CastTick has settled the layout for this frame. Under the feed
 // lock like every other write on this side; a re-entrant frame simply skips it, and the
 // comparison below sends it again next frame because the published snapshot is unchanged.
+// PROTOTYPE (side panel): the game window changed size, so the host's frame must too. The same
+// 'W' the sliders send, with the size computed from the game window instead of read from them.
+static void CastSideResize(int w, int h)
+{
+    if (g.pipe == nullptr || !FeedEnter()) return;
+    if (g.pipe != nullptr)
+    {
+#pragma pack(push, 1)
+        struct { BYTE tag; FeedWindowMsg wm; } msg = { 'W', { static_cast<uint32_t>(w), static_cast<uint32_t>(h) } };
+#pragma pack(pop)
+        if (!PipeWrite(&msg, sizeof(msg))) HostLost("the side panel resize could not be sent");
+        else
+        {
+            CastAdoptPanelSize(static_cast<unsigned>(w), static_cast<unsigned>(h), "side panel: the game window changed size");
+            g_panel_poll_quiet_until = GetTickCount64() + 2500;
+        }
+    }
+    FeedLeave();
+}
+
 static bool  g_cast_pub_shown  = false;
 static RECT  g_cast_pub_rect   = {};
 static float g_cast_pub_scale  = 0.0f;
@@ -3241,6 +3488,7 @@ static void HostConsumeRequest()
     else if (req == HOST_REQ_APPLY) HostApplySettings();
     else if (req == HOST_REQ_WINSIZE) HostApplyWindowSize();
     else if (req == HOST_REQ_OVERLAY) HostToggleOverlay();
+    else if (req == HOST_REQ_BRIDGE) FeedPanelApply();
 }
 
 // ---------------------------------------------------------------------------
@@ -6182,6 +6430,17 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     if (ImGui::SliderFloat("MV scale Y", &g_cfg.mv_scale_y, 0.0f, 4.0f)) dirty = true;
 
     ImGui::Separator();
+    {
+        // The feeder's own panel (feed_panel.h): the settings of whichever neural tool is in
+        // host64, under one set of names, with no host window and nothing cast.
+        char key[96], label[160];
+        FeedPanelKeyName(key, sizeof(key));
+        sprintf_s(label, "%s the DLSS 5 Feeder menu", g_panel_wanted ? "Hide" : "Show");
+        if (ImGui::Button(label)) { PanelSetup(); FeedPanelShow(!g_panel_wanted); }
+        ImGui::SameLine();
+        ImGui::TextDisabled("shortcut: %s (panel_key / panel_mods in dlss5-feed.cfg)", key);
+    }
+    ImGui::Separator();
     ImGui::TextUnformatted("DLSS 5 panel in-game");
     ImGui::SameLine();
     HelpMarker("Shows the helper process's own tuning panel (the neural consumer's tab column) inside this "
@@ -6219,6 +6478,26 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                   : "Drawn by this game's ReShade from a copy of the host's frame: works in exclusive "
                                     "fullscreen and on any monitor. The panel appears once the feed has built (its "
                                     "texture is set up with the first build).");
+    // PROTOTYPE: the side panel. Needs a host started for it (no window, sized to this game
+    // window), so choosing it while another kind of host runs restarts the host.
+    ImGui::SameLine();
+    if (g.is_d3d10) ImGui::BeginDisabled();
+    {
+        const bool shown_side = g_cast_wanted && g_cfg.cast_mode == 2;
+        if (ImGui::Button(shown_side ? "Hide the side panel" : "Side panel (prototype)"))
+        {
+            g_cast_wanted = !shown_side;
+            if (g_cfg.cast_mode != 2)
+            {
+                g_cfg.cast_mode = 2;
+                dirty = true;
+                if (HostAlive() && !g_host_side)
+                    HostRequest(HOST_REQ_RESTART, "side panel: the host restarts with no window, sized for the panel");
+            }
+            Log("[feed32] cast: %s (overlay, side panel)", g_cast_wanted ? "shown" : "hidden");
+        }
+    }
+    if (g.is_d3d10) ImGui::EndDisabled();
     // What the two buttons above cast is the host's ReShade overlay. The host opens it once
     // when it starts; close it and there was no way back, because the overlay key does not
     // survive the trip through the cast (see HostToggleOverlay).

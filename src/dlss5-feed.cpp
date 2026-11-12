@@ -64,6 +64,7 @@
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
 #include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
 #include "feed_opti.h" // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
+#include "feed_panel.h" // the feeder's own in-game panel, the same in every build of the add-on
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 #include "feed_pq12.h" // the D3D12 PQ<->linear pass, for the transports with no shaders of their own
 #include "feed_hold12.h" // the output stabiliser: one compute pass after the evaluate, all four transports
@@ -1148,6 +1149,7 @@ static bool CfgReload()
         else if (_stricmp(key, "warmup_rebuild") == 0) next.warmup_rebuild = iv;
         else if (_stricmp(key, "rebuild")        == 0) next.rebuild        = iv;
         else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
+        else if (FeedPanelCfg(key, iv)) {}   // panel_key / panel_mods / panel_side (feed_panel.h)
         else if (_stricmp(key, "create_delay")   == 0) next.create_delay   = iv;
         else if (_stricmp(key, "preset")         == 0) next.preset         = iv;
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
@@ -5023,6 +5025,21 @@ static bool FeedUpliftLoaded()
     return true;
 }
 
+// ShortFuse's renodx-dlss.addon64, loaded next to this add-on. Not a supported pairing (it is
+// built to run without the feeder, and the settings panel ignores it); this only keeps a user
+// who loads both from hanging the game. Its neural pass ("DLSS-NR direct") runs inside our NGX evaluate, on the NATIVE command list and
+// device behind ReShade's wrappers; with NGX started on the wrapper its feature creation read a
+// null in D3D12Core and the game hung seconds later (lab, 2026-11-12: 0xC0000005 at +0xC,
+// D3D12Core <- nvngx_dlssnr <- renodx-dlss.addon64). On the native device, as for Deep Fried
+// Chicken, nothing faults -- but its pass then never starts either (it finds our objects through
+// ReShade's wrappers), so this only makes the pair harmless; it works from the helper (host64).
+// Tried and worse: NGX on the native device with our list on the wrapper -> "command list would
+// not close" and a fault in nvngx_dlss, the mix the Uplift note above describes.
+static bool FeedShortFuseLoaded()
+{
+    return GetModuleHandleW(L"renodx-dlss.addon64") != nullptr;
+}
+
 static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
 {
     Breadcrumb("opening the D3D12 session");
@@ -5091,7 +5108,8 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         // Keep the proxy alive until session teardown for observers holding it.
         const bool uplift = FeedUpliftLoaded();
         g_uplift_device_shared = false;
-        if (g_chicken_present || uplift)
+        const bool shortfuse = FeedShortFuseLoaded();
+        if (g_chicken_present || uplift || shortfuse)
         {
             // ReShade v6.8.0 source/com_utils.hpp: IID_UnwrappedObject (QueryInterface owns a reference).
             static constexpr GUID unwrapped = { 0x7f2c9a11, 0x3b4e, 0x4d6a,
@@ -5103,7 +5121,7 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
                 g.dev12 = native;
                 g_uplift_device_shared = uplift;
                 Log("[feed] %s native D3D12 transport: proxy=%p native=%p; device, lists and descriptor heaps share native identity",
-                    g_chicken_present ? "DFC" : "GITC Uplift", g_dfc_device_proxy, g.dev12);
+                    g_chicken_present ? "DFC" : uplift ? "GITC Uplift" : "RenoDX DLSS (ShortFuse)", g_dfc_device_proxy, g.dev12);
                 if (uplift)
                     Log("[feed] GITC Uplift is loaded: it runs NGX on the native device, which D3D12 may hand this "
                         "add-on too (one device per adapter when Uplift cannot get an independent one, #153). NGX "
@@ -8787,9 +8805,54 @@ static void OnReloadedEffects(reshade::api::effect_runtime *rt)
 // where DLSS5_Feed.fx is genuinely absent (which is the whole point of the #81 warning) got no
 // warning either, because nothing was rendering to carry the timer forward. reshade_present
 // fires once per present per runtime regardless, which is what this needs.
-static void OnReShadePresent(reshade::api::effect_runtime * /*rt*/)
+// ---------------------------------------------------------------------------
+// The feeder's own panel (feed_panel.h), for a tool that runs in THIS process: its files are
+// beside this add-on, it shares this ReShade, and nothing has to be relayed. The panel itself
+// -- the settings, the drawing, the shortcut -- is the shared header's.
+// ---------------------------------------------------------------------------
+static void PanelRefresh()
+{
+    GetModuleFileNameA(g_self, g_panel_env.tool_dir, MAX_PATH);
+    if (char *s = strrchr(g_panel_env.tool_dir, '\\')) *(s + 1) = '\0';
+    // OptiScaler is found when it is loaded, which can be after this add-on attached (the
+    // feeder's own check runs once, at start): look again, without disturbing that record.
+    OptiInfo o = g_opti;
+    if (!o.present)
+    {
+        OptiInfo late = {};
+        if (OptiFindModule(&late)) { late.present = true; OptiClassify(late.path, &late.nr_fork, &late.direct); o = late; }
+    }
+    g_panel_env.opti_nr = o.present && o.nr_fork;
+    static char checked[MAX_PATH] = "";
+    static bool live = false;
+    if (g_panel_env.opti_nr && strcmp(checked, o.path) != 0) { strcpy_s(checked, o.path); live = OptiFileHasLiteral(o.path, OPTI_LIVE_LITERAL); }
+    g_panel_env.opti_live = g_panel_env.opti_nr && live;
+    _snprintf_s(g_panel_env.opti_ini, sizeof(g_panel_env.opti_ini), _TRUNCATE, "%s" OPTI_INI, o.dir);
+}
+static void PanelSetup()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    g_panel_env.helper       = false;
+    g_panel_env.refresh      = PanelRefresh;
+    g_panel_env.log          = Log;
+    CfgPath(g_panel_env.cfg_path);
+}
+// Drawn for the runtime the feed is bound to (any runtime while it is bound to none).
+static void OnPanelOverlay(reshade::api::effect_runtime *rt)
+{
+    if (g_cfg.enabled && (g.runtime == nullptr || rt == g.runtime)) FeedPanelDraw(rt);
+}
+
+static void OnReShadePresent(reshade::api::effect_runtime *rt)
 {
     FeedPollConfig();
+    if (g_cfg.enabled && rt != nullptr && (g.runtime == nullptr || rt == g.runtime))
+    {
+        PanelSetup();
+        FeedPanelTick(rt);
+    }
 }
 
 static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::effect_technique technique,
@@ -8956,6 +9019,17 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         if (enabled && rt != nullptr) { Log("[feed] enabled from the overlay; re-adopting the effect runtime"); OnInitEffectRuntime(rt); }
         else if (!enabled) Log("[feed] disabled from the overlay: no frames are fed and nothing is queried. "
                                "An already-installed Vulkan interop hook stays until the game exits.");
+    }
+
+    {
+        // The feeder's own panel (feed_panel.h): the settings of whichever neural tool is beside
+        // the feeder, under one set of names -- the same panel the 32-bit add-on has.
+        char key[96], label[160];
+        FeedPanelKeyName(key, sizeof(key));
+        sprintf_s(label, "%s the DLSS 5 Feeder menu", g_panel_wanted ? "Hide" : "Show");
+        if (ImGui::Button(label)) { PanelSetup(); FeedPanelShow(!g_panel_wanted); }
+        ImGui::SameLine();
+        ImGui::TextDisabled("shortcut: %s (panel_key / panel_mods in dlss5-feed.cfg)", key);
     }
 
     ImGui::Separator();
@@ -9318,6 +9392,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::register_event<reshade::addon_event::reshade_present>(OnReShadePresent);
+        reshade::register_event<reshade::addon_event::reshade_overlay>(OnPanelOverlay);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         feed_depthsrc::Register();
         reshade::register_overlay(nullptr, DrawOverlay);
@@ -9347,6 +9422,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::unregister_event<reshade::addon_event::reshade_present>(OnReShadePresent);
+        reshade::unregister_event<reshade::addon_event::reshade_overlay>(OnPanelOverlay);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         feed_depthsrc::Unregister();
         FeedVkFramePresentRemove();

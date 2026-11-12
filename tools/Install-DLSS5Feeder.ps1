@@ -288,6 +288,25 @@ function Write-Banner
     Write-Host ''
 }
 
+# The last thing on screen: a green box, each line its own colour. Used for the one sentence a
+# user must not miss -- how to open the DLSS 5 Feeder menu once the game is running.
+function Write-DoneBox
+{
+    param([object[]] $Lines)   # each: @{ Text = '...'; Colour = 'White' }
+    $box = 'Green'
+    $w   = 68
+    Write-Host ''
+    Write-Chunk ('  ' + [char]0x2554 + ([string][char]0x2550) * $w + [char]0x2557) $box
+    foreach ($l in @(@{ Text = ''; Colour = '' }) + $Lines + @(@{ Text = ''; Colour = '' })) {
+        $t = '   ' + $l.Text
+        if ($t.Length -gt $w) { $t = $t.Substring(0, $w) }
+        Write-Chunk ('  ' + [char]0x2551) $box -NoNewline
+        Write-Chunk $t.PadRight($w) $l.Colour -NoNewline
+        Write-Chunk ([string][char]0x2551) $box
+    }
+    Write-Chunk ('  ' + [char]0x255A + ([string][char]0x2550) * $w + [char]0x255D) $box
+}
+
 function Write-Section
 {
     param([string] $Title)
@@ -3016,11 +3035,14 @@ if ($Consumer -eq 'DFC') {
     $steps += 'On its first armed run Chicken registers itself for early load in ReShade.ini and asks for one more full restart. Do that restart.'
 }
 elseif ($Consumer -eq 'RenoDX') {
-    $steps += 'Turn on neural rendering in the DLSS 5 Neural Rendering add-on panel.'
+    $steps += 'Press Alt+C for the DLSS 5 Feeder menu and check that "Neural rendering" is ticked. The look, the passes and the white point are all there.'
+    if ($useHost) { $steps += 'A change in that menu is applied with its Apply button, which restarts the host64 helper (a few seconds; the game keeps running).' }
+    else { $steps += 'A change in that menu is saved with its Apply button and used from the next start of the game (RenoDX reads its settings at start).' }
 }
 else {
-    if ($useHost) { $steps += 'OptiScaler''s menu lives in the host64 helper: open the ReShade overlay > Add-ons > DLSS 5 Feed, press "Show the DLSS 5 panel in-game", then press Insert. Its neural-rendering section holds the pass controls; the pass is already switched on.' }
-    else { $steps += 'Press Insert for OptiScaler''s menu; its neural-rendering section holds the pass controls, and the pass is already switched on.' }
+    $steps += 'Press Alt+C for the DLSS 5 Feeder menu: OptiScaler''s neural-rendering settings are there, and the pass is already switched on.'
+    if ($useHost) { $steps += 'OptiScaler''s own menu is still there if you want it, in the host64 helper: ReShade overlay > Add-ons > DLSS 5 Feed > "Show the DLSS 5 panel in-game", then Insert.' }
+    else { $steps += 'OptiScaler''s own menu is still on Insert if you want it.' }
     $steps += 'dlss5-feed.log (host64\dlss5-feed-host.log for a 32-bit game or the helper mode) should say "NGX calls are routed through OptiScaler DLSS-NR" and, after the first frames, "neural model (feature 18) loaded".'
 }
 $steps += 'Turn the game''s MSAA/SSAA off.'
@@ -3030,6 +3052,21 @@ if ($isVulkan) { $steps += 'If dlss5-feed.log says the Vulkan interop entry poin
 $steps += 'Then check dlss5-feed.log next to the exe for "feature ready", "frame N delivered", and re-run Verify-DLSS5Feeder.ps1 for a runtime verdict.'
 $i = 1
 foreach ($s in $steps) { Write-Chunk ('   ' + $i + '. ' + $s) 'Gray'; $i++ }
+
+# Said last and in a box, so it is still on screen when the window is read: the menu's shortcut.
+# Deep Fried Chicken keeps its own tab and is not driven by the menu, so it gets no such line.
+if ($script:CountFail -gt 0) {
+    Write-DoneBox @(@{ Text = 'Install finished with ' + $script:CountFail + ' problem(s). See the lines marked above.'; Colour = 'Yellow' })
+}
+elseif ($Consumer -eq 'DFC') {
+    Write-DoneBox @(@{ Text = 'Install done.'; Colour = 'White' },
+                    @{ Text = 'Once in game: Deep Fried Chicken''s settings are in its own tab.'; Colour = 'Gray' })
+}
+else {
+    Write-DoneBox @(@{ Text = 'Install done.'; Colour = 'White' },
+                    @{ Text = ''; Colour = '' },
+                    @{ Text = 'Once in game, press  ALT + C  to show the DLSS 5 Feeder menu.'; Colour = 'Green' })
+}
 
 Write-Host ''
 if ($script:CountFail -gt 0) { Exit-Installer 1 }

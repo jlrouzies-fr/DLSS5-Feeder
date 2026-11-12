@@ -303,6 +303,7 @@ your antivirus.
 - [Before you install: four things](#before-you-install-four-things)
 - [Status](#status)
 - [Install: the automated way](#install-the-automated-way)
+- [The DLSS 5 Feeder menu (Alt+C)](#the-dlss-5-feeder-menu-altc)
 - [Install for a 64-bit game](#install-for-a-64-bit-game)
   - [Deep Fried Chicken: first run](#deep-fried-chicken-first-run)
   - [Alternative: the RenoDX add-on](#alternative-the-renodx-add-on)
@@ -410,6 +411,9 @@ in fast motion, softness on thin moving geometry), and the HUD is processed alon
 
 ![Installer](docs/images/dlss5-feeder-install-script.png)
 
+It ends on the one thing to remember: **once in game, press Alt+C to show
+[the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc)**.
+
 Or point it at the exe from anywhere:
 
 ```
@@ -453,6 +457,69 @@ Things to know:
 - The Discord download links inside the script expire; when one does, the script says so and
   tells you which parameter takes a fresh link or file.
 
+## The DLSS 5 Feeder menu (Alt+C)
+
+<!-- DRAFT for the release that ships the menu. Before publishing:
+     - retake the picture (this one is Fable Anniversary in a 1080p window, from the prototype);
+     - name the OptiScaler fork release that carries live settings, once there is one;
+     - run the menu against the RenoDX build the installer fetches (tested with v6.1 only);
+     - try it in an exclusive-fullscreen game before saying anything about fullscreen. -->
+
+Press **Alt+C** in the game. A panel slides in from the right edge with the settings of the neural
+tool that is doing the work, and **Alt+C** or **Esc** closes it again. It is the same panel in a
+32-bit game, in the 64-bit helper mode and in an ordinary 64-bit game, and it is drawn by the game's
+own ReShade, so there is no second window to find.
+
+![The DLSS 5 Feeder menu](docs/images/dlss5-feeder-menu.png)
+
+**What it drives.** Whichever of these two is installed; the line under the title names it and says
+whether it is running:
+
+- the **RenoDX add-on** (`renodx-dlss5*.addon64`), or
+- the **OptiScaler DLSS-NR** fork.
+
+Deep Fried Chicken is not driven by the menu: it keeps its own tab. ShortFuse's `renodx-dlss` is
+not supported next to this project at all (see [Before you install](#1-you-might-not-need-this-project-at-all)).
+
+**What is on it.** Two tabs. **Common** holds what both tools have under one name:
+
+| Group | Settings |
+| --- | --- |
+| Look | neural rendering on/off, preset, style, intensity |
+| Model | tone, structure, skin, character mask |
+| Passes and cost | number of passes, working resolution |
+| Final picture | detail strength, colour strength |
+| White point | paper white |
+
+The second tab is named after the tool and holds what only that tool has: for OptiScaler the
+highlight guard, the white point source and exposure trims, the unlock for up to 10 passes and the
+separate skin / environment controls; for the RenoDX add-on global tone, HUD correction, diffuse
+white and its two stacking switches.
+
+**When a change takes effect** depends on the tool and on where it runs:
+
+| Tool | Where it runs | A change takes effect |
+| --- | --- | --- |
+| OptiScaler DLSS-NR, a build with live settings | anywhere | at once; the menu shows **LIVE** and has no Apply button |
+| OptiScaler DLSS-NR, an older build | the helper (`host64\`) | on **Apply**, which restarts the helper: a few seconds, the game keeps running |
+| OptiScaler DLSS-NR, an older build | the game's own process | on **Apply** it is saved, and used from the next start of the game |
+| RenoDX add-on | the helper (`host64\`) | on **Apply**, which restarts the helper |
+| RenoDX add-on | the game's own process | on **Apply** it is saved, and used from the next start of the game |
+
+Either tool reads its settings from its own file (`OptiScaler.ini`, or the `[RenoDX.DLSS5]` section
+of the ReShade.ini beside it), and that is where the menu writes them, so its own page and the menu
+always agree.
+
+**Size.** The **Panel size** row at the foot of the menu makes everything on it larger or smaller
+in steps of 10%. **Auto** follows the larger of two things: the height of the picture (a 4K picture
+gets 200%) and the Windows display scaling of the game's window (a 4K television at 200% gets 200%
+even when the game runs in a 1080p window). The choice is saved as `panel_scale`.
+
+**The shortcut** is `panel_key` and `panel_mods` in `dlss5-feed.cfg` (see
+[Configuration](#configuration)); **Show the DLSS 5 Feeder menu** on the overlay page (ReShade
+overlay → Add-ons → **DLSS 5 Feed**) opens it too. While the menu is up the mouse and keyboard
+belong to it and the game does not see them.
+
 ## Install for a 64-bit game
 
 1. Run **ReShade's installer** (https://reshade.me), point it at your game's `.exe`, choose
@@ -480,6 +547,8 @@ Things to know:
 6. In-game: enable **"LUMENITE: Kernel 2.0"**, then **DLSS 5 Feed** below it, then turn on neural
    rendering in the consumer's own panel — the **Deep Fried Chicken** tab, or the **DLSS 5 Neural
    Rendering** panel if you took the RenoDX route. Turn the game's MSAA/SSAA **off**.
+   With the RenoDX add-on or OptiScaler, **Alt+C** opens [the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc),
+   which has the same switch and the rest of the tool's settings.
 
 Check `dlss5-feed.log` (next to the game `.exe`) for `feature ready … DLAA`, `frame N delivered`,
 and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`. The overlay's
@@ -575,8 +644,10 @@ the list of build generations:
 - In step 4, put `renodx-dlss5.addon64` next to the game `.exe` in place of the three Chicken files.
   `nvngx_dlssnr.dll` and `nvngx_dlss.dll` are needed either way. For a 32-bit game it goes into
   `host64\`, again for the same reason Chicken does.
-- Its neural rendering is turned on in ReShade's **DLSS 5 Neural Rendering** panel, and on 32-bit
-  games mirrored onto our own overlay page — see [Configuration](#configuration).
+- Its settings are in [the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc) (**Alt+C**), neural rendering on/off
+  included. Its own **DLSS 5 Neural Rendering** panel in ReShade is still there and shows the same
+  values; on 32-bit games a few of them are also mirrored onto our overlay page — see
+  [Configuration](#configuration).
 - The feeder writes `EnableHooks=2`, `NeuralUplift=1` and `NREnableUpscaling=0` when they are unset,
   and unbinds the helper's global hotkeys. Both are RenoDX-specific and do nothing on the Chicken path.
 - `warmup_rebuild` matters here: older builds latch STANDBY on their first create, and the warm-up
@@ -620,9 +691,10 @@ underneath. The installer does all of the below with `-Consumer OptiScaler` and 
 - Remove Deep Fried Chicken's three files and any `renodx-dlss5*.addon64` from that folder.
   OptiScaler captures every `nvngx` load in the process — Chicken's own bridge DLL ends in
   `nvngx.dll` — so a second consumer either talks to OptiScaler or runs a second neural pass.
-- OptiScaler's menu opens with **Insert**; its neural-rendering section holds the pass controls.
-  For a 32-bit game the menu is in the helper: press **Show the DLSS 5 panel in-game** and then
-  Insert, or run with `host_window=1`.
+- Its neural-rendering settings are in [the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc) (**Alt+C**), in a
+  32-bit game as well. OptiScaler's own menu still opens with **Insert**; for a 32-bit game that
+  menu is in the helper: press **Show the DLSS 5 panel in-game** and then Insert, or run with
+  `host_window=1`.
 - **Model resolution below 100% flickers on wilsjo2's builds up to v0.8.91** and keeps "settling"
   for a few frames after the camera stops, at every scale below 100%. The cause is in the fork's
   reduced path: the model was given a colour at the working size and depth / motion vectors at the
@@ -668,9 +740,14 @@ work. Two folders to fill:
 **Then, in-game**
 - Turn it on as for a 64-bit game. The first fed frame starts the helper by itself.
 - Day-to-day settings: ReShade overlay → Add-ons → **DLSS 5 Feed** (see [Configuration](#configuration)).
-- The neural consumer's own panel lives in the helper, not in the game's ReShade. No alt-tab needed:
-  press **Show the DLSS 5 panel in-game** on that page, or bind a key with **Set key**, and it is drawn
-  at the top right of the game window with your clicks forwarded to it. Changes apply live.
+- The neural tool's settings: press **Alt+C** for [the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc). It is
+  drawn by the game's own ReShade and reaches the tool in the helper for you (RenoDX add-on or
+  OptiScaler; not Deep Fried Chicken).
+- The neural consumer's **own** panel lives in the helper, not in the game's ReShade, and can be
+  cast into the game — the way to Deep Fried Chicken's tab, and to anything the menu does not
+  carry. No alt-tab needed: press **Show the DLSS 5 panel in-game** on that page, or bind a key
+  with **Set key**, and it is drawn at the top right of the game window with your clicks forwarded
+  to it. Changes apply live.
   - That button uses the desktop compositor: windowed or borderless games only.
   - **Show as texture** draws it through the game's own ReShade instead and also works in exclusive
     fullscreen; it appears once the feed has built.
@@ -1337,6 +1414,9 @@ memory objects are import-only and a GL process cannot export one. Both directio
 
 ## Configuration
 
+The neural tool's own settings (style, intensity, passes, white point) are not here: they are in
+[the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc), on **Alt+C**. This section is about the feeder itself.
+
 The easiest way to change any of this is **ReShade's overlay → Add-ons tab → DLSS 5 Feed**: every
 setting below is a live control there (checkboxes, sliders, combos), reading from and saving straight
 to `dlss5-feed.cfg`. On 32-bit games **running the RenoDX add-on**, the same page also mirrors that
@@ -1386,6 +1466,10 @@ if you prefer editing the file directly:
 | `cast_scale` | 100 | **32-bit games only.** Size of the cast panel, 25..300 % of the largest size that fits the game window (above 100 % it may run past the window's edges). Also on the overlay as "Panel size". |
 | `cast_mode` | 0 | **32-bit games only.** How the cast panel is drawn: 0 = a desktop-compositor thumbnail of the helper's window (windowed / borderless games, any API); 1 = a shared copy of the helper's frame drawn by the game's ReShade or blitted onto its backbuffer (works in exclusive fullscreen; D3D11, OpenGL and Vulkan). The two overlay buttons set it. |
 | `cast_anchor` | 1 | **32-bit games only.** Which corner of the game window the cast panel sits in: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right. Before 0.14.0-beta.4 it was always the top-right and there was no way to move it. Also on the overlay as "Panel corner". |
+| `panel_key` | 67 | **Every build, not on the overlay page.** Virtual-key code that shows and hides [the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc); 67 is **C**. 0 = no shortcut (the button on the overlay page still opens it). |
+| `panel_mods` | 1 | Modifiers that must be held with `panel_key`: 1 = Alt, 2 = Ctrl, 4 = Shift, added together. The match is exact both ways, so Alt+C does not also answer to Ctrl+Alt+C (AltGr+C). |
+| `panel_side` | 1 | Which edge of the picture the menu slides in from: 0 left, 1 right. |
+| `panel_scale` | 0 | Size of the menu in percent, 50..400. 0 = automatic: the larger of the picture's height over 1080 and the Windows display scaling of the game's window, never below 100. Written by the menu's own **Panel size** row. |
 | `native_dlss_ok` | 0 | **D3D12 games (64-bit), parse-only.** Since 1.17.0-beta.2 the same-device D3D12 session refuses to open when the game has loaded a DLSS runtime of its own (`nvngx_dlss.dll` / `nvngx_dlssd.dll` from anywhere other than this add-on's folder or the driver, or Streamline's `sl.dlss.dll`). A second DLSS contract on the game's device is what crashed the neural consumer in #130; in such a game, turn DLSS on in its own settings and let the DLSS 5 add-on use that instead. `1` opens the session anyway. |
 | `hold_strength` | 0 | **Experimental output stabiliser, since 1.17.0-beta.2 (32-bit games) / beta.3 (64-bit, all four transports).** The neural consumer re-decides what a still region should look like from small frame-to-frame differences in its input: a slope under a tree is bright while the camera pans and darkens over the frames after the stop, although the game drew it the same way on every one of them (and a reset on every frame still darkens, so it is not history). The helper runs one compute pass after the evaluate: per output pixel it compares a 3x3 box of the game's frame with an anchor (that box as it was when the pixel last moved), relative to local brightness. Where the input moved, the model's answer shows as is and the anchor follows; where it did not, the shown pixel keeps this much of last frame's value and takes the rest from the model. 0 = off, 1 = a still region never moves until its input changes, 0.9 = the model's new opinion fades in over about ten frames. No reprojection, so nothing ghosts: a pixel whose input changed shows the current output that frame. A slider on the overlay page ("Output stabiliser"), applied live. On the 64-bit add-on it runs on the same device as the evaluate, so on the same-device D3D12 transport that is the game's device. |
 | `hold_tolerance` | 0.04 | How much a pixel's input (3x3 box, relative to its brightness) may differ from its anchor and still count as still: 0.04 = 4%. Below it the pixel is held; at twice it the model shows through fully. Raise it if a held region unlocks by itself (exposure drift, shimmer), lower it if slow animation lags behind. |
