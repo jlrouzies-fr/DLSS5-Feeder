@@ -411,9 +411,6 @@ in fast motion, softness on thin moving geometry), and the HUD is processed alon
 
 ![Installer](docs/images/dlss5-feeder-install-script.png)
 
-It ends on the one thing to remember: **once in game, press Alt+C to show
-[the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc)**.
-
 Or point it at the exe from anywhere:
 
 ```
@@ -429,6 +426,9 @@ headers, LumeniteFX, Deep Fried Chicken, both NVIDIA runtimes, dgVoodoo2 for Dir
 provider selected and both techniques enabled in the right order. Existing files are merged into
 and backed up, not replaced. It ends by running a read-only verification pass and prints the
 result — every line is `[ OK ]`, `[WARN]` or `[FAIL]`, with the fix for each failure.
+
+The last thing it prints is the one to remember: **once in game, press Alt+C to show
+[the DLSS 5 Feeder menu](#the-dlss-5-feeder-menu-altc)**.
 
 Things to know:
 
