@@ -31,17 +31,17 @@
       4  LumeniteFX QuantMotion
                              lumenite_QuantMotion.fx: QuantMotion::tFlow -- the light cut of 3.
       5  Built in            this file's own estimator: hierarchical block matching on a luma
-                             pyramid, 1/64 of the frame down to 1/2, written for finished 2D
-                             pictures (UI over video, menus, scrolling lists). Nothing to install
-                             and no technique to enable. Under 3D camera motion it is clearly
-                             behind 3 (measured, tools/fx-testbed) -- use 3 for a 3D game.
+                             pyramid, 1/64 of the frame down to 1/2, for finished pictures of
+                             any kind (a 3D game, UI over video, menus, scrolling lists). Nothing
+                             to install and no technique to enable. Uses the depth buffer when
+                             there is a stable one, and needs none.
 
-    For 0-4 this is the same mechanism dh_uber_rt (USE_MARTY_LAUNCHPAD_MOTION / USE_VORT_MOTION)
-    and vort (V_MV_MODE) use: the selected provider's OUTPUT texture is declared here exactly as
-    the provider declares it, so ReShade binds the same resource, and only that one is allocated.
-    Every provider above hands out delta UV with prev_uv = uv + mv. Nothing of any provider is
-    included or bundled: this file contains no third-party code (the built-in estimator is
-    written from scratch) and includes no third-party files beyond ReShade's own headers.
+    For 0-4, ReShade shares a texture between effects by its name: the selected provider's
+    OUTPUT texture is declared here under the name and format it has, so ReShade binds the same
+    resource, and only that one is allocated. Every provider above hands out delta UV with
+    prev_uv = uv + mv. Nothing of any provider is included or bundled: this file contains no
+    third-party code (the built-in estimator is written from scratch) and includes no
+    third-party files beyond ReShade's own headers.
 
     REFINEMENT (the default "Vector pipeline"). Whatever the provider, its field is coarse and
     a coarse field cannot follow the outline of a glyph. It gives the pixels of a still caption
@@ -128,18 +128,19 @@ sampler sDLSS5_ColorInput { Texture = DLSS5_ColorInput; AddressU = Clamp; Addres
 #endif
 
 // ---------------------------------------------------------------------------------------------
-// The selected provider's output, declared byte for byte like the provider itself does.
+// The selected provider's output texture, under the name and format the provider gives it:
+// that is how ReShade lets one effect read what another one wrote. Names and formats only --
+// no code of any provider is in this file.
 // ---------------------------------------------------------------------------------------------
 
 #if DLSS5_MV_PROVIDER == 1
-    // iMMERSE Launchpad (MartysMods/mmx_deferred.fxh)
+    // iMMERSE Launchpad
     namespace Deferred {
         texture MotionVectorsTex { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F; };
-        // Launchpad's request buffer. Launchpad only computes optical flow when a consumer asked
-        // for it during the previous frame (it reads this 1x1 RGBA8 at the top of its technique
-        // and clears it at the bottom; bit 4 = optical flow, written through the render-target
-        // write mask). Being below Launchpad in the list, our request lands for the next frame.
-        // Declared like Launchpad declares it; the two shaders that write it below are ours.
+        // Launchpad computes optical flow only when an effect that uses it asked for it during
+        // the previous frame, through a 1x1 request texture it shares for that purpose (bit 4 =
+        // optical flow). This effect asks every frame; being below Launchpad in the list, the
+        // request lands for the next one.
         namespace IPC {
             texture2D PredicationBuffer { Format = RGBA8; };
         }
@@ -150,12 +151,12 @@ sampler sDLSS5_ColorInput { Texture = DLSS5_ColorInput; AddressU = Clamp; Addres
     #define DLSS5_MV_PROVIDER_NAME "Launchpad (Deferred::MotionVectorsTex)"
     #define DLSS5_MV_REQUEST_PASS pass IpcRequestOpticalFlow { PrimitiveTopology = POINTLIST; VertexCount = 1; VertexShader = DLSS5_IpcRequestVS; PixelShader = DLSS5_IpcRequestPS; RenderTarget = Deferred::IPC::PredicationBuffer; RenderTargetWriteMask = 4; }
 #elif DLSS5_MV_PROVIDER == 2
-    // VORT (Includes/vort_MotionUtils.fxh, V_MV_MODE 1)
+    // VORT
     texture2D MotVectTexVort { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F; };
     sampler sDLSS5_ProviderMV { Texture = MotVectTexVort; AddressU = Clamp; AddressV = Clamp; MipFilter = Point; MinFilter = Point; MagFilter = Point; };
     #define DLSS5_MV_PROVIDER_NAME "VORT (MotVectTexVort)"
 #elif DLSS5_MV_PROVIDER == 3
-    // LumeniteFX Kernel (lumenite_Kernel.fx), as lumenite_RTAO/TRAA re-declare it. 1/8 resolution.
+    // LumeniteFX Kernel (lumenite_Kernel.fx). 1/8 resolution.
     namespace Kernel {
         texture2D tFlow { Width = BUFFER_WIDTH/8; Height = BUFFER_HEIGHT/8; Format = RG16F; };
         texture2D tConfidence { Width = BUFFER_WIDTH/8; Height = BUFFER_HEIGHT/8; Format = R16F; };
@@ -166,7 +167,7 @@ sampler sDLSS5_ColorInput { Texture = DLSS5_ColorInput; AddressU = Clamp; Addres
     #define DLSS5_MV_PROVIDER_NAME "LumeniteFX Kernel (Kernel::tFlow, 1/8 res)"
     #define DLSS5_MV_LOWRES 1
 #elif DLSS5_MV_PROVIDER == 4
-    // LumeniteFX QuantMotion (lumenite_QuantMotion.fx), as lumenite_QuantAO re-declares it. 1/8 resolution.
+    // LumeniteFX QuantMotion (lumenite_QuantMotion.fx). 1/8 resolution.
     namespace QuantMotion {
         texture2D tFlow { Width = BUFFER_WIDTH/8; Height = BUFFER_HEIGHT/8; Format = RG16F; };
         texture2D tConfidence { Width = BUFFER_WIDTH/8; Height = BUFFER_HEIGHT/8; Format = R16F; };
