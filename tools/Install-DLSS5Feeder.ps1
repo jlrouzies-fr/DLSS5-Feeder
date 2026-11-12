@@ -238,6 +238,7 @@ $ReShadeMinVersion = '6.8'
 $script:CountDone = 0
 $script:CountWarn = 0
 $script:CountFail = 0
+$script:OptiLive  = $false   # the installed OptiScaler build takes settings while the game runs
 $script:Manual    = New-Object System.Collections.ArrayList   # steps the user must do
 $script:Changed   = New-Object System.Collections.ArrayList   # files written, for Unblock-File
 
@@ -2739,6 +2740,16 @@ else {
                 $beside = if ($zipForwarder) { 'the neural forwarder nvngx.dll_dlssnr.dll and the OptiScaler\ runtime folder beside it' }
                           else { 'the OptiScaler\ runtime folder beside it; this build needs no forwarder DLL (feature 18 goes through the driver''s NGX core)' }
                 Report -Status 'Done' -Text ($t + '.') -Detail ('in ' + $consumerWhere + '; ' + $beside)
+                # Does this build take settings while the game runs? This project's fork does from
+                # v0.8.93 on, and says so in the DLL -- the same text the add-on looks for before
+                # its menu shows LIVE. An older build (a cached zip, another fork) reads its ini at
+                # start only, and the closing steps say which of the two the user has.
+                $script:OptiLive = [bool](Get-BinaryMarker -Path $dll -Pattern 'DLSS-NR live settings' -MaxBytes 67108864)
+                if ($script:OptiLive) { Report -Status 'Ok' -Text 'This OptiScaler build takes changes from the DLSS 5 Feeder menu while the game runs.' }
+                else {
+                    Report -Status 'Info' -Text 'This OptiScaler build reads its settings at start only.' `
+                           -Detail ('A change made in the DLSS 5 Feeder menu is used after its Apply button (helper) or at the next start of the game. This project''s fork applies changes at once from v0.8.93: ' + $Sources.OptiScalerHome['Feeder'])
+                }
                 if (-not $zipForwarder) {
                     # Left over from the other generation: nothing loads it, and the fork's own install
                     # notes say to remove it on upgrade.
@@ -3021,6 +3032,9 @@ elseif ($Consumer -eq 'RenoDX') {
 }
 else {
     $steps += 'Press Alt+C for the DLSS 5 Feeder menu: OptiScaler''s neural-rendering settings are there, and the pass is already switched on.'
+    if ($script:OptiLive) { $steps += 'Changes in that menu apply at once, while the game runs (the menu shows LIVE).' }
+    elseif ($useHost) { $steps += 'A change in that menu is applied with its Apply button, which restarts the host64 helper (a few seconds; the game keeps running).' }
+    else { $steps += 'A change in that menu is saved with its Apply button and used from the next start of the game.' }
     if ($useHost) { $steps += 'OptiScaler''s own menu is still there if you want it, in the host64 helper: ReShade overlay > Add-ons > DLSS 5 Feed > "Show the DLSS 5 panel in-game", then Insert.' }
     else { $steps += 'OptiScaler''s own menu is still on Insert if you want it.' }
     $steps += 'dlss5-feed.log (host64\dlss5-feed-host.log for a 32-bit game or the helper mode) should say "NGX calls are routed through OptiScaler DLSS-NR" and, after the first frames, "neural model (feature 18) loaded".'

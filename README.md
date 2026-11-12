@@ -464,7 +464,6 @@ Things to know:
 
 <!-- DRAFT for the release that ships the menu. Before publishing:
      - retake the picture (this one is Fable Anniversary in a 1080p window, from the prototype);
-     - name the OptiScaler fork release that carries live settings, once there is one;
      - RenoDX: run in the lab against v6.1 and against 10.8.0 (RHI's newest on 2026-11-12); a newer
        one the installer may fetch by then is untested;
      - try it in an exclusive-fullscreen game before saying anything about fullscreen. -->
@@ -509,7 +508,7 @@ its own page.
 
 | Tool | Where it runs | A change takes effect |
 | --- | --- | --- |
-| OptiScaler DLSS-NR, a build with live settings | anywhere | at once; the menu shows **LIVE** and has no Apply button |
+| OptiScaler DLSS-NR, [this project's fork](https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases) from **v0.8.93** (what the installer fetches) | anywhere | at once; the menu shows **LIVE** and has no Apply button |
 | OptiScaler DLSS-NR, an older build | the helper (`host64\`) | on **Apply**, which restarts the helper: a few seconds, the game keeps running |
 | OptiScaler DLSS-NR, an older build | the game's own process | on **Apply** it is saved, and used from the next start of the game |
 | RenoDX add-on | the helper (`host64\`) | on **Apply**, which restarts the helper |
@@ -709,10 +708,11 @@ underneath. The installer does all of the below, with this project's fork unless
 - **Model resolution below 100% flickers on wilsjo2's builds up to v0.8.91** and keeps "settling"
   for a few frames after the camera stops, at every scale below 100%. The cause is in the fork's
   reduced path: the model was given a colour at the working size and depth / motion vectors at the
-  frame's size. A fixed build is on
-  [this project's fork, release v0.8.92](https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.8.92)
-  (v0.8.91 plus that one change, offered upstream as a pull request): same zip layout, same
-  install. `[DlssNr] MatchGuides=false` in its `OptiScaler.ini` brings the old behaviour back for
+  frame's size. It is fixed in
+  [this project's fork from release v0.8.92](https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.8.92)
+  (v0.8.91 plus that change, offered upstream as a pull request), and so in the newer
+  [v0.8.93](https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.8.93)
+  the installer fetches: same zip layout, same install. `[DlssNr] MatchGuides=false` in its `OptiScaler.ini` brings the old behaviour back for
   a comparison. The feeder's own **Work resolution** (`work_resolution`) is the other way to run
   the model below native, and was never affected: it shrinks the whole frame and makes the guides
   at that size.
