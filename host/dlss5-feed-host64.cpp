@@ -50,6 +50,24 @@
 // The GPU cost of a frame, for the game's menu (FeedStats in feed_ipc.h). Averaged over 30
 // timed frames so the number on screen is steady.
 static FeedStats *g_stats = nullptr;
+// Wine CPU sync (FEED_FRAME_CPU_SYNC): the finished frame number, polled by the game.
+static volatile FeedDone *g_done = nullptr;
+static void DoneOpen(DWORD game_pid)
+{
+    char name[64];
+    sprintf_s(name, FEED_DONE_FMT, static_cast<unsigned long>(game_pid));
+    HANDLE m = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(FeedDone), name);
+    if (m == nullptr) return;
+    g_done = static_cast<volatile FeedDone *>(MapViewOfFile(m, FILE_MAP_WRITE, 0, 0, sizeof(FeedDone)));
+    if (g_done != nullptr) { g_done->done_n = 0; MemoryBarrier(); g_done->magic = FEED_DONE_MAGIC; }
+}
+static void DoneWrite(UINT64 n)
+{
+    if (g_done == nullptr) return;
+    MemoryBarrier();
+    if (n > g_done->done_n) g_done->done_n = n;
+    MemoryBarrier();
+}
 static double     g_stats_sum = 0.0;
 static unsigned   g_stats_n = 0;
 static void StatsOpen(DWORD game_pid)
@@ -60,6 +78,7 @@ static void StatsOpen(DWORD game_pid)
     if (m == nullptr) return;
     g_stats = static_cast<FeedStats *>(MapViewOfFile(m, FILE_MAP_WRITE, 0, 0, sizeof(FeedStats)));
     if (g_stats != nullptr) { g_stats->magic = FEED_STATS_MAGIC; g_stats->gpu_ms = 0.0f; g_stats->tick = GetTickCount(); }
+    DoneOpen(game_pid);
 }
 static void StatsSample(double gpu_ms)
 {
@@ -3911,9 +3930,20 @@ static int Serve(DWORD game_pid)
             // arriving at game rate the tag wait never goes idle -- so a bare `continue`
             // left the window unpumped for as long as the feature was missing, and
             // Windows ghosts it as "Not Responding" within seconds while the game runs on.
+            const bool cpu_sync = (fm.flags & FEED_FRAME_CPU_SYNC) != 0;
+            {
+                static bool cpu_logged = false;
+                if (cpu_sync && !cpu_logged)
+                {
+                    cpu_logged = true;
+                    Log("[host] Wine CPU sync: the game CPU-waits its own GPU and polls the done block; "
+                        "no cross-process fence waits (#121)");
+                }
+            }
             if (h.feature == nullptr && !transport_only)
             {
                 h.fence_out->Signal(fm.n);
+                DoneWrite(fm.n);
                 PumpPresent();
                 if (g_device_removed) break;
                 continue;
@@ -3925,7 +3955,7 @@ static int Serve(DWORD game_pid)
             // (issue #15). A game whose GPU never reaches fm.n now surfaces three frames
             // later as BeginCommands' allocator-retire timeout, which fails the evaluate
             // and CPU-signals fence_out below -- the never-hang guarantee is unchanged.
-            h.queue->Wait(h.fence_in, fm.n);
+            if (!cpu_sync) h.queue->Wait(h.fence_in, fm.n);
 
             bool done = false;
             if (transport_only)
@@ -3970,6 +4000,13 @@ static int Serve(DWORD game_pid)
             if (done)
             {
                 h.queue->Signal(h.fence_out, fm.n);
+                if (cpu_sync)
+                {
+                    if (!WaitFenceValue(h.fence_out, fm.n, 2000))
+                        Log("[host] Wine CPU sync: frame %llu did not finish on our GPU within 2 s",
+                            static_cast<unsigned long long>(fm.n));
+                    DoneWrite(fm.n);
+                }
                 if (!transport_only && !outcome_logged && ++outcome_frames >= 300)
                 {
                     outcome_logged = true;
@@ -4013,6 +4050,7 @@ static int Serve(DWORD game_pid)
             else
             {
                 h.fence_out->Signal(fm.n);     // CPU-signal so the game never hangs on us
+                DoneWrite(fm.n);
                 if (DeviceRemoved("an evaluate")) break;
             }
 
@@ -4104,6 +4142,7 @@ static int Serve(DWORD game_pid)
     CloseHandle(ev_tag);
     if (!g_device_removed) WaitFenceValue(h.fence, h.fence_value, 2000);   // nothing to wait for on a dead device
     if (h.fence_out != nullptr) h.fence_out->Signal(UINT64_MAX);
+    DoneWrite(UINT64_MAX);
     Log("[host] pending game fence waits released; exiting%s", g_device_removed ? " (device removed)" : "");
     return g_device_removed ? 3 : 0;
 }

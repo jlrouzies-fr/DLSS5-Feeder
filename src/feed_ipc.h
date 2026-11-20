@@ -258,6 +258,20 @@ struct FeedFrameMsg     // game -> host, per frame
 };
 
 // FeedFrameMsg::flags (v11+)
+#define FEED_FRAME_CPU_SYNC   2u   // Wine/Proton: the game already CPU-waited its own GPU for this frame's
+                                   // inputs, so the host must NOT GPU-wait in_fence (a fence opened in another
+                                   // process is not connected under Wine, #121). The host CPU-waits its own
+                                   // out fence and publishes n in the FeedDone block instead of relying on
+                                   // the game's GPU wait on out_fence.
+// The FeedDone block: created by the host next to FeedStats, read by the game under FEED_FRAME_CPU_SYNC.
+#define FEED_DONE_FMT    "Local\\DLSS5FeedDone-%lu"
+#define FEED_DONE_MAGIC  0x4E443546u   // "F5DN"
+struct FeedDone
+{
+    uint32_t magic;
+    uint32_t reserved;
+    uint64_t done_n;     // highest frame whose host work is finished on the GPU (UINT64_MAX = host exiting)
+};
 #define FEED_FRAME_HOLD_INPUT 1u   // diagnostic: the host keeps handing the model the colour and depth it
                                    // captured on the first flagged frame, with zero motion, until the flag
                                    // drops. Separates "the model drifts on a constant input" from "the

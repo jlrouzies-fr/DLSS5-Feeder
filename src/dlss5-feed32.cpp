@@ -416,6 +416,8 @@ struct Cfg
 
 //                                        host_window --v  v-- host_gpu_priority (off)          settle_evals --v  v-- hold_input
 static const uint32_t kDefaultPreset = 12;   // L
+// Wine CPU sync for the D3D11 client: -1 auto (on under Wine/Proton), 0 off, 1 on. Parse-only.
+static int g_wine_cpu_sync = -1;
 static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 0, 100, 0, 1, 0, 0, 0, 0,
                      /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f, /* d3d10_pipeline */ 1, /* preset */ 0 };
 static int       g_work_resolution_ui = 100;
@@ -624,6 +626,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "cast_anchor")    == 0) next.cast_anchor    = iv < 0 ? 0 : iv > 3 ? 3 : iv;
         else if (_stricmp(key, "host_creates")   == 0) next.host_creates   = iv == 1 ? 1 : 0;
         else if (_stricmp(key, "wine_fence_import") == 0) next.wine_fence_import = iv == 1 ? 1 : 0;
+        else if (_stricmp(key, "wine_cpu_sync") == 0) g_wine_cpu_sync = iv < 0 ? -1 : (iv != 0 ? 1 : 0);
         else if (_stricmp(key, "settle_evals")   == 0) next.settle_evals   = iv < 0 ? 0 : iv > 8 ? 8 : iv;
         else if (_stricmp(key, "hold_strength")  == 0) next.hold_strength  = val < 0.0f ? 0.0f : val > 1.0f ? 1.0f : val;
         else if (_stricmp(key, "hold_tolerance") == 0) next.hold_tolerance = val < 0.005f ? 0.005f : val > 0.5f ? 0.5f : val;
@@ -1127,6 +1130,89 @@ static void HostDrain()
         Log("[feed32] drain: frame %llu never signalled by the host",
             static_cast<unsigned long long>(g.wait_n));
     CloseHandle(evt);
+}
+
+// ---- Wine CPU sync (D3D11 client) ----------------------------------------------------
+// Under Wine a D3D12 fence opened in another process is not connected to the original
+// (#121): the host's Signal(out_fence) never reaches our Wait, the game's GPU queue
+// stalls, and DXVK reports VK_ERROR_DEVICE_LOST (a black screen). With CPU sync the
+// fences are bypassed: we CPU-wait our own GPU before handing a frame over (a local
+// event query), and the host CPU-waits its own fence and publishes the finished frame
+// number in a named shared-memory block (FeedDone) that we poll.
+static bool CpuSyncOn()
+{
+    static int decided = -2;
+    if (g_wine_cpu_sync >= 0) return g_wine_cpu_sync == 1;
+    if (decided == -2)
+    {
+        const char *wine = FeedGlWineVersion();
+        decided = wine != nullptr ? 1 : 0;
+        if (decided)
+            Log("[feed32] running under Wine %s: cross-process fences are not connected there (#121), so the "
+                "D3D11 handoff uses CPU sync (wine_cpu_sync=0 in dlss5-feed.cfg turns it off)", wine);
+    }
+    return decided == 1;
+}
+static volatile FeedDone *g_done_blk = nullptr;
+static volatile FeedDone *DoneBlock()
+{
+    if (g_done_blk != nullptr) return g_done_blk;
+    char name[64];
+    sprintf_s(name, FEED_DONE_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
+    HANDLE m = OpenFileMappingA(FILE_MAP_READ, FALSE, name);
+    if (m == nullptr) return nullptr;
+    void *p = MapViewOfFile(m, FILE_MAP_READ, 0, 0, sizeof(FeedDone));
+    CloseHandle(m);
+    if (p != nullptr && static_cast<FeedDone *>(p)->magic == FEED_DONE_MAGIC) g_done_blk = static_cast<volatile FeedDone *>(p);
+    else if (p != nullptr) UnmapViewOfFile(p);
+    return g_done_blk;
+}
+static void CpuSpin(unsigned *spins)
+{
+    if (++*spins < 64) YieldProcessor();
+    else if (*spins < 2048) SwitchToThread();
+    else Sleep(1);
+}
+// Wait until the host has finished frame n on its GPU. false = timed out or host gone.
+static bool CpuWaitHost(UINT64 n)
+{
+    volatile FeedDone *d = DoneBlock();
+    if (d == nullptr) { Log("[feed32] Wine CPU sync: the host's done block is missing (a host from another build?)"); return false; }
+    const ULONGLONG deadline = GetTickCount64() + 2000;
+    unsigned spins = 0;
+    while (d->done_n < n)
+    {
+        if (GetTickCount64() > deadline)
+        {
+            Log("[feed32] Wine CPU sync: frame %llu never finished by the host within 2 s (done=%llu)",
+                static_cast<unsigned long long>(n), static_cast<unsigned long long>(d->done_n));
+            return false;
+        }
+        if (g.hproc != nullptr && WaitForSingleObject(g.hproc, 0) != WAIT_TIMEOUT) return false;
+        CpuSpin(&spins);
+    }
+    MemoryBarrier();
+    return true;
+}
+// Flush and wait until our own GPU has executed everything recorded so far.
+static ID3D11Query *g_cpu_query = nullptr;
+static bool CpuWaitOwnGpu(ID3D11DeviceContext *ctx)
+{
+    if (g_cpu_query == nullptr)
+    {
+        D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
+        if (g.dev == nullptr || FAILED(g.dev->CreateQuery(&qd, &g_cpu_query))) return false;
+    }
+    ctx->End(g_cpu_query);
+    ctx->Flush();
+    const ULONGLONG deadline = GetTickCount64() + 2000;
+    unsigned spins = 0;
+    while (ctx->GetData(g_cpu_query, nullptr, 0, 0) == S_FALSE)
+    {
+        if (GetTickCount64() > deadline) { Log("[feed32] Wine CPU sync: our own GPU did not finish within 2 s"); return false; }
+        CpuSpin(&spins);
+    }
+    return true;
 }
 
 static void CastHostLost();       // below: drop the thumbnail of a window that is going away
@@ -4011,7 +4097,16 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
             Log("[feed32] fsr1 intermediate (%ux%u fmt=%u) failed; work_upscale=1 falls back to bilinear", backbuffer_w, backbuffer_h, g.output_fmt);
     }
 
-    if (g.fence_in == nullptr || g.fence_out == nullptr)
+    if (CpuSyncOn())
+    {
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            Log("[feed32] Wine CPU sync: not importing the host's fences (OpenSharedFence faults inside Wine, #121)");
+        }
+    }
+    else if (g.fence_in == nullptr || g.fence_out == nullptr)
     {
         ID3D11Device5 *dev5 = nullptr;
         if (FAILED(g.dev->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&dev5))) || dev5 == nullptr)
@@ -5755,12 +5850,25 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
             // Depth and MV for that evaluate, and this is the only thing ordering our
             // overwrite of them against it.
             const bool async_home = g_cfg.async_home != 0;
+            const bool cpu_sync = CpuSyncOn();
             if (async_home && g.sent_n != 0)
             {
                 Breadcrumb("waiting for the previous result");
-                g.ctx4->Wait(g.fence_out, g.sent_n);   // GPU-side; the host CPU-signals on failure
-                g.fence_wait_queued = true;
-                g.wait_n            = g.sent_n;
+                if (cpu_sync)
+                {
+                    if (!CpuWaitHost(g.sent_n))
+                    {
+                        FeedDisable("Wine CPU sync: the host stopped answering (see dlss5-feed.log)");
+                        SafeRelease(color); SafeRelease(mv); SafeRelease(depth);
+                        return;
+                    }
+                }
+                else
+                {
+                    g.ctx4->Wait(g.fence_out, g.sent_n);   // GPU-side; the host CPU-signals on failure
+                    g.fence_wait_queued = true;
+                    g.wait_n            = g.sent_n;
+                }
             }
 
             // work_upscale=2: this frame's grid shift. The sequence restarts with the DLSS
@@ -5795,15 +5903,27 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
             const bool carried = async_home && g.out_valid;
             if (carried) BlitOutputToBackbuffer(ctx, rtv11);
 
-            g.ctx4->Signal(g.fence_in, n);
-            ctx->Flush();
+            if (cpu_sync)
+            {
+                if (!CpuWaitOwnGpu(ctx))
+                {
+                    FeedDisable("Wine CPU sync: could not wait for the game's own GPU (see dlss5-feed.log)");
+                    SafeRelease(color); SafeRelease(mv); SafeRelease(depth);
+                    return;
+                }
+            }
+            else
+            {
+                g.ctx4->Signal(g.fence_in, n);
+                ctx->Flush();
+            }
 
             // Jitter sign: the shift was applied to the sampling grid, so a sample sits at
             // pixel centre + jitter -- the convention the SDK's jitter offset describes.
             const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset),
                                       g.sr_active ? g.jitter_x : 0.0f, g.sr_active ? g.jitter_y : 0.0f,
                                       static_cast<uint32_t>(g_cfg.settle_evals),
-                                      g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u,
+                                      (g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u) | (cpu_sync ? FEED_FRAME_CPU_SYNC : 0u),
                                       g_cfg.hold_strength, g_cfg.hold_tolerance };
             const bool sent = PipeWriteFrame(fm);
             if (sent && g.sr_active) ++g.jitter_index;
@@ -5824,9 +5944,21 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
             else
             {
                 Breadcrumb("waiting for the host's result");
-                g.ctx4->Wait(g.fence_out, n);       // GPU-side; the host CPU-signals on failure
-                g.fence_wait_queued = true;         // HostDrain must resolve this before any close
-                g.wait_n            = n;
+                if (cpu_sync)
+                {
+                    if (!CpuWaitHost(n))
+                    {
+                        FeedDisable("Wine CPU sync: the host stopped answering (see dlss5-feed.log)");
+                        SafeRelease(color); SafeRelease(mv); SafeRelease(depth);
+                        return;
+                    }
+                }
+                else
+                {
+                    g.ctx4->Wait(g.fence_out, n);       // GPU-side; the host CPU-signals on failure
+                    g.fence_wait_queued = true;         // HostDrain must resolve this before any close
+                    g.wait_n            = n;
+                }
                 g.sent_n            = n;
                 BlitOutputToBackbuffer(ctx, rtv11);
                 g.out_valid = true;
@@ -6240,6 +6372,7 @@ static void OnDestroyDevice(reshade::api::device *dev)
         g.mt_was_on = false;
     }
     SafeRelease(g.ctx4);
+    SafeRelease(g_cpu_query);
     SafeRelease(g.blit_vs);
     SafeRelease(g.blit_ps);
     SafeRelease(g.resample_ps);
